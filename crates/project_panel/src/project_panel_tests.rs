@@ -5995,7 +5995,7 @@ mod multibuffer_wrapper {
 #[gpui::test]
 async fn test_autoreveal_follows_multibuffer_selection(cx: &mut gpui::TestAppContext) {
     use editor::{
-        Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, SelectionEffects, ToOffset,
+        Editor, EditorEvent, EditorModeConfig, MultiBuffer, PathKey, SelectionEffects, ToOffset,
     };
     use language::Point;
     use multibuffer_wrapper::TestMultibufferWrapper;
@@ -6074,7 +6074,7 @@ async fn test_autoreveal_follows_multibuffer_selection(cx: &mut gpui::TestAppCon
     let inner_editor = cx.update(|window, cx| {
         cx.new(|cx| {
             Editor::new(
-                EditorMode::full(),
+                EditorModeConfig::full(),
                 multi_buffer.clone(),
                 Some(project.clone()),
                 window,
