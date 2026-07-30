@@ -517,6 +517,11 @@ message Envelope {
     GetIncomingCallsResponse get_incoming_calls_response = 485;
     GetOutgoingCalls get_outgoing_calls = 486;
     GetOutgoingCallsResponse get_outgoing_calls_response = 487; // current max
+    GitCheckoutCommit git_checkout_commit = 488;
+    GitCreateTag git_create_tag = 489;
+    GitCherryPick git_cherry_pick = 490;
+    GitRevertCommit git_revert_commit = 491;
+    GitMerge git_merge = 492; // current max
   }
 
   reserved 87 to 88;

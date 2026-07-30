@@ -49,6 +49,28 @@ pub struct FakeCommitSnapshot {
     pub sha: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FakeGitMutation {
+    Reset {
+        commit: String,
+        mode: ResetMode,
+    },
+    CheckoutCommit(String),
+    CreateTag(CreateTagOptions),
+    CherryPick {
+        commits: Vec<String>,
+        no_commit: bool,
+    },
+    Revert {
+        commit: String,
+        no_commit: bool,
+    },
+    Merge {
+        commit: String,
+        mode: MergeMode,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub enum FakeCommitDataEntry {
     Success(CommitData),
@@ -81,6 +103,7 @@ pub struct FakeGitRepositoryState {
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     pub stash_entries: GitStash,
     pub commit_template: Option<GitCommitTemplate>,
+    pub graph_mutations: Vec<FakeGitMutation>,
 }
 
 impl FakeGitRepositoryState {
@@ -108,6 +131,7 @@ impl FakeGitRepositoryState {
             commit_history: Vec::new(),
             stash_entries: Default::default(),
             commit_template: None,
+            graph_mutations: Vec::new(),
         }
     }
 }
@@ -325,6 +349,10 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         self.with_state_async(true, move |state| {
+            state.graph_mutations.push(FakeGitMutation::Reset {
+                commit: commit.clone(),
+                mode,
+            });
             let pop_count = if commit == "HEAD~" || commit == "HEAD^" {
                 1
             } else if let Some(suffix) = commit.strip_prefix("HEAD~") {
@@ -374,6 +402,9 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         self.with_state_async(true, move |state| {
+            state
+                .graph_mutations
+                .push(FakeGitMutation::CheckoutCommit(commit.clone()));
             let commit = state.refs.get(&commit).cloned().unwrap_or(commit);
             let snapshot = state
                 .commit_history
@@ -395,6 +426,9 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         self.with_state_async(true, move |state| {
+            state
+                .graph_mutations
+                .push(FakeGitMutation::CreateTag(options.clone()));
             anyhow::ensure!(!options.name.is_empty(), "tag name cannot be empty");
             let target = state
                 .refs
@@ -415,10 +449,14 @@ impl GitRepository for FakeGitRepository {
     fn cherry_pick(
         &self,
         commits: Vec<String>,
-        _no_commit: bool,
+        no_commit: bool,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         self.with_state_async(true, move |state| {
+            state.graph_mutations.push(FakeGitMutation::CherryPick {
+                commits: commits.clone(),
+                no_commit,
+            });
             anyhow::ensure!(
                 !commits.is_empty(),
                 "cherry-pick requires at least one commit"
@@ -443,10 +481,14 @@ impl GitRepository for FakeGitRepository {
     fn revert(
         &self,
         commit: String,
-        _no_commit: bool,
+        no_commit: bool,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         self.with_state_async(true, move |state| {
+            state.graph_mutations.push(FakeGitMutation::Revert {
+                commit: commit.clone(),
+                no_commit,
+            });
             let commit = state.refs.get(&commit).cloned().unwrap_or(commit);
             let index = state
                 .commit_history
@@ -482,6 +524,10 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         self.with_state_async(true, move |state| {
+            state.graph_mutations.push(FakeGitMutation::Merge {
+                commit: commit.clone(),
+                mode,
+            });
             let commit = state.refs.get(&commit).cloned().unwrap_or(commit);
             let snapshot = state
                 .commit_history
