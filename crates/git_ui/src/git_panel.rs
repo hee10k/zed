@@ -6135,21 +6135,12 @@ impl GitPanel {
                         return anyhow::Ok(());
                     };
                     let receiver = repository.update(cx, |repository, cx| {
-                        repository.run_operation_action(
-                            operation,
-                            GitOperationAction::Abort,
-                            cx,
-                        )
+                        repository.run_operation_action(operation, GitOperationAction::Abort, cx)
                     });
                     if let Err(error) = receiver.await? {
                         if let Some(workspace) = workspace.upgrade() {
-                            cx.update(|_, cx| {
-                                show_error_toast(
-                                    workspace,
-                                    "abort Git operation",
-                                    error,
-                                    cx,
-                                );
+                            let _ = cx.update(|_, cx| {
+                                show_error_toast(workspace, "abort Git operation", error, cx);
                             });
                         }
                     }
@@ -6773,10 +6764,12 @@ impl GitPanel {
                 sha: commit.sha,
                 tag_names: commit.tag_names,
             },
+            vec![commit.sha],
             CommitContextMenuSource::GitPanel,
             None,
             self.focus_handle.clone(),
             Some(repository.downgrade()),
+            None,
             self.workspace.clone(),
             window,
             cx,

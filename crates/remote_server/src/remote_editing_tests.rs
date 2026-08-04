@@ -3848,7 +3848,6 @@ async fn test_remote_git_operation_lifecycle(
 
     fs.with_git_state(dot_git, true, |state| {
         state.active_operation = Some(GitOperationKind::Rebase);
-        Ok(())
     })
     .unwrap();
 
@@ -3856,7 +3855,6 @@ async fn test_remote_git_operation_lifecycle(
         .update(cx, |repository, cx| repository.operation_state(cx))
         .await
         .unwrap()
-        .await
         .unwrap();
     assert_eq!(op, Some(GitOperationKind::Rebase));
 
@@ -3873,7 +3871,6 @@ async fn test_remote_git_operation_lifecycle(
         .update(cx, |repository, cx| repository.operation_state(cx))
         .await
         .unwrap()
-        .await
         .unwrap();
     assert_eq!(op_after, None);
 }

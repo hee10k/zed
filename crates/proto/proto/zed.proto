@@ -517,19 +517,17 @@ message Envelope {
     GetIncomingCallsResponse get_incoming_calls_response = 485;
     GetOutgoingCalls get_outgoing_calls = 486;
     GetOutgoingCallsResponse get_outgoing_calls_response = 487; // current max
-    GitCheckoutCommit git_checkout_commit = 488;
-    GitCreateTag git_create_tag = 489;
-    GitCherryPick git_cherry_pick = 490;
-    GitRevertCommit git_revert_commit = 491;
-    GitMerge git_merge = 492; // current max
-    GitCheckoutCommit git_checkout_commit = 478;
-    GitCreateTag git_create_tag = 479;
-    GitCherryPick git_cherry_pick = 480;
-    GitRevertCommit git_revert_commit = 481;
-    GitMerge git_merge = 482;
-    GitOperationState git_operation_state = 483;
-    GitOperationStateResponse git_operation_state_response = 484;
-    GitRunOperationAction git_run_operation_action = 485; // current max
+
+    GitCheckoutCommit git_checkout_commit = 499;
+    GitCreateTag git_create_tag = 500;
+    GitCherryPick git_cherry_pick = 501;
+    GitRevertCommit git_revert_commit = 502;
+    GitMerge git_merge = 503;
+    GitOperationState git_operation_state = 504;
+    GitOperationStateResponse git_operation_state_response = 505;
+    GitRunOperationAction git_run_operation_action = 506;
+    LoadCommitRangeDiff load_commit_range_diff = 507;
+    LoadCommitRangeDiffResponse load_commit_range_diff_response = 508;
   }
 
   reserved 87 to 88;
