@@ -106,10 +106,30 @@ jobs:
       - name: Set release version
         shell: pwsh
         run: |
-          $path = "crates/zed/Cargo.toml"
-          $content = Get-Content -Raw $path
-          $content = $content -replace '(?m)^version = "[^"]*"', 'version = "${{ needs.prepare.outputs.version }}"'
-          Set-Content -Path $path -Value $content -NoNewline
+          $ErrorActionPreference = "Stop"
+          $version = "${{ needs.prepare.outputs.version }}"
+          $manifestPath = "crates/zed/Cargo.toml"
+          $manifest = Get-Content -Raw $manifestPath
+          $manifest = $manifest -replace '(?m)^version = "[^"]*"', "version = `"$version`""
+          Set-Content -Path $manifestPath -Value $manifest -NoNewline
+
+          $lockPath = "Cargo.lock"
+          $lockLines = Get-Content $lockPath
+          $updated = $false
+          for ($index = 0; $index -lt $lockLines.Count - 1; $index++) {
+            if ($lockLines[$index] -eq 'name = "zed"') {
+              if ($lockLines[$index + 1] -notmatch '^version = "') {
+                throw "Unexpected zed package entry in Cargo.lock"
+              }
+              $lockLines[$index + 1] = "version = `"$version`""
+              $updated = $true
+              break
+            }
+          }
+          if (-not $updated) {
+            throw "Could not find zed package entry in Cargo.lock"
+          }
+          Set-Content -Path $lockPath -Value $lockLines
       - name: Enable long paths
         shell: pwsh
         run: |
