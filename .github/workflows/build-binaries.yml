@@ -165,12 +165,19 @@ jobs:
           if (-not (Test-Path $setup)) {
             throw "Visual Studio Installer not found: $setup"
           }
-          & $setup modify `
-            --installPath $installationPath `
-            --add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre `
-            --quiet --norestart --wait
-          if ($LASTEXITCODE -notin @(0, 3010)) {
-            throw "Visual Studio Installer failed with exit code $LASTEXITCODE"
+          $arguments = @(
+            "modify"
+            "--installPath"
+            "`"$installationPath`""
+            "--add"
+            "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre"
+            "--quiet"
+            "--norestart"
+            "--wait"
+          )
+          $installerProcess = Start-Process -FilePath $setup -ArgumentList $arguments -Wait -PassThru
+          if ($installerProcess.ExitCode -notin @(0, 3010)) {
+            throw "Visual Studio Installer failed with exit code $($installerProcess.ExitCode)"
           }
 
           $spectreLib = Get-ChildItem -Path $msvcPath -Directory -ErrorAction SilentlyContinue |
