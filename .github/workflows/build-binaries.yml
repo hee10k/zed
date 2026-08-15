@@ -135,6 +135,52 @@ jobs:
         run: |
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f
           git config --global core.longpaths true
+      - name: Ensure Spectre-mitigated libraries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installerRoot = ${env:ProgramFiles(x86)}
+          $vswhere = Join-Path $installerRoot "Microsoft Visual Studio\Installer\vswhere.exe"
+          $setup = Join-Path $installerRoot "Microsoft Visual Studio\Installer\setup.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "Visual Studio installation discovery tool not found: $vswhere"
+          }
+
+          $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($installationPath)) {
+            throw "No Visual Studio installation with MSVC tools was found"
+          }
+          $installationPath = $installationPath.Trim()
+          $msvcPath = Join-Path $installationPath "VC\Tools\MSVC"
+          $spectreLib = Get-ChildItem -Path $msvcPath -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName "lib\spectre\x64" } |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+          if ($spectreLib) {
+            Write-Host "Spectre-mitigated libraries already installed: $spectreLib"
+            exit 0
+          }
+
+          if (-not (Test-Path $setup)) {
+            throw "Visual Studio Installer not found: $setup"
+          }
+          & $setup modify `
+            --installPath $installationPath `
+            --add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre `
+            --quiet --norestart --wait
+          if ($LASTEXITCODE -notin @(0, 3010)) {
+            throw "Visual Studio Installer failed with exit code $LASTEXITCODE"
+          }
+
+          $spectreLib = Get-ChildItem -Path $msvcPath -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName "lib\spectre\x64" } |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+          if (-not $spectreLib) {
+            throw "Spectre-mitigated x64 libraries are still unavailable after installation"
+          }
+          Write-Host "Installed Spectre-mitigated libraries: $spectreLib"
       - name: Fetch dependencies
         shell: pwsh
         run: cargo fetch --locked --target x86_64-pc-windows-msvc
