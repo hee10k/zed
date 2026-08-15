@@ -96,6 +96,7 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.ref }}
           clean: false
+          set-safe-directory: false
       - name: Manage persistent target
         shell: pwsh
         run: ./script/clear-target-dir-if-larger-than.ps1 -MAX_SIZE_IN_GB 350 -SMALL_CLEAN_SIZE_IN_GB 200
