@@ -463,6 +463,7 @@ impl WorktreePickerDelegate {
                         &action,
                         window,
                         focused_dock,
+                        workspace::OpenMode::Activate,
                         cx,
                     );
                 });
@@ -470,7 +471,7 @@ impl WorktreePickerDelegate {
         });
 
         if let Some(workspace) = selector_workspace.upgrade() {
-            let picker_workspace = selector_workspace.clone();
+            let picker_workspace = selector_workspace;
             workspace.update(cx, |workspace, cx| {
                 workspace.toggle_modal(window, cx, move |window, cx| {
                     crate::build_branch_selector(
@@ -1026,6 +1027,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                             },
                             window,
                             self.focused_dock,
+                            workspace::OpenMode::Activate,
                             cx,
                         );
                     });
@@ -1048,6 +1050,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                             },
                             window,
                             self.focused_dock,
+                            workspace::OpenMode::Activate,
                             cx,
                         );
                     });
@@ -1084,6 +1087,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                     },
                                     window,
                                     self.focused_dock,
+                                    workspace::OpenMode::Activate,
                                     cx,
                                 );
                             });
@@ -1107,6 +1111,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                 },
                                 window,
                                 self.focused_dock,
+                                workspace::OpenMode::Activate,
                                 cx,
                             );
                         });
