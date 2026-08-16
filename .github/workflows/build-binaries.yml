@@ -120,11 +120,24 @@ jobs:
           if ((Test-Path target) -and (Get-ChildItem target -Force | Select-Object -First 1)) {
             throw "target directory is not empty after benchmark reset"
           }
+      - name: Use pinned Rust toolchain binaries
+        shell: pwsh
+        run: |
+          $toolchainBin = Join-Path $env:USERPROFILE ".rustup\toolchains\1.97.1-x86_64-pc-windows-msvc\bin"
+          $cargo = Join-Path $toolchainBin "cargo.exe"
+          $rustc = Join-Path $toolchainBin "rustc.exe"
+          if (-not (Test-Path $cargo) -or -not (Test-Path $rustc)) {
+            throw "Pinned Rust toolchain binaries are unavailable in $toolchainBin"
+          }
+          $toolchainBin >> $env:GITHUB_PATH
+          & $cargo --version
+          & $rustc -vV
       - name: Cache Rust dependencies
         id: rust-cache
         uses: Swatinem/rust-cache@72d126e709cad40056a62344eee609d696d62d33
         with:
           cache-targets: false
+          cache-bin: false
       - name: Set release version
         shell: pwsh
         run: |
