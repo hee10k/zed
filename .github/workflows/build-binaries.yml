@@ -187,6 +187,28 @@ jobs:
             throw "Spectre-mitigated x64 libraries are still unavailable after installation"
           }
           Write-Host "Installed Spectre-mitigated libraries: $spectreLib"
+      - name: Configure WebRTC Windows SDK compatibility
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Include"
+          $hasWindows11Sdk = Get-ChildItem -Path $sdkRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^10\.0\.26100\.' } |
+            Select-Object -First 1
+          if ($hasWindows11Sdk) {
+            Write-Host "Windows 11 SDK 10.0.26100 is installed: $($hasWindows11Sdk.Name)"
+            exit 0
+          }
+
+          $compatibilityFlag = "-DNTDDI_WIN11_GE=0x0A000010"
+          $compilerFlags = [Environment]::GetEnvironmentVariable("CXXFLAGS")
+          if ([string]::IsNullOrWhiteSpace($compilerFlags)) {
+            $compilerFlags = $compatibilityFlag
+          } elseif ($compilerFlags -notlike "*NTDDI_WIN11_GE*") {
+            $compilerFlags = "$compilerFlags $compatibilityFlag"
+          }
+          "CXXFLAGS=$compilerFlags" >> $env:GITHUB_ENV
+          Write-Warning "Windows 11 SDK 10.0.26100 is unavailable; using $compatibilityFlag"
       - name: Fetch dependencies
         shell: pwsh
         run: cargo fetch --locked --target x86_64-pc-windows-msvc
