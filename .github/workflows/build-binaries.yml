@@ -362,7 +362,15 @@ jobs:
           }
       - name: Bundle Windows installer
         shell: pwsh
-        run: ./script/bundle-windows.ps1
+        run: |
+          function rustup {
+            if ($args.Count -eq 3 -and $args[0] -eq "target" -and $args[1] -eq "add" -and $args[2] -eq "x86_64-pc-windows-msvc") {
+              Write-Host "Using preinstalled Rust target $($args[2])"
+              return
+            }
+            throw "Unexpected rustup invocation: $args"
+          }
+          ./script/bundle-windows.ps1
 
   release:
     needs: [prepare, build-windows]
