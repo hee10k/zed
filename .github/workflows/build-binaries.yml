@@ -173,7 +173,6 @@ jobs:
             "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre"
             "--quiet"
             "--norestart"
-            "--wait"
           )
           $installerProcess = Start-Process -FilePath $setup -ArgumentList $arguments -Wait -PassThru
           if ($installerProcess.ExitCode -notin @(0, 3010)) {
