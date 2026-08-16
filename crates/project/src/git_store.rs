@@ -517,6 +517,27 @@ impl sum_tree::KeyedItem for StatusEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepositoryId(pub u64);
 
+/// Opaque project-owned identity of the Git common directory shared by one or
+/// more repositories (e.g. a main checkout plus its linked worktrees, or
+/// open sub-directories of one checkout).
+///
+/// The same physical common directory is represented identically for every
+/// repository that shares it, so callers can group repositories by this
+/// identity to avoid creating multiple worktrees for one underlying
+/// repository. It is intentionally opaque: code outside this crate must not
+/// derive host scope or compare common paths across Projects from it.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CommonRepositoryIdentity(Arc<Path>);
+
+impl CommonRepositoryIdentity {
+    /// Constructs an identity from a raw path. Only intended for tests that
+    /// exercise grouping logic without a live [`Repository`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_path_for_tests(path: impl Into<Arc<Path>>) -> Self {
+        Self(path.into())
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MergeDetails {
     pub merge_heads_by_conflicted_path: TreeMap<RepoPath, Vec<Option<SharedString>>>,
@@ -9432,6 +9453,16 @@ impl Repository {
             .main_worktree_abs_path()
             .or_else(|| repo_identity_path_if_local(&self.common_dir_abs_path, self.path_style))
             .unwrap_or(self.common_dir_abs_path.as_ref())
+    }
+
+    /// The identity of the Git common directory this repository belongs to.
+    ///
+    /// All repositories sharing one underlying Git repository (a main
+    /// checkout, its linked worktrees, or open sub-directories of either)
+    /// compare equal here, so callers can deduplicate worktree creation
+    /// across project roots.
+    pub fn common_repository_identity(&self) -> CommonRepositoryIdentity {
+        CommonRepositoryIdentity(self.snapshot.common_dir_abs_path.clone())
     }
 
     pub fn path_for_new_linked_worktree(

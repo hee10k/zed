@@ -311,6 +311,15 @@ pub enum NewWorktreeBranchTarget {
         remote_name: String,
         branch_name: String,
     },
+    /// Create a detached worktree at a specific commit in the repository
+    /// identified by [`Self::Commit::repository_id`]. The repository id is a
+    /// project-owned repository id serialized to its proto form; it is
+    /// resolved to exactly one repository inside the current Project at
+    /// creation time.
+    Commit {
+        repository_id: u64,
+        sha: String,
+    },
 }
 
 /// Creates a new git worktree and switches the workspace to it.

@@ -4829,7 +4829,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 let creation = window.update(cx, |_root, window, cx| {
                     workspace.update(cx, |workspace, cx| {
                         git_ui_core::worktree_service::create_worktree_workspace(
-                            workspace, &action, window, None, cx,
+                            workspace, &action, window, None, workspace::OpenMode::Add, cx,
                         )
                     })
                 })?;

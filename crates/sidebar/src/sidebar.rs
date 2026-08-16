@@ -756,6 +756,7 @@ fn create_worktree_in_workspace(
             },
             window,
             focused_dock,
+            workspace::OpenMode::Activate,
             cx,
         );
     });

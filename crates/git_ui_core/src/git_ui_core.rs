@@ -13,6 +13,7 @@ pub mod created_worktrees;
 pub mod file_diff_view;
 pub mod notifications;
 pub mod worktree_names;
+pub mod worktree_name_modal;
 pub mod worktree_picker;
 pub mod worktree_service;
 

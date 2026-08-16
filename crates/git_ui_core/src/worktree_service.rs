@@ -12,7 +12,7 @@ use gpui::{
     Task, TaskExt, WeakEntity,
 };
 use project::Project;
-use project::git_store::Repository;
+use project::git_store::{CommonRepositoryIdentity, Repository};
 use project::project_settings::ProjectSettings;
 use project::trusted_worktrees::{PathTrust, TrustedWorktrees};
 use remote::RemoteConnectionOptions;
@@ -23,7 +23,7 @@ use workspace::{
 };
 use zed_actions::NewWorktreeBranchTarget;
 
-use git::repository::{Branch, FetchOptions, Remote};
+use git::repository::{Branch, CreateWorktreeTarget, FetchOptions, Remote};
 
 use util::ResultExt as _;
 
@@ -294,7 +294,7 @@ impl Render for WorktreeFetchFailedToast {
                                 focused_dock,
                                 RemoteBranchFetchMode::UseLocal,
                                 // User-initiated retry of a foreground create.
-                                true,
+                                OpenMode::Activate,
                                 cx,
                             );
                             task.detach_and_log_err(cx);
@@ -374,9 +374,13 @@ pub fn classify_worktrees(
 
 /// Resolves a branch target into the ref the new worktree should be based on.
 /// Returns `None` for `CurrentBranch`, meaning "use the current HEAD".
+/// A `Commit` target does not name a single ref observable outside the
+/// worktree service, so it can't be resolved here; the repository-aware
+/// resolver in [`start_worktree_creations`] picks the per-repository base.
 pub fn resolve_worktree_branch_target(branch_target: &NewWorktreeBranchTarget) -> Option<String> {
     match branch_target {
-        NewWorktreeBranchTarget::CurrentBranch => None,
+        NewWorktreeBranchTarget::CurrentBranch
+        | NewWorktreeBranchTarget::Commit { .. } => None,
         NewWorktreeBranchTarget::ExistingBranch { name } => Some(name.clone()),
         NewWorktreeBranchTarget::RemoteBranch {
             remote_name,
@@ -391,9 +395,9 @@ fn remote_branch_to_fetch(branch_target: &NewWorktreeBranchTarget) -> Option<(&s
             remote_name,
             branch_name,
         } => Some((remote_name, branch_name)),
-        NewWorktreeBranchTarget::CurrentBranch | NewWorktreeBranchTarget::ExistingBranch { .. } => {
-            None
-        }
+        NewWorktreeBranchTarget::CurrentBranch
+        | NewWorktreeBranchTarget::ExistingBranch { .. }
+        | NewWorktreeBranchTarget::Commit { .. } => None,
     }
 }
 
@@ -466,6 +470,52 @@ async fn fetch_remote_for_worktree_base(
     Ok(())
 }
 
+/// Resolves the Git creation target for one repository given the requested
+/// branch target.
+///
+/// For a [`NewWorktreeBranchTarget::Commit`] target, every repository
+/// sharing the clicked repository's common identity uses the selected SHA
+/// and every other underlying repository uses the current HEAD. All other
+/// targets resolve to a single base shared by every repository.
+fn detached_target_for_repository(
+    branch_target: &NewWorktreeBranchTarget,
+    clicked_common_identity: Option<&CommonRepositoryIdentity>,
+    repository: &Repository,
+) -> anyhow::Result<CreateWorktreeTarget> {
+    let repository_common_identity = repository.common_repository_identity();
+    let base_sha = resolve_target_base_sha(
+        branch_target,
+        clicked_common_identity,
+        &repository_common_identity,
+    )?;
+    Ok(CreateWorktreeTarget::Detached { base_sha })
+}
+
+/// Pure base-ref decision for one repository against a branch target. Kept
+/// separate from [`detached_target_for_repository`] so the commit-versus-HEAD
+/// grouping is directly unit-testable without a live [`Repository`]. For a
+/// `Commit` target only repositories sharing the clicked common identity are
+/// based on the selected SHA; every other repository uses the current HEAD
+/// (`None`).
+fn resolve_target_base_sha(
+    branch_target: &NewWorktreeBranchTarget,
+    clicked_common_identity: Option<&CommonRepositoryIdentity>,
+    repository_common_identity: &CommonRepositoryIdentity,
+) -> anyhow::Result<Option<String>> {
+    let base_sha = match branch_target {
+        NewWorktreeBranchTarget::CurrentBranch => None,
+        NewWorktreeBranchTarget::ExistingBranch { name } => Some(name.clone()),
+        NewWorktreeBranchTarget::RemoteBranch {
+            remote_name,
+            branch_name,
+        } => Some(format!("refs/remotes/{remote_name}/{branch_name}")),
+        NewWorktreeBranchTarget::Commit { sha, .. } => clicked_common_identity
+            .filter(|clicked_identity| *clicked_identity == repository_common_identity)
+            .map(|_| sha.clone()),
+    };
+    Ok(base_sha)
+}
+
 /// Kicks off an async git-worktree creation for each repository. Returns:
 ///
 /// - `creation_infos`: a vec of `(repo, new_path, receiver)` tuples.
@@ -473,17 +523,23 @@ async fn fetch_remote_for_worktree_base(
 ///
 /// Multiple entries in `git_repos` can be linked worktrees of the *same*
 /// underlying repository (e.g. a project that has both the main checkout and
-/// one of its linked worktrees open as separate Zed worktrees). Those entries
-/// resolve to the same target path via [`Repository::path_for_new_linked_worktree`],
-/// so we create the new worktree only once and remap every contributing
-/// work directory onto it. Without this dedup, the second `git worktree add`
-/// fails with "already exists".
+/// one of its linked worktrees open as separate Zed worktrees, or two open
+/// sub-directories of one checkout). Those entries resolve to the same target
+/// path via [`Repository::path_for_new_linked_worktree`] and receive the same
+/// base from [`detached_target_for_repository`], so we create the new worktree
+/// only once and remap every contributing work directory onto it. Without this
+/// dedup, the second `git worktree add` fails with "already exists".
+///
+/// `clicked_common_identity` is `Some` only for a `Commit` target and is the
+/// common identity of the repository the user clicked in the graph; it
+/// determines which repositories are based on the selected SHA.
 fn start_worktree_creations(
     git_repos: &[Entity<Repository>],
     worktree_name: Option<String>,
     existing_worktree_names: &[String],
     existing_worktree_paths: &HashSet<PathBuf>,
-    base_ref: Option<String>,
+    branch_target: &NewWorktreeBranchTarget,
+    clicked_common_identity: Option<CommonRepositoryIdentity>,
     worktree_directory_setting: &str,
     rng: &mut impl rand::Rng,
     cx: &mut gpui::App,
@@ -513,15 +569,17 @@ fn start_worktree_creations(
                 anyhow::bail!("A worktree already exists at {}", new_path.display());
             }
             let work_dir = repo.work_directory_abs_path.clone();
+            let target = detached_target_for_repository(
+                branch_target,
+                clicked_common_identity.as_ref(),
+                repo,
+            )?;
             // Only the first repo that resolves to a given target path
             // actually creates the worktree; subsequent linked worktrees of
             // the same repository just contribute a path remapping.
             let receiver = if scheduled_paths.contains(&new_path) {
                 None
             } else {
-                let target = git::repository::CreateWorktreeTarget::Detached {
-                    base_sha: base_ref.clone(),
-                };
                 Some(repo.create_worktree(target, new_path.clone()))
             };
             anyhow::Ok((work_dir, new_path, receiver))
@@ -708,6 +766,7 @@ pub fn handle_create_worktree(
     action: &zed_actions::CreateWorktree,
     window: &mut gpui::Window,
     fallback_focused_dock: Option<DockPosition>,
+    open_mode: OpenMode,
     cx: &mut gpui::Context<Workspace>,
 ) {
     let task = create_worktree_workspace_inner(
@@ -716,8 +775,7 @@ pub fn handle_create_worktree(
         window,
         fallback_focused_dock,
         RemoteBranchFetchMode::Fetch,
-        // The user explicitly asked to create a worktree, so foreground it.
-        true,
+        open_mode,
         cx,
     );
     task.detach_and_log_err(cx);
@@ -756,6 +814,7 @@ pub fn create_worktree_workspace(
     action: &zed_actions::CreateWorktree,
     window: &mut gpui::Window,
     fallback_focused_dock: Option<DockPosition>,
+    open_mode: OpenMode,
     cx: &mut gpui::Context<Workspace>,
 ) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
     create_worktree_workspace_inner(
@@ -764,8 +823,7 @@ pub fn create_worktree_workspace(
         window,
         fallback_focused_dock,
         RemoteBranchFetchMode::Fetch,
-        // Agent-created worktree workspaces open in the background.
-        false,
+        open_mode,
         cx,
     )
 }
@@ -776,7 +834,7 @@ fn create_worktree_workspace_inner(
     window: &mut gpui::Window,
     fallback_focused_dock: Option<DockPosition>,
     remote_branch_fetch_mode: RemoteBranchFetchMode,
-    activate: bool,
+    open_mode: OpenMode,
     cx: &mut gpui::Context<Workspace>,
 ) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
     let project = workspace.project().clone();
@@ -839,6 +897,13 @@ fn create_worktree_workspace_inner(
     }
 
     let worktree_name = action.worktree_name.clone();
+    // Re-validate a caller-supplied name at the service boundary before any
+    // path calculation or Git job: the UI is not a trust boundary.
+    if let Some(name) = &worktree_name
+        && let Err(error) = worktree_names::normalize_worktree_name(name)
+    {
+        return Task::ready(Err(error.context("Invalid worktree name")));
+    }
     let branch_target = action.branch_target.clone();
     let fetch_askpass_delegates = if remote_branch_fetch_mode.should_fetch() {
         remote_branch_to_fetch(&branch_target)
@@ -879,7 +944,7 @@ fn create_worktree_workspace_inner(
             workspace_handle.clone(),
             window_handle,
             remote_connection_options,
-            activate,
+            open_mode,
             &mut cx,
         )
         .await;
@@ -917,6 +982,7 @@ pub fn handle_switch_worktree(
     action: &zed_actions::SwitchWorktree,
     window: &mut gpui::Window,
     fallback_focused_dock: Option<DockPosition>,
+    open_mode: OpenMode,
     cx: &mut gpui::Context<Workspace>,
 ) {
     let project = workspace.project().clone();
@@ -963,6 +1029,7 @@ pub fn handle_switch_worktree(
             workspace_handle.clone(),
             window_handle,
             remote_connection_options,
+            open_mode,
             &mut cx,
         )
         .await;
@@ -993,7 +1060,7 @@ async fn do_create_worktree(
     workspace: WeakEntity<Workspace>,
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
-    activate: bool,
+    open_mode: OpenMode,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<CreatedWorktreeWorkspace> {
     // List existing worktrees from all repos to detect name collisions
@@ -1058,7 +1125,25 @@ async fn do_create_worktree(
 
     let mut rng = rand::rng();
 
-    let base_ref = resolve_worktree_branch_target(&branch_target);
+    let clicked_common_identity = match &branch_target {
+        NewWorktreeBranchTarget::Commit { repository_id, .. } => {
+            let clicked_repository = cx.update(|_, cx| {
+                git_repos
+                    .iter()
+                    .find(|repo| repo.read(cx).id.to_proto() == *repository_id)
+                    .map(|repo| repo.read(cx).common_repository_identity())
+            })?;
+            Some(clicked_repository.ok_or_else(|| {
+                anyhow!(
+                    "Unable to create worktree: no repository with id {repository_id} \
+                     was found in the current project"
+                )
+            })?)
+        }
+        NewWorktreeBranchTarget::CurrentBranch
+        | NewWorktreeBranchTarget::ExistingBranch { .. }
+        | NewWorktreeBranchTarget::RemoteBranch { .. } => None,
+    };
 
     let (creation_infos, path_remapping) = cx.update(|_, cx| {
         start_worktree_creations(
@@ -1066,7 +1151,8 @@ async fn do_create_worktree(
             worktree_name,
             &existing_worktree_names,
             &existing_worktree_paths,
-            base_ref,
+            &branch_target,
+            clicked_common_identity,
             &worktree_directory_setting,
             &mut rng,
             cx,
@@ -1115,7 +1201,7 @@ async fn do_create_worktree(
         window_handle,
         remote_connection_options,
         WorktreeOperation::Create,
-        activate,
+        open_mode,
         cx,
     )
     .await?;
@@ -1134,6 +1220,7 @@ async fn do_switch_worktree(
     workspace: WeakEntity<Workspace>,
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
+    open_mode: OpenMode,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<Entity<Workspace>> {
     let path_remapping: Vec<(PathBuf, PathBuf)> = git_repo_work_dirs
@@ -1155,8 +1242,7 @@ async fn do_switch_worktree(
         window_handle,
         remote_connection_options,
         WorktreeOperation::Switch,
-        // Switching is always an explicit, foreground user action.
-        true,
+        open_mode,
         cx,
     )
     .await
@@ -1175,22 +1261,23 @@ async fn open_worktree_workspace(
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
     operation: WorktreeOperation,
-    activate: bool,
+    open_mode: OpenMode,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<Entity<Workspace>> {
+    let is_creating_new_worktree = matches!(operation, WorktreeOperation::Create);
+
     let window_handle = window_handle
         .ok_or_else(|| anyhow!("No window handle available for workspace creation"))?;
 
     let focused_dock = previous_state.focused_dock;
 
-    let is_creating_new_worktree = matches!(operation, WorktreeOperation::Create);
-
-    // When `activate` is false the new workspace is opened in the background
-    // (e.g. the agent's `create_thread` tool), so it should be a clean
+    // When `open_mode` is `Add` (e.g. the agent's `create_thread` tool) the
+    // new workspace is opened in the background, so it should be a clean
     // checkout rather than inheriting the source workspace's open files and
-    // dock layout. The state transfer only applies when we're foregrounding
-    // a freshly-created worktree for the user.
-    let transfer_state = is_creating_new_worktree && activate;
+    // dock layout. The state transfer only applies when we're foregrounding a
+    // freshly-created worktree for the user.
+    let transfer_state =
+        is_creating_new_worktree && matches!(open_mode, OpenMode::Activate);
 
     let source_for_transfer = if transfer_state {
         Some(workspace.clone())
@@ -1377,7 +1464,7 @@ async fn open_worktree_workspace(
         .ok();
 
     window_handle.update(cx, |multi_workspace, window, cx| {
-        if activate {
+        if open_mode == OpenMode::Activate {
             multi_workspace.activate(new_workspace.clone(), source_for_transfer, window, cx);
         } else {
             // Background open: register the new workspace as a retained tab
@@ -1391,7 +1478,7 @@ async fn open_worktree_workspace(
                 // background — the worktree was created either way.
                 workspace.run_create_worktree_tasks(window, cx);
 
-                if activate && let Some(dock_position) = focused_dock {
+                if open_mode == OpenMode::Activate && let Some(dock_position) = focused_dock {
                     let dock = workspace.dock_at_position(dock_position);
                     if let Some(panel) = dock.read(cx).active_panel() {
                         panel.activation_focus_handle(cx).focus(window, cx);
@@ -1562,6 +1649,7 @@ mod tests {
                 },
                 window,
                 None,
+                OpenMode::Activate,
                 cx,
             );
         });
@@ -1601,6 +1689,7 @@ mod tests {
                 },
                 window,
                 None,
+                OpenMode::Activate,
                 cx,
             );
         });
@@ -1696,6 +1785,7 @@ mod tests {
                 },
                 window,
                 None,
+                OpenMode::Activate,
                 cx,
             );
         });
@@ -1805,6 +1895,330 @@ mod tests {
         assert_eq!(
             WorktreeCreateTarget::CurrentBranch.branch_label(true, Some("feature")),
             "current branches"
+        );
+    }
+
+    fn fake_common_identity(path: &str) -> CommonRepositoryIdentity {
+        CommonRepositoryIdentity::from_path_for_tests(std::sync::Arc::from(Path::new(path)))
+    }
+
+    #[test]
+    fn test_resolve_target_base_sha_commit_grouping_is_order_independent() {
+        let clicked = fake_common_identity("/root/a/.git");
+        let sibling = fake_common_identity("/root/a/.git");
+        let other_repo = fake_common_identity("/root/b/.git");
+
+        let commit_target = NewWorktreeBranchTarget::Commit {
+            repository_id: 1,
+            sha: "abc123".to_string(),
+        };
+
+        // The clicked repository and any sibling sharing its common identity
+        // are based on the selected SHA; a distinct repository uses HEAD.
+        let clicked_base =
+            resolve_target_base_sha(&commit_target, Some(&clicked), &clicked).unwrap();
+        let sibling_base =
+            resolve_target_base_sha(&commit_target, Some(&clicked), &sibling).unwrap();
+        let other_base =
+            resolve_target_base_sha(&commit_target, Some(&clicked), &other_repo).unwrap();
+
+        assert_eq!(clicked_base.as_deref(), Some("abc123"));
+        assert_eq!(sibling_base.as_deref(), Some("abc123"));
+        assert_eq!(other_base, None);
+
+        // Reversing which repository position is inspected first does not
+        // change any allocation: equality is symmetric.
+        assert_eq!(
+            resolve_target_base_sha(&commit_target, Some(&sibling), &clicked).unwrap(),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_base_sha_non_commit_targets_share_one_base() {
+        let identity = fake_common_identity("/root/a/.git");
+        let ta = |target: &NewWorktreeBranchTarget, repo: &CommonRepositoryIdentity| {
+            resolve_target_base_sha(target, None, repo).unwrap()
+        };
+
+        // For non-commit targets the clicked identity is irrelevant and every
+        // repository resolves to the same single base.
+        let current = NewWorktreeBranchTarget::CurrentBranch;
+        assert_eq!(ta(&current, &identity), None);
+
+        let existing = NewWorktreeBranchTarget::ExistingBranch {
+            name: "feature".to_string(),
+        };
+        assert_eq!(ta(&existing, &identity).as_deref(), Some("feature"));
+
+        let remote = NewWorktreeBranchTarget::RemoteBranch {
+            remote_name: "origin".to_string(),
+            branch_name: "main".to_string(),
+        };
+        assert_eq!(
+            ta(&remote, &identity).as_deref(),
+            Some("refs/remotes/origin/main")
+        );
+
+        // A Commit target never resolves when no clicked identity was resolved
+        // (defensive; `do_create_worktree` always resolves it or errors first).
+        let commit = NewWorktreeBranchTarget::Commit {
+            repository_id: 1,
+            sha: "abc123".to_string(),
+        };
+        assert_eq!(ta(&commit, &identity), None);
+    }
+
+    /// Returns the repository entity whose work directory is `work_dir`,
+    /// panicking if the project does not contain one.
+    fn repo_with_work_dir(
+        project: &Entity<Project>,
+        work_dir: &Path,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<Repository> {
+        project.read_with(cx, |project, cx| {
+            project
+                .repositories(cx)
+                .values()
+                .find(|repo| repo.read(cx).work_directory_abs_path.as_ref() == work_dir)
+                .cloned()
+                .unwrap_or_else(|| panic!("expected a repository for {work_dir:?}"))
+        })
+    }
+
+    /// Runs a full commit-target worktree creation for `worktree_name` at
+    /// `sha` on the multi-root project in `multi_workspace`.
+    async fn create_commit_worktree(
+        multi_workspace: &Entity<MultiWorkspace>,
+        repository_id: u64,
+        sha: &str,
+        worktree_name: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) -> anyhow::Result<CreatedWorktreeWorkspace> {
+        let main_workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let action = zed_actions::CreateWorktree {
+            worktree_name: Some(worktree_name.to_string()),
+            branch_target: NewWorktreeBranchTarget::Commit {
+                repository_id,
+                sha: sha.to_string(),
+            },
+        };
+        let task = main_workspace.update_in(cx, |workspace, window, cx| {
+            create_worktree_workspace(workspace, &action, window, None, OpenMode::Activate, cx)
+        });
+        task.await
+    }
+
+    /// Returns the checked-out SHA recorded in each newly created linked
+    /// worktree under `<root>/.git/worktrees/*/HEAD`, keyed by the repo root.
+    fn created_worktree_head_shas(
+        fs: &FakeFs,
+        repo_roots: &[&Path],
+    ) -> std::collections::BTreeMap<PathBuf, Vec<String>> {
+        let mut result: std::collections::BTreeMap<PathBuf, Vec<String>> = Default::default();
+        for (path, content) in fs.files_with_contents(std::path::Path::new("/")) {
+            if !path.ends_with("HEAD") {
+                continue;
+            }
+            let has_worktrees_component = path
+                .components()
+                .any(|component| component == std::path::Component::Normal("worktrees".as_ref()));
+            if !has_worktrees_component {
+                continue;
+            }
+            let Some(root) = repo_roots
+                .iter()
+                .find(|root| path.starts_with(root))
+                .map(|root| (*root).to_path_buf())
+            else {
+                continue;
+            };
+            result
+                .entry(root)
+                .or_default()
+                .push(String::from_utf8_lossy(content.as_slice()).trim().to_string());
+        }
+        result
+    }
+
+    #[gpui::test]
+    async fn test_commit_target_applies_only_to_matching_common_repository(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            "/root",
+            json!({
+                "repo-a": { ".git": {}, "src": { "a.rs": "fn a() {}" } },
+                "repo-b": { ".git": {}, "src": { "b.rs": "fn b() {}" } },
+                "notes": { "notes.txt": "note" },
+            }),
+        )
+        .await;
+
+        let root_a = PathBuf::from(path!("/root/repo-a"));
+        let root_b = PathBuf::from(path!("/root/repo-b"));
+        let non_git_root = PathBuf::from(path!("/root/notes"));
+
+        let project =
+            Project::test(fs.clone(), [root_a.as_path(), root_b.as_path(), non_git_root.as_path()], cx)
+                .await;
+        project.update(cx, |project, cx| project.git_scans_complete(cx)).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |mw, cx| mw.retain_active_workspace(cx));
+
+        let repo_a = repo_with_work_dir(&project, &root_a, cx);
+        let repo_b = repo_with_work_dir(&project, &root_b, cx);
+        assert_ne!(repo_a.read_with(cx, |r, _| r.id), repo_b.read_with(cx, |r, _| r.id));
+
+        let created = create_commit_worktree(
+            &multi_workspace,
+            repo_a.read_with(cx, |r, _| r.id.to_proto()),
+            "abc123",
+            "feature",
+            cx,
+        )
+        .await
+        .expect("commit-target creation should succeed");
+
+        let shas = created_worktree_head_shas(&fs, &[&root_a, &root_b]);
+        assert_eq!(
+            shas.get(&root_a).map(|v| v.as_slice()),
+            Some(&["abc123".to_string()][..]),
+            "the clicked common repository should be based on the selected SHA"
+        );
+        assert_eq!(
+            shas.get(&root_b).map(|v| v.as_slice()),
+            Some(&["fake-sha".to_string()][..]),
+            "the other underlying git repository should use current HEAD"
+        );
+        assert_eq!(shas.len(), 2, "exactly one worktree per common repository");
+
+        // The non-git root must be retained in the created workspace.
+        let has_non_git_root = created.workspace.read_with(cx, |ws, cx| {
+            ws.project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .any(|wt| wt.read(cx).abs_path().as_ref() == non_git_root.as_path())
+        });
+        assert!(has_non_git_root, "non-git roots must remain in the new workspace");
+    }
+
+    #[gpui::test]
+    async fn test_commit_target_is_independent_of_root_order(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            "/root",
+            json!({
+                "repo-a": { ".git": {}, "src": { "a.rs": "fn a() {}" } },
+                "repo-b": { ".git": {}, "src": { "b.rs": "fn b() {}" } },
+                "notes": { "notes.txt": "note" },
+            }),
+        )
+        .await;
+
+        // Register the roots in the reverse order from the grouping test.
+        let root_a = PathBuf::from(path!("/root/repo-a"));
+        let root_b = PathBuf::from(path!("/root/repo-b"));
+        let non_git_root = PathBuf::from(path!("/root/notes"));
+
+        let project =
+            Project::test(fs.clone(), [non_git_root.as_path(), root_b.as_path(), root_a.as_path()], cx)
+                .await;
+        project.update(cx, |project, cx| project.git_scans_complete(cx)).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |mw, cx| mw.retain_active_workspace(cx));
+
+        let repo_a = repo_with_work_dir(&project, &root_a, cx);
+
+        let created = create_commit_worktree(
+            &multi_workspace,
+            repo_a.read_with(cx, |r, _| r.id.to_proto()),
+            "abc123",
+            "feature-order",
+            cx,
+        )
+        .await
+        .expect("commit-target creation should succeed");
+
+        let shas = created_worktree_head_shas(&fs, &[&root_a, &root_b]);
+        assert_eq!(
+            shas.get(&root_a).map(|v| v.as_slice()),
+            Some(&["abc123".to_string()][..]),
+        );
+        assert_eq!(
+            shas.get(&root_b).map(|v| v.as_slice()),
+            Some(&["fake-sha".to_string()][..]),
+        );
+        assert_eq!(shas.len(), 2);
+
+        let has_non_git_root = created.workspace.read_with(cx, |ws, cx| {
+            ws.project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .any(|wt| wt.read(cx).abs_path().as_ref() == non_git_root.as_path())
+        });
+        assert!(has_non_git_root);
+    }
+
+    #[gpui::test]
+    async fn test_missing_commit_target_repository_fails_before_creation(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            "/root",
+            json!({
+                "project": { ".git": {}, "src": { "main.rs": "fn main() {}" } },
+            }),
+        )
+        .await;
+
+        let project_root = PathBuf::from(path!("/root/project"));
+        let project = Project::test(fs.clone(), [project_root.as_path()], cx).await;
+        project.update(cx, |project, cx| project.git_scans_complete(cx)).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |mw, cx| mw.retain_active_workspace(cx));
+
+        // Use a repository id that is not present in the project.
+        let missing_id = u64::MAX;
+        let result = create_commit_worktree(
+            &multi_workspace,
+            missing_id,
+            "abc123",
+            "feature",
+            cx,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("missing repository must fail creation"),
+            Err(err) => err,
+        };
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no repository with id"),
+            "unexpected error message: {message}"
+        );
+
+        // No worktree may have been created anywhere.
+        let shas = created_worktree_head_shas(&fs, &[&project_root]);
+        assert!(
+            shas.values().all(|heads| heads.is_empty()),
+            "no worktree should be created when the target repository is missing"
         );
     }
 }

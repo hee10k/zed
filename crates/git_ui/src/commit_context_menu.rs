@@ -7,6 +7,9 @@ use crate::{
 use anyhow::anyhow;
 use git::Oid;
 use git::repository::{CreateTagOptions, MergeMode, ResetMode};
+use git_ui_core::notifications::show_error_toast;
+use git_ui_core::worktree_name_modal::WorktreeNameModal;
+use git_ui_core::worktree_service::{handle_create_worktree, handle_switch_worktree};
 use gpui::{
     Action, App, ClipboardItem, Entity, FocusHandle, SharedString, Task, WeakEntity, Window,
     actions,
@@ -14,7 +17,11 @@ use gpui::{
 use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
 use task::{TaskContext, TaskVariables, VariableName};
 use ui::{Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
-use workspace::{Workspace, notifications::DetachAndPromptErr};
+use workspace::{
+    OpenMode, Workspace,
+    notifications::DetachAndPromptErr,
+};
+use zed_actions::{NewWorktreeBranchTarget, OpenWorktreeInNewWindow, SwitchWorktree};
 
 actions!(
     git_graph,
@@ -61,6 +68,29 @@ pub(crate) fn commit_context_menu(
         selected_commits
     };
     let sha_short = sha.display_short();
+    // Linked worktrees checked out at this exact commit, captured from live
+    // repository state so the Worktree submenu can offer one-entry-per-worktree
+    // navigation. Only surfaced in the Git Graph; the Git Panel history menu
+    // stays commit-only.
+    let matching_worktrees: Vec<git::repository::Worktree> = if source
+        == CommitContextMenuSource::GitGraph
+    {
+        repository
+            .as_ref()
+            .and_then(|repository| repository.upgrade())
+            .map(|repository| {
+                repository
+                    .read(cx)
+                    .linked_worktrees
+                    .iter()
+                    .filter(|worktree| worktree.sha.as_ref() == sha.to_string())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let git_tasks = git_context_menu_tasks(
         git_task_context(&repository, sha, ref_name.as_deref(), cx),
         &workspace,
@@ -320,6 +350,84 @@ pub(crate) fn commit_context_menu(
                         );
                     })
             })
+            .when(source == CommitContextMenuSource::GitGraph, |menu| {
+                let workspace = workspace.clone();
+                #[allow(clippy::redundant_clone)]
+                let workspace_for_entry = workspace.clone();
+                let worktrees = matching_worktrees.clone();
+                let mut menu = menu.separator().header("Worktree");
+                menu = menu.submenu(
+                    "Create Detached Worktree",
+                    {
+                        let repository = repository.clone();
+                        let workspace = workspace_for_entry.clone();
+                        move |menu, _window, _cx| {
+                            #[allow(clippy::redundant_clone)]
+                            let repository = repository.clone();
+                            #[allow(clippy::redundant_clone)]
+                            let workspace = workspace.clone();
+                            menu.entry("Create…", None, move |window, cx| {
+                                create_detached_worktree_for_commit(
+                                    repository.clone(),
+                                    workspace.clone(),
+                                    sha,
+                                    window,
+                                    cx,
+                                );
+                            })
+                        }
+                    },
+                );
+                if !worktrees.is_empty() {
+                    for worktree in &worktrees {
+                        let path = worktree.path.clone();
+                        let display_name = worktree
+                            .path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("worktree")
+                            .to_string();
+                        let switch_workspace = workspace_for_entry.clone();
+                        let switch_path = path.clone();
+                        let switch_display_name = display_name.clone();
+                        menu = menu.entry(
+                            format!("Switch to {display_name}"),
+                            None,
+                            move |window, cx| {
+                                if let Some(workspace) = switch_workspace.upgrade() {
+                                    workspace.update(cx, |workspace, cx| {
+                                        handle_switch_worktree(
+                                            workspace,
+                                            &SwitchWorktree {
+                                                path: switch_path.clone(),
+                                                display_name: switch_display_name.clone(),
+                                            },
+                                            window,
+                                            None,
+                                            OpenMode::Activate,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            },
+                        );
+                        let new_window_path = path.clone();
+                        menu = menu.entry(
+                            format!("Open {display_name} in New Window"),
+                            None,
+                            move |window, cx| {
+                                window.dispatch_action(
+                                    Box::new(OpenWorktreeInNewWindow {
+                                        path: new_window_path.clone(),
+                                    }),
+                                    cx,
+                                );
+                            },
+                        );
+                    }
+                }
+                menu
+            })
             .when(source == CommitContextMenuSource::GitPanel, |menu| {
                 menu.entry("Show in Git Graph", None, move |window, cx| {
                     window.dispatch_action(
@@ -368,6 +476,71 @@ pub(crate) fn commit_context_menu(
                 menu
             })
     })
+}
+
+fn create_detached_worktree_for_commit(
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    sha: git::Oid,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(repository_id) = repository
+        .as_ref()
+        .and_then(|repository| repository.upgrade())
+        .map(|repository| repository.read(cx).id.to_proto())
+    else {
+        if let Some(workspace) = workspace.upgrade() {
+            show_error_toast(
+                workspace,
+                "worktree create",
+                anyhow!("The repository is no longer available"),
+                cx,
+            );
+        }
+        return;
+    };
+    let repository_name = repository
+        .as_ref()
+        .and_then(|repository| repository.upgrade())
+        .and_then(|repository| {
+            repository
+                .read(cx)
+                .work_directory_abs_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToString::to_string)
+        });
+    let context_label = match repository_name {
+        Some(repository_name) => {
+            Some(format!("from {} in {repository_name}", sha.display_short()).into())
+        }
+        None => Some(format!("from {}", sha.display_short()).into()),
+    };
+
+    let modal = WorktreeNameModal::open(workspace.clone(), None, context_label, window, cx);
+    window
+        .spawn(cx, async move |cx| {
+            let Some(name) = modal.await else {
+                return Ok(());
+            };
+            let action = zed_actions::CreateWorktree {
+                worktree_name: Some(name),
+                branch_target: NewWorktreeBranchTarget::Commit {
+                    repository_id,
+                    sha: sha.to_string(),
+                },
+            };
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    handle_create_worktree(workspace, &action, window, None, OpenMode::Activate, cx);
+                })
+                .map_err(|error| anyhow!(error))?;
+            Ok(())
+        })
+        .detach_and_prompt_err("Git graph worktree action failed", window, cx, |error, _, _| {
+            Some(error.to_string())
+        });
 }
 
 fn schedule_graph_mutation(
