@@ -294,6 +294,38 @@ jobs:
       - name: Fetch dependencies
         shell: pwsh
         run: cargo fetch --locked --target x86_64-pc-windows-msvc
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $innoSetupPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (Test-Path $innoSetupPath) {
+            Write-Host "Inno Setup is already installed: $innoSetupPath"
+            exit 0
+          }
+
+          $installerPath = Join-Path $env:RUNNER_TEMP "innosetup-6.7.3.exe"
+          Invoke-WebRequest `
+            -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe" `
+            -OutFile $installerPath
+          $expectedHash = "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732"
+          $actualHash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "Inno Setup installer checksum mismatch: $actualHash"
+          }
+
+          $installerProcess = Start-Process -FilePath $installerPath -ArgumentList @(
+            "/VERYSILENT"
+            "/SUPPRESSMSGBOXES"
+            "/NORESTART"
+            "/SP-"
+          ) -Wait -PassThru
+          if ($installerProcess.ExitCode -ne 0) {
+            throw "Inno Setup installer failed with exit code $($installerProcess.ExitCode)"
+          }
+          if (-not (Test-Path $innoSetupPath)) {
+            throw "Inno Setup did not install ISCC.exe at $innoSetupPath"
+          }
       - name: Bundle Windows installer
         shell: pwsh
         run: ./script/bundle-windows.ps1
