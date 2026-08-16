@@ -26,7 +26,7 @@ env:
 
 
 concurrency:
-  group: build-binaries
+  group: benchmark-windows-build-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -82,15 +82,21 @@ jobs:
 
 
   build-windows:
+    name: build-windows-jobs-${{ matrix.cargo_build_jobs }}
     needs: prepare
-    if: needs.prepare.outputs.skip != 'true' && (github.event_name != 'workflow_dispatch' || inputs.branch == 'main')
+    if: needs.prepare.outputs.skip != 'true' && github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        cargo_build_jobs: [1, 4]
     env:
       ZED_WORKSPACE: ${{ github.workspace }}
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
       ZED_RELEASE_CHANNEL: stable
-      CARGO_BUILD_JOBS: 1
+      CARGO_BUILD_JOBS: ${{ matrix.cargo_build_jobs }}
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -98,12 +104,23 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.ref }}
           clean: false
           set-safe-directory: false
-      - name: Manage persistent target
+      - name: Record benchmark environment
         shell: pwsh
-        run: ./script/clear-target-dir-if-larger-than.ps1 -MAX_SIZE_IN_GB 350 -SMALL_CLEAN_SIZE_IN_GB 200
+        run: |
+          git rev-parse HEAD
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object TotalPhysicalMemory
+          Write-Host "CARGO_BUILD_JOBS=$env:CARGO_BUILD_JOBS"
+      - name: Reset target for clean benchmark
+        shell: pwsh
+        run: cargo clean
       - name: Cache Rust dependencies
         id: rust-cache
         uses: Swatinem/rust-cache@72d126e709cad40056a62344eee609d696d62d33
+        with:
+          cache-targets: false
       - name: Set release version
         shell: pwsh
         run: |
@@ -329,17 +346,10 @@ jobs:
       - name: Bundle Windows installer
         shell: pwsh
         run: ./script/bundle-windows.ps1
-      - name: Upload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: windows-assets
-          path: |
-            target/Zed-x86_64.exe
-            target/zed-remote-server-windows-x86_64.zip
 
   release:
     needs: [prepare, build-windows]
-    if: needs.prepare.outputs.skip != 'true' && (github.event_name != 'workflow_dispatch' || inputs.branch == 'main')
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
