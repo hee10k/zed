@@ -115,7 +115,11 @@ jobs:
           Write-Host "CARGO_BUILD_JOBS=$env:CARGO_BUILD_JOBS"
       - name: Reset target for clean benchmark
         shell: pwsh
-        run: cargo clean
+        run: |
+          ./script/clear-target-dir-if-larger-than.ps1 -MAX_SIZE_IN_GB 0
+          if ((Test-Path target) -and (Get-ChildItem target -Force | Select-Object -First 1)) {
+            throw "target directory is not empty after benchmark reset"
+          }
       - name: Cache Rust dependencies
         id: rust-cache
         uses: Swatinem/rust-cache@72d126e709cad40056a62344eee609d696d62d33
