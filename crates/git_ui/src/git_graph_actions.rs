@@ -284,7 +284,6 @@ mod tests {
         Oid,
         repository::{GitOperationKind, MergeMode, ResetMode},
     };
-    use project::git_store::RepositorySnapshot;
     use smallvec::SmallVec;
     use std::cell::RefCell;
     use std::sync::Arc;
