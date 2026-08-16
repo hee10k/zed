@@ -200,15 +200,20 @@ jobs:
             exit 0
           }
 
-          $compatibilityFlag = "-DNTDDI_WIN11_GE=0x0A000010"
+          $compatibilityFlags = @(
+            "-DNTDDI_WIN11_GE=0x0A000010"
+            "/Zc:twoPhase-"
+          )
           $compilerFlags = [Environment]::GetEnvironmentVariable("CXXFLAGS")
-          if ([string]::IsNullOrWhiteSpace($compilerFlags)) {
-            $compilerFlags = $compatibilityFlag
-          } elseif ($compilerFlags -notlike "*NTDDI_WIN11_GE*") {
-            $compilerFlags = "$compilerFlags $compatibilityFlag"
+          foreach ($flag in $compatibilityFlags) {
+            if ([string]::IsNullOrWhiteSpace($compilerFlags)) {
+              $compilerFlags = $flag
+            } elseif ($compilerFlags -notlike "*$flag*") {
+              $compilerFlags = "$compilerFlags $flag"
+            }
           }
           "CXXFLAGS=$compilerFlags" >> $env:GITHUB_ENV
-          Write-Warning "Windows 11 SDK 10.0.26100 is unavailable; using $compatibilityFlag"
+          Write-Warning "Windows 11 SDK 10.0.26100 is unavailable; using $($compatibilityFlags -join ' ')"
       - name: Fetch dependencies
         shell: pwsh
         run: cargo fetch --locked --target x86_64-pc-windows-msvc
