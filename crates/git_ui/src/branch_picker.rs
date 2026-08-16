@@ -3,12 +3,12 @@ use editor::Editor;
 use fuzzy_nucleo::StringMatchCandidate;
 
 use collections::{HashMap, HashSet};
-use git::repository::{Branch, delete_branch_flag};
+use git::repository::Branch;
 use git::{GitHostingProviderRegistry, parse_git_remote_url};
 use gpui::http_client::Url;
 use gpui::{
     Action, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Global,
-    InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent, ParentElement, PromptLevel,
+    InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent, ParentElement,
     Render, SharedString, Styled, Subscription, Task, TaskExt, WeakEntity, Window, actions, rems,
 };
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
@@ -28,7 +28,7 @@ use workspace::notifications::DetachAndPromptErr;
 use workspace::{ModalView, Workspace};
 
 use crate::branch_picker;
-use git_ui_core::{SelectBranchCallback, notifications::show_error_toast};
+use git_ui_core::SelectBranchCallback;
 
 actions!(
     branch_picker,
@@ -792,48 +792,9 @@ enum PickerState {
     NewBranch,
 }
 
-fn delete_branch_command(is_remote: bool, branch_name: &str, force: bool) -> String {
-    format!(
-        "branch {} {branch_name}",
-        delete_branch_flag(is_remote, force)
-    )
-}
 
-struct BranchDeleteForceDeletePrompt {
-    required_error_substrings: &'static [&'static str],
-    message: fn(&str) -> String,
-}
 
-impl BranchDeleteForceDeletePrompt {
-    fn matches(&self, normalized_error_message: &str) -> bool {
-        self.required_error_substrings
-            .iter()
-            .all(|substring| normalized_error_message.contains(substring))
-    }
-}
 
-const BRANCH_DELETE_FORCE_DELETE_PROMPTS: &[BranchDeleteForceDeletePrompt] =
-    &[BranchDeleteForceDeletePrompt {
-        required_error_substrings: &["not fully merged"],
-        message: unmerged_branch_force_delete_prompt,
-    }];
-
-fn unmerged_branch_force_delete_prompt(branch_name: &str) -> String {
-    format!("Branch \"{branch_name}\" is not fully merged. Force delete it?")
-}
-
-// Git only reports these cases via localized stderr, so this best-effort check
-// may miss some locales and fall back to the raw error toast.
-fn force_delete_prompt_for_branch_delete_error(
-    error: &anyhow::Error,
-    branch_name: &str,
-) -> Option<String> {
-    let normalized_error_message = error.to_string().to_lowercase();
-    BRANCH_DELETE_FORCE_DELETE_PROMPTS
-        .iter()
-        .find(|prompt| prompt.matches(&normalized_error_message))
-        .map(|prompt| (prompt.message)(branch_name))
-}
 
 struct DeleteBranchTooltip {
     picker: WeakEntity<Picker<BranchListDelegate>>,
@@ -1118,68 +1079,24 @@ impl BranchListDelegate {
 
             let is_remote = branch.is_remote();
             let branch_name = branch.name().to_string();
-            let initial_result = repo
-                .update(cx, |repo, _| {
-                    repo.delete_branch(is_remote, branch_name.clone(), force)
-                })
-                .await?;
+            let display_name: SharedString = entry.name().to_string().into();
 
-            let (result, attempted_force) = match initial_result {
-                Ok(()) => (Ok(()), force),
-                Err(error) => {
-                    if is_remote {
-                        log::error!("Failed to delete remote branch: {error}");
-                    } else {
-                        log::error!("Failed to delete branch: {error}");
-                    }
+            let outcome = cx
+                .update(|window, cx| {
+                    git_ui_core::delete_service::delete_branch(
+                        repo,
+                        is_remote,
+                        branch_name,
+                        display_name,
+                        force,
+                        workspace,
+                        window,
+                        cx,
+                    )
+                })?
+                .await;
 
-                    let force_delete_prompt = (!force)
-                        .then(|| force_delete_prompt_for_branch_delete_error(&error, entry.name()))
-                        .flatten();
-
-                    if let Some(prompt_message) = force_delete_prompt {
-                        let answer = cx.update(|window, cx| {
-                            window.prompt(
-                                PromptLevel::Warning,
-                                &prompt_message,
-                                None,
-                                &["Force Delete", "Cancel"],
-                                cx,
-                            )
-                        })?;
-
-                        if answer.await != Ok(0) {
-                            return Ok(());
-                        }
-
-                        let retry = repo
-                            .update(cx, |repo, _| {
-                                repo.delete_branch(is_remote, branch_name, true)
-                            })
-                            .await?;
-
-                        if let Err(error) = &retry {
-                            log::error!("Failed to force delete branch: {error}");
-                        }
-                        (retry, true)
-                    } else {
-                        (Err(error), force)
-                    }
-                }
-            };
-
-            if let Err(error) = result {
-                if let Some(workspace) = workspace.upgrade() {
-                    cx.update(|_window, cx| {
-                        show_error_toast(
-                            workspace,
-                            delete_branch_command(is_remote, entry.name(), attempted_force),
-                            error,
-                            cx,
-                        )
-                    })?;
-                }
-
+            if !matches!(outcome, Ok(git_ui_core::delete_service::DeleteOutcome::Deleted)) {
                 return Ok(());
             }
 
@@ -2137,9 +2054,10 @@ impl PickerDelegate for BranchListDelegate {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::{Cell, RefCell},
+        cell::Cell,
         collections::HashSet,
         rc::Rc,
+        sync::Mutex,
     };
 
     use super::*;
@@ -2370,10 +2288,10 @@ mod tests {
         });
         let workspace_handle = workspace.downgrade();
 
-        let selected_branch = Rc::new(RefCell::new(None));
+        let selected_branch = Arc::new(Mutex::new(None));
         let selected_branch_for_callback = selected_branch.clone();
         let on_select: git_ui_core::SelectBranchCallback = Arc::new(move |branch, _, _| {
-            *selected_branch_for_callback.borrow_mut() = Some(branch);
+            *selected_branch_for_callback.lock().unwrap() = Some(branch);
         });
 
         workspace.update_in(&mut cx, |workspace, window, cx| {
@@ -2414,7 +2332,7 @@ mod tests {
         cx.dispatch_action(menu::Confirm);
         cx.run_until_parked();
 
-        assert_eq!(*selected_branch.borrow(), Some(expected_branch));
+        assert_eq!(*selected_branch.lock().unwrap(), Some(expected_branch));
         assert_eq!(
             repository.read_with(&cx, |repository, _| repository.branch.clone()),
             checked_out_branch,

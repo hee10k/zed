@@ -7,7 +7,7 @@ use fuzzy::StringMatchCandidate;
 use git::repository::{Branch, Worktree as GitWorktree};
 use gpui::{
     Action, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent, ParentElement, PromptLevel,
+    InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent, ParentElement,
     Render, SharedString, Styled, Subscription, Task, TaskExt, WeakEntity, Window, actions,
 };
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
@@ -22,9 +22,9 @@ use workspace::{
     notifications::DetachAndPromptErr,
 };
 
-use crate::notifications::show_error_toast;
 use crate::worktree_service::{
-    RemoteBranchName, WorktreeCreateTarget, worktree_branch_target, worktree_create_targets,
+    HostScopedRepositoryIdentity, RemoteBranchName, WorktreeCreateTarget, worktree_branch_target,
+    worktree_create_targets,
 };
 use zed_actions::{
     CreateWorktree, NewWorktreeBranchTarget, OpenWorktreeInNewWindow, OpenWorktreeSetupTasks,
@@ -335,50 +335,6 @@ fn worktree_name_anchor<'a>(
         .or(repository_identity_path)
 }
 
-fn remove_worktree_command(path: &Path, force: bool) -> String {
-    if force {
-        format!("worktree remove --force {}", path.display())
-    } else {
-        format!("worktree remove {}", path.display())
-    }
-}
-
-struct WorktreeRemoveForceDeletePrompt {
-    required_error_substrings: &'static [&'static str],
-    message: fn(&str) -> String,
-}
-
-impl WorktreeRemoveForceDeletePrompt {
-    fn matches(&self, normalized_error_message: &str) -> bool {
-        self.required_error_substrings
-            .iter()
-            .all(|substring| normalized_error_message.contains(substring))
-    }
-}
-
-const WORKTREE_REMOVE_FORCE_DELETE_PROMPTS: &[WorktreeRemoveForceDeletePrompt] =
-    &[WorktreeRemoveForceDeletePrompt {
-        required_error_substrings: &[
-            "contains modified or untracked files",
-            "use --force to delete it",
-        ],
-        message: dirty_worktree_force_delete_prompt,
-    }];
-
-fn dirty_worktree_force_delete_prompt(display_name: &str) -> String {
-    format!("Worktree \"{display_name}\" contains modified or untracked files. Force delete it?")
-}
-
-fn force_delete_prompt_for_worktree_remove_error(
-    error: &anyhow::Error,
-    display_name: &str,
-) -> Option<String> {
-    let normalized_error_message = error.to_string().to_lowercase();
-    WORKTREE_REMOVE_FORCE_DELETE_PROMPTS
-        .iter()
-        .find(|prompt| prompt.matches(&normalized_error_message))
-        .map(|prompt| (prompt.message)(display_name))
-}
 
 struct DeleteWorktreeTooltip {
     picker: WeakEntity<Picker<WorktreePickerDelegate>>,
@@ -561,7 +517,7 @@ impl WorktreePickerDelegate {
     fn delete_worktree(
         &mut self,
         ix: usize,
-        force: bool,
+        _force: bool,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
@@ -571,9 +527,7 @@ impl WorktreePickerDelegate {
         let WorktreeEntry::Worktree { worktree, .. } = entry else {
             return;
         };
-        if !self.can_delete_worktree(worktree)
-            || self.deleting_worktree_paths.contains(&worktree.path)
-        {
+        if self.deleting_worktree_paths.contains(&worktree.path) {
             return;
         }
 
@@ -581,8 +535,13 @@ impl WorktreePickerDelegate {
         let Some(repo) = repo else {
             return;
         };
+        let identity = HostScopedRepositoryIdentity::new(
+            repo.read(cx).common_repository_identity(),
+            self.project.read(cx).remote_connection_options(cx).as_ref(),
+        );
+
         let path = worktree.path.clone();
-        let display_name = worktree.directory_name(self.worktree_name_anchor());
+        let worktree = worktree.clone();
         let workspace = self.workspace.clone();
 
         self.deleting_worktree_paths.insert(path.clone());
@@ -592,133 +551,53 @@ impl WorktreePickerDelegate {
         cx.notify();
 
         cx.spawn_in(window, async move |picker, cx| {
-            let initial_result = match repo
-                .update(cx, |repo, _| repo.remove_worktree(path.clone(), force))
-                .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    picker.update_in(cx, |picker, _window, cx| {
-                        if picker.delegate.deleting_worktree_paths.remove(&path) {
-                            cx.notify();
-                        }
-                    })?;
-                    return Err(error.into());
-                }
-            };
+            let outcome = cx
+                .update(|window, cx| {
+                    crate::delete_service::confirm_remove_worktree(
+                        repo,
+                        identity,
+                        worktree,
+                        workspace,
+                        window,
+                        cx,
+                    )
+                })?
+                .await;
 
-            let (result, attempted_force) = match initial_result {
-                Ok(()) => (Ok(()), force),
-                Err(error) => {
-                    log::error!("Failed to remove worktree: {}", error);
-
-                    let force_delete_prompt = (!force)
-                        .then(|| {
-                            force_delete_prompt_for_worktree_remove_error(&error, &display_name)
-                        })
-                        .flatten();
-
-                    if let Some(prompt_message) = force_delete_prompt {
-                        picker.update_in(cx, |picker, _window, cx| {
-                            if picker.delegate.deleting_worktree_paths.remove(&path) {
-                                cx.notify();
-                            }
-                        })?;
-
-                        let answer = cx.update(|window, cx| {
-                            window.prompt(
-                                PromptLevel::Warning,
-                                &prompt_message,
-                                None,
-                                &["Force Delete", "Cancel"],
-                                cx,
-                            )
-                        })?;
-
-                        if answer.await != Ok(0) {
-                            return Ok(());
-                        }
-
-                        let should_retry = picker.update_in(cx, |picker, _window, cx| {
-                            let worktree_still_exists = picker
-                                .delegate
-                                .all_worktrees
-                                .iter()
-                                .any(|worktree| worktree.path == path);
-                            if !worktree_still_exists
-                                || !picker.delegate.deleting_worktree_paths.insert(path.clone())
-                            {
-                                return false;
-                            }
-                            cx.notify();
-                            true
-                        })?;
-
-                        if !should_retry {
-                            return Ok(());
-                        }
-
-                        let retry = match repo
-                            .update(cx, |repo, _| repo.remove_worktree(path.clone(), true))
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(error) => {
-                                picker.update_in(cx, |picker, _window, cx| {
-                                    if picker.delegate.deleting_worktree_paths.remove(&path) {
-                                        cx.notify();
-                                    }
-                                })?;
-                                return Err(error.into());
-                            }
-                        };
-
-                        if let Err(error) = &retry {
-                            log::error!("Failed to force remove worktree: {error}");
-                        }
-
-                        (retry, true)
-                    } else {
-                        (Err(error), force)
-                    }
-                }
-            };
-
-            if let Err(error) = result {
-                picker.update_in(cx, |picker, _window, cx| {
-                    if picker.delegate.deleting_worktree_paths.remove(&path) {
-                        cx.notify();
-                    }
-                })?;
-
-                if let Some(workspace) = workspace.upgrade() {
-                    cx.update(|_window, cx| {
-                        show_error_toast(
-                            workspace,
-                            remove_worktree_command(&path, attempted_force),
-                            error,
-                            cx,
-                        )
-                    })?;
-                }
-
-                return Ok(());
-            }
+            let mut branch_error_to_show = None;
 
             picker.update_in(cx, |picker, _window, cx| {
                 picker.delegate.deleting_worktree_paths.remove(&path);
-                picker.delegate.matches.retain(|e| {
-                    !matches!(e, WorktreeEntry::Worktree { worktree, .. } if worktree.path == path)
-                });
-                picker.delegate.all_worktrees.retain(|w| w.path != path);
-                if picker.delegate.matches.is_empty() {
-                    picker.delegate.selected_index = 0;
-                } else if picker.delegate.selected_index >= picker.delegate.matches.len() {
-                    picker.delegate.selected_index = picker.delegate.matches.len() - 1;
+                if let Ok(crate::delete_service::WorktreeRemovalOutcome::Removed { branch_error }) =
+                    outcome
+                {
+                    picker.delegate.matches.retain(|e| {
+                        !matches!(e, WorktreeEntry::Worktree { worktree, .. } if worktree.path == path)
+                    });
+                    picker.delegate.all_worktrees.retain(|w| w.path != path);
+                    if picker.delegate.matches.is_empty() {
+                        picker.delegate.selected_index = 0;
+                    } else if picker.delegate.selected_index >= picker.delegate.matches.len() {
+                        picker.delegate.selected_index = picker.delegate.matches.len() - 1;
+                    }
+                    picker.delegate.hovered_delete_index = None;
+                    branch_error_to_show = branch_error;
                 }
-                picker.delegate.hovered_delete_index = None;
                 cx.notify();
             })?;
+
+            if let Some(err) = branch_error_to_show {
+                picker.update_in(cx, |picker, _window, cx| {
+                    if let Some(workspace) = picker.delegate.workspace.upgrade() {
+                        crate::notifications::show_error_toast(
+                            workspace,
+                            "delete branch".to_string(),
+                            err,
+                            cx,
+                        );
+                    }
+                })?;
+            }
 
             anyhow::Ok(())
         })
@@ -1875,6 +1754,7 @@ mod tests {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree(
             path!("/root"),
             json!({
@@ -1938,6 +1818,7 @@ mod tests {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree(
             path!("/root"),
             json!({
@@ -2097,6 +1978,8 @@ mod tests {
         });
         assert!(deleting_worktree_paths(&worktree_picker, &mut cx).contains(&worktree_path));
 
+        cx.run_until_parked();
+        cx.dispatch_action(menu::Confirm);
         cx.run_until_parked();
 
         assert!(deleting_worktree_paths(&worktree_picker, &mut cx).is_empty());
@@ -2364,13 +2247,15 @@ mod tests {
         assert!(deleting_worktree_paths(&worktree_picker, &mut cx).contains(&worktree_path));
 
         cx.run_until_parked();
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
         assert!(cx.has_pending_prompt());
         assert!(
-            !deleting_worktree_paths(&worktree_picker, &mut cx).contains(&worktree_path),
-            "pending delete state should clear while waiting for force-delete confirmation"
+            deleting_worktree_paths(&worktree_picker, &mut cx).contains(&worktree_path),
+            "pending delete state should remain set while waiting for force-delete confirmation"
         );
 
-        cx.simulate_prompt_answer("Force Delete");
+        cx.simulate_prompt_answer("Force Remove");
         cx.run_until_parked();
 
         assert!(!cx.has_pending_prompt());
@@ -2411,8 +2296,10 @@ mod tests {
         assert!(pending_paths.contains(&worktree_path));
 
         cx.run_until_parked();
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
         assert!(cx.has_pending_prompt());
-        assert!(deleting_worktree_paths(&worktree_picker, &mut cx).is_empty());
+        assert!(deleting_worktree_paths(&worktree_picker, &mut cx).contains(&worktree_path));
 
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
@@ -2472,6 +2359,12 @@ mod tests {
         });
         assert!(deleting_worktree_paths(&worktree_picker, &mut cx).contains(&worktree_path));
 
+        cx.run_until_parked();
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Force Remove");
         cx.run_until_parked();
 
         assert!(!cx.has_pending_prompt());
@@ -2709,5 +2602,102 @@ mod tests {
             repo_contains_worktree(&repository, &worktree_path, &mut cx).await,
             "removing the worktree from the window should not delete the git worktree"
         );
+    }
+
+    #[gpui::test]
+    async fn test_worktree_open_in_another_window_cannot_be_deleted(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {
+                    ".git": {},
+                    "file.txt": "buffer_text",
+                },
+                "worktrees": {},
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            path!("/root/project/.git").as_ref(),
+            &[("file.txt", "buffer_text".to_string())],
+            "deadbeef",
+        );
+
+        let project = Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project.repositories(cx).values().next().unwrap().clone()
+        });
+        let worktree_path = PathBuf::from(path!("/root/worktrees/open-wt"));
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.create_worktree(
+                    git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: "open-wt".to_string(),
+                        base_sha: Some("deadbeef".to_string()),
+                    },
+                    worktree_path.clone(),
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let second_project = Project::test(fs.clone(), [worktree_path.as_path()], cx).await;
+        cx.executor().run_until_parked();
+
+        let window_handle1 =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace1 = window_handle1
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+
+        let window_handle2 =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(second_project.clone(), window, cx));
+        cx.executor().run_until_parked();
+
+        let mut cx = VisualTestContext::from_window(window_handle1.into(), cx);
+        let worktree_picker = cx.update(|window, cx| {
+            cx.new(|cx| WorktreePicker::new(project, workspace1.downgrade(), window, cx))
+        });
+        cx.run_until_parked();
+
+        let open_wt_index = worktree_picker.update(&mut cx, |picker, cx| {
+            picker
+                .picker
+                .read(cx)
+                .delegate
+                .matches
+                .iter()
+                .position(|entry| {
+                    matches!(entry, WorktreeEntry::Worktree { worktree, .. } if worktree.path == worktree_path)
+                })
+                .expect("open worktree should be in picker matches")
+        });
+
+        worktree_picker.update_in(&mut cx, |picker, window, cx| {
+            picker.picker.update(cx, |picker, cx| {
+                picker.delegate.delete_worktree(open_wt_index, false, window, cx);
+            })
+        });
+        cx.run_until_parked();
+
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+
+        let still_exists = worktree_picker.update(&mut cx, |picker, cx| {
+            picker.picker.read(cx).delegate.matches.iter().any(|entry| {
+                matches!(entry, WorktreeEntry::Worktree { worktree, .. } if worktree.path == worktree_path)
+            })
+        });
+        assert!(still_exists, "worktree open in another window should not be deleted from picker");
+
+        let _ = window_handle2;
     }
 }

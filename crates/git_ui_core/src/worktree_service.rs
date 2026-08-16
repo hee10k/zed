@@ -8,8 +8,8 @@ use askpass::AskPassDelegate;
 use collections::HashSet;
 use fs::Fs;
 use gpui::{
-    AsyncWindowContext, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
-    Task, TaskExt, WeakEntity,
+    AppContext, AsyncWindowContext, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    SharedString, Task, TaskExt, WeakEntity,
 };
 use project::Project;
 use project::git_store::{CommonRepositoryIdentity, Repository};
@@ -30,6 +30,76 @@ use util::ResultExt as _;
 use crate::askpass_modal::AskPassModal;
 use crate::notifications::{open_output, show_error_toast};
 use crate::worktree_names;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct HostScopedRepositoryIdentity {
+    pub common_identity: CommonRepositoryIdentity,
+    pub host_key: String,
+}
+
+impl HostScopedRepositoryIdentity {
+    pub fn new(
+        common_identity: CommonRepositoryIdentity,
+        options: Option<&RemoteConnectionOptions>,
+    ) -> Self {
+        let host_key = match options {
+            None => "local".to_string(),
+            Some(RemoteConnectionOptions::Ssh(opts)) => {
+                let mut key = opts.host.to_string();
+                if let Some(port) = opts.port {
+                    key.push_str(&format!(":{}", port));
+                }
+                key
+            }
+            Some(RemoteConnectionOptions::Wsl(opts)) => opts.distro_name.clone(),
+            Some(RemoteConnectionOptions::Docker(opts)) => {
+                let kind = if opts.use_podman { "podman" } else { "docker" };
+                format!("{}:{}", kind, opts.container_id)
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            Some(RemoteConnectionOptions::Mock(opts)) => format!("mock-{}", opts.id),
+            #[allow(unreachable_patterns)]
+            _ => "remote".to_string(),
+        };
+        Self {
+            common_identity,
+            host_key,
+        }
+    }
+}
+
+pub fn app_workspaces(cx: &gpui::App) -> anyhow::Result<Vec<gpui::Entity<workspace::Workspace>>> {
+    app_workspaces_with_active_window(None, cx)
+}
+
+pub fn app_workspaces_with_active_window(
+    active_window: Option<&gpui::Window>,
+    cx: &gpui::App,
+) -> anyhow::Result<Vec<gpui::Entity<workspace::Workspace>>> {
+    let mut workspaces = Vec::new();
+    let active_window_id = active_window.map(|w| w.window_handle().window_id());
+    if let Some(active_window) = active_window {
+        if let Some(multi_workspace) = active_window.root::<workspace::MultiWorkspace>().flatten() {
+            workspaces.extend(multi_workspace.read(cx).workspaces().cloned());
+        }
+    }
+    for window in cx.windows() {
+        if Some(window.window_id()) == active_window_id {
+            continue;
+        }
+        if let Some(multi_workspace) = window.downcast::<workspace::MultiWorkspace>() {
+            let res = multi_workspace.read_with(cx, |mw, _| mw.workspaces().cloned().collect::<Vec<_>>());
+            if let Ok(ws) = res {
+                for w in ws {
+                    if !workspaces.contains(&w) {
+                        workspaces.push(w);
+                    }
+                }
+            }
+        }
+    }
+    Ok(workspaces)
+}
 
 /// A remote-tracking branch reference parsed into its remote and branch parts,
 /// e.g. `origin/main` -> remote `origin`, branch `main`.
