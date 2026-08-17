@@ -5041,9 +5041,9 @@ mod tests {
     use super::*;
     use anyhow::{Context, Result, bail};
     use collections::{HashMap, HashSet};
-    use fs::FakeFs;
+    use fs::{FakeFs, Fs};
     use git::Oid;
-    use git::repository::{CommitData, InitialGraphCommitData};
+    use git::repository::{CommitData, InitialGraphCommitData, Worktree};
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
     use project::git_store::{GitStoreEvent, RepositoryEvent};
     use project::{
@@ -5053,7 +5053,7 @@ mod tests {
     use serde_json::json;
     use settings::{SettingsStore, ThemeSettingsContent};
     use smallvec::{SmallVec, smallvec};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     fn init_test(cx: &mut TestAppContext) {
@@ -8105,6 +8105,199 @@ mod tests {
         (fs, project, repository, head_sha)
     }
 
+    /// Seeds a repo like [`seed_ref_menu_repo`] but additionally checks the
+    /// local `feature` branch out in a linked worktree (path != the main
+    /// worktree), so the ref menu must classify it as a worktree destination.
+    async fn seed_ref_menu_repo_with_linked_feature(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<FakeFs>,
+        Entity<Project>,
+        Entity<Repository>,
+        Oid,
+        Worktree,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.insert_branches(Path::new("/project/.git"), &["feature"]);
+
+        let head_sha = Oid::try_from("abcdef1234567890abcdef1234567890abcdef12")
+            .expect("HEAD sha should parse");
+        let second_sha = Oid::try_from("1111111111111111111111111111111111111111")
+            .expect("second sha should parse");
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head_sha.to_string(),
+        );
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: head_sha,
+                    parents: smallvec![second_sha],
+                    ref_names: vec![
+                        "HEAD -> refs/heads/main".into(),
+                        "refs/heads/feature".into(),
+                        "refs/remotes/origin/main".into(),
+                        "refs/heads/origin/main".into(),
+                        "tag: refs/tags/v1.0".into(),
+                    ],
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: second_sha,
+                    parents: smallvec![],
+                    ref_names: vec![],
+                }),
+            ],
+        );
+        fs.set_status_for_repo(Path::new("/project/.git"), &[]);
+
+        let linked_worktree = Worktree {
+            path: PathBuf::from("/project-worktrees/feature"),
+            ref_name: Some("refs/heads/feature".into()),
+            sha: head_sha.to_string().into(),
+            is_main: false,
+            is_bare: false,
+        };
+        fs.add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            false,
+            linked_worktree.clone(),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have an active repository")
+        });
+
+        (fs, project, repository, head_sha, linked_worktree)
+    }
+
+    /// Seeds a repo whose *local* branch `origin/main` is checked out in a
+    /// linked worktree while the remote-tracking `refs/remotes/origin/main`
+    /// (same display text) is not, exercising exact-ref classification.
+    async fn seed_ref_menu_repo_with_linked_origin_main(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<FakeFs>,
+        Entity<Project>,
+        Entity<Repository>,
+        Oid,
+        Worktree,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.insert_branches(Path::new("/project/.git"), &["origin/main"]);
+
+        let head_sha = Oid::try_from("abcdef1234567890abcdef1234567890abcdef12")
+            .expect("HEAD sha should parse");
+        let second_sha = Oid::try_from("1111111111111111111111111111111111111111")
+            .expect("second sha should parse");
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head_sha.to_string(),
+        );
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: head_sha,
+                    parents: smallvec![second_sha],
+                    ref_names: vec![
+                        "HEAD -> refs/heads/main".into(),
+                        "refs/heads/origin/main".into(),
+                        "refs/remotes/origin/main".into(),
+                    ],
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: second_sha,
+                    parents: smallvec![],
+                    ref_names: vec![],
+                }),
+            ],
+        );
+        fs.set_status_for_repo(Path::new("/project/.git"), &[]);
+
+        // Hand-seed a flat `.git/worktrees/` entry (the fake scanner only reads
+        // single-level dirs, so a `refs/heads/origin/main` entry must use a
+        // flat admin name while its HEAD points at the nested local ref). This
+        // produces a linked worktree whose ref is `refs/heads/origin/main` —
+        // the exact collision case: same display text as the remote-tracking
+        // `refs/remotes/origin/main`, but a distinct fully-qualified ref.
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state
+                .refs
+                .insert("refs/heads/origin/main".to_string(), head_sha.to_string());
+        })
+        .unwrap();
+        let entry_dir = Path::new("/project/.git/worktrees/collision");
+        fs.create_dir(entry_dir).await.unwrap();
+        fs.write(entry_dir.join("HEAD").as_path(), b"ref: refs/heads/origin/main")
+            .await
+            .unwrap();
+        fs.write(entry_dir.join("commondir").as_path(), b"/project/.git")
+            .await
+            .unwrap();
+        fs.write(entry_dir.join("gitdir").as_path(), b"/project-worktrees/collision/.git")
+            .await
+            .unwrap();
+        fs.create_dir(Path::new("/project-worktrees/collision"))
+            .await
+            .unwrap();
+        fs.write(
+            Path::new("/project-worktrees/collision/.git"),
+            b"gitdir: /project/.git/worktrees/collision",
+        )
+        .await
+        .unwrap();
+
+        let linked_worktree = Worktree {
+            path: PathBuf::from("/project-worktrees/collision"),
+            ref_name: Some("refs/heads/origin/main".into()),
+            sha: head_sha.to_string().into(),
+            is_main: false,
+            is_bare: false,
+        };
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have an active repository")
+        });
+
+        (fs, project, repository, head_sha, linked_worktree)
+    }
+
     /// Opens the git graph in a fresh window and returns it alongside the
     /// window's visual test context (needed to drive context menus).
     fn open_graph_window(
@@ -8314,6 +8507,222 @@ mod tests {
         assert!(
             tag_labels.iter().any(|label| label == "Copy Name"),
             "tag chip should offer Copy Name, got {tag_labels:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_menu_linked_branch_is_worktree_destination(cx: &mut TestAppContext) {
+        let (_fs, project, repository, _head_sha, linked_worktree) =
+            seed_ref_menu_repo_with_linked_feature(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        // Confirm the seed actually populated the linked worktree in the live
+        // snapshot.
+        let linked_paths = repository.read_with(&*cx, |repo, _| {
+            repo.linked_worktrees
+                .iter()
+                .map(|wt| wt.path.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            linked_paths.contains(&linked_worktree.path),
+            "seed should place feature in a linked worktree, got {linked_paths:?}"
+        );
+
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/feature".into(),
+                display_name: "feature".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        let labels = ref_menu_labels(&git_graph, cx);
+        assert!(
+            labels.iter().any(|label| label == "Switch Here")
+                && labels.iter().any(|label| label.ends_with("in New Window"))
+                && labels.iter().any(|label| label == "Remove Worktree…")
+                && labels.iter().any(|label| label == "Copy Name"),
+            "linked branch should offer switch/new-window/remove/copy, got {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "Checkout")
+                && !labels.iter().any(|label| label == "Rename…")
+                && !labels.iter().any(|label| label == "Delete…")
+                && !labels.iter().any(|label| label == "Merge into Current")
+                && !labels.iter().any(|label| label == "Create Detached Worktree"),
+            "linked branch must omit checkout/rename/delete/merge/create-detached, got {labels:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_menu_linked_branch_matches_exact_full_ref(cx: &mut TestAppContext) {
+        let (_fs, project, repository, _head_sha, _linked_worktree) =
+            seed_ref_menu_repo_with_linked_feature(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        // The local `feature` is linked; its remote-tracking counterpart stays
+        // an ordinary remote chip (switch/remove omitted). The linked state is
+        // resolved by the fully-qualified ref, never by the shortened display
+        // text that could be shared by two refs (local `origin/main` vs remote
+        // `refs/remotes/origin/main` on the same commit).
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/remotes/origin/main".into(),
+                display_name: "origin/main".into(),
+                kind: RefKind::RemoteBranch,
+            },
+            cx,
+        );
+        let remote_labels = ref_menu_labels(&git_graph, cx);
+        assert!(
+            !remote_labels.iter().any(|label| label == "Switch Here")
+                && !remote_labels.iter().any(|label| label == "Remove Worktree…"),
+            "remote ref must never route to a worktree destination, got {remote_labels:?}"
+        );
+        assert!(
+            remote_labels.iter().any(|label| label == "Merge into Current")
+                && remote_labels.iter().any(|label| label == "Copy Name"),
+            "remote ref should keep the ordinary commit-target actions, got {remote_labels:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_menu_linked_branch_same_name_collision(cx: &mut TestAppContext) {
+        // A local branch literally named `origin/main` checked out in a linked
+        // worktree must be classified by its exact `refs/heads/origin/main`
+        // ref — never confused with the `refs/remotes/origin/main`
+        // remote-tracking ref, even though both share the display text
+        // `origin/main` and decorate the same commit.
+        let (_fs, project, repository, _head_sha, _linked) =
+            seed_ref_menu_repo_with_linked_origin_main(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        // The local `refs/heads/origin/main` is checked out in a linked
+        // worktree -> worktree destination.
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/origin/main".into(),
+                display_name: "origin/main".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        let local_labels = ref_menu_labels(&git_graph, cx);
+        assert!(
+            local_labels.iter().any(|label| label == "Switch Here"),
+            "local refs/heads/origin/main linked in a worktree should be a destination, got {local_labels:?}"
+        );
+        assert!(
+            !local_labels.iter().any(|label| label == "Checkout"),
+            "linked same-name local branch should omit Checkout, got {local_labels:?}"
+        );
+
+        // The remote-tracking `refs/remotes/origin/main` is untouched -> still an
+        // ordinary remote chip, never a worktree destination.
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/remotes/origin/main".into(),
+                display_name: "origin/main".into(),
+                kind: RefKind::RemoteBranch,
+            },
+            cx,
+        );
+        let remote_labels = ref_menu_labels(&git_graph, cx);
+        assert!(
+            !remote_labels.iter().any(|label| label == "Switch Here")
+                && !remote_labels.iter().any(|label| label == "Remove Worktree…"),
+            "remote same-name ref must not inherit local linked state, got {remote_labels:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_menu_linked_branch_stale_worktree_returns_to_ordinary(cx: &mut TestAppContext) {
+        // Once the linked worktree leaves the live snapshot (filled another
+        // branch, or removed), a freshly deployed menu falls back to the
+        // ordinary local-branch actions — it never dispatches against a stale
+        // destination captured by an older snapshot.
+        let (fs, project, repository, _head_sha, _linked_worktree) =
+            seed_ref_menu_repo_with_linked_feature(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak.clone(), cx);
+        cx.run_until_parked();
+
+        // First confirm the linked classification while the worktree is live.
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/feature".into(),
+                display_name: "feature".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        assert!(
+            ref_menu_labels(&git_graph, cx).iter().any(|label| label == "Switch Here"),
+            "linked feature should be a destination while the worktree is live"
+        );
+
+        // Remove the linked worktree and refresh the repository snapshot, so a
+        // subsequently deployed menu must no longer treat `feature` as a
+        // worktree destination.
+        fs.remove_worktree_for_repo(Path::new("/project/.git"), true, "refs/heads/feature")
+            .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        cx.run_until_parked();
+
+        // Deploy a fresh graph window against the refreshed snapshot: the menu
+        // is re-classified from the live linked-worktree state and falls back to
+        // the ordinary local-branch actions.
+        drop(git_graph);
+        let git_graph2 = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+        deploy_ref_menu(
+            &git_graph2,
+            ResolvedRef {
+                ref_name: "refs/heads/feature".into(),
+                display_name: "feature".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        let labels = ref_menu_labels(&git_graph2, cx);
+        assert!(
+            !labels.iter().any(|label| label == "Switch Here"),
+            "stale linked destination must not be offered after removal, got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label == "Checkout"),
+            "stale linked branch should fall back to an ordinary checkout target, got {labels:?}"
         );
     }
 
