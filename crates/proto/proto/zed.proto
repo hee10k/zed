@@ -407,6 +407,11 @@ message Envelope {
     StashApply stash_apply = 379;
     StashPopReply stash_pop_reply = 494;
 
+    StashRename stash_rename = 495;
+    StashRenameReply stash_rename_reply = 496;
+    PendingStashRenameRecoveries pending_stash_rename_recoveries = 497;
+    PendingStashRenameRecoveriesReply pending_stash_rename_recoveries_reply = 498;
+
     GitRenameBranch git_rename_branch = 380;
 
     RemoteStarted remote_started = 381;

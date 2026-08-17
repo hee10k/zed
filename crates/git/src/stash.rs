@@ -5,6 +5,16 @@ use std::{fmt, str::FromStr, sync::Arc};
 /// The ref that backs the stash reflog.
 pub const STASH_REF: &str = "refs/stash";
 
+/// Namespace prefix under which a crash-recoverable stash rename keeps its
+/// versioned manifest ref plus one stable recovery ref per involved OID. Any
+/// ref under this prefix marks an unfinished rename that the next repository
+/// refresh must discover and expose for retry/recover/cleanup.
+pub const STASH_RENAME_RECOVERY_PREFIX: &str = "refs/zed-git/stash-rename";
+
+/// Version of the manifest blob a stash rename writes before its destructive
+/// replay, so recovery tooling can evolve the format without losing old runs.
+pub const STASH_RENAME_MANIFEST_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct StashEntry {
     pub index: usize,
@@ -70,6 +80,59 @@ impl fmt::Display for StashResolveError {
 }
 
 impl std::error::Error for StashResolveError {}
+
+/// Manifests and stable recovery refs a stash rename retains if any destructive
+/// step (replay, verification, or cleanup) fails or is interrupted. They stay
+/// in the repository so the operation can be discovered after a restart and
+/// retried, recovered, or cleaned up; never delete them blindly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StashRenameRecovery {
+    /// Fully-qualified ref referencing the versioned manifest blob.
+    pub manifest_ref: String,
+    /// Stable recovery refs protecting every involved stash OID plus the new
+    /// rewritten OID from garbage collection.
+    pub recovery_refs: Vec<String>,
+    /// The observable stash stack (newest first) after the failure, so a caller
+    /// can judge whether the rename applied partial.
+    pub observed_entries: Vec<StashEntry>,
+    /// True when the rename applied and verified but recovery cleanup failed;
+    /// false when the rename itself did not complete.
+    pub rename_applied: bool,
+}
+
+/// The outcome of a crash-recoverable stash rename.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StashRenameResult {
+    /// The rename applied, verified, and the recovery refs were cleaned up.
+    Success,
+    /// The rename applied and verified, but deleting the recovery refs failed;
+    /// they are retained and reported for cleanup.
+    SuccessWithRecoveryRefs(StashRenameRecovery),
+    /// The rename did not complete (a destructive replay, concurrent-mutation,
+    /// verification, or cleanup failure). The manifest + recovery refs are
+    /// retained and reported for retry/recover/cleanup.
+    FailedWithRecovery(StashRenameRecovery),
+}
+
+/// Rebuild the full stash subject line for a renamed entry, preserving the
+/// original branch prefix (`On <branch>: ...` / `WIP on <branch>: ...`) so the
+/// entry keeps reading like the stash Git reports, and falling back to a bare
+/// message when the original had no prefix.
+pub fn renamed_stash_subject(original_subject: &str, new_message: &str) -> String {
+    if let Some(rest) = original_subject.strip_prefix("WIP on ")
+        && let Some(colon) = rest.find(": ")
+    {
+        let branch = &rest[..colon];
+        format!("WIP on {branch}: {new_message}")
+    } else if let Some(rest) = original_subject.strip_prefix("On ")
+        && let Some(colon) = rest.find(": ")
+    {
+        let branch = &rest[..colon];
+        format!("On {branch}: {new_message}")
+    } else {
+        new_message.to_string()
+    }
+}
 
 /// Resolve exactly one current stash entry from a captured identity against a
 /// fresh reflog snapshot (`entries`). Returns the current entry, or
@@ -208,7 +271,7 @@ fn parse_stash_line(line: &str) -> Result<StashEntry> {
 }
 
 /// Parse stash index from format "stash@{N}" where N is the index
-fn parse_stash_index(input: &str) -> Result<usize> {
+pub(crate) fn parse_stash_index(input: &str) -> Result<usize> {
     let trimmed = input.trim();
 
     if !trimmed.starts_with("stash@{") || !trimmed.ends_with('}') {
@@ -233,7 +296,7 @@ fn parse_stash_index(input: &str) -> Result<usize> {
 /// - "WIP on <branch>: <message>" -> (Some(branch), message)
 /// - "On <branch>: <message>" -> (Some(branch), message)
 /// - "<message>" -> (None, message)
-fn parse_stash_message(input: &str) -> (Option<&str>, &str) {
+pub(crate) fn parse_stash_message(input: &str) -> (Option<&str>, &str) {
     // Handle "WIP on <branch>: <message>" pattern
     if let Some(stripped) = input.strip_prefix("WIP on ")
         && let Some(colon_pos) = stripped.find(": ")
@@ -365,6 +428,25 @@ mod tests {
         assert_eq!(parse_stash_selector_index("refs/stash@{}"), None);
         assert_eq!(parse_stash_selector_index("refs/stash@{x}"), None);
         assert_eq!(parse_stash_selector_index("stash@{1}"), None);
+    }
+
+    #[test]
+    fn test_renamed_stash_subject_preserves_branch_prefix() {
+        assert_eq!(
+            renamed_stash_subject("On main: old message", "new message"),
+            "On main: new message"
+        );
+        assert_eq!(
+            renamed_stash_subject("WIP on feature: old", "renamed"),
+            "WIP on feature: renamed"
+        );
+        assert_eq!(
+            renamed_stash_subject("plain message", "fresh"),
+            "fresh"
+        );
+        // An empty-branch "On main:" has no recognized prefix
+        // (parse_stash_message treats it as bare), so the rename is bare.
+        assert_eq!(renamed_stash_subject("On main:", "bare"), "bare");
     }
 
     #[test]

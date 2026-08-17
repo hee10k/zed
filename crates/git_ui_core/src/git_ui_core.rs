@@ -17,6 +17,7 @@ pub mod worktree_names;
 pub mod worktree_name_modal;
 pub mod worktree_picker;
 pub mod worktree_service;
+pub mod stash_rename_modal;
 
 /// A type-erased picker view, e.g. for the title bar's branch popover.
 ///
