@@ -9,7 +9,7 @@ use git::Oid;
 use git::repository::{CreateTagOptions, MergeMode, ResetMode};
 use git_ui_core::notifications::show_error_toast;
 use git_ui_core::worktree_name_modal::WorktreeNameModal;
-use git_ui_core::worktree_service::{handle_create_worktree, handle_switch_worktree};
+use git_ui_core::worktree_service::{handle_create_worktree, linked_worktree_label, switch_to_worktree};
 use gpui::{
     Action, App, ClipboardItem, Entity, FocusHandle, SharedString, Task, WeakEntity, Window,
     actions,
@@ -21,7 +21,7 @@ use workspace::{
     OpenMode, Workspace,
     notifications::DetachAndPromptErr,
 };
-use zed_actions::{NewWorktreeBranchTarget, OpenWorktreeInNewWindow, SwitchWorktree};
+use zed_actions::{NewWorktreeBranchTarget, OpenWorktreeInNewWindow};
 
 actions!(
     git_graph,
@@ -381,34 +381,44 @@ pub(crate) fn commit_context_menu(
                 if !worktrees.is_empty() {
                     for worktree in &worktrees {
                         let path = worktree.path.clone();
-                        let display_name = worktree
-                            .path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("worktree")
-                            .to_string();
+                        // Each entry is distinguishable by its checked-out
+                        // branch and a portable short path, so worktrees that
+                        // share the clicked commit stay separately addressable.
+                        let display_name = linked_worktree_label(worktree).to_string();
                         let switch_workspace = workspace_for_entry.clone();
                         let switch_path = path.clone();
                         let switch_display_name = display_name.clone();
+                        let switch_offer_sha = sha.to_string();
                         menu = menu.entry(
                             format!("Switch to {display_name}"),
                             None,
                             move |window, cx| {
-                                if let Some(workspace) = switch_workspace.upgrade() {
-                                    workspace.update(cx, |workspace, cx| {
-                                        handle_switch_worktree(
-                                            workspace,
-                                            &SwitchWorktree {
-                                                path: switch_path.clone(),
-                                                display_name: switch_display_name.clone(),
-                                            },
-                                            window,
-                                            None,
-                                            OpenMode::Activate,
-                                            cx,
-                                        );
-                                    });
-                                }
+                                // This is also the shared worktree service switch
+                                // (same OS window, never a terminal `cd`), catching
+                                // current-target, disappeared-target, and
+                                // stale-snapshot as explicit no-ops via toasts.
+                                let Some(workspace) = switch_workspace.upgrade() else {
+                                    // Missing-window-handle: explicit error state,
+                                    // never a silent `if let Some` fallback.
+                                    log::error!(
+                                        "worktree switch: source window handle for {} is no \
+                                         longer available",
+                                        switch_path.display()
+                                    );
+                                    return;
+                                };
+                                workspace.update(cx, |workspace, cx| {
+                                    switch_to_worktree(
+                                        workspace,
+                                        switch_path.clone(),
+                                        switch_display_name.clone().into(),
+                                        Some(switch_offer_sha.clone().into()),
+                                        window,
+                                        None,
+                                        OpenMode::Activate,
+                                        cx,
+                                    );
+                                });
                             },
                         );
                         let new_window_path = path.clone();
@@ -416,6 +426,8 @@ pub(crate) fn commit_context_menu(
                             format!("Open {display_name} in New Window"),
                             None,
                             move |window, cx| {
+                                // Routes through the shared open-in-new-window seam:
+                                // a distinct OS window, no file/dock transfer.
                                 window.dispatch_action(
                                     Box::new(OpenWorktreeInNewWindow {
                                         path: new_window_path.clone(),

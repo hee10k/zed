@@ -1,9 +1,10 @@
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use anyhow::Context as _;
 use askpass::AskPassDelegate;
 use collections::HashSet;
 use fs::Fs;
@@ -20,10 +21,11 @@ use settings::Settings;
 use ui::prelude::*;
 use workspace::{
     MultiWorkspace, OpenMode, PreviousWorkspaceState, ToastView, Workspace, dock::DockPosition,
+    notifications::DetachAndPromptErr,
 };
 use zed_actions::NewWorktreeBranchTarget;
 
-use git::repository::{Branch, CreateWorktreeTarget, FetchOptions, Remote};
+use git::repository::{Branch, CreateWorktreeTarget, FetchOptions, Remote, Worktree};
 
 use util::ResultExt as _;
 
@@ -125,6 +127,73 @@ impl RemoteBranchName {
     pub fn display_name(&self) -> String {
         format!("{}/{}", self.remote_name, self.branch_name)
     }
+}
+
+/// Explicit no-op/error reasons a worktree navigation is prevented. The Git
+/// Graph navigation surfaces these to the user (via a toast) instead of
+/// silently falling back, covering the five failure categories: current-target,
+/// disappeared-target, stale-snapshot, missing-window-handle, and open-failure
+/// (the last is produced by [`open_worktree_workspace`] and surfaced by the
+/// switch/open wrappers rather than this enum).
+#[derive(Clone, Debug)]
+pub enum WorktreeNavigationBlocker {
+    /// The requested target is the workspace the user is already in.
+    AlreadyCurrent { display_name: SharedString },
+    /// The target worktree directory no longer exists on disk.
+    TargetDisappeared { path: PathBuf },
+    /// The offer came from a stale snapshot: the path/sha is no longer a live
+    /// linked worktree in repository state.
+    StaleSnapshot { path: PathBuf },
+    /// The source workspace's window handle is no longer available.
+    NoWindowHandle,
+}
+
+impl WorktreeNavigationBlocker {
+    /// User-facing explanation of why the navigation cannot proceed. Callers
+    /// surface this via a toast so the block is never silent.
+    pub fn message(&self) -> SharedString {
+        match self {
+            WorktreeNavigationBlocker::AlreadyCurrent { display_name } => {
+                format!("Already working in {display_name}").into()
+            }
+            WorktreeNavigationBlocker::TargetDisappeared { path } => {
+                format!("Cannot open worktree: {} no longer exists", path.display()).into()
+            }
+            WorktreeNavigationBlocker::StaleSnapshot { path } => {
+                format!(
+                    "This worktree is no longer linked at {}. Refresh the Git Graph and try again.",
+                    path.display()
+                )
+                .into()
+            }
+            WorktreeNavigationBlocker::NoWindowHandle => {
+                "Worktree window is no longer available; open the folder from the project picker."
+                    .into()
+            }
+        }
+    }
+}
+
+/// The last up-to-two components of `path`, joined portably with `/`. Used to
+/// build stable Git Graph worktree labels: sibling worktrees that share a final
+/// folder name stay distinguishable because their parent component differs.
+fn portable_short_path(path: &Path) -> String {
+    let mut components = Vec::new();
+    for component in path.components().rev().take(2) {
+        components.push(component.as_os_str().to_string_lossy().into_owned());
+    }
+    components.reverse();
+    components.join("/")
+}
+
+/// A stable, distinguishable label for a linked worktree shown in the Git Graph
+/// commit submenu. Combines the checked-out branch with a portable short path so
+/// that entries at the same commit remain distinguishable by both — even when
+/// their final folder names collide (e.g. two worktrees both named "worktree"
+/// under different parent directories, or a detached-HEAD worktree).
+pub fn linked_worktree_label(worktree: &Worktree) -> SharedString {
+    let branch = worktree.branch_name().unwrap_or("detached HEAD");
+    format!("{branch} · {}", portable_short_path(&worktree.path)).into()
 }
 
 /// A "create new worktree" option offered to the user. The set of targets is
@@ -1047,9 +1116,312 @@ fn create_worktree_workspace_inner(
     })
 }
 
+/// Shared "open this worktree in a new OS window" seam. Every open-in-new-window
+/// control — the Worktree Picker's row/icon buttons, the Git Graph commit
+/// submenu, and the `OpenWorktreeInNewWindow` action handler — routes through
+/// this so the local and remote implementations live behind one interface. The
+/// picker-owned remote implementation ([`open_remote_worktree`]) was moved here
+/// during the cutover, so there is no longer a duplicate high-level path.
+///
+/// Opening in a new window neither transfers the source window's open files nor
+/// its dock layout: the destination is a clean checkout. Errors are surfaced as
+/// a toast on the source workspace (the explicit open-failure state) and
+/// returned so callers can respond.
+pub fn open_worktree_in_new_window(
+    workspace: &mut Workspace,
+    path: PathBuf,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) -> Task<anyhow::Result<()>> {
+    let workspace_handle = workspace.weak_handle();
+
+    if workspace.project().read(cx).is_local() {
+        // A distinct OS window opens via `open_workspace_for_paths` with
+        // `WorkspaceMatching::None` and no state transfer: the destination is a
+        // clean checkout with neither the source window's files nor its docks.
+        let open_task =
+            workspace.open_workspace_for_paths(OpenMode::NewWindow, vec![path], window, cx);
+        cx.spawn_in(window, async move |_, cx| {
+            let result = open_task.await.map(|_workspace| ());
+            surface_new_window_open_error(&workspace_handle, &result, cx);
+            result
+        })
+    } else {
+        let connection_options = workspace.project().read(cx).remote_connection_options(cx);
+        let app_state = workspace.app_state().clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = match connection_options {
+                Some(connection_options) => open_remote_worktree(
+                    connection_options,
+                    vec![path],
+                    app_state,
+                    workspace_handle.clone(),
+                    cx,
+                )
+                .await,
+                None => anyhow::Ok(()),
+            };
+            surface_new_window_open_error(&workspace_handle, &result, cx);
+            result
+        })
+    }
+}
+
+/// Surfaces an open-in-new-window failure to the user (explicit open-failure
+/// state) rather than silently dropping the error. Kept as a helper so the
+/// local and remote branches of [`open_worktree_in_new_window`] share it.
+fn surface_new_window_open_error(
+    workspace_handle: &WeakEntity<Workspace>,
+    result: &anyhow::Result<()>,
+    cx: &mut AsyncWindowContext,
+) {
+    if let Err(err) = result {
+        log::error!("Failed to open worktree in new window: {err}");
+        workspace_handle
+            .update(cx, |_workspace, cx| {
+                show_error_toast(
+                    cx.entity(),
+                    "open worktree in new window",
+                    anyhow!("{err:#}"),
+                    cx,
+                );
+            })
+            .ok();
+    }
+}
+
+/// Opens a linked-worktree folder in a new OS window for a remote project,
+/// reusing the existing connection (showing a connection modal if disconnected)
+/// and restoring the workspace position stored for that folder. Shared by the
+/// Worktree Picker, the Git Graph submenu, and the `OpenWorktreeInNewWindow`
+/// action handler through [`open_worktree_in_new_window`].
+pub async fn open_remote_worktree(
+    connection_options: remote::RemoteConnectionOptions,
+    paths: Vec<PathBuf>,
+    app_state: Arc<workspace::AppState>,
+    workspace: gpui::WeakEntity<Workspace>,
+    cx: &mut gpui::AsyncWindowContext,
+) -> anyhow::Result<()> {
+    let connect_task = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_modal(window, cx, |window, cx| {
+            remote_connection::RemoteConnectionModal::new(
+                &connection_options,
+                Vec::new(),
+                window,
+                cx,
+            )
+        });
+
+        let prompt = workspace
+            .active_modal::<remote_connection::RemoteConnectionModal>(cx)
+            .expect("Modal just created")
+            .read(cx)
+            .prompt
+            .clone();
+
+        remote_connection::connect(
+            remote::remote_client::ConnectionIdentifier::setup(),
+            connection_options.clone(),
+            prompt,
+            window,
+            cx,
+        )
+        .prompt_err("Failed to connect", window, cx, |_, _, _| None)
+    })?;
+
+    let session = connect_task.await;
+
+    workspace
+        .update_in(cx, |workspace, _window, cx| {
+            if let Some(prompt) =
+                workspace.active_modal::<remote_connection::RemoteConnectionModal>(cx)
+            {
+                prompt.update(cx, |prompt, cx| prompt.finished(cx))
+            }
+        })
+        .ok();
+
+    let Some(Some(session)) = session else {
+        return Ok(());
+    };
+
+    let new_project = cx.update(|_, cx| {
+        project::Project::remote(
+            session,
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            true,
+            cx,
+        )
+    })?;
+
+    let workspace_position = cx
+        .update(|_, cx| {
+            workspace::remote_workspace_position_from_db(connection_options.clone(), &paths, cx)
+        })?
+        .await
+        .context("fetching workspace position from db")?;
+
+    let mut options =
+        cx.update(|_, cx| (app_state.build_window_options)(workspace_position.display, cx))?;
+    options.window_bounds = workspace_position.window_bounds;
+
+    let new_window = cx.open_window(options, |window, cx| {
+        let workspace = cx.new(|cx| {
+            let mut workspace =
+                Workspace::new(None, new_project.clone(), app_state.clone(), window, cx);
+            workspace.centered_layout = workspace_position.centered_layout;
+            workspace
+        });
+        cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+    })?;
+
+    workspace::open_remote_project_with_existing_connection(
+        connection_options,
+        new_project,
+        paths,
+        app_state,
+        new_window,
+        None,
+        None,
+        cx,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Validates a switch to `target_path` against live repository state and the
+/// current workspace, returning the explicit [`WorktreeNavigationBlocker`] that
+/// should stop the switch (to be shown to the user) or `None` if it may
+/// proceed. This is the single shared decision point for the current-target,
+/// disappeared-target, and stale-snapshot states, so every switch caller (the
+/// Git Graph submenu, the Worktree Picker row, and the `SwitchWorktree` action
+/// handler) gets explicit no-op handling rather than a silent fallback.
+///
+/// `offer_sha` is the commit SHA captured when the offering control built its
+/// entry. Only the Git Graph supplies it (its entries are always linked
+/// worktrees); when present it enables the stale-snapshot check. Switches to
+/// the main checkout or a plain folder (Sidebar, Agent Panel) never supply it,
+/// so they are never misclassified as stale.
+pub async fn switch_worktree_blocker(
+    source_workspace: &Entity<Workspace>,
+    target_path: &Path,
+    display_name: SharedString,
+    offer_sha: Option<&str>,
+    cx: &mut AsyncWindowContext,
+) -> Option<WorktreeNavigationBlocker> {
+    // Current-target: the target is already the active workspace's root. This
+    // is the common "switch to the worktree I'm already in" no-op.
+    let is_current = cx
+        .update(|_, cx| {
+            source_workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .any(|worktree| worktree.read(cx).abs_path().as_ref() == target_path)
+        })
+        .unwrap_or(false);
+    if is_current {
+        return Some(WorktreeNavigationBlocker::AlreadyCurrent { display_name });
+    }
+
+    // Stale-snapshot: the Git Graph offered a linked worktree at this path/sha,
+    // but it is no longer a live linked worktree in repository state. Only
+    // checked when the offer carries a SHA, so non-graph switches are unaffected.
+    if let Some(offer_sha) = offer_sha {
+        let still_linked = cx
+            .update(|_, cx| {
+                source_workspace
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .repositories(cx)
+                    .values()
+                    .any(|repository| {
+                        repository.read(cx).linked_worktrees().iter().any(|worktree| {
+                            worktree.path == target_path && worktree.sha.as_ref() == offer_sha
+                        })
+                    })
+            })
+            .unwrap_or(false);
+        if !still_linked {
+            return Some(WorktreeNavigationBlocker::StaleSnapshot {
+                path: target_path.to_path_buf(),
+            });
+        }
+    }
+
+    // Disappeared-target: the worktree folder no longer exists on disk.
+    let fs = cx.update(|_, cx| <dyn Fs>::global(cx)).ok()?;
+    if !fs.is_dir(target_path).await {
+        return Some(WorktreeNavigationBlocker::TargetDisappeared {
+            path: target_path.to_path_buf(),
+        });
+    }
+
+    None
+}
+
+/// Handles the `SwitchWorktree` action generically (Git UI action handler,
+/// Worktree Picker row, Sidebar, Agent Panel). Same-window workspace activation
+/// via the shared switch implementation; explicit no-op states are toasted.
 pub fn handle_switch_worktree(
     workspace: &mut Workspace,
     action: &zed_actions::SwitchWorktree,
+    window: &mut gpui::Window,
+    fallback_focused_dock: Option<DockPosition>,
+    open_mode: OpenMode,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    switch_worktree_impl(
+        workspace,
+        action.path.clone(),
+        action.display_name.clone().into(),
+        None,
+        window,
+        fallback_focused_dock,
+        open_mode,
+        cx,
+    );
+}
+
+/// Shared switch seam used by the Git Graph submenu. Identical to
+/// [`handle_switch_worktree`] but carries the commit SHA the menu entry was
+/// built from, enabling the stale-snapshot explicit state (a linked worktree
+/// removed or moved since the menu was captured surfaces as a toast instead of
+/// silently proceeding).
+pub fn switch_to_worktree(
+    workspace: &mut Workspace,
+    target_path: PathBuf,
+    display_name: SharedString,
+    offer_sha: Option<SharedString>,
+    window: &mut gpui::Window,
+    fallback_focused_dock: Option<DockPosition>,
+    open_mode: OpenMode,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    switch_worktree_impl(
+        workspace,
+        target_path,
+        display_name,
+        offer_sha,
+        window,
+        fallback_focused_dock,
+        open_mode,
+        cx,
+    );
+}
+
+fn switch_worktree_impl(
+    workspace: &mut Workspace,
+    worktree_path: PathBuf,
+    display_name: SharedString,
+    offer_sha: Option<SharedString>,
     window: &mut gpui::Window,
     fallback_focused_dock: Option<DockPosition>,
     open_mode: OpenMode,
@@ -1074,6 +1446,7 @@ pub fn handle_switch_worktree(
     let previous_state =
         workspace.capture_state_for_worktree_switch(window, fallback_focused_dock, cx);
     let workspace_handle = workspace.weak_handle();
+    let source_workspace = cx.entity();
     let window_handle = window.window_handle().downcast::<MultiWorkspace>();
     let remote_connection_options = project.read(cx).remote_connection_options(cx);
 
@@ -1084,13 +1457,36 @@ pub fn handle_switch_worktree(
         .map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
         .collect();
 
-    let display_name: SharedString = action.display_name.clone().into();
+    workspace.set_active_worktree_creation(Some(display_name.clone()), true, cx);
 
-    workspace.set_active_worktree_creation(Some(display_name), true, cx);
-
-    let worktree_path = action.path.clone();
+    let blocker_path = worktree_path.clone();
 
     cx.spawn_in(window, async move |_workspace_entity, mut cx| {
+        // Surface explicit no-op states (already-current, disappeared target,
+        // stale snapshot) instead of silently proceeding or doing nothing.
+        if let Some(blocker) = switch_worktree_blocker(
+            &source_workspace,
+            &blocker_path,
+            display_name,
+            offer_sha.as_deref(),
+            &mut cx,
+        )
+        .await
+        {
+            workspace_handle
+                .update(cx, |workspace, cx| {
+                    workspace.set_active_worktree_creation(None, false, cx);
+                    show_error_toast(
+                        cx.entity(),
+                        "worktree switch",
+                        anyhow!(blocker.message()),
+                        cx,
+                    );
+                })
+                .ok();
+            return anyhow::Ok(());
+        }
+
         let result = do_switch_worktree(
             worktree_path,
             git_repo_work_dirs,
@@ -1114,7 +1510,7 @@ pub fn handle_switch_worktree(
                 .ok();
         }
 
-        result
+        result.map(|_workspace| ())
     })
     .detach_and_log_err(cx);
 }
@@ -2289,6 +2685,341 @@ mod tests {
         assert!(
             shas.values().all(|heads| heads.is_empty()),
             "no worktree should be created when the target repository is missing"
+        );
+    }
+
+    #[test]
+    fn test_linked_worktree_label_distinguishes_same_sha_worktrees() {
+        let make = |path: &str, ref_name: Option<&str>| Worktree {
+            path: PathBuf::from(path),
+            ref_name: ref_name.map(Into::into),
+            sha: "abc123".into(),
+            is_main: false,
+            is_bare: false,
+        };
+
+        // Same commit, same final folder name, different parents: entries must
+        // stay distinguishable via their portable path.
+        let a = make("/root/worktrees/wt-a/feature", Some("refs/heads/feature"));
+        let b = make("/root/worktrees/wt-b/feature", Some("refs/heads/feature"));
+        let label_a = linked_worktree_label(&a);
+        let label_b = linked_worktree_label(&b);
+        assert_ne!(
+            label_a, label_b,
+            "same-SHA entries must be distinguishable by parent path"
+        );
+        assert!(
+            label_a.contains("feature"),
+            "label should carry the checked-out branch"
+        );
+        assert!(
+            label_a.contains("wt-a/feature"),
+            "label should carry a portable path"
+        );
+
+        // Different branches on the same path also differ.
+        let c = make("/root/worktrees/wt-a/feature", Some("refs/heads/other"));
+        assert_ne!(linked_worktree_label(&c), label_a);
+
+        // A detached-HEAD worktree has no branch; the portable path remains.
+        let detached = make("/root/worktrees/wt-a/feature", None);
+        let detached_label = linked_worktree_label(&detached);
+        assert!(
+            detached_label.contains("detached HEAD"),
+            "detached worktree label should still surface a branch-or-fallback"
+        );
+        assert!(detached_label.contains("wt-a/feature"));
+    }
+
+    #[test]
+    fn test_worktree_navigation_blocker_messages_are_non_empty_and_distinct() {
+        let blockers = [
+            WorktreeNavigationBlocker::AlreadyCurrent {
+                display_name: "feature · wt-a/feature".into(),
+            },
+            WorktreeNavigationBlocker::TargetDisappeared {
+                path: PathBuf::from("/root/gone"),
+            },
+            WorktreeNavigationBlocker::StaleSnapshot {
+                path: PathBuf::from("/root/gone"),
+            },
+            WorktreeNavigationBlocker::NoWindowHandle,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for blocker in blockers {
+            let message = blocker.message();
+            assert!(!message.is_empty(), "blocker message must never be empty");
+            assert!(
+                seen.insert(message),
+                "blocker messages should be distinguishable"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_switch_worktree_blocker_states(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            "/root",
+            json!({
+                "project": { ".git": {}, "src": { "main.rs": "fn main() {}" } },
+                "other": { "file.txt": "x" },
+            }),
+        )
+        .await;
+
+        let main_root = PathBuf::from(path!("/root/project"));
+        let other_root = PathBuf::from(path!("/root/other"));
+        let gone_root = PathBuf::from(path!("/root/gone"));
+        let project = Project::test(fs.clone(), [main_root.as_path()], cx).await;
+        project.update(cx, |project, cx| project.git_scans_complete(cx)).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |mw, cx| mw.retain_active_workspace(cx));
+        let workspace_entity = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        // Run `switch_worktree_blocker` on the foreground executor.
+        let mut run_blocker = |target: PathBuf, offer_sha: Option<&str>| {
+            let workspace_entity = workspace_entity.clone();
+            let offer_sha = offer_sha.map(ToOwned::to_owned);
+            multi_workspace.update_in(cx, |_mw, window, cx| {
+                cx.spawn_in(window, async move |_, cx| {
+                    switch_worktree_blocker(
+                        &workspace_entity,
+                        &target,
+                        "wt".into(),
+                        offer_sha.as_deref(),
+                        cx,
+                    )
+                    .await
+                })
+            })
+        };
+
+        // Current-target: switching to the already-active workspace is an
+        // explicit no-op, not a silent fallback.
+        assert!(
+            matches!(
+                run_blocker(main_root.clone(), None).await,
+                Some(WorktreeNavigationBlocker::AlreadyCurrent { .. })
+            ),
+            "switching to the already-active workspace must be an explicit no-op"
+        );
+
+        // A switch to an existing sibling folder (no stale offer) proceeds.
+        assert!(
+            run_blocker(other_root.clone(), None).await.is_none(),
+            "a plain switch to an existing sibling folder must proceed"
+        );
+
+        // Stale-snapshot: a Git Graph offer for a path that is no longer a
+        // live linked worktree is surfaced even though the folder exists.
+        assert!(
+            matches!(
+                run_blocker(other_root.clone(), Some("abc123")).await,
+                Some(WorktreeNavigationBlocker::StaleSnapshot { .. })
+            ),
+            "a stale Git Graph offer at a non-linked path must be surfaced"
+        );
+
+        // Disappeared-target: the folder no longer exists on disk.
+        assert!(
+            matches!(
+                run_blocker(gone_root.clone(), None).await,
+                Some(WorktreeNavigationBlocker::TargetDisappeared { .. })
+            ),
+            "a vanished worktree folder must be surfaced as disappeared"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_switch_to_worktree_activates_sibling_in_same_window_without_terminal_cd(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            "/root",
+            json!({
+                "project": { ".git": {}, "src": { "main.rs": "fn main() {}" } },
+            }),
+        )
+        .await;
+
+        let main_root = PathBuf::from(path!("/root/project"));
+        let project = Project::test(fs.clone(), [main_root.as_path()], cx).await;
+        project.update(cx, |project, cx| project.git_scans_complete(cx)).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |mw, cx| mw.retain_active_workspace(cx));
+
+        let spawned_task_labels = Arc::new(Mutex::new(Vec::new()));
+        multi_workspace.update(cx, |mw, cx| {
+            mw.workspace().update(cx, |workspace, _cx| {
+                workspace.set_terminal_provider(CountingTerminalProvider {
+                    spawned_task_labels: spawned_task_labels.clone(),
+                });
+            });
+        });
+
+        let main_workspace =
+            multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        main_workspace.update_in(cx, |workspace, window, cx| {
+            handle_create_worktree(
+                workspace,
+                &zed_actions::CreateWorktree {
+                    worktree_name: Some("feature".to_string()),
+                    branch_target: NewWorktreeBranchTarget::CurrentBranch,
+                },
+                window,
+                None,
+                OpenMode::Activate,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let active_root_after_create = multi_workspace
+            .read_with(cx, |mw, cx| {
+                mw.workspace()
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|wt| wt.read(cx).abs_path().to_path_buf())
+            })
+            .expect("active workspace should have a root");
+        assert_ne!(
+            active_root_after_create.as_path(),
+            main_root.as_path(),
+            "creating a worktree should foreground the new linked worktree"
+        );
+        assert_eq!(cx.windows().len(), 1, "the same-window flow must not open a new OS window");
+
+        let spawns_after_create = spawned_task_labels
+            .lock()
+            .expect("terminal spawn mutex should not be poisoned")
+            .len();
+
+        // Switch back to the main worktree through the shared service switch.
+        let active_before =
+            multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        active_before.update_in(cx, |workspace, window, cx| {
+            switch_to_worktree(
+                workspace,
+                main_root.clone(),
+                "project".into(),
+                None,
+                window,
+                None,
+                OpenMode::Activate,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let active_root_after_switch = multi_workspace
+            .read_with(cx, |mw, cx| {
+                mw.workspace()
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|wt| wt.read(cx).abs_path().to_path_buf())
+            })
+            .expect("a workspace should be active after switch");
+        assert_eq!(
+            active_root_after_switch.as_path(),
+            main_root.as_path(),
+            "switch must activate the sibling workspace in the current window"
+        );
+
+        // A worktree switch is Workspace activation, never a terminal `cd`:
+        // no terminal command (e.g. a `cd`) may have been spawned for it.
+        let spawns_after_switch = spawned_task_labels
+            .lock()
+            .expect("terminal spawn mutex should not be poisoned")
+            .len();
+        assert_eq!(
+            spawns_after_switch, spawns_after_create,
+            "a worktree switch must not spawn a terminal or issue a `cd`"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_worktree_in_new_window_opens_second_os_window(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            "/root",
+            json!({
+                "project-old": { ".git": {}, "src": { "main.rs": "fn main() {}" } },
+                "project-new": { "file.txt": "hi" },
+            }),
+        )
+        .await;
+
+        let old_root = PathBuf::from(path!("/root/project-old"));
+        let new_root = PathBuf::from(path!("/root/project-new"));
+        let project = Project::test(fs.clone(), [old_root.as_path()], cx).await;
+        project.update(cx, |project, cx| project.git_scans_complete(cx)).await;
+
+let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |mw, cx| mw.retain_active_workspace(cx));
+        let source_workspace =
+            multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let open_task = source_workspace.update_in(cx, |workspace, window, cx| {
+            open_worktree_in_new_window(workspace, new_root.clone(), window, cx)
+        });
+        open_task
+            .await
+            .expect("opening a worktree in a new window should succeed");
+        cx.run_until_parked();
+
+        // A distinct, second OS window opened.
+        assert_eq!(cx.windows().len(), 2, "new-window open must create a second OS window");
+
+        // The new window's workspace is rooted at the target and carried over
+        // no open files or docks from the source window.
+        let new_item_count = cx
+            .windows()
+            .iter()
+            .find_map(|handle| {
+                let mw = handle.downcast::<MultiWorkspace>()?;
+                mw.read_with(cx, |mw, cx| {
+                    let ws = mw.workspace();
+                    let root = ws
+                        .read(cx)
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|wt| wt.read(cx).abs_path().to_path_buf());
+                    if root.as_deref() == Some(new_root.as_path()) {
+                        Some(ws.read(cx).items(cx).count())
+                    } else {
+                        None
+                    }
+                })
+                .ok()
+                .flatten()
+            })
+            .expect("a new-window workspace rooted at the target should exist");
+        assert_eq!(
+            new_item_count, 0,
+            "open in new window must not transfer files from the source window"
         );
     }
 }
