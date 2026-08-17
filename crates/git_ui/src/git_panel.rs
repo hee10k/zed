@@ -6764,6 +6764,7 @@ impl GitPanel {
                 sha: commit.sha,
                 tag_names: commit.tag_names,
                 is_stash: false,
+                stash_identity: None,
             },
             vec![commit.sha],
             CommitContextMenuSource::GitPanel,

@@ -10,6 +10,7 @@ use crate::{
     },
     git_status_icon,
 };
+use git::stash::{STASH_REF, StashIdentity};
 use collections::{BTreeMap, HashMap, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
@@ -2756,6 +2757,19 @@ impl GitGraph {
         } else {
             vec![commit.data.sha]
         };
+        // For a stash row, capture the composite stash target (exact OID +
+        // reflog selector) at deploy time so the open menu targets this entry —
+        // never the current row index or OID alone. Duplicate OIDs stay
+        // independently addressable through their distinct selectors.
+        let stash_identity = if commit.is_stash {
+            commit.data.stash_selector().map(|selector| StashIdentity {
+                oid: commit.data.sha,
+                ref_name: STASH_REF.to_string(),
+                selector: selector.to_string(),
+            })
+        } else {
+            None
+        };
         let context_menu = commit_context_menu(
             CommitContextMenuData {
                 sha: commit.data.sha,
@@ -2766,6 +2780,7 @@ impl GitGraph {
                     .map(|tag_name| SharedString::from(tag_name.to_string()))
                     .collect(),
                 is_stash: commit.is_stash,
+                stash_identity,
             },
             selected_commits,
             CommitContextMenuSource::GitGraph,
@@ -9363,6 +9378,11 @@ mod tests {
         cx.run_until_parked();
 
         let labels = ref_menu_labels(&git_graph, cx);
+        // A stash row offers the stash-only actions submenu.
+        assert!(
+            labels.iter().any(|label| label == "Stash"),
+            "stash row must offer the stash-only actions submenu, got {labels:?}"
+        );
         // A stash row must not offer commit-oriented actions.
         for forbidden in ["Checkout", "Cherry-pick", "Revert", "Reset", "Merge", "Create Branch", "Git Actions", "Worktree", "Custom Commands"] {
             assert!(
