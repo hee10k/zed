@@ -1,6 +1,8 @@
 use crate::commit::{CommitDiffObject, CommitDiffObjectKind, parse_git_diff_raw};
 use crate::stash::{
-    GitStash, STASH_REF, StashEntry, StashIdentity, StashMutationResult, resolve_stash_identity,
+    GitStash, STASH_REF, STASH_RENAME_MANIFEST_VERSION, STASH_RENAME_RECOVERY_PREFIX, StashEntry,
+    StashIdentity, StashMutationResult, StashRenameRecovery, StashRenameResult,
+    parse_stash_index, parse_stash_message, renamed_stash_subject, resolve_stash_identity,
 };
 use crate::status::{
     DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus,
@@ -1155,6 +1157,30 @@ pub trait GitRepository: Send + Sync {
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>>;
 
+    /// Rename only the selected stash entry's display message without moving it
+    /// to the top, preserving every other stash OID and non-target observable
+    /// reflog field. Crash-recoverable: before the destructive replay this
+    /// writes a versioned recovery manifest blob plus stable recovery refs for
+    /// every involved OID in one atomic ref transaction, rebuilds the stash
+    /// reflog oldest-to-newest through Git's ref backend, verifies the complete
+    /// observable result, and only then deletes the recovery refs. Any
+    /// destructive-boundary failure retains the manifest + recovery refs and
+    /// reports them plus the observed stack via `StashRenameResult`.
+    fn stash_rename(
+        &self,
+        identity: Option<StashIdentity>,
+        message: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<StashRenameResult>>;
+
+    /// Discover unfinished crash-recoverable stash renames left by a previous
+    /// run (any recovery ref under `STASH_RENAME_RECOVERY_PREFIX`), reading the
+    /// versioned manifest blob and the current observable stack so a caller can
+    /// offer retry/recover/cleanup guidance after a restart.
+    fn pending_stash_rename_recovers(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<StashRenameRecovery>>>;
+
     fn push(
         &self,
         branch_name: String,
@@ -1366,6 +1392,13 @@ pub struct RealGitRepository {
     any_git_binary_help_output: Arc<Mutex<Option<SharedString>>>,
     executor: BackgroundExecutor,
     is_trusted: Arc<AtomicBool>,
+    /// Test-only fault-injection hook for crash-recoverable stash rename
+    /// boundaries. Production paths never install one (`None`), so this is a
+    /// zero-cost no-op there. Field lives here (not a global) so parallel tests
+    /// cannot interfere with one another.
+    stash_rename_fault: Arc<
+        Mutex<Option<Box<dyn Fn(StashRenameBoundary) -> Result<()> + Send>>>,
+    >,
 }
 
 #[derive(Debug)]
@@ -1455,6 +1488,7 @@ impl RealGitRepository {
             executor,
             any_git_binary_help_output: Arc::new(Mutex::new(None)),
             is_trusted: Arc::new(AtomicBool::new(false)),
+            stash_rename_fault: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1649,6 +1683,712 @@ async fn resolve_stash_target(
             .next()
             .with_context(|| "Expected a stash entry to operate on"),
     }
+}
+
+/// A stash entry as captured for a rename, carrying the raw subject and reflog
+/// subject lines so a rebuild can reproduce every non-target observable reflog
+/// field byte-for-byte.
+#[derive(Clone, Debug)]
+struct CapturedStash {
+    entry: StashEntry,
+    /// The commit subject (`%s`) — the primary display message.
+    raw_subject: String,
+    /// The reflog subject (`%gs`) — `git stash list` shows this field too.
+    reflog_message: String,
+}
+
+impl CapturedStash {
+    /// Deterministic recovery-ref key for this entry: its position in the
+    /// newest-first captured stack.
+    fn ref_key(&self) -> String {
+        self.entry.index.to_string()
+    }
+
+    /// Audit representation written into the recovery manifest.
+    fn manifest_line(&self) -> String {
+        format!(
+            "{}\0{}\0{}\0{}\0{}",
+            self.entry.index,
+            self.entry.oid,
+            self.entry.timestamp,
+            self.entry.message,
+            self.entry.branch.as_deref().unwrap_or("")
+        )
+    }
+
+    fn from_manifest_line(line: &str) -> Result<Self> {
+        let parts: Vec<&str> = line.splitn(5, '\0').collect();
+        if parts.len() != 5 {
+            anyhow::bail!("invalid captured stash manifest line: {line:?}");
+        }
+        let index = parts[0].parse::<usize>()?;
+        let oid = Oid::from_str(parts[1])?;
+        let timestamp = parts[2].parse::<i64>()?;
+        let message = parts[3].to_string();
+        let branch = (!parts[4].is_empty()).then(|| parts[4].to_string());
+        let raw_subject = match (&branch, message.as_str()) {
+            (Some(branch), _) => format!("On {branch}: {message}"),
+            (None, message) => message.to_string(),
+        };
+        Ok(Self {
+            entry: StashEntry {
+                index,
+                oid,
+                message,
+                branch,
+                timestamp,
+            },
+            raw_subject: raw_subject.clone(),
+            reflog_message: raw_subject,
+        })
+    }
+}
+
+/// Versioned manifest a stash rename writes before its destructive replay.
+#[derive(Clone, Serialize, Deserialize)]
+struct StashRenameManifest {
+    version: u32,
+    manifest_id: String,
+    new_message: String,
+    /// Hex OID of the rewritten target commit.
+    new_oid: String,
+    /// Reflog selector of the exact selected target (e.g. `refs/stash@{2}`).
+    target_selector: String,
+    /// Captured stack newest-first as audit lines (see `CapturedStash`).
+    captured_lines: Vec<String>,
+}
+
+/// Deterministic manifest ref for a rename id.
+fn stash_rename_manifest_ref(manifest_id: &str) -> String {
+    format!("{STASH_RENAME_RECOVERY_PREFIX}/{manifest_id}/manifest")
+}
+
+/// Deterministic recovery ref protecting one involved OID.
+fn stash_rename_entry_ref(manifest_id: &str, key: &str) -> String {
+    format!("{STASH_RENAME_RECOVERY_PREFIX}/{manifest_id}/entry/{key}")
+}
+
+/// The recovery refs protecting every involved OID (each captured entry,
+/// newest-first, plus the rewritten target OID), deterministically named so a
+/// later failure and a post-restart discovery report the same refs.
+fn stash_rename_recovery_refs(manifest_id: &str, captured: &[CapturedStash]) -> Vec<String> {
+    let mut refs = Vec::with_capacity(captured.len() + 1);
+    for entry in captured {
+        refs.push(stash_rename_entry_ref(manifest_id, &entry.ref_key()));
+    }
+    refs.push(stash_rename_entry_ref(manifest_id, "target"));
+    refs
+}
+
+/// Capture the current stash stack newest-first, keeping the raw subject and
+/// reflog subject lines so a rebuild can reproduce non-target fields exactly.
+async fn capture_stash_stack(git: &GitBinary) -> Result<Vec<CapturedStash>> {
+    let output = git
+        .build_command(&[
+            "stash",
+            "list",
+            "--pretty=format:%gd%x00%H%x00%ct%x00%s%x00%gs",
+        ])
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git stash list failed: {stderr}");
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut captured = Vec::new();
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(5, '\0').collect();
+        if parts.len() != 5 {
+            anyhow::bail!("unexpected stash list line: {line:?}");
+        }
+        let index = parse_stash_index(parts[0])?;
+        let oid = Oid::from_str(parts[1])?;
+        let timestamp = parts[2].parse::<i64>()?;
+        let raw_subject = parts[3].to_string();
+        let reflog_message = parts[4].to_string();
+        let (branch, message) = parse_stash_message(&raw_subject);
+        captured.push(CapturedStash {
+            entry: StashEntry {
+                index,
+                oid,
+                message: message.to_string(),
+                branch: branch.map(Into::into),
+                timestamp,
+            },
+            raw_subject,
+            reflog_message,
+        });
+    }
+    Ok(captured)
+}
+
+/// Write bytes as a repository blob (`git hash-object -w`) and return its OID.
+async fn write_git_blob(
+    git: &GitBinary,
+    content: &str,
+    env: &Arc<HashMap<String, String>>,
+) -> Result<Oid> {
+    let mut child = git
+        .build_command(&["hash-object", "-w", "--stdin"])
+        .envs(env.iter())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning git hash-object")?;
+    let mut stdin = child.stdin.take().context("hash-object has no stdin")?;
+    stdin.write_all(content.as_bytes()).await?;
+    stdin.flush().await?;
+    drop(stdin);
+    let output = child.output().await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "writing recovery manifest blob failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sha = str::from_utf8(&output.stdout)?.trim();
+    Oid::from_str(sha).context("invalid manifest blob OID")
+}
+
+/// Run an atomic `git update-ref --stdin` transaction: `start`, the given
+/// directives, `prepare`, then `commit`. Any failing directive or `prepare`
+/// failure aborts the whole transaction (nothing partially applied).
+async fn run_ref_transaction(git: &GitBinary, lines: &[String]) -> Result<()> {
+    let mut input = String::from("start\n");
+    for line in lines {
+        input.push_str(line);
+        input.push('\n');
+    }
+    input.push_str("prepare\n");
+    input.push_str("commit\n");
+
+    let mut child = git
+        .build_command(&["update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning git update-ref --stdin")?;
+    let mut stdin = child.stdin.take().context("git update-ref has no stdin")?;
+    stdin.write_all(input.as_bytes()).await?;
+    stdin.flush().await?;
+    drop(stdin);
+    let output = child.output().await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git ref transaction failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+/// Probe that Git supports atomic multi-ref transactions (required to write the
+/// recovery refs + manifest in one all-or-nothing transaction before any
+/// destructive work). Runs a create+delete of a scratch ref in one transaction
+/// and cleans it up; unsupported Git stops the feature here.
+async fn ensure_ref_transaction_supported(git: &GitBinary) -> Result<()> {
+    let tip = git
+        .run(&["rev-parse", STASH_REF])
+        .await
+        .context("resolving refs/stash for capability probe")?;
+    let probe_a = format!(
+        "{STASH_RENAME_RECOVERY_PREFIX}/probe/{}",
+        Uuid::new_v4().simple()
+    );
+    let probe_b = format!(
+        "{STASH_RENAME_RECOVERY_PREFIX}/probe/{}",
+        Uuid::new_v4().simple()
+    );
+    // Verify that Git can apply multiple ref updates atomically (the rename
+    // writes the manifest ref + one recovery ref per OID in a single
+    // transaction). Two distinct creates then two distinct deletes; unsupported
+    // Git stops the feature here, before any destructive work.
+    run_ref_transaction(git, &[format!("create {probe_a} {tip}"), format!("create {probe_b} {tip}")])
+        .await
+        .with_context(|| {
+            "this git does not support atomic ref transactions, required for crash-recoverable stash rename"
+        })?;
+    run_ref_transaction(git, &[format!("delete {probe_a}"), format!("delete {probe_b}")])
+        .await
+        .context("cleaning up capability probe refs")
+}
+
+/// Rewrite a stash commit to carry a new subject while preserving its tree,
+/// parents, and author/committer identity and timestamps, returning the new OID.
+async fn rewrite_stash_commit(
+    git: &GitBinary,
+    original: Oid,
+    new_subject: &str,
+    env: &Arc<HashMap<String, String>>,
+) -> Result<Oid> {
+    let raw = git
+        .run(&["cat-file", "commit", &original.to_string()])
+        .await
+        .with_context(|| format!("reading stash commit {original}"))?;
+    let headers = raw.split_once("\n\n").map(|(h, _)| h).unwrap_or(&raw);
+
+    let mut tree: Option<&str> = None;
+    let mut parents: Vec<String> = Vec::new();
+    let mut author: Option<&str> = None;
+    let mut committer: Option<&str> = None;
+    for line in headers.lines() {
+        if let Some(value) = line.strip_prefix("tree ") {
+            tree = Some(value);
+        } else if let Some(value) = line.strip_prefix("parent ") {
+            parents.push(value.to_string());
+        } else if let Some(value) = line.strip_prefix("author ") {
+            author = Some(value);
+        } else if let Some(value) = line.strip_prefix("committer ") {
+            committer = Some(value);
+        }
+    }
+
+    let tree = tree.context("stash commit missing tree header")?;
+    let (author_name, author_email, author_date) =
+        parse_identity_line(author.context("stash commit missing author")?)?;
+    let (committer_name, committer_email, committer_date) =
+        parse_identity_line(committer.context("stash commit missing committer")?)?;
+
+    let mut args = vec!["commit-tree".to_string(), tree.to_string()];
+    for parent in &parents {
+        args.push("-p".to_string());
+        args.push(parent.clone());
+    }
+    args.push("-m".to_string());
+    args.push(new_subject.to_string());
+
+    let output = git
+        .build_command(&args)
+        .envs(env.iter())
+        .env("GIT_AUTHOR_NAME", &author_name)
+        .env("GIT_AUTHOR_EMAIL", &author_email)
+        .env("GIT_AUTHOR_DATE", &author_date)
+        .env("GIT_COMMITTER_NAME", &committer_name)
+        .env("GIT_COMMITTER_EMAIL", &committer_email)
+        .env("GIT_COMMITTER_DATE", &committer_date)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "rewriting stash commit failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sha = str::from_utf8(&output.stdout)?.trim();
+    Oid::from_str(sha).context("invalid rewritten stash commit OID")
+}
+
+/// Parse a `name <email> timestamp tz` identity line into its name, email, and
+/// raw date (preserved verbatim so git reproduces the original commit time).
+fn parse_identity_line(line: &str) -> Result<(String, String, String)> {
+    let lt = line.find('<').context("identity line missing '<'")?;
+    let gt = line.find('>').context("identity line missing '>'")?;
+    let name = line[..lt].trim().to_string();
+    let email = line[lt + 1..gt].to_string();
+    let date = line[gt + 1..].trim().to_string();
+    Ok((name, email, date))
+}
+
+/// A planned rebuilt stash entry: the observable `StashEntry` plus the raw
+/// subject used to reproduce its reflog message.
+#[derive(Clone, Debug)]
+struct PlannedStash {
+    entry: StashEntry,
+    /// Reflog subject reproduced when this entry is rewritten into the rebuilt
+    /// reflog, so every non-target observable reflog field is preserved
+    /// byte-for-byte and the target carries its new subject.
+    reflog_message: String,
+}
+
+/// Compare two observable stacks field-by-field (oid, message, branch,
+/// timestamp) for the fields `git stash list` surfaces.
+fn observable_stacks_match(actual: &[StashEntry], expected: &[StashEntry]) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| {
+                actual.oid == expected.oid
+                    && actual.message == expected.message
+                    && actual.branch == expected.branch
+                    && actual.timestamp == expected.timestamp
+            })
+}
+
+/// Build recovery metadata for a failed rename by reading the current stack.
+async fn stash_recovery_for(
+    git: &GitBinary,
+    manifest_ref: &str,
+    recovery_refs: &[String],
+    rename_applied: bool,
+) -> Result<StashRenameRecovery> {
+    let observed_entries = stash_entries_for(git).await?;
+    Ok(StashRenameRecovery {
+        manifest_ref: manifest_ref.to_string(),
+        recovery_refs: recovery_refs.to_vec(),
+        observed_entries,
+        rename_applied,
+    })
+}
+
+/// Read a recovery manifest blob referenced by `manifest_ref`.
+async fn read_rename_manifest(git: &GitBinary, manifest_ref: &str) -> Result<StashRenameManifest> {
+    let content = git.run(&["cat-file", "blob", manifest_ref]).await?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("invalid stash rename manifest at {manifest_ref}"))
+}
+
+/// Whether the observed stack reflects an applied rename described by the
+/// manifest: it matches the captured stack except the selected target, whose
+/// entry now carries the rewritten OID and the new message.
+fn observed_matches_manifest(observed: &[StashEntry], manifest: &StashRenameManifest) -> bool {
+    let mut captured: Vec<CapturedStash> = manifest
+        .captured_lines
+        .iter()
+        .filter_map(|line| CapturedStash::from_manifest_line(line).ok())
+        .collect();
+    if captured.len() != observed.len() {
+        return false;
+    }
+    let target_index = manifest
+        .target_selector
+        .strip_prefix(&format!("{STASH_REF}@{{"))
+        .and_then(|s| s.strip_suffix('}'))
+        .and_then(|index| index.parse::<usize>().ok());
+    let new_oid = Oid::from_str(&manifest.new_oid).ok();
+    let Some(target_index) = target_index else {
+        return false;
+    };
+    let Some(new_oid) = new_oid else {
+        return false;
+    };
+    if let Some(target) = captured.get_mut(target_index) {
+        target.entry.oid = new_oid;
+        target.entry.message = manifest.new_message.clone();
+        target.raw_subject = renamed_stash_subject(&target.raw_subject, &manifest.new_message);
+    } else {
+        return false;
+    }
+    let expected: Vec<StashEntry> = captured.into_iter().map(|c| c.entry).collect();
+    observable_stacks_match(observed, &expected)
+}
+
+/// List unfinished crash-recoverable stash renames: group every recovery ref
+/// under `STASH_RENAME_RECOVERY_PREFIX` by manifest id and read each manifest.
+async fn pending_stash_rename_recovers_impl(
+    git: &GitBinary,
+) -> Result<Vec<StashRenameRecovery>> {
+    let refs_output = git
+        .run(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            STASH_RENAME_RECOVERY_PREFIX,
+        ])
+        .await?;
+
+    let mut grouped: HashMap<String, Vec<String>> = HashMap::default();
+    for line in refs_output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(&format!("{STASH_RENAME_RECOVERY_PREFIX}/")) else {
+            continue;
+        };
+        let manifest_id = rest
+            .split('/')
+            .next()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        grouped.entry(manifest_id).or_default().push(line.to_string());
+    }
+
+    let observed = stash_entries_for(git).await.unwrap_or_default();
+    let mut recovers = Vec::new();
+    for (manifest_id, refs) in grouped {
+        if manifest_id.is_empty() {
+            continue;
+        }
+        let manifest_ref = stash_rename_manifest_ref(&manifest_id);
+        let recovery_refs: Vec<String> = refs
+            .into_iter()
+            .filter(|r| *r != manifest_ref)
+            .collect();
+        // Read the manifest best-effort to decide whether the rename applied.
+        let rename_applied = match read_rename_manifest(git, &manifest_ref).await {
+            Ok(manifest) => observed_matches_manifest(&observed, &manifest),
+            Err(_) => false,
+        };
+        recovers.push(StashRenameRecovery {
+            manifest_ref: manifest_ref.clone(),
+            recovery_refs,
+            observed_entries: observed.clone(),
+            rename_applied,
+        });
+    }
+    recovers.sort_by(|a, b| a.manifest_ref.cmp(&b.manifest_ref));
+    Ok(recovers)
+}
+
+/// The destructive boundaries of a stash rename at which a test may inject a
+/// failure (or a concurrent mutation) to verify crash-recovery semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StashRenameBoundary {
+    /// Immediately after the recovery manifest + refs are written.
+    AfterRecoveryWrite,
+    /// After pre-replay revalidation, before the stash tip is deleted.
+    BeforeRebuild,
+    /// After the stash tip is deleted, before the first rebuild step (a
+    /// partially replayed stack).
+    MidRebuild,
+    /// After the rebuild, before verification.
+    BeforeVerify,
+    /// After verification, before recovery refs are cleaned up.
+    Cleanup,
+}
+
+/// Fire the repository's fault-injection hook at a destructive boundary, if one
+/// is installed (only tests install one; production always stores `None`).
+fn stash_rename_test_hook(
+    fault: &Arc<
+        Mutex<Option<Box<dyn Fn(StashRenameBoundary) -> Result<()> + Send>>>,
+    >,
+    boundary: StashRenameBoundary,
+) -> Result<()> {
+    if let Some(hook) = fault.lock().as_ref() {
+        hook(boundary)?;
+    }
+    Ok(())
+}
+
+/// Perform a crash-recoverable stash rename. See `GitRepository::stash_rename`
+/// for the contract; every destructive step is preceded by revalidation that
+/// no external mutation moved the stack, and any failure after the recovery
+/// manifest + refs are written retains them and reports their names plus the
+/// observed stack.
+async fn stash_rename_impl(
+    git: &GitBinary,
+    identity: Option<StashIdentity>,
+    message: String,
+    env: Arc<HashMap<String, String>>,
+    fault: &Arc<
+        Mutex<Option<Box<dyn Fn(StashRenameBoundary) -> Result<()> + Send>>>,
+    >,
+) -> Result<StashRenameResult> {
+    let message = message.trim();
+    anyhow::ensure!(
+        !message.is_empty(),
+        "stash rename requires a non-empty message"
+    );
+
+    // Capability gate: atomic ref transactions must be supported before any
+    // destructive work (the recovery refs + manifest are written in one).
+    ensure_ref_transaction_supported(git)
+        .await
+        .context("unsupported git capabilities for stash rename")?;
+
+    // Capture the stack and uniquely resolve the exact target.
+    let captured = capture_stash_stack(git).await?;
+    let entries: Vec<StashEntry> = captured.iter().map(|c| c.entry.clone()).collect();
+    let target = match identity {
+        Some(identity) => resolve_stash_identity(&entries, &identity)
+            .cloned()
+            .map_err(|err| anyhow!("{err}"))?,
+        None => entries
+            .first()
+            .cloned()
+            .context("no stash entry to rename")?,
+    };
+    let target_captured = captured
+        .iter()
+        .find(|c| c.entry.index == target.index)
+        .context("target stash vanished during planning")?;
+
+    // Rewrite only the target commit's subject into a new commit (new OID),
+    // preserving every other entry's OID and the stack order.
+    let new_subject = renamed_stash_subject(&target_captured.raw_subject, message);
+    let new_oid = rewrite_stash_commit(git, target.oid, &new_subject, &env).await?;
+
+    // Planned observable outcome (newest-first): the target swapped for the
+    // rewritten commit, everything else byte-for-byte identical and in place.
+    let planned: Vec<PlannedStash> = captured
+        .iter()
+        .map(|captured| {
+            if captured.entry.index == target.index {
+                PlannedStash {
+                    entry: StashEntry {
+                        index: captured.entry.index,
+                        oid: new_oid,
+                        message: message.to_string(),
+                        branch: captured.entry.branch.clone(),
+                        timestamp: captured.entry.timestamp,
+                    },
+                    reflog_message: new_subject.clone(),
+                }
+            } else {
+                PlannedStash {
+                    entry: captured.entry.clone(),
+                    reflog_message: captured.reflog_message.clone(),
+                }
+            }
+        })
+        .collect();
+
+    // Phase 1: write the versioned recovery manifest blob and stable recovery
+    // refs for every involved OID in ONE atomic ref transaction. After this
+    // succeeds, any later failure must retain them and report them.
+    let manifest_id = Uuid::new_v4().simple().to_string();
+    let manifest_ref = stash_rename_manifest_ref(&manifest_id);
+    let recovery_refs = stash_rename_recovery_refs(&manifest_id, &captured);
+    let manifest = StashRenameManifest {
+        version: STASH_RENAME_MANIFEST_VERSION,
+        manifest_id: manifest_id.clone(),
+        new_message: message.to_string(),
+        new_oid: new_oid.to_string(),
+        target_selector: stash_selector_for_index(target.index),
+        captured_lines: captured.iter().map(|c| c.manifest_line()).collect(),
+    };
+    let manifest_blob_oid = write_git_blob(git, &serde_json::to_string(&manifest)?, &env).await?;
+    let mut transaction_lines = vec![format!("create {manifest_ref} {}", manifest_blob_oid)];
+    for (i, entry) in captured.iter().enumerate() {
+        transaction_lines.push(format!(
+            "create {} {}",
+            recovery_refs[i],
+            entry.entry.oid
+        ));
+    }
+    transaction_lines.push(format!(
+        "create {} {new_oid}",
+        recovery_refs.last().context("missing target recovery ref")?
+    ));
+    run_ref_transaction(git, &transaction_lines).await?;
+
+    // Phase 2: rebuild the stash reflog oldest-to-newest through Git's ref
+    // backend, revalidating the captured prefix before each destructive step.
+    let renamed = async {
+        // After the recovery manifest + refs are written, failures must retain
+        // and report them.
+        stash_rename_test_hook(fault, StashRenameBoundary::AfterRecoveryWrite)?;
+
+        // Pre-replay revalidation: nothing external may have moved the stack
+        // while we were planning.
+        let observed_now = stash_entries_for(git).await?;
+        if !observable_stacks_match(&observed_now, &entries) {
+            anyhow::bail!(
+                "the stash changed while renaming; aborting before any destructive step"
+            );
+        }
+
+        stash_rename_test_hook(fault, StashRenameBoundary::BeforeRebuild)?;
+
+        // Delete the stash reflog tip, CAS-checked against the captured newest
+        // entry so an external drop/insert is detected, not clobbered.
+        let newest_hex = captured
+            .first()
+            .context("captured stack is empty")?
+            .entry
+            .oid
+            .to_string();
+        let delete_output = git
+            .build_command(&["update-ref", "-d", STASH_REF])
+            .arg(&newest_hex)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+        anyhow::ensure!(
+            delete_output.status.success(),
+            "stash changed concurrently while renaming (could not take the tip):\n{}",
+            String::from_utf8_lossy(&delete_output.stderr)
+        );
+
+        stash_rename_test_hook(fault, StashRenameBoundary::MidRebuild)?;
+
+        // Rebuild oldest-to-newest. Each update-ref records a reflog entry and,
+        // from the second entry on, is CAS-checked against the previous OID we
+        // wrote: an external insert/drop mid-replay fails the step, not us.
+        // The first entry must create the reflog explicitly (`stash list` reads
+        // the reflog, so a bare update would leave a silent empty stash).
+        let mut prev: Option<Oid> = None;
+        for planned in planned.iter().rev() {
+            let new_hex = planned.entry.oid.to_string();
+            let mut command = git.build_command(&["update-ref"]);
+            if prev.is_none() {
+                command.arg("--create-reflog");
+            }
+            command
+                .arg("-m")
+                .arg(&planned.reflog_message)
+                .arg(STASH_REF)
+                .arg(&new_hex);
+            if let Some(prev_oid) = prev {
+                command.arg(prev_oid.to_string());
+            }
+            let update_output = command.stdout(Stdio::piped()).stderr(Stdio::piped()).output().await?;
+            anyhow::ensure!(
+                update_output.status.success(),
+                "rebuilding stash reflog failed at entry {}:\n{}",
+                planned.entry.index,
+                String::from_utf8_lossy(&update_output.stderr)
+            );
+            prev = Some(planned.entry.oid);
+        }
+        stash_rename_test_hook(fault, StashRenameBoundary::BeforeVerify)?;
+        Ok::<bool, anyhow::Error>(true)
+    }
+    .await;
+
+    let applied = match renamed {
+        Ok(applied) => applied,
+        Err(err) => {
+            log::warn!("stash rename failed mid-replay, retaining recovery: {err:#}");
+            return Ok(StashRenameResult::FailedWithRecovery(
+                stash_recovery_for(git, &manifest_ref, &recovery_refs, false).await?,
+            ));
+        }
+    };
+    if !applied {
+        return Ok(StashRenameResult::FailedWithRecovery(
+            stash_recovery_for(git, &manifest_ref, &recovery_refs, false).await?,
+        ));
+    }
+
+    // Phase 3: verify the complete observable result matches the plan.
+    let observed = stash_entries_for(git).await?;
+    let expected: Vec<StashEntry> = planned.into_iter().map(|p| p.entry).collect();
+    if !observable_stacks_match(&observed, &expected) {
+        log::warn!("stash rename verification failed; retaining recovery");
+        return Ok(StashRenameResult::FailedWithRecovery(
+            stash_recovery_for(git, &manifest_ref, &recovery_refs, false).await?,
+        ));
+    }
+
+    // Phase 4: delete the recovery refs only after verification passed.
+    let mut cleanup_lines: Vec<String> = recovery_refs
+        .iter()
+        .map(|ref_name| format!("delete {ref_name}"))
+        .collect();
+    cleanup_lines.push(format!("delete {manifest_ref}"));
+    if let Err(err) = async {
+        stash_rename_test_hook(fault, StashRenameBoundary::Cleanup)?;
+        run_ref_transaction(git, &cleanup_lines).await
+    }
+    .await
+    {
+        // The rename is applied and verified; only cleanup failed. Retain and
+        // report the recovery refs so they are not left silently behind.
+        log::warn!("stash rename cleanup of recovery refs failed: {err:#}");
+        return Ok(StashRenameResult::SuccessWithRecoveryRefs(
+            stash_recovery_for(git, &manifest_ref, &recovery_refs, true).await?,
+        ));
+    }
+
+    Ok(StashRenameResult::Success)
 }
 
 impl GitRepository for RealGitRepository {
@@ -3288,6 +4028,32 @@ impl GitRepository for RealGitRepository {
                     String::from_utf8_lossy(&output.stderr)
                 );
                 Ok(())
+            })
+            .boxed()
+    }
+
+    fn stash_rename(
+        &self,
+        identity: Option<StashIdentity>,
+        message: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<StashRenameResult>> {
+        let git = self.git_binary_in_worktree();
+        let fault = self.stash_rename_fault.clone();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                stash_rename_impl(&git, identity, message, env, &fault).await
+            })
+            .boxed()
+    }
+
+    fn pending_stash_rename_recovers(&self) -> BoxFuture<'_, Result<Vec<StashRenameRecovery>>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                pending_stash_rename_recovers_impl(&git).await
             })
             .boxed()
     }
@@ -8264,6 +9030,55 @@ mod tests {
         .unwrap()
     }
 
+    /// List the recovery refs an unfinished stash rename left behind.
+    fn stash_rename_recovery_refs(repo_dir: &Path) -> Vec<String> {
+        git_command_output(
+            repo_dir,
+            ["for-each-ref", "--format=%(refname)", "refs/zed-git/stash-rename"],
+        )
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+    }
+
+    /// Read the stash stack as `(oid, message)` newest-first, for asserting
+    /// message/order preservation.
+    fn stash_entries_newest_first(repo_dir: &Path) -> Vec<(Oid, String)> {
+        let output =
+            git_command_output(repo_dir, ["stash", "list", "--format=%H%x00%s"]);
+        if output.trim().is_empty() {
+            return Vec::new();
+        }
+        output
+            .lines()
+            .filter_map(|line| {
+                let (oid, message) = line.split_once('\0')?;
+                Some((oid.trim().parse().ok()?, message.to_string()))
+            })
+            .collect()
+    }
+
+    /// Assert a stash rename cleaned up its recovery refs + manifest.
+    fn assert_no_rename_recovery(repo_dir: &Path) {
+        let refs = stash_rename_recovery_refs(repo_dir);
+        assert!(
+            refs.is_empty(),
+            "expected no lingering recovery refs, found: {refs:?}"
+        );
+    }
+
+    fn set_stash_rename_fault(
+        repository: &RealGitRepository,
+        f: impl Fn(StashRenameBoundary) -> Result<()> + Send + 'static,
+    ) {
+        *repository.stash_rename_fault.lock() = Some(Box::new(f));
+    }
+
+    fn clear_stash_rename_fault(repository: &RealGitRepository) {
+        *repository.stash_rename_fault.lock() = None;
+    }
+
     #[gpui::test]
     async fn test_stash_apply_uses_exact_oid_and_retains_entry(
         cx: &mut TestAppContext,
@@ -8380,6 +9195,485 @@ mod tests {
         );
         // Holding on to the repo so the drop does not remove the whole temp dir early.
         drop(repository);
+    }
+
+    #[gpui::test]
+    async fn test_stash_rename_mid_entry_preserves_order_oids_and_metadata(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+
+        let first = stash_with_marker(repo_dir.path(), "first");
+        let second = stash_with_marker(repo_dir.path(), "second");
+        let third = stash_with_marker(repo_dir.path(), "third");
+
+        let before = stash_entries_newest_first(repo_dir.path());
+        // newest-first: [third, second, first]
+        assert_eq!(before.len(), 3);
+        assert_eq!(before[0].0, third);
+        assert!(before[0].1.contains("third"));
+        assert_eq!(before[1].0, second);
+        assert!(before[1].1.contains("second"));
+        assert_eq!(before[2].0, first);
+        assert!(before[2].1.contains("first"));
+
+        // Rename the middle entry (stash@{1} = second).
+        let identity = StashIdentity {
+            oid: second,
+            ref_name: STASH_REF.to_string(),
+            selector: "refs/stash@{1}".to_string(),
+        };
+        let repository = new_real_repo(repo_dir.path(), cx);
+        let result = repository
+            .stash_rename(Some(identity), "renamed middle".to_string(), graph_mutation_env())
+            .await
+            .unwrap();
+        assert_eq!(result, StashRenameResult::Success);
+
+        let after = stash_entries_newest_first(repo_dir.path());
+        assert_eq!(after.len(), 3, "order and count preserved");
+        // Order preserved (no move to top): third still 0, middle still 1, first still 2.
+        assert_eq!(after[0].0, third, "top entry OID untouched");
+        assert!(after[0].1.contains("third"), "top subject untouched");
+        assert_eq!(after[2].0, first, "bottom entry OID untouched");
+        assert!(after[2].1.contains("first"), "bottom subject untouched");
+        // Only the middle entry's message changed; its OID must differ (rewritten).
+        assert_ne!(after[1].0, second, "renamed entry gets a rewritten OID");
+        assert_eq!(after[1].1, "On main: renamed middle");
+        // Other non-target OIDs preserved exactly.
+        let before_oids: Vec<Oid> = before.iter().map(|(o, _)| *o).collect();
+        let after_oids: Vec<Oid> = after.iter().map(|(o, _)| *o).collect();
+        let renamed_oid = after_oids[1];
+        assert!(before_oids.contains(&after_oids[0]));
+        assert!(before_oids.contains(&after_oids[2]));
+        assert!(!before_oids.contains(&renamed_oid));
+
+        // Recovery refs must be cleaned up after a successful rename.
+        assert_no_rename_recovery(repo_dir.path());
+
+        // The rewritten commit preserves the original commit timestamp.
+        let before_ct = git_command_output(
+            repo_dir.path(),
+            ["log", "-1", "--format=%ct", &second.to_string()],
+        );
+        let after_ct = git_command_output(
+            repo_dir.path(),
+            ["log", "-1", "--format=%ct", &renamed_oid.to_string()],
+        );
+        assert_eq!(after_ct, before_ct, "commit timestamp preserved");
+    }
+
+    #[gpui::test]
+    async fn test_stash_rename_duplicate_oids_renames_only_selector_target(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+
+        // Push one stash, then move the ref away and back so two reflog
+        // entries point at the SAME commit OID, with a non-duplicate entry
+        // between them.
+        let oid = stash_with_marker(repo_dir.path(), "shared");
+        let head = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        // Move the tip to HEAD (drops the stash tip), then back to `oid`.
+        git_command(
+            repo_dir.path(),
+            ["update-ref", "-m", "interim", STASH_REF, &head, &oid.to_string()],
+        );
+        git_command(
+            repo_dir.path(),
+            ["update-ref", "-m", "On main: dup", STASH_REF, &oid.to_string(), &head],
+        );
+
+        let before = stash_entries_newest_first(repo_dir.path());
+        assert_eq!(before.len(), 3);
+        assert_eq!(before[0].0, oid, "top duplicate shares the OID");
+        assert_eq!(before[1].0.to_string(), head, "interim entry is the base");
+        assert_eq!(before[2].0, oid, "bottom duplicate shares the OID");
+        // Both duplicate entries surface the SAME commit subject (the reflog
+        // message differs but `%s` is the commit subject), so only the exact
+        // OID + selector identity can tell them apart.
+        assert!(before[0].1.contains("stash shared"));
+        assert!(before[2].1.contains("stash shared"));
+
+        // Rename the entry captured at selector @2 (the "shared" duplicate).
+        let identity = StashIdentity {
+            oid,
+            ref_name: STASH_REF.to_string(),
+            selector: "refs/stash@{2}".to_string(),
+        };
+        let repository = new_real_repo(repo_dir.path(), cx);
+        let result = repository
+            .stash_rename(Some(identity), "only this one".to_string(), graph_mutation_env())
+            .await
+            .unwrap();
+        assert_eq!(result, StashRenameResult::Success);
+
+        let after = stash_entries_newest_first(repo_dir.path());
+        assert_eq!(after.len(), 3);
+        // Only the target (bottom) duplicate changed; the upper duplicate keeps
+        // the original OID and message, and the interim entry is untouched.
+        assert_eq!(after[0].0, oid, "untouched duplicate OID preserved");
+        assert!(after[0].1.contains("stash shared"), "untouched subject kept");
+        assert_eq!(after[1].0.to_string(), head, "interim entry untouched");
+        assert_ne!(after[2].0, oid, "renamed duplicate gets a rewritten OID");
+        assert_eq!(after[2].1, "On main: only this one");
+        assert_no_rename_recovery(repo_dir.path());
+    }
+
+    #[gpui::test]
+    async fn test_stash_rename_empty_message_and_missing_identity_are_safe(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        let oid = stash_with_marker(repo_dir.path(), "only");
+
+        let repository = new_real_repo(repo_dir.path(), cx);
+
+        // Empty message is rejected before any destructive work.
+        let identity = StashIdentity {
+            oid,
+            ref_name: STASH_REF.to_string(),
+            selector: "refs/stash@{0}".to_string(),
+        };
+        let err = repository
+            .stash_rename(Some(identity.clone()), "   ".to_string(), graph_mutation_env())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-empty"), "{err:#}");
+        assert_eq!(stash_oids(repo_dir.path()), vec![oid]);
+        assert_no_rename_recovery(repo_dir.path());
+
+        // A missing identity is rejected uniquely (no recovery, nothing changed).
+        let dangling = Oid::from_str("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap();
+        let missing = StashIdentity {
+            oid: dangling,
+            ref_name: STASH_REF.to_string(),
+            selector: "refs/stash@{0}".to_string(),
+        };
+        let err = repository
+            .stash_rename(Some(missing), "new".to_string(), graph_mutation_env())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("stash not found"), "{err:#}");
+        assert_eq!(stash_oids(repo_dir.path()), vec![oid]);
+        assert!(stash_entries_newest_first(repo_dir.path())[0].1.contains("only"));
+        assert_no_rename_recovery(repo_dir.path());
+
+        drop(repository);
+    }
+
+    #[gpui::test]
+    async fn test_stash_rename_every_boundary_failure_retains_recovery(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        // A failure at every destructive boundary must retain the manifest +
+        // recovery refs and report them plus the observed stack.
+        let boundaries = [
+            ("after-write", StashRenameBoundary::AfterRecoveryWrite, false),
+            ("before-rebuild", StashRenameBoundary::BeforeRebuild, false),
+            ("mid-rebuild", StashRenameBoundary::MidRebuild, false),
+            ("before-verify", StashRenameBoundary::BeforeVerify, false),
+            ("cleanup", StashRenameBoundary::Cleanup, true),
+        ];
+        for (label, boundary, cleanup_only) in boundaries {
+            let repo_dir = tempfile::tempdir().unwrap();
+            git_init_repo(repo_dir.path());
+            fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+            git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+            git_command(repo_dir.path(), ["commit", "-m", "base"]);
+            let first = stash_with_marker(repo_dir.path(), "first");
+            let second = stash_with_marker(repo_dir.path(), "second");
+            stash_with_marker(repo_dir.path(), "third");
+            let identity = StashIdentity {
+                oid: second,
+                ref_name: STASH_REF.to_string(),
+                selector: "refs/stash@{1}".to_string(),
+            };
+
+            let repository = new_real_repo(repo_dir.path(), cx);
+            set_stash_rename_fault(&repository, {
+                let boundary = boundary;
+                move |step| {
+                    if step == boundary {
+                        anyhow::bail!("injected {label} failure");
+                    }
+                    Ok(())
+                }
+            });
+            let result = repository
+                .stash_rename(Some(identity), "renamed".to_string(), graph_mutation_env())
+                .await
+                .unwrap();
+            let recovery = if cleanup_only {
+                assert!(
+                    matches!(result, StashRenameResult::SuccessWithRecoveryRefs(_)),
+                    "{label}: expected SuccessWithRecoveryRefs, got {result:?}"
+                );
+                match result {
+                    StashRenameResult::SuccessWithRecoveryRefs(r) => r,
+                    _ => unreachable!(),
+                }
+            } else {
+                assert!(
+                    matches!(result, StashRenameResult::FailedWithRecovery(_)),
+                    "{label}: expected FailedWithRecovery, got {result:?}"
+                );
+                match result {
+                    StashRenameResult::FailedWithRecovery(r) => r,
+                    _ => unreachable!(),
+                }
+            };
+
+            // Manifest + recovery refs retained and reported.
+            let listed = stash_rename_recovery_refs(repo_dir.path());
+            assert!(!listed.is_empty(), "{label}: no recovery refs retained");
+            assert!(
+                listed.iter().any(|r| *r == recovery.manifest_ref),
+                "{label}: manifest ref {0} not in retained refs {listed:?}",
+                recovery.manifest_ref
+            );
+            for ref_name in &recovery.recovery_refs {
+                assert!(
+                    listed.contains(ref_name),
+                    "{label}: recovery ref {ref_name} not retained"
+                );
+            }
+            assert!(
+                recovery.manifest_ref.starts_with("refs/zed-git/stash-rename/"),
+                "{label}: unexpected manifest ref"
+            );
+            assert!(
+                recovery.recovery_refs.iter().all(|r| r.contains("/entry/")),
+                "{label}: unexpected recovery ref"
+            );
+
+            // The commit OID protection refs prevent GC of the involved OIDs.
+            for affected in [first, second] {
+                assert!(
+                    listed.iter().any(|r| {
+                        git_command_output(
+                            repo_dir.path(),
+                            ["for-each-ref", "--format=%(objectname)", r],
+                        )
+                        .trim()
+                            == affected.to_string()
+                    }),
+                    "{label}: involved OID {affected} not protected"
+                );
+            }
+
+            clear_stash_rename_fault(&repository);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_stash_rename_external_drop_between_steps_is_safe(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        let first = stash_with_marker(repo_dir.path(), "first");
+        let second = stash_with_marker(repo_dir.path(), "second");
+        stash_with_marker(repo_dir.path(), "third");
+
+        let identity = StashIdentity {
+            oid: second,
+            ref_name: STASH_REF.to_string(),
+            selector: "refs/stash@{1}".to_string(),
+        };
+
+        let repo_dir_path = repo_dir.path().to_path_buf();
+        let repository = new_real_repo(repo_dir.path(), cx);
+        // An external drop of the top of stack happens at the revalidation
+        // boundary (right before the destructive delete). The CAS delete must
+        // detect it and refuse, retaining the recovery instead of clobbering.
+        set_stash_rename_fault(&repository, move |step| {
+            if step == StashRenameBoundary::BeforeRebuild {
+                git_command(&repo_dir_path, ["stash", "drop", "stash@{0}"]);
+            }
+            Ok(())
+        });
+        let result = repository
+            .stash_rename(Some(identity), "renamed".to_string(), graph_mutation_env())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, StashRenameResult::FailedWithRecovery(_)),
+            "external drop mid-rename must fail safe, got {result:?}"
+        );
+        let StashRenameResult::FailedWithRecovery(recovery) = result else {
+            unreachable!()
+        };
+
+        // Recovery retained + observed stack reflects the external drop (2 left).
+        let listed = stash_rename_recovery_refs(repo_dir.path());
+        assert!(!listed.is_empty(), "recovery must be retained");
+        assert!(listed.contains(&recovery.manifest_ref));
+        assert_eq!(recovery.observed_entries.len(), 2, "external drop observed");
+        let observed_oids: Vec<Oid> =
+            recovery.observed_entries.iter().map(|e| e.oid).collect();
+        assert_eq!(observed_oids, vec![second, first], "post-drop observed stack");
+        clear_stash_rename_fault(&repository);
+    }
+
+    #[gpui::test]
+    async fn test_stash_rename_partial_replay_is_discovered_after_restart(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        let _first = stash_with_marker(repo_dir.path(), "first");
+        let second = stash_with_marker(repo_dir.path(), "second");
+        stash_with_marker(repo_dir.path(), "third");
+
+        let identity = StashIdentity {
+            oid: second,
+            ref_name: STASH_REF.to_string(),
+            selector: "refs/stash@{1}".to_string(),
+        };
+
+        // Fail right after the stash tip is deleted (mid-rebuild): the stack is
+        // partially replayed and the recovery refs must persist for discovery.
+        let repository = new_real_repo(repo_dir.path(), cx);
+        set_stash_rename_fault(&repository, |step| {
+            if step == StashRenameBoundary::MidRebuild {
+                anyhow::bail!("injected mid-rebuild failure");
+            }
+            Ok(())
+        });
+        let result = repository
+            .stash_rename(Some(identity), "renamed".to_string(), graph_mutation_env())
+            .await
+            .unwrap();
+        assert!(matches!(result, StashRenameResult::FailedWithRecovery(_)));
+        clear_stash_rename_fault(&repository);
+
+        // A fresh repository (simulating a Zed restart) must discover the
+        // unfinished recovery: manifest ref + recovery refs + observed stack.
+        let listed = stash_rename_recovery_refs(repo_dir.path());
+        assert!(!listed.is_empty(), "recovery refs must survive restart");
+        let pending = new_real_repo(repo_dir.path(), cx)
+            .pending_stash_rename_recovers()
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "exactly one unfinished recovery");
+        let recovery = &pending[0];
+        assert!(
+            listed.contains(&recovery.manifest_ref),
+            "discovered manifest ref not in retained refs"
+        );
+        for ref_name in &recovery.recovery_refs {
+            assert!(
+                listed.contains(ref_name),
+                "discovered recovery ref {ref_name} missing"
+            );
+        }
+        assert!(
+            recovery.manifest_ref.starts_with("refs/zed-git/stash-rename/"),
+            "unexpected manifest ref: {}",
+            recovery.manifest_ref
+        );
+        // A MidRebuild failure deletes the stash tip but never rebuilds it, so
+        // the observed stack is empty at discovery — exactly why the manifest
+        // retains the captured stack for recovery.
+        assert_eq!(
+            recovery.observed_entries.len(),
+            0,
+            "mid-rebuild leaves the stack empty until recovery"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_stash_rename_cleanup_failure_reports_recovery_and_is_discoverable(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        stash_with_marker(repo_dir.path(), "first");
+        let second = stash_with_marker(repo_dir.path(), "second");
+
+        let identity = StashIdentity {
+            oid: second,
+            ref_name: STASH_REF.to_string(),
+            selector: "refs/stash@{0}".to_string(),
+        };
+
+        let repository = new_real_repo(repo_dir.path(), cx);
+        set_stash_rename_fault(&repository, |step| {
+            if step == StashRenameBoundary::Cleanup {
+                anyhow::bail!("injected cleanup failure");
+            }
+            Ok(())
+        });
+        let result = repository
+            .stash_rename(Some(identity), "renamed top".to_string(), graph_mutation_env())
+            .await
+            .unwrap();
+        let StashRenameResult::SuccessWithRecoveryRefs(recovery) = result else {
+            panic!("cleanup-only failure should report applied rename, got {result:?}")
+        };
+        assert!(recovery.rename_applied, "rename applied and verified");
+        // The rename visibly applied.
+        let entries = stash_entries_newest_first(repo_dir.path());
+        assert_eq!(entries[0].1, "On main: renamed top");
+        assert!(stash_rename_recovery_refs(repo_dir.path()).contains(&recovery.manifest_ref));
+        clear_stash_rename_fault(&repository);
+
+        // Discovery sees the applied rename (rename_applied == true) since the
+        // observed stack already carries the rewritten commit.
+        let pending = new_real_repo(repo_dir.path(), cx)
+            .pending_stash_rename_recovers()
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0].rename_applied,
+            "discovered an applied-but-uncleaned rename"
+        );
     }
 
     #[gpui::test]

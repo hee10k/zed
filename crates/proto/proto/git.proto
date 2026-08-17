@@ -540,6 +540,53 @@ message StashDrop {
   optional StashIdentity identity = 4;
 }
 
+// Rename only the selected stash entry's display message without moving it to
+// the top. The receiving backend writes a recovery manifest + stable recovery
+// refs before its destructive replay; a partial outcome is reported via
+// `StashRenameReply` with its recovery refs + observed stack.
+message StashRename {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  // Deprecated: older peers shipped an index-authoritative selector here.
+  // New code always sends `identity`, mirroring StashDrop.
+  optional uint64 stash_index = 3;
+  optional StashIdentity identity = 4;
+  // Required: the new display message for the selected entry.
+  string message = 5;
+}
+
+// Recovery metadata a failed/interrupted crash-recoverable stash rename retains
+// (and a repository refresh discovers after a restart) so a caller can offer
+// retry/recover/cleanup guidance.
+message StashRenameRecovery {
+  string manifest_ref = 1;
+  repeated string recovery_refs = 2;
+  bool rename_applied = 3;
+  repeated StashEntry observed_entries = 4;
+}
+
+message StashRenameReply {
+  // True when the rename applied and the recovery refs were cleaned up.
+  bool success = 1;
+  // True when the rename applied and verified but cleaning up the recovery
+  // refs failed; `recovery` carries them for cleanup.
+  bool success_with_recovery_refs = 2;
+  // Populated when recovery refs are retained (applied-but-uncleaned, or a
+  // destructive-boundary failure); the recovery refs + observed stack are
+  // reported so the caller never hides the partial result.
+  optional StashRenameRecovery recovery = 3;
+}
+
+// Discover unfinished crash-recoverable stash renames after a restart.
+message PendingStashRenameRecoveries {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+}
+
+message PendingStashRenameRecoveriesReply {
+  repeated StashRenameRecovery recovers = 1;
+}
+
 message Commit {
   uint64 project_id = 1;
   reserved 2;

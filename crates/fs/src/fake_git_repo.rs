@@ -18,7 +18,10 @@ use git::{
         PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
         commit_hash_search_query,
     },
-    stash::{GitStash, STASH_REF},
+    stash::{
+        GitStash, STASH_RENAME_RECOVERY_PREFIX, STASH_REF, StashIdentity, StashRenameRecovery,
+        StashRenameResult, renamed_stash_subject, resolve_stash_identity,
+    },
     status::{
         DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus,
         UnmergedStatus,
@@ -136,6 +139,9 @@ pub struct FakeGitRepositoryState {
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     pub stash_entries: GitStash,
+    /// Unfinished crash-recoverable stash renames discovered after a simulated
+    /// restart, surfaced by `pending_stash_rename_recovers`.
+    pub pending_stash_rename_recovers: Vec<git::stash::StashRenameRecovery>,
     pub commit_template: Option<GitCommitTemplate>,
     pub graph_mutations: Vec<FakeGitMutation>,
     pub active_operation: Option<GitOperationKind>,
@@ -175,6 +181,7 @@ impl FakeGitRepositoryState {
             commit_data: Default::default(),
             commit_history: Vec::new(),
             stash_entries: Default::default(),
+            pending_stash_rename_recovers: Vec::new(),
             commit_template: None,
             graph_mutations: Vec::new(),
             active_operation: None,
@@ -1485,12 +1492,58 @@ impl GitRepository for FakeGitRepository {
         unimplemented!()
     }
 
-    fn stash_drop(
+fn stash_drop(
         &self,
-        _identity: Option<git::stash::StashIdentity>,
+        _identity: Option<StashIdentity>,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         unimplemented!()
+    }
+
+    fn stash_rename(
+        &self,
+        identity: Option<StashIdentity>,
+        message: String,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<StashRenameResult>> {
+        self.with_state_async(true, move |state| {
+            let message = message.trim();
+            anyhow::ensure!(!message.is_empty(), "stash rename requires a non-empty message");
+            let entries = state.stash_entries.entries.to_vec();
+            let target = match identity {
+                Some(identity) => resolve_stash_identity(&entries, &identity)
+                    .cloned()
+                    .map_err(|err| anyhow::anyhow!("{err}"))?,
+                None => entries
+                    .first()
+                    .context("no stash entry to rename")?
+                    .clone(),
+            };
+            // Fake backend models the UI-observable part of a rename: only the
+            // selected entry's message changes, order and other entries are
+            // untouched (the real backend additionally rewrites the commit OID
+            // and drives crash recovery through real Git refs).
+            let new_entries: Vec<git::stash::StashEntry> = entries
+                .into_iter()
+                .map(|mut entry| {
+                    if entry.index == target.index {
+                        let original_subject =
+                            format!("On {}: {}", entry.branch.as_deref().unwrap_or(""), entry.message);
+                        entry.message =
+                            renamed_stash_subject(&original_subject, message).to_string();
+                    }
+                    entry
+                })
+                .collect();
+            state.stash_entries = GitStash {
+                entries: new_entries.into(),
+            };
+            Ok(StashRenameResult::Success)
+        })
+    }
+
+    fn pending_stash_rename_recovers(&self) -> BoxFuture<'_, Result<Vec<StashRenameRecovery>>> {
+        self.with_state_async(false, |state| Ok(state.pending_stash_rename_recovers.clone()))
     }
 
     fn commit(
