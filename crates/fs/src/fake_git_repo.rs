@@ -1315,15 +1315,15 @@ impl GitRepository for FakeGitRepository {
 
     fn stash_pop(
         &self,
-        _index: Option<usize>,
+        _identity: Option<git::stash::StashIdentity>,
         _env: Arc<HashMap<String, String>>,
-    ) -> BoxFuture<'_, Result<()>> {
+    ) -> BoxFuture<'_, Result<git::stash::StashMutationResult>> {
         unimplemented!()
     }
 
     fn stash_apply(
         &self,
-        _index: Option<usize>,
+        _identity: Option<git::stash::StashIdentity>,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         unimplemented!()
@@ -1331,7 +1331,7 @@ impl GitRepository for FakeGitRepository {
 
     fn stash_drop(
         &self,
-        _index: Option<usize>,
+        _identity: Option<git::stash::StashIdentity>,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         unimplemented!()

@@ -454,22 +454,44 @@ message Stash {
   optional bool staged = 5;
 }
 
+// A transparent, composite reference to a single stash entry. Not authoritative
+// at mutation time: the receiving backend refreshes `refs/stash` and re-resolves
+// exactly one current entry from these fields.
+message StashIdentity {
+  string ref_name = 1;
+  string oid = 2;
+  string selector = 3;
+}
+
 message StashPop {
   uint64 project_id = 1;
   uint64 repository_id = 2;
+  // Deprecated: older peers shipped an index-authoritative selector here.
+  // New code always sends `identity`; a request carrying only `stash_index` is
+  // rejected for version skew rather than acted on.
   optional uint64 stash_index = 3;
+  optional StashIdentity identity = 4;
+}
+
+// Reply to `StashPop`. Pop can succeed partially: the entry was applied but the
+// follow-up drop failed. We carry that outcome back so the caller can report a
+// truthful `applied but retained` result instead of fabricating full success.
+message StashPopReply {
+  bool applied_but_retained = 1;
 }
 
 message StashApply {
   uint64 project_id = 1;
   uint64 repository_id = 2;
   optional uint64 stash_index = 3;
+  optional StashIdentity identity = 4;
 }
 
 message StashDrop {
   uint64 project_id = 1;
   uint64 repository_id = 2;
   optional uint64 stash_index = 3;
+  optional StashIdentity identity = 4;
 }
 
 message Commit {

@@ -405,6 +405,7 @@ message Envelope {
 
     StashDrop stash_drop = 378;
     StashApply stash_apply = 379;
+    StashPopReply stash_pop_reply = 490;
 
     GitRenameBranch git_rename_branch = 380;
 

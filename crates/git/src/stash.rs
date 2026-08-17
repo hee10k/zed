@@ -1,6 +1,9 @@
 use crate::Oid;
 use anyhow::{Context, Result, anyhow};
-use std::{str::FromStr, sync::Arc};
+use std::{fmt, str::FromStr, sync::Arc};
+
+/// The ref that backs the stash reflog.
+pub const STASH_REF: &str = "refs/stash";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct StashEntry {
@@ -9,6 +12,116 @@ pub struct StashEntry {
     pub message: String,
     pub branch: Option<String>,
     pub timestamp: i64,
+}
+
+/// A transparent reference to a single stash entry, captured when the user
+/// selects it. Not authoritative at mutation time: backends refresh `refs/stash`
+/// and re-resolve exactly one current entry from this composite, so mutations
+/// keep following the entry even when indices move or entries share one OID.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct StashIdentity {
+    /// Exact commit OID of the selected entry.
+    pub oid: Oid,
+    /// Reflog ref name (always `refs/stash`).
+    pub ref_name: String,
+    /// Explicit, fully-qualified reflog selector captured at selection time
+    /// (for example `refs/stash@{2}`). The backend uses it only as a hint: it
+    /// refreshes `refs/stash` at mutation time and re-resolves a fresh selector,
+    /// following the entry even when indices move. Destructive drops use only
+    /// the freshly resolved selector, never this captured one.
+    pub selector: String,
+}
+
+impl StashIdentity {
+    pub fn for_entry(entry: &StashEntry) -> Self {
+        Self {
+            oid: entry.oid,
+            ref_name: STASH_REF.to_string(),
+            selector: format!("{STASH_REF}@{{{}}}", entry.index),
+        }
+    }
+}
+
+/// The result of a stash mutation that can succeed partially.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StashMutationResult {
+    /// The mutation completed fully (pop applied and dropped the entry).
+    Success,
+    /// Pop applied the entry but the follow-up drop failed; the stash is retained.
+    AppliedButRetained,
+}
+
+/// Why a composite stash identity could not be resolved against a fresh reflog.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StashResolveError {
+    /// No current entry matches; the stash was likely dropped or never existed.
+    Missing(String),
+    /// More than one current entry matches and the selector hint cannot disambiguate.
+    Ambiguous(String),
+}
+
+impl fmt::Display for StashResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StashResolveError::Missing(detail) => write!(f, "stash not found: {detail}"),
+            StashResolveError::Ambiguous(detail) => write!(f, "stash is ambiguous: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for StashResolveError {}
+
+/// Resolve exactly one current stash entry from a captured identity against a
+/// fresh reflog snapshot (`entries`). Returns the current entry, or
+/// `StashResolveError::Missing`/`Ambiguous` when zero or multiple entries match.
+pub fn resolve_stash_identity<'a>(
+    entries: &'a [StashEntry],
+    identity: &StashIdentity,
+) -> Result<&'a StashEntry, StashResolveError> {
+    if identity.ref_name != STASH_REF {
+        return Err(StashResolveError::Missing(format!(
+            "unexpected stash ref '{}'",
+            identity.ref_name
+        )));
+    }
+
+    // Resolve by the captured reflog selector first: the entry currently at that
+    // selector, provided its OID still matches the captured one. This is the
+    // authoritative hint and pins the exact selected entry even when another
+    // entry shares the same commit OID.
+    if let Some(selector_index) = parse_stash_selector_index(&identity.selector) {
+        if let Some(entry) = entries.get(selector_index)
+            && entry.oid == identity.oid
+        {
+            return Ok(entry);
+        }
+    }
+
+    // Fall back to matching purely by OID. This handles reordered stacks where
+    // the selected entry moved to a different index.
+    let mut matching = entries.iter().filter(move |entry| entry.oid == identity.oid);
+    match (matching.next(), matching.next()) {
+        // The entry is unique, so the stack has reordered since selection.
+        (Some(first), None) => Ok(first),
+        // Several current entries claim the same commit and the selector hint
+        // cannot disambiguate: refuse the mutation rather than guess.
+        (Some(_), Some(_)) => Err(StashResolveError::Ambiguous(format!(
+            "multiple entries reference commit {}",
+            identity.oid
+        ))),
+        (None, _) => Err(StashResolveError::Missing(format!(
+            "no entry references commit {}",
+            identity.oid
+        ))),
+    }
+}
+
+/// Parse the index out of an explicit fully-qualified reflog selector such as
+/// `refs/stash@{2}`. Returns `None` for a malformed selector.
+fn parse_stash_selector_index(selector: &str) -> Option<usize> {
+    let selector = selector.strip_prefix(&format!("{STASH_REF}@{{"))?;
+    let selector = selector.strip_suffix('}')?;
+    selector.parse().ok()
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
@@ -219,5 +332,117 @@ mod tests {
 
         let stash = GitStash::from_str("   \n  \n  ").unwrap();
         assert_eq!(stash.entries.len(), 0);
+    }
+
+    fn entry(index: usize, oid: Oid) -> StashEntry {
+        StashEntry {
+            index,
+            oid,
+            message: format!("stash #{index}"),
+            branch: None,
+            timestamp: 0,
+        }
+    }
+
+    fn oid(n: u8) -> Oid {
+        Oid::from_str(&format!("{:040x}", n)).unwrap()
+    }
+
+    #[test]
+    fn test_stash_identity_for_entry() {
+        let entry = entry(2, oid(7));
+        let identity = StashIdentity::for_entry(&entry);
+        assert_eq!(identity.oid, oid(7));
+        assert_eq!(identity.ref_name, STASH_REF);
+        assert_eq!(identity.selector, "refs/stash@{2}");
+    }
+
+    #[test]
+    fn test_parse_stash_selector_index() {
+        assert_eq!(parse_stash_selector_index("refs/stash@{0}"), Some(0));
+        assert_eq!(parse_stash_selector_index("refs/stash@{42}"), Some(42));
+        assert_eq!(parse_stash_selector_index("refs/heads/main@{1}"), None);
+        assert_eq!(parse_stash_selector_index("refs/stash@{}"), None);
+        assert_eq!(parse_stash_selector_index("refs/stash@{x}"), None);
+        assert_eq!(parse_stash_selector_index("stash@{1}"), None);
+    }
+
+    #[test]
+    fn test_resolve_identity_exact_position_match() {
+        let entries = vec![entry(0, oid(1)), entry(1, oid(2))];
+        let identity = StashIdentity::for_entry(&entries[1]);
+        let resolved = resolve_stash_identity(&entries, &identity).unwrap();
+        assert_eq!(resolved.index, 1);
+        assert_eq!(resolved.oid, oid(2));
+    }
+
+    #[test]
+    fn test_resolve_identity_follows_reordering_by_oid() {
+        // The entry originally at index 1 (commit 2) was pushed to index 2 by an
+        // externally inserted stash; resolution must follow the OID.
+        let entries = vec![entry(0, oid(9)), entry(1, oid(1)), entry(2, oid(2))];
+        let identity = StashIdentity {
+            oid: oid(2),
+            ref_name: STASH_REF.to_string(),
+            selector: "refs/stash@{1}".to_string(),
+        };
+        let resolved = resolve_stash_identity(&entries, &identity).unwrap();
+        assert_eq!(resolved.index, 2);
+        assert_eq!(resolved.oid, oid(2));
+    }
+
+    #[test]
+    fn test_resolve_identity_disambiguates_duplicate_oids_by_position() {
+        // Two entries share commit 3; a hint index pins the exact selected one.
+        let entries = vec![entry(0, oid(1)), entry(1, oid(3)), entry(2, oid(3))];
+        let identity = StashIdentity {
+            oid: oid(3),
+            ref_name: STASH_REF.to_string(),
+            selector: "refs/stash@{2}".to_string(),
+        };
+        let resolved = resolve_stash_identity(&entries, &identity).unwrap();
+        assert_eq!(resolved.index, 2);
+    }
+
+    #[test]
+    fn test_resolve_identity_missing() {
+        let entries = vec![entry(0, oid(1))];
+        let identity = StashIdentity {
+            oid: oid(99),
+            ref_name: STASH_REF.to_string(),
+            selector: "refs/stash@{0}".to_string(),
+        };
+        let err = resolve_stash_identity(&entries, &identity).unwrap_err();
+        assert_eq!(
+            err,
+            StashResolveError::Missing(format!(
+                "no entry references commit {}",
+                oid(99)
+            ))
+        );
+    }
+
+    #[test]
+    fn test_resolve_identity_ambiguous_duplicates_after_reorder() {
+        // Duplicate OIDs AND a reordered stack means the hint cannot disambiguate.
+        let entries = vec![entry(0, oid(3)), entry(1, oid(3))];
+        let identity = StashIdentity {
+            oid: oid(3),
+            ref_name: STASH_REF.to_string(),
+            selector: "refs/stash@{4}".to_string(),
+        };
+        let err = resolve_stash_identity(&entries, &identity).unwrap_err();
+        assert!(matches!(err, StashResolveError::Ambiguous(_)));
+    }
+
+    #[test]
+    fn test_resolve_identity_rejects_wrong_ref() {
+        let entries = vec![entry(0, oid(1))];
+        let identity = StashIdentity {
+            oid: oid(1),
+            ref_name: "refs/heads/main".to_string(),
+            selector: "refs/heads/main@{0}".to_string(),
+        };
+        assert!(resolve_stash_identity(&entries, &identity).is_err());
     }
 }

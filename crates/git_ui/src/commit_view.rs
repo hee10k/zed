@@ -8,6 +8,7 @@ use editor::{
 use futures_lite::future::yield_now;
 use git::Oid;
 use git::repository::{CommitDetails, RepoPath};
+use git::stash::{StashIdentity, StashMutationResult, resolve_stash_identity};
 use git::status::{FileStatus, StatusCode, TrackedStatus};
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, ParsedGitRemote,
@@ -80,7 +81,7 @@ pub struct CommitView {
     message: Entity<Markdown>,
     message_expanded: bool,
     message_scroll_handle: ScrollHandle,
-    stash: Option<usize>,
+    stash: Option<StashIdentity>,
     multibuffer: Entity<MultiBuffer>,
     repository: Entity<Repository>,
     project: Entity<Project>,
@@ -219,7 +220,7 @@ impl CommitView {
         commit_sha: String,
         repo: WeakEntity<Repository>,
         workspace: WeakEntity<Workspace>,
-        stash: Option<usize>,
+        stash: Option<StashIdentity>,
         file_filter: Option<RepoPath>,
         window: &mut Window,
         cx: &mut App,
@@ -404,7 +405,7 @@ impl CommitView {
         project: Entity<Project>,
         workspace_entity: Entity<Workspace>,
         workspace: WeakEntity<Workspace>,
-        stash: Option<usize>,
+        stash: Option<StashIdentity>,
         file_filter: Option<RepoPath>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1025,10 +1026,10 @@ impl CommitView {
             cx,
             async move |repository, sha, stash, commit_view, workspace, cx| {
                 let result = repository.update(cx, |repo, cx| {
-                    if !stash_matches_index(&sha, stash, repo) {
+                    if !stash_matches_identity(&sha, &stash, repo) {
                         return Err(anyhow::anyhow!("Stash has changed, not applying"));
                     }
-                    Ok(repo.stash_apply(Some(stash), cx))
+                    Ok(repo.stash_apply(Some(stash.clone()), cx))
                 });
 
                 match result {
@@ -1052,19 +1053,34 @@ impl CommitView {
             cx,
             async move |repository, sha, stash, commit_view, workspace, cx| {
                 let result = repository.update(cx, |repo, cx| {
-                    if !stash_matches_index(&sha, stash, repo) {
+                    if !stash_matches_identity(&sha, &stash, repo) {
                         return Err(anyhow::anyhow!("Stash has changed, pop aborted"));
                     }
-                    Ok(repo.stash_pop(Some(stash), cx))
+                    Ok(repo.stash_pop(Some(stash.clone()), cx))
                 });
 
-                match result {
+                let outcome = match result {
                     Ok(task) => task.await?,
                     Err(err) => {
                         Self::close_commit_view(commit_view, workspace, cx).await?;
                         return Err(err);
                     }
                 };
+                if outcome == StashMutationResult::AppliedButRetained
+                    && let Some(workspace) = workspace.clone().upgrade()
+                {
+                    workspace.update_in(cx, |_, window, cx| {
+                        let _ = window.prompt(
+                            PromptLevel::Info,
+                            "Stash popped",
+                            Some(
+                                "The stash was applied but could not be dropped;\nit has been retained.",
+                            ),
+                            &["OK"],
+                            cx,
+                        );
+                    })?;
+                }
                 Self::close_commit_view(commit_view, workspace, cx).await?;
                 anyhow::Ok(())
             },
@@ -1079,10 +1095,10 @@ impl CommitView {
             cx,
             async move |repository, sha, stash, commit_view, workspace, cx| {
                 let result = repository.update(cx, |repo, cx| {
-                    if !stash_matches_index(&sha, stash, repo) {
+                    if !stash_matches_identity(&sha, &stash, repo) {
                         return Err(anyhow::anyhow!("Stash has changed, drop aborted"));
                     }
-                    Ok(repo.stash_drop(Some(stash), cx))
+                    Ok(repo.stash_drop(Some(stash.clone()), cx))
                 });
 
                 match result {
@@ -1108,7 +1124,7 @@ impl CommitView {
         AsyncFn: AsyncFnOnce(
                 Entity<Repository>,
                 &SharedString,
-                usize,
+                StashIdentity,
                 Entity<CommitView>,
                 WeakEntity<Workspace>,
                 &mut AsyncWindowContext,
@@ -1118,13 +1134,13 @@ impl CommitView {
         let Some(commit_view) = workspace.active_item_as::<CommitView>(cx) else {
             return;
         };
-        let Some(stash) = commit_view.read(cx).stash else {
+        let Some(stash) = commit_view.read(cx).stash.clone() else {
             return;
         };
         let sha = commit_view.read(cx).commit.sha.clone();
         let answer = window.prompt(
             PromptLevel::Info,
-            &format!("{} stash@{{{}}}?", str_action, stash),
+            &format!("{} {}?", str_action, stash.selector),
             None,
             &[str_action, "Cancel"],
             cx,
@@ -1484,7 +1500,7 @@ impl Item for CommitView {
                 message_scroll_handle: ScrollHandle::new(),
                 multibuffer: self.multibuffer.clone(),
                 commit: self.commit.clone(),
-                stash: self.stash,
+                stash: self.stash.clone(),
                 repository: self.repository.clone(),
                 project: self.project.clone(),
                 workspace: self.workspace.clone(),
@@ -1639,10 +1655,9 @@ impl ToolbarItemView for CommitViewToolbar {
     }
 }
 
-fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool {
-    repo.stash_entries
-        .entries
-        .get(stash_index)
-        .map(|entry| entry.oid.to_string() == sha)
-        .unwrap_or(false)
+fn stash_matches_identity(sha: &str, identity: &StashIdentity, repo: &Repository) -> bool {
+    match resolve_stash_identity(&repo.stash_entries.entries, identity) {
+        Ok(entry) => entry.oid.to_string() == sha,
+        Err(_) => false,
+    }
 }

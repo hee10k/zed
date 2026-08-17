@@ -42,7 +42,7 @@ use git::{
         SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
         is_binary_content,
     },
-    stash::{GitStash, StashEntry},
+    stash::{GitStash, StashEntry, StashIdentity, StashMutationResult},
     status::{
         self, DiffStat, DiffTreeType, FileStatus, GitSummary, StatusCode, TrackedStatus, TreeDiff,
         TreeDiffStatus, UnmergedStatus, UnmergedStatusCode,
@@ -3629,18 +3629,23 @@ impl GitStore {
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::StashPop>,
         mut cx: AsyncApp,
-    ) -> Result<proto::Ack> {
+    ) -> Result<proto::StashPopReply> {
         let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
-        let stash_index = envelope.payload.stash_index.map(|i| i as usize);
+        let identity = resolve_incoming_stash_identity(
+            envelope.payload.identity.as_ref(),
+            envelope.payload.stash_index,
+        )?;
 
-        repository_handle
+        let outcome = repository_handle
             .update(&mut cx, |repository_handle, cx| {
-                repository_handle.stash_pop(stash_index, cx)
+                repository_handle.stash_pop(identity, cx)
             })
             .await?;
 
-        Ok(proto::Ack {})
+        Ok(proto::StashPopReply {
+            applied_but_retained: outcome == StashMutationResult::AppliedButRetained,
+        })
     }
 
     async fn handle_stash_apply(
@@ -3650,11 +3655,14 @@ impl GitStore {
     ) -> Result<proto::Ack> {
         let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
-        let stash_index = envelope.payload.stash_index.map(|i| i as usize);
+        let identity = resolve_incoming_stash_identity(
+            envelope.payload.identity.as_ref(),
+            envelope.payload.stash_index,
+        )?;
 
         repository_handle
             .update(&mut cx, |repository_handle, cx| {
-                repository_handle.stash_apply(stash_index, cx)
+                repository_handle.stash_apply(identity, cx)
             })
             .await?;
 
@@ -3668,11 +3676,14 @@ impl GitStore {
     ) -> Result<proto::Ack> {
         let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
-        let stash_index = envelope.payload.stash_index.map(|i| i as usize);
+        let identity = resolve_incoming_stash_identity(
+            envelope.payload.identity.as_ref(),
+            envelope.payload.stash_index,
+        )?;
 
         repository_handle
             .update(&mut cx, |repository_handle, cx| {
-                repository_handle.stash_drop(stash_index, cx)
+                repository_handle.stash_drop(identity, cx)
             })
             .await??;
 
@@ -6464,6 +6475,53 @@ pub fn proto_to_stash(entry: &proto::StashEntry) -> Result<StashEntry> {
     })
 }
 
+fn stash_identity_to_proto(identity: &StashIdentity) -> proto::StashIdentity {
+    proto::StashIdentity {
+        ref_name: identity.ref_name.clone(),
+        oid: identity.oid.to_string(),
+        selector: identity.selector.clone(),
+    }
+}
+
+fn proto_to_stash_identity(identity: &proto::StashIdentity) -> Result<StashIdentity> {
+    Ok(StashIdentity {
+        ref_name: identity.ref_name.clone(),
+        oid: Oid::from_str(&identity.oid).context("invalid stash OID in identity")?,
+        selector: identity.selector.clone(),
+    })
+}
+
+/// Map a decoded `StashPopReply` back to the typed mutation result so a remote
+/// client reports the same outcome as a local one — notably surfacing the
+/// `applied but retained` partial success instead of fabricating full success.
+fn stash_pop_reply_to_result(reply: &proto::StashPopReply) -> StashMutationResult {
+    if reply.applied_but_retained {
+        StashMutationResult::AppliedButRetained
+    } else {
+        StashMutationResult::Success
+    }
+}
+
+/// Resolve the stash identity a peer asked to mutate. New peers always send a
+/// composite `identity`; an incoming request that carries only the obsolete
+/// index-authoritative `stash_index` is rejected for version skew rather than
+/// acted on. A request with neither targets the current top of stack.
+fn resolve_incoming_stash_identity(
+    identity: Option<&proto::StashIdentity>,
+    stash_index: Option<u64>,
+) -> Result<Option<StashIdentity>> {
+    if let Some(identity) = identity {
+        return proto_to_stash_identity(identity).map(Some);
+    }
+    if stash_index.is_some() {
+        anyhow::bail!(
+            "stash mutation from an outdated peer used an index-authoritative selector; \
+             refusing to apply (please upgrade the peer)"
+        );
+    }
+    Ok(None)
+}
+
 impl MergeDetails {
     async fn update(
         &mut self,
@@ -8610,59 +8668,113 @@ impl Repository {
 
     pub fn stash_pop(
         &mut self,
-        index: Option<usize>,
+        identity: Option<StashIdentity>,
         cx: &mut Context<Self>,
-    ) -> Task<anyhow::Result<()>> {
+    ) -> Task<anyhow::Result<StashMutationResult>> {
         let id = self.id;
+        let updates_tx = self
+            .git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            });
+        let weak_repository = cx.weak_entity();
         cx.spawn(async move |this, cx| {
-            this.update(cx, |this, _| {
-                this.send_job("stash_pop", None, move |git_repo, _cx| async move {
+            let outcome = this.update(cx, |this, _| {
+                    this.send_job("stash_pop", None, move |git_repo, mut cx| async move {
                     match git_repo {
                         RepositoryState::Local(LocalRepositoryState {
                             backend,
                             environment,
                             ..
-                        }) => backend.stash_pop(index, environment).await,
+                        }) => {
+                            let result = backend.stash_pop(identity, environment).await;
+                            if result.is_ok()
+                                && let Ok(stash_entries) = backend.stash_entries().await
+                            {
+                                let snapshot = weak_repository.update(&mut cx, |this, cx| {
+                                    this.snapshot.stash_entries = stash_entries;
+                                    cx.emit(RepositoryEvent::StashEntriesChanged);
+                                    this.snapshot.clone()
+                                })?;
+                                if let Some(updates_tx) = updates_tx {
+                                    updates_tx
+                                        .unbounded_send(DownstreamUpdate::UpdateRepository(snapshot))
+                                        .ok();
+                                }
+                            }
+                            result
+                        }
                         RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
-                            client
+                            let reply: proto::StashPopReply = client
                                 .request(proto::StashPop {
                                     project_id: project_id.0,
                                     repository_id: id.to_proto(),
-                                    stash_index: index.map(|i| i as u64),
+                                    stash_index: None,
+                                    identity: identity.as_ref().map(stash_identity_to_proto),
                                 })
                                 .await
                                 .context("sending stash pop request")?;
-                            Ok(())
+                            Ok(stash_pop_reply_to_result(&reply))
                         }
                     }
                 })
             })?
             .await??;
-            Ok(())
+            Ok(outcome)
         })
     }
 
     pub fn stash_apply(
         &mut self,
-        index: Option<usize>,
+        identity: Option<StashIdentity>,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
         let id = self.id;
+        let updates_tx = self
+            .git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            });
+        let weak_repository = cx.weak_entity();
         cx.spawn(async move |this, cx| {
             this.update(cx, |this, _| {
-                this.send_job("stash_apply", None, move |git_repo, _cx| async move {
+                this.send_job("stash_apply", None, move |git_repo, mut cx| async move {
                     match git_repo {
                         RepositoryState::Local(LocalRepositoryState {
                             backend,
                             environment,
                             ..
-                        }) => backend.stash_apply(index, environment).await,
+                        }) => {
+                            let result = backend.stash_apply(identity, environment).await;
+                            if result.is_ok()
+                                && let Ok(stash_entries) = backend.stash_entries().await
+                            {
+                                let snapshot = weak_repository.update(&mut cx, |this, cx| {
+                                    this.snapshot.stash_entries = stash_entries;
+                                    cx.emit(RepositoryEvent::StashEntriesChanged);
+                                    this.snapshot.clone()
+                                })?;
+                                if let Some(updates_tx) = updates_tx {
+                                    updates_tx
+                                        .unbounded_send(DownstreamUpdate::UpdateRepository(snapshot))
+                                        .ok();
+                                }
+                            }
+                            result
+                        }
                         RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                             client
                                 .request(proto::StashApply {
                                     project_id: project_id.0,
                                     repository_id: id.to_proto(),
-                                    stash_index: index.map(|i| i as u64),
+                                    stash_index: None,
+                                    identity: identity.as_ref().map(stash_identity_to_proto),
                                 })
                                 .await
                                 .context("sending stash apply request")?;
@@ -8768,7 +8880,7 @@ impl Repository {
 
     pub fn stash_drop(
         &mut self,
-        index: Option<usize>,
+        identity: Option<StashIdentity>,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<anyhow::Result<()>> {
         let id = self.id;
@@ -8788,8 +8900,7 @@ impl Repository {
                     environment,
                     ..
                 }) => {
-                    // TODO would be nice to not have to do this manually
-                    let result = backend.stash_drop(index, environment).await;
+                    let result = backend.stash_drop(identity, environment).await;
                     if result.is_ok()
                         && let Ok(stash_entries) = backend.stash_entries().await
                     {
@@ -8812,10 +8923,11 @@ impl Repository {
                         .request(proto::StashDrop {
                             project_id: project_id.0,
                             repository_id: id.to_proto(),
-                            stash_index: index.map(|i| i as u64),
+                            stash_index: None,
+                            identity: identity.as_ref().map(stash_identity_to_proto),
                         })
                         .await
-                        .context("sending stash pop request")?;
+                        .context("sending stash drop request")?;
                     Ok(())
                 }
             }
@@ -13194,5 +13306,72 @@ fn tracked_status_to_proto(code: StatusCode) -> i32 {
         StatusCode::TypeChanged => proto::GitStatus::TypeChanged as _,
         StatusCode::Copied => proto::GitStatus::Copied as _,
         StatusCode::Unmodified => proto::GitStatus::Unmodified as _,
+    }
+}
+
+#[cfg(test)]
+mod stash_identity_tests {
+    use super::*;
+
+    fn identity() -> StashIdentity {
+        StashIdentity {
+            oid: Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            ref_name: "refs/stash".to_string(),
+            selector: "refs/stash@{3}".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_stash_identity_proto_round_trip() {
+        let identity = identity();
+        let proto = stash_identity_to_proto(&identity);
+        assert_eq!(proto.oid, identity.oid.to_string());
+        assert_eq!(proto.ref_name, identity.ref_name);
+        assert_eq!(proto.selector, identity.selector);
+        let parsed = proto_to_stash_identity(&proto).unwrap();
+        assert_eq!(parsed, identity);
+    }
+
+    #[test]
+    fn test_resolve_incoming_stash_identity_accepts_composite() {
+        let identity = identity();
+        let proto = stash_identity_to_proto(&identity);
+        let resolved = resolve_incoming_stash_identity(Some(&proto), None).unwrap();
+        assert_eq!(resolved, Some(identity));
+    }
+
+    #[test]
+    fn test_resolve_incoming_stash_identity_rejects_old_client_index() {
+        // An outdated peer sent only an index-authoritative selector: refuse it.
+        let err = resolve_incoming_stash_identity(None, Some(2)).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("outdated peer"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_incoming_stash_identity_top_when_both_empty() {
+        let resolved = resolve_incoming_stash_identity(None, None).unwrap();
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn test_stash_pop_reply_remote_parity() {
+        // Local pop returns the real outcome; the remote client must mirror it
+        // from the decoded `StashPopReply` rather than fabricating Success.
+        assert_eq!(
+            stash_pop_reply_to_result(&proto::StashPopReply {
+                applied_but_retained: false
+            }),
+            StashMutationResult::Success
+        );
+        assert_eq!(
+            stash_pop_reply_to_result(&proto::StashPopReply {
+                applied_but_retained: true
+            }),
+            StashMutationResult::AppliedButRetained
+        );
     }
 }

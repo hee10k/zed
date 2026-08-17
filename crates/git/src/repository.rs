@@ -1,5 +1,7 @@
 use crate::commit::{CommitDiffObject, CommitDiffObjectKind, parse_git_diff_raw};
-use crate::stash::GitStash;
+use crate::stash::{
+    GitStash, STASH_REF, StashEntry, StashIdentity, StashMutationResult, resolve_stash_identity,
+};
 use crate::status::{
     DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus,
 };
@@ -1084,19 +1086,19 @@ pub trait GitRepository: Send + Sync {
 
     fn stash_pop(
         &self,
-        index: Option<usize>,
+        identity: Option<StashIdentity>,
         env: Arc<HashMap<String, String>>,
-    ) -> BoxFuture<'_, Result<()>>;
+    ) -> BoxFuture<'_, Result<StashMutationResult>>;
 
     fn stash_apply(
         &self,
-        index: Option<usize>,
+        identity: Option<StashIdentity>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>>;
 
     fn stash_drop(
         &self,
-        index: Option<usize>,
+        identity: Option<StashIdentity>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>>;
 
@@ -1511,6 +1513,45 @@ where
         }
     );
     Ok(())
+}
+
+/// Build the explicit, fully-qualified reflog selector for a stash index.
+fn stash_selector_for_index(index: usize) -> String {
+    format!("{STASH_REF}@{{{index}}}")
+}
+
+/// Run `git stash list` against the current reflog (`refs/stash`).
+async fn stash_entries_for(git: &GitBinary) -> Result<Vec<StashEntry>> {
+    let output = git
+        .build_command(&["stash", "list", "--pretty=format:%gd%x00%H%x00%ct%x00%s"])
+        .output()
+        .await?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stash: GitStash = stdout.parse()?;
+        Ok(stash.entries.to_vec())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git stash list failed: {stderr}");
+    }
+}
+
+/// Refresh `refs/stash` and resolve exactly one target entry for a mutation.
+/// `None` selects the current top of stack (`stash@{0}`), resolved fresh.
+async fn resolve_stash_target(
+    git: &GitBinary,
+    identity: Option<&StashIdentity>,
+) -> Result<StashEntry> {
+    let entries = stash_entries_for(git).await?;
+    match identity {
+        Some(identity) => resolve_stash_identity(&entries, identity)
+            .cloned()
+            .map_err(|err| anyhow!("{err}")),
+        None => entries
+            .into_iter()
+            .next()
+            .with_context(|| "Expected a stash entry to operate on"),
+    }
 }
 
 impl GitRepository for RealGitRepository {
@@ -3041,44 +3082,82 @@ impl GitRepository for RealGitRepository {
 
     fn stash_pop(
         &self,
-        index: Option<usize>,
+        identity: Option<StashIdentity>,
         env: Arc<HashMap<String, String>>,
-    ) -> BoxFuture<'_, Result<()>> {
+    ) -> BoxFuture<'_, Result<StashMutationResult>> {
         let git = self.git_binary_in_worktree();
         self.executor
             .spawn(async move {
                 let git = git?;
-                let mut args = vec!["stash".to_string(), "pop".to_string()];
-                if let Some(index) = index {
-                    args.push(format!("stash@{{{}}}", index));
-                }
-                let output = git.build_command(&args).envs(env.iter()).output().await?;
-
+                let target = resolve_stash_target(&git, identity.as_ref()).await?;
+                // Apply uses the exact selected OID.
+                let oid_hex = target.oid.to_string();
+                let output = git
+                    .build_command(&["stash", "apply", &oid_hex])
+                    .envs(env.iter())
+                    .output()
+                    .await?;
                 anyhow::ensure!(
                     output.status.success(),
-                    "Failed to stash pop:\n{}",
+                    "Failed to stash apply during pop:\n{}",
                     String::from_utf8_lossy(&output.stderr)
                 );
-                Ok(())
+
+                // Re-resolve the same entry after applying, then drop it by its
+                // freshly resolved reflog selector.
+                let retained = match resolve_stash_target(&git, identity.as_ref()).await {
+                    Ok(target) => {
+                        let selector = stash_selector_for_index(target.index);
+                        let output = git
+                            .build_command(&["stash", "drop", &selector])
+                            .envs(env.iter())
+                            .output()
+                            .await?;
+                        if output.status.success() {
+                            false
+                        } else {
+                            log::warn!(
+                                "stash pop applied but drop failed: {}",
+                                String::from_utf8_lossy(&output.stderr)
+                            );
+                            true
+                        }
+                    }
+                    Err(err) => {
+                        // The entry vanished between apply and drop on the next
+                        // step; treat it as still applied (it was), so we do not
+                        // hide the partial success.
+                        log::warn!("stash pop apply succeeded but drop could not be re-resolved: {err}");
+                        true
+                    }
+                };
+
+                Ok(if retained {
+                    StashMutationResult::AppliedButRetained
+                } else {
+                    StashMutationResult::Success
+                })
             })
             .boxed()
     }
 
     fn stash_apply(
         &self,
-        index: Option<usize>,
+        identity: Option<StashIdentity>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         let git = self.git_binary_in_worktree();
         self.executor
             .spawn(async move {
                 let git = git?;
-                let mut args = vec!["stash".to_string(), "apply".to_string()];
-                if let Some(index) = index {
-                    args.push(format!("stash@{{{}}}", index));
-                }
-                let output = git.build_command(&args).envs(env.iter()).output().await?;
-
+                let target = resolve_stash_target(&git, identity.as_ref()).await?;
+                // Apply uses the exact selected OID.
+                let oid_hex = target.oid.to_string();
+                let output = git
+                    .build_command(&["stash", "apply", &oid_hex])
+                    .envs(env.iter())
+                    .output()
+                    .await?;
                 anyhow::ensure!(
                     output.status.success(),
                     "Failed to apply stash:\n{}",
@@ -3091,22 +3170,24 @@ impl GitRepository for RealGitRepository {
 
     fn stash_drop(
         &self,
-        index: Option<usize>,
+        identity: Option<StashIdentity>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         let git = self.git_binary_in_worktree();
         self.executor
             .spawn(async move {
                 let git = git?;
-                let mut args = vec!["stash".to_string(), "drop".to_string()];
-                if let Some(index) = index {
-                    args.push(format!("stash@{{{}}}", index));
-                }
-                let output = git.build_command(&args).envs(env.iter()).output().await?;
-
+                let target = resolve_stash_target(&git, identity.as_ref()).await?;
+                // Drop uses only the freshly resolved reflog selector.
+                let selector = stash_selector_for_index(target.index);
+                let output = git
+                    .build_command(&["stash", "drop", &selector])
+                    .envs(env.iter())
+                    .output()
+                    .await?;
                 anyhow::ensure!(
                     output.status.success(),
-                    "Failed to stash drop:\n{}",
+                    "Failed to drop stash:\n{}",
                     String::from_utf8_lossy(&output.stderr)
                 );
                 Ok(())
@@ -7527,5 +7608,163 @@ mod tests {
         .unwrap();
 
         assert_eq!(repo.operation_state().await.unwrap(), None);
+    }
+
+    /// Set up a tracked base file, then push a stash whose working-tree change is
+    /// the given marker line. Returns the resulting stash commit OID.
+    fn stash_with_marker(repo_dir: &Path, marker: &str) -> Oid {
+        fs::write(
+            repo_dir.join("stash_file.txt"),
+            format!("base\n{marker}\n"),
+        )
+        .unwrap();
+        git_command(repo_dir, ["add", "stash_file.txt"]);
+        git_command(
+            repo_dir,
+            ["stash", "push", "-m", &format!("stash {marker}")],
+        );
+        git_command_output(repo_dir, ["rev-parse", "refs/stash"])
+            .parse()
+            .unwrap()
+    }
+
+    fn stash_oids(repo_dir: &Path) -> Vec<Oid> {
+        let output = git_command_output(repo_dir, ["stash", "list", "--format=%H"]);
+        if output.trim().is_empty() {
+            Vec::new()
+        } else {
+            output
+                .lines()
+                .map(|line| line.parse().unwrap())
+                .collect::<Vec<_>>()
+        }
+    }
+
+    fn new_real_repo(repo_dir: &Path, cx: &TestAppContext) -> RealGitRepository {
+        RealGitRepository::new(
+            &repo_dir.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap()
+    }
+
+    #[gpui::test]
+    async fn test_stash_apply_uses_exact_oid_and_retains_entry(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+
+        let oid = stash_with_marker(repo_dir.path(), "applied");
+        let repository = new_real_repo(repo_dir.path(), cx);
+        let identity = StashIdentity::for_entry(&StashEntry {
+            index: 0,
+            oid,
+            message: "stash applied".into(),
+            branch: None,
+            timestamp: 0,
+        });
+
+        repository
+            .stash_apply(Some(identity), graph_mutation_env())
+            .await
+            .unwrap();
+
+        // apply restores the change but keeps the stash.
+        let contents = fs::read_to_string(repo_dir.path().join("stash_file.txt")).unwrap();
+        assert!(contents.contains("applied"), "apply did not restore: {contents}");
+        assert!(
+            stash_oids(repo_dir.path()).contains(&oid),
+            "apply must retain the stash entry"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_stash_pop_removes_fresh_selector_and_follows_reorder(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+
+        // push two stashes, then an external one so "first" moves off its hint index.
+        let first = stash_with_marker(repo_dir.path(), "first");
+        stash_with_marker(repo_dir.path(), "second");
+        stash_with_marker(repo_dir.path(), "third");
+
+        // Capture the identity of "first" as it was selected (at index 2 before the reorder
+        // by the externally-inserted "third" at the top). The backend must still resolve it
+        // by OID and drop the freshly resolved selector.
+        let identity = StashIdentity {
+            oid: first,
+            ref_name: STASH_REF.to_string(),
+            selector: format!("{}@{{2}}", STASH_REF),
+        };
+        let repository = new_real_repo(repo_dir.path(), cx);
+        let outcome = repository
+            .stash_pop(Some(identity), graph_mutation_env())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            StashMutationResult::Success,
+            "pop should fully drop the matched entry"
+        );
+
+        let remaining = stash_oids(repo_dir.path());
+        assert!(!remaining.contains(&first), "popped entry must be dropped");
+        assert_eq!(remaining.len(), 2, "only the other two stashes remain");
+
+        let contents = fs::read_to_string(repo_dir.path().join("stash_file.txt")).unwrap();
+        assert!(
+            contents.contains("first"),
+            "pop must apply the exactly-selected entry: {contents}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_stash_pop_missing_identity_errors(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        stash_with_marker(repo_dir.path(), "only");
+
+        let dangling_oid = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            .parse()
+            .unwrap();
+        let identity = StashIdentity {
+            oid: dangling_oid,
+            ref_name: STASH_REF.to_string(),
+            selector: format!("{}@{{0}}", STASH_REF),
+        };
+        let repository = new_real_repo(repo_dir.path(), cx);
+        let err = repository
+            .stash_pop(Some(identity), graph_mutation_env())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("stash not found"),
+            "expected a missing-stash error, got: {err:#}"
+        );
+        // Holding on to the repo so the drop does not remove the whole temp dir early.
+        drop(repository);
     }
 }
