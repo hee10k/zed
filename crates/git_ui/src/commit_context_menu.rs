@@ -638,10 +638,129 @@ pub(crate) fn ref_chip_context_menu(
     let display_name = resolved_ref.display_name.clone();
     let header = format!("Ref {display_name}");
 
+    // A local branch checked out in another (non-main) linked worktree is a
+    // worktree destination, not an ordinary checkout target. Resolved from the
+    // live repository snapshot against the worktree's exact fully-qualified
+    // ref (`refs/heads/<name>`), never by the shortened display text — so a
+    // local branch literally named `origin/main` is never confused with the
+    // unrelated `refs/remotes/origin/main` remote-tracking ref. The snapshot
+    // already excludes the main worktree, and the `!is_main` guard keeps this a
+    // linked destination even if a snapshot ever carried the main worktree.
+    let linked_worktree: Option<git::repository::Worktree> = if is_local_branch {
+        let full_ref = resolved_ref.ref_name.clone();
+        repository
+            .as_ref()
+            .and_then(|repository| repository.upgrade())
+            .and_then(|repository| {
+                repository
+                    .read(cx)
+                    .linked_worktrees
+                    .iter()
+                    .find(|worktree| {
+                        !worktree.is_main && worktree.ref_name.as_deref() == Some(full_ref.as_ref())
+                    })
+                    .cloned()
+            })
+    } else {
+        None
+    };
+    // Build-time "potentially eligible" flag for the linked-branch `Remove
+    // Worktree…` entry, mirroring the commit menu's linked-worktree eligibility
+    // logic (not the main worktree, and not open in any Zed window). The
+    // authoritative open/disappearance re-check happens in the shared remove
+    // service immediately before mutation, so a stale menu never mutates
+    // against a worktree that vanished or was replaced while the menu was open.
+    let linked_worktree_eligible = linked_worktree.as_ref().map(|worktree| {
+        let window = &*window;
+        let cx = &*cx;
+        let workspace_entity = workspace.upgrade();
+        let identity = repository
+            .as_ref()
+            .and_then(|repository| repository.upgrade())
+            .map(|repository| {
+                let common_identity = repository.read(cx).common_repository_identity();
+                let remote_options = workspace_entity.as_ref().and_then(|workspace| {
+                    workspace
+                        .read(cx)
+                        .project()
+                        .read(cx)
+                        .remote_connection_options(cx)
+                });
+                HostScopedRepositoryIdentity::new(common_identity, remote_options.as_ref())
+            });
+        worktree_removal_eligible(worktree, identity.as_ref(), window, cx)
+    });
+    let linked_worktree_label = linked_worktree.as_ref().map(linked_worktree_label);
+
     ContextMenu::build(window, cx, move |menu, _window, _cx| {
         let mut menu = menu.header(header);
 
-        if is_local_branch {
+        if let Some(worktree) = &linked_worktree {
+            // Linked-worktree branch: route to the exact worktree instead of
+            // offering ordinary Checkout / Rename / direct branch Delete. The
+            // `Switch Here` path reuses the shared worktree service switch,
+            // which fails safely (toast) when the target is already current,
+            // has disappeared, or the snapshot is stale.
+            let switch_workspace = workspace.clone();
+            let switch_path = worktree.path.clone();
+            let switch_label = linked_worktree_label
+                .clone()
+                .unwrap_or_else(|| display_name.clone().into());
+            let switch_offer_sha = commit_sha.to_string();
+            menu = menu.entry("Switch Here", None, move |window, cx| {
+                let Some(workspace) = switch_workspace.upgrade() else {
+                    log::error!(
+                        "linked branch switch: source window handle for {} is no longer \
+                         available",
+                        switch_path.display()
+                    );
+                    return;
+                };
+                workspace.update(cx, |workspace, cx| {
+                    switch_to_worktree(
+                        workspace,
+                        switch_path.clone(),
+                        switch_label.clone(),
+                        Some(switch_offer_sha.clone().into()),
+                        window,
+                        None,
+                        OpenMode::Activate,
+                        cx,
+                    );
+                });
+            });
+            menu = menu.entry(
+                format!("Open {display_name} in New Window"),
+                None,
+                {
+                    let new_window_path = worktree.path.clone();
+                    move |window, cx| {
+                        window.dispatch_action(
+                            Box::new(OpenWorktreeInNewWindow {
+                                path: new_window_path.clone(),
+                            }),
+                            cx,
+                        );
+                    }
+                },
+            );
+            if linked_worktree_eligible == Some(true) {
+                let remove_repository = repository.clone();
+                let remove_graph = graph.clone();
+                let remove_workspace = workspace.clone();
+                let remove_worktree = worktree.clone();
+                menu = menu.entry("Remove Worktree…", None, move |window, cx| {
+                    remove_worktree_from_graph(
+                        remove_repository.clone(),
+                        remove_graph.clone(),
+                        remove_workspace.clone(),
+                        remove_worktree.clone(),
+                        window,
+                        cx,
+                    );
+                });
+            }
+        } else if is_local_branch {
             if !is_current_branch {
                 menu = menu.entry("Checkout", None, {
                     let graph = graph.clone();
