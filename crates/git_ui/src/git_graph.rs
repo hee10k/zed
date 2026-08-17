@@ -8433,8 +8433,7 @@ mod tests {
             "remote chip should offer checkout/delete-on-server/merge/create/copy, got {remote_labels:?}"
         );
 
-        // Tag chip: remains a commit-target chip (no remote/local branch
-        // actions) until the tag-lifecycle ticket lands.
+        // Tag chip: the full lifecycle menu (inspect, push, delete local/server).
         deploy_ref_menu(
             &git_graph,
             ResolvedRef {
@@ -8447,14 +8446,17 @@ mod tests {
         let tag_labels = ref_menu_labels(&git_graph, cx);
         assert!(
             !tag_labels.iter().any(|label| label == "Checkout")
-                && !tag_labels.iter().any(|label| label == "Delete…")
-                && !tag_labels.iter().any(|label| label == "Delete on Server…"),
-            "tag chip should not offer branch/remote actions, got {tag_labels:?}"
+                && !tag_labels.iter().any(|label| label == "Rename…")
+                && !tag_labels.iter().any(|label| label == "Delete…"),
+            "tag chip should not offer branch checkout/rename/local-delete labels, got {tag_labels:?}"
         );
         assert!(
-            tag_labels.iter().any(|label| label == "Merge into Current")
+            tag_labels.iter().any(|label| label == "View Details…")
+                && tag_labels.iter().any(|label| label == "Push to Remote…")
+                && tag_labels.iter().any(|label| label == "Delete Local…")
+                && tag_labels.iter().any(|label| label == "Delete on Remote…")
                 && tag_labels.iter().any(|label| label == "Copy Name"),
-            "tag chip should keep commit-target actions, got {tag_labels:?}"
+            "tag chip should offer the full lifecycle, got {tag_labels:?}"
         );
     }
 
