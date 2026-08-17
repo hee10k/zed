@@ -217,19 +217,20 @@ pub fn worktree_is_open(
     worktree_is_open_in_window(None, identity, path, fs, cx)
 }
 
-pub fn worktree_is_open_in_window(
+/// Synchronously enumerates the app's workspaces and collects every visible
+/// worktree path whose repository matches `identity`, along with the path style
+/// used on that workspace's host. This is the shared enumeration factored out of
+/// `worktree_is_open_in_window` so the Git Graph Worktree submenu can run the
+/// same matching logic synchronously for build-time eligibility gating without
+/// duplicating it. It does NOT canonicalize symlinks; the authoritative async
+/// `worktree_is_open_in_window` does that.
+fn open_worktrees_matching_repo(
     active_window: Option<&Window>,
-    identity: HostScopedRepositoryIdentity,
-    path: PathBuf,
-    fs: Arc<dyn Fs>,
+    identity: &HostScopedRepositoryIdentity,
     cx: &App,
-) -> Task<Result<bool>> {
-    let workspaces = match app_workspaces_with_active_window(active_window, cx) {
-        Ok(workspaces) => workspaces,
-        Err(err) => return Task::ready(Err(err)),
-    };
+) -> anyhow::Result<Vec<(PathBuf, util::paths::PathStyle)>> {
+    let workspaces = app_workspaces_with_active_window(active_window, cx)?;
 
-    let is_local = identity.host_key == "local";
     let mut open_paths_matching_repo: Vec<(PathBuf, util::paths::PathStyle)> = Vec::new();
 
     for workspace in workspaces {
@@ -261,12 +262,63 @@ pub fn worktree_is_open_in_window(
             if let Some(common_identity) = matching_repo {
                 let repo_host_identity =
                     HostScopedRepositoryIdentity::new(common_identity, remote_options.as_ref());
-                if repo_host_identity == identity {
+                if &repo_host_identity == identity {
                     open_paths_matching_repo.push((open_wt_path, path_style));
                 }
             }
         }
     }
+
+    Ok(open_paths_matching_repo)
+}
+
+/// Synchronous open-worktree check, mirroring the sync (non-canonicalizing)
+/// portion of the authoritative `worktree_is_open_in_window`. Used for
+/// build-time "potentially eligible" gating in the Git Graph Worktree
+/// submenu: it reports whether `path` is open as a visible worktree of the
+/// given repository in any app window (including the active one). Because it
+/// cannot resolve symlinks, it is optimistic; the authoritative async check
+/// (with canonicalization) is always re-run immediately before mutation.
+pub fn worktree_is_open_in_window_sync(
+    active_window: Option<&Window>,
+    identity: HostScopedRepositoryIdentity,
+    path: &Path,
+    cx: &App,
+) -> anyhow::Result<bool> {
+    let open_paths_matching_repo = open_worktrees_matching_repo(active_window, &identity, cx)?;
+
+    let is_local = identity.host_key == "local";
+    for (open_wt_path, path_style) in open_paths_matching_repo {
+        if open_wt_path == path {
+            return Ok(true);
+        }
+        // Remote hosts compare via path-style normalization (mirrors the
+        // authoritative async check's non-local branch).
+        if !is_local
+            && path_style.normalize(open_wt_path.to_str().unwrap_or(""))
+                == path_style.normalize(path.to_str().unwrap_or(""))
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+pub fn worktree_is_open_in_window(
+    active_window: Option<&Window>,
+    identity: HostScopedRepositoryIdentity,
+    path: PathBuf,
+    fs: Arc<dyn Fs>,
+    cx: &App,
+) -> Task<Result<bool>> {
+    let open_paths_matching_repo = match open_worktrees_matching_repo(active_window, &identity, cx)
+    {
+        Ok(paths) => paths,
+        Err(err) => return Task::ready(Err(err)),
+    };
+
+    let is_local = identity.host_key == "local";
 
     if open_paths_matching_repo.is_empty() {
         return Task::ready(Ok(false));
@@ -449,6 +501,14 @@ impl WorktreeRemovalConfirmModal {
             let _ = tx.send(Ok(ModalResult::Cancelled));
         }
         cx.emit(DismissEvent);
+    }
+
+    /// Test hook: programmatically set the "delete linked branch" checkbox,
+    /// mirroring what a user toggling the checkbox in the rendered modal does.
+    /// Gated behind `test-support` so it never ships in production builds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_set_delete_linked_branch(&mut self, value: bool) {
+        self.delete_linked_branch = value;
     }
 }
 
