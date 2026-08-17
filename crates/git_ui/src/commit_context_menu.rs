@@ -6,8 +6,10 @@ use crate::{
     open_branch_rename_modal,
 };
 use anyhow::anyhow;
+use futures::channel::oneshot;
 use git::Oid;
-use git::repository::{CreateTagOptions, MergeMode, ResetMode};
+use git::repository::{AskPassDelegate, CreateTagOptions, MergeMode, Remote, ResetMode};
+use git_ui_core::askpass_modal::AskPassModal;
 use git_ui_core::delete_service::{self as delete_service, WorktreeRemovalOutcome};
 use git_ui_core::notifications::show_error_toast;
 use git_ui_core::worktree_name_modal::WorktreeNameModal;
@@ -15,12 +17,18 @@ use git_ui_core::worktree_service::{
     HostScopedRepositoryIdentity, handle_create_worktree, linked_worktree_label, switch_to_worktree,
 };
 use gpui::{
-    Action, App, ClipboardItem, Entity, FocusHandle, SharedString, Task, WeakEntity, Window,
-    actions,
+    Action, AnyWindowHandle, App, AsyncWindowContext, ClipboardItem, Entity, FocusHandle,
+    SharedString, Task, WeakEntity, Window, actions,
 };
+use gpui::{DismissEvent, EventEmitter, Focusable, InteractiveElement, ParentElement};
+use menu;
+use notifications::status_toast::StatusToast;
 use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
 use task::{TaskContext, TaskVariables, VariableName};
-use ui::{Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
+use ui::{
+    Button, ButtonStyle, Color, ContextMenu, ContextMenuEntry, Headline, HeadlineSize, IconName,
+    IconPosition, Label, prelude::*,
+};
 use workspace::{
     OpenMode, Workspace,
     notifications::DetachAndPromptErr,
@@ -635,6 +643,7 @@ pub(crate) fn ref_chip_context_menu(
     cx: &mut App,
 ) -> Entity<ContextMenu> {
     let is_local_branch = resolved_ref.kind == RefKind::LocalBranch;
+    let is_remote_branch = resolved_ref.kind == RefKind::RemoteBranch;
     let display_name = resolved_ref.display_name.clone();
     let header = format!("Ref {display_name}");
 
@@ -816,9 +825,63 @@ pub(crate) fn ref_chip_context_menu(
                     }
                 });
             }
+        } else if is_remote_branch {
+            // Remote-tracking branch: check out the exact clicked upstream (with
+            // exact-tracker reuse, else a distinct local name that never repoints
+            // an existing branch) and delete it on its server remote. Local-only
+            // Rename/Delete are never offered for a remote chip.
+            menu = menu.entry("Checkout", None, {
+                let resolved_ref = resolved_ref.clone();
+                let repository = repository.clone();
+                let graph = graph.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    schedule_remote_branch_checkout(
+                        &resolved_ref,
+                        repository.clone(),
+                        graph.clone(),
+                        workspace.clone(),
+                        window,
+                        cx,
+                    );
+                }
+            });
+            menu = menu.entry("Merge into Current", None, {
+                let graph = graph.clone();
+                move |window, cx| schedule_ref_merge(graph.clone(), commit_sha, window, cx)
+            });
+            menu = menu.entry("Create Detached Worktree", None, {
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    create_detached_worktree_for_commit(
+                        repository.clone(),
+                        workspace.clone(),
+                        commit_sha,
+                        window,
+                        cx,
+                    );
+                }
+            });
+            menu = menu.entry("Delete on Server…", None, {
+                let resolved_ref = resolved_ref.clone();
+                let repository = repository.clone();
+                let graph = graph.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    schedule_remote_branch_delete_on_server(
+                        &resolved_ref,
+                        repository.clone(),
+                        graph.clone(),
+                        workspace.clone(),
+                        window,
+                        cx,
+                    );
+                }
+            });
         } else {
-            // Remote / tag refs share the commit-target actions but never
-            // rename/delete/checkout the local branch namespace.
+            // Tags and other non-branch refs keep the commit-target actions;
+            // the remote branch actions above are remote-chip-specific.
             menu = menu.entry("Merge into Current", None, {
                 let graph = graph.clone();
                 move |window, cx| schedule_ref_merge(graph.clone(), commit_sha, window, cx)
@@ -868,6 +931,469 @@ fn schedule_ref_merge(
         cx,
     );
 }
+
+/// Splits a canonical `refs/remotes/<remote>/<branch>` ref into its remote and
+/// branch names. Returns `None` for malformed/empty refs (the caller then fails
+/// visibly rather than guessing at a remote).
+fn remote_ref_parts(ref_name: &str) -> Option<(String, String)> {
+    let stripped = ref_name.strip_prefix("refs/remotes/")?;
+    let (remote, branch) = stripped.split_once('/')?;
+    if remote.is_empty() || branch.is_empty() {
+        return None;
+    }
+    Some((remote.to_string(), branch.to_string()))
+}
+
+/// Acquires the ref-operation duplicate-dispatch guard from the graph. Returns
+/// the graph's weak handle when the guard was acquired (the caller MUST call
+/// `end_ref_operation` once the operation settles), or `None` when a ref
+/// operation is already in flight (the dispatch is suppressed) or the graph is
+/// gone.
+fn begin_graph_ref_operation(
+    graph: &Option<WeakEntity<GitGraph>>,
+    cx: &mut App,
+) -> Option<WeakEntity<GitGraph>> {
+    let graph = graph.as_ref().and_then(|graph| graph.upgrade())?;
+    if !graph.update(cx, |graph, _| graph.begin_ref_operation()) {
+        return None;
+    }
+    Some(graph.downgrade())
+}
+
+/// A compact destructive-confirmation modal naming exactly what will be
+/// destroyed. Distinct from the worktree-removal modal and reused for
+/// branch-server-delete and tag-delete confirmations, which must be worded
+/// differently and must never be implied by a generic "Delete".
+pub(crate) struct RefDestroyConfirmModal {
+    title: SharedString,
+    body: SharedString,
+    confirm_label: SharedString,
+    focus_handle: FocusHandle,
+    tx: Option<oneshot::Sender<bool>>,
+}
+
+impl EventEmitter<DismissEvent> for RefDestroyConfirmModal {}
+
+impl Focusable for RefDestroyConfirmModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl workspace::ModalView for RefDestroyConfirmModal {}
+
+impl Render for RefDestroyConfirmModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self.title.clone();
+        let body = self.body.clone();
+        let confirm_label = self.confirm_label.clone();
+
+        v_flex()
+            .key_context("RefDestroyConfirmModal")
+            .elevation_3(cx)
+            .p_4()
+            .gap_4()
+            .w(rems(30.))
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                this.cancel(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                this.confirm(window, cx);
+            }))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(Headline::new(title).size(HeadlineSize::Small))
+                    .child(Label::new(body).color(Color::Muted)),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(Button::new("cancel", "Cancel").on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.cancel(window, cx);
+                        },
+                    )))
+                    .child(
+                        Button::new("destroy", confirm_label.clone())
+                            .style(ButtonStyle::Filled)
+                            .color(Color::Error)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(window, cx);
+                            })),
+                    ),
+            )
+    }
+}
+
+impl RefDestroyConfirmModal {
+    fn confirm(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(true);
+        }
+        cx.emit(DismissEvent);
+    }
+
+    fn cancel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(false);
+        }
+        cx.emit(DismissEvent);
+    }
+}
+
+/// Opens the destructive-confirmation modal from inside an async flow and
+/// awaits the user's decision (or `false` if the workspace/graph is gone).
+/// Opens the destructive-confirmation modal from inside an async flow and
+/// returns a oneshot that yields the user's decision (`true` = confirmed,
+/// `false` = cancelled or the workspace/graph disappeared).
+/// Opens the destructive-confirmation modal from inside an async flow and
+/// returns a oneshot that yields the user's decision (`true` = confirmed,
+/// `false` = cancelled or the workspace/graph disappeared).
+fn open_destructive_confirmation(
+    workspace: &WeakEntity<Workspace>,
+    cx: &mut AsyncWindowContext,
+    title: SharedString,
+    body: SharedString,
+    confirm_label: SharedString,
+) -> oneshot::Receiver<bool> {
+    let (tx, rx) = oneshot::channel();
+    if let Some(workspace_entity) = workspace.upgrade() {
+        let _ = workspace_entity.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_modal(window, cx, |_window, cx| {
+                let focus_handle = cx.focus_handle();
+                RefDestroyConfirmModal {
+                    title: title.clone(),
+                    body: body.clone(),
+                    confirm_label: confirm_label.clone(),
+                    focus_handle,
+                    tx: Some(tx),
+                }
+            })
+        });
+    }
+    rx
+}
+
+/// Surfaces an actionable error toast from inside an async flow (e.g. expired
+/// repository, auth/network failure, or an unknown error).
+fn emit_error_async(
+    workspace: &WeakEntity<Workspace>,
+    cx: &mut AsyncWindowContext,
+    action: &str,
+    e: anyhow::Error,
+) {
+    if let Some(workspace_entity) = workspace.upgrade() {
+        let action = action.to_string();
+        let for_toast = workspace_entity.clone();
+        let _ = workspace_entity.update(cx, |_, app_cx| {
+            show_error_toast(for_toast, action, e, app_cx)
+        });
+    }
+}
+
+/// Surfaces a plain informational/success toast from inside an async flow.
+fn emit_toast(
+    workspace: &WeakEntity<Workspace>,
+    cx: &mut AsyncWindowContext,
+    message: impl Into<SharedString>,
+) {
+    let message = message.into();
+    if let Some(workspace_entity) = workspace.upgrade() {
+        let for_toast = workspace_entity.clone();
+        let _ = for_toast.update(cx, |workspace, app_cx| {
+            let status_toast =
+                StatusToast::new(message.clone(), app_cx, |this, _| this.dismiss_button(true));
+            workspace.toggle_status_toast(status_toast, app_cx);
+        });
+    }
+}
+
+/// Checkout of a clicked remote-tracking branch (`refs/remotes/<remote>/<b>`),
+/// locked to the exact clicked ref. If a local branch already tracks that exact
+/// upstream, switches to it; otherwise Zed proposes a local name and creates a
+/// tracking branch, never repointing an existing branch whose upstream differs
+/// or is absent (a same-name collision yields a distinct proposed name).
+fn schedule_remote_branch_checkout(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ref_name = resolved_ref.ref_name.as_ref().to_string();
+    let Some((remote, branch)) = remote_ref_parts(&ref_name) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "checkout remote branch",
+            anyhow!("Malformed remote branch ref {ref_name}"),
+        );
+        return;
+    };
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "checkout remote branch",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let scan = repository_entity
+                    .update(cx, |repository, _| repository.branches())
+                    .await
+                    .map_err(|e| anyhow!("branch scan cancelled: {e}"))??;
+
+                // 1. Exact tracker: a local branch whose upstream is this very
+                //    remote ref. Switching to it preserves existing tracking.
+                let target_upstream = format!("refs/remotes/{remote}/{branch}");
+                let exact_tracker = scan.branches.iter().find(|b| {
+                    !b.is_remote()
+                        && b.upstream
+                            .as_ref()
+                            .map(|u| u.ref_name.as_ref())
+                            == Some(target_upstream.as_str())
+                });
+                if let Some(tracker) = exact_tracker {
+                    let local_name = tracker.name().to_string();
+                    repository_entity
+                        .update(cx, |repository, _| repository.change_branch(local_name.clone()))
+                        .await
+                        .map_err(|e| anyhow!("checkout cancelled: {e}"))??;
+                    emit_toast(&workspace, cx, format!("Switched to \"{local_name}\""));
+                    return Ok(());
+                }
+
+                // 2. No exact tracker. Propose `<branch>` unless a local branch
+                //    of that name already exists (tracking something else or an
+                //    absent upstream) — then use a distinct collision-free
+                //    name. Never repoint the existing branch.
+                let local_names: std::collections::HashSet<String> = scan
+                    .branches
+                    .iter()
+                    .filter(|b| !b.is_remote())
+                    .map(|b| b.name().to_string())
+                    .collect();
+                let mut proposed = branch.clone();
+                let mut suffix = 2;
+                while local_names.contains(&proposed) {
+                    proposed = format!("{branch}-{suffix}");
+                    suffix += 1;
+                }
+                // Creating a local branch from the remote-tracking ref sets up
+                // exact upstream tracking and checks it out.
+                repository_entity
+                    .update(cx, |repository, _| {
+                        repository.create_branch(proposed.clone(), Some(target_upstream.clone()))
+                    })
+                    .await
+                    .map_err(|e| anyhow!("create branch cancelled: {e}"))??;
+                emit_toast(
+                    &workspace,
+                    cx,
+                    format!("Checked out \"{proposed}\" tracking {remote}/{branch}"),
+                );
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph remote branch checkout failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
+/// Collects the configured remote names for the repository.
+async fn configured_remote_names(
+    repository_entity: &Entity<Repository>,
+    cx: &mut AsyncWindowContext,
+) -> anyhow::Result<Vec<SharedString>> {
+    let remotes = repository_entity
+        .update(cx, |repository, _| repository.get_remotes(None, true))
+        .await
+        .map_err(|e| anyhow!("get remotes cancelled: {e}"))??;
+    Ok(remotes.into_iter().map(|r| r.name).collect())
+}
+
+/// Explicitly prompts the user to pick a configured remote, even when only one
+/// exists. Returns `None` when there are no remotes or the selection is
+/// cancelled.
+async fn select_remote_explicit(
+    repository_entity: &Entity<Repository>,
+    workspace: WeakEntity<Workspace>,
+    window_handle: AnyWindowHandle,
+    cx: &mut AsyncWindowContext,
+    prompt: &str,
+) -> anyhow::Result<Option<Remote>> {
+    let names = configured_remote_names(repository_entity, cx).await?;
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let selection = window_handle
+        .update(cx, |_, window, app_cx| {
+            crate::picker_prompt::prompt_explicit(prompt, names.clone(), workspace, window, app_cx)
+        })
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(selection
+        .await
+        .map(|index| Remote {
+            name: names[index].clone(),
+        }))
+}
+
+fn remote_delete_summary(remote: &str, stderr: String) -> String {
+    let detail = if stderr.trim().is_empty() {
+        "deleted".to_string()
+    } else {
+        stderr.trim().to_string()
+    };
+    format!("{remote}: {detail}")
+}
+
+/// Builds an [`AskPassDelegate`] wired to the `AskPassModal`, reusing Zed's
+/// existing AskPass seam. Constructed in the synchronous flow (where a live
+/// `&mut App` is available) and moved into the async operation.
+fn askpass_delegate(
+    workspace: &WeakEntity<Workspace>,
+    window_handle: AnyWindowHandle,
+    cx: &mut App,
+    operation: &str,
+) -> AskPassDelegate {
+    let workspace = workspace.clone();
+    let operation: SharedString = operation.to_string().into();
+    AskPassDelegate::new(&mut cx.to_async(), move |prompt, tx, cx| {
+        let workspace = workspace.clone();
+        let operation = operation.clone();
+        window_handle
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        AskPassModal::new(operation.clone(), prompt.into(), tx, window, cx)
+                    });
+                })
+            })
+            .ok();
+    })
+}
+
+/// Deletes the clicked remote-tracking branch on its server remote via an
+/// explicit `git push <remote> --delete refs/heads/<branch>` — never a local-only
+/// remote-tracking deletion. Requires a destructive confirmation naming the
+/// remote and branch; clears the pending guard on success, cancellation,
+/// expired repository, and any error.
+fn schedule_remote_branch_delete_on_server(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ref_name = resolved_ref.ref_name.as_ref().to_string();
+    let Some((remote, branch)) = remote_ref_parts(&ref_name) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "delete remote branch",
+            anyhow!("Malformed remote branch ref {ref_name}"),
+        );
+        return;
+    };
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "delete remote branch",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    let window_handle = window.window_handle();
+    let askpass = askpass_delegate(&workspace, window_handle, cx, "git push");
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let confirmed = open_destructive_confirmation(
+                    &workspace,
+                    cx,
+                    "Delete Branch on Remote".into(),
+                    format!(
+                        "Delete branch \"{branch}\" on remote \"{remote}\"? This removes it on the server and cannot be undone."
+                    )
+                    .into(),
+                    format!("Delete {remote}/{branch}").into(),
+                )
+                .await
+                .unwrap_or(false);
+                if !confirmed {
+                    // Cancellation clears pending state without dispatch.
+                    return Ok(());
+                }
+                let remote_name =
+                    match select_remote_explicit(
+                        &repository_entity,
+                        workspace.clone(),
+                        window_handle,
+                        cx,
+                        "Pick which remote to delete the branch from",
+                    )
+                    .await?
+                    {
+                        Some(remote) => remote.name,
+                        None => {
+                            // Zero remotes: informational, no dispatch.
+                            emit_toast(
+                                &workspace,
+                                cx,
+                                format!("No configured remote to delete {branch} from."),
+                            );
+                            return Ok(());
+                        }
+                    };
+                let output = repository_entity
+                    .update(cx, |repository, cx| {
+                        repository.delete_refs_on_remote(
+                            remote_name.clone(),
+                            vec![format!("refs/heads/{branch}")],
+                            askpass,
+                            cx,
+                        )
+                    })
+                    .await
+                    .map_err(|e| anyhow!("remote delete cancelled: {e}"))?;
+                let output = output?;
+                emit_toast(&workspace, cx, remote_delete_summary(&remote_name, output.stderr));
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph remote branch delete failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
 
 /// Opens the single shared prefill renaming modal for the exact canonical
 /// branch captured by the chip. Cancellation dispatches nothing and retains

@@ -991,6 +991,9 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_create_remote);
         client.add_entity_request_handler(Self::handle_remove_remote);
         client.add_entity_request_handler(Self::handle_delete_branch);
+        client.add_entity_request_handler(Self::handle_delete_tag);
+        client.add_entity_request_handler(Self::handle_tag_details);
+        client.add_entity_request_handler(Self::handle_delete_refs_on_remote);
         client.add_entity_request_handler(Self::handle_git_init);
         client.add_entity_request_handler(Self::handle_push);
         client.add_entity_request_handler(Self::handle_pull);
@@ -4325,6 +4328,74 @@ impl GitStore {
         Ok(proto::Ack {})
     }
 
+    async fn handle_delete_tag(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitDeleteTag>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+
+        repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.delete_tag(envelope.payload.name, cx)
+            })
+            .await??;
+
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_tag_details(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitTagDetails>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitTagDetailsResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+
+        let details = repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.tag_details(envelope.payload.ref_name, cx)
+            })
+            .await??;
+
+        Ok(tag_details_to_proto(details))
+    }
+
+    async fn handle_delete_refs_on_remote(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitDeleteRefsOnRemote>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::RemoteMessageResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+
+        let askpass_id = envelope.payload.askpass_id;
+        let askpass = make_remote_delegate(
+            this,
+            envelope.payload.project_id,
+            repository_id,
+            askpass_id,
+            &mut cx,
+        );
+
+        let remote_output = repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.delete_refs_on_remote(
+                    envelope.payload.remote_name.into(),
+                    envelope.payload.refs,
+                    askpass,
+                    cx,
+                )
+            })
+            .await??;
+
+        Ok(proto::RemoteMessageResponse {
+            stdout: remote_output.stdout,
+            stderr: remote_output.stderr,
+        })
+    }
+
     async fn handle_remove_remote(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::GitRemoveRemote>,
@@ -7325,6 +7396,62 @@ impl Repository {
         self.finish_graph_mutation(receiver, cx)
     }
 
+    /// Deletes the local tag `name` (`git tag -d`). Dispatches to the local or
+    /// remote-project backend and refreshes the graph on success.
+    pub fn delete_tag(
+        &mut self,
+        name: String,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        let receiver = self.send_job("delete_tag", None, move |git_repo, _| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.delete_tag(name).await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    client
+                        .request(proto::GitDeleteTag {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            name,
+                        })
+                        .await?;
+                    Ok(())
+                }
+            }
+        });
+        self.finish_graph_mutation(receiver, cx)
+    }
+
+    /// Reads structured metadata about the tag at the canonical
+    /// `refs/tags/<name>` ref (lightweight vs annotated distinction, tagger
+    /// metadata, message). Read-only; does not refresh the graph.
+    pub fn tag_details(
+        &mut self,
+        ref_name: String,
+        _cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<git::repository::TagDetails>> {
+        let id = self.id;
+        self.send_job("tag_details", None, move |git_repo, _| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.tag_details(ref_name).await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let response: proto::GitTagDetailsResponse = client
+                        .request(proto::GitTagDetails {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            ref_name,
+                        })
+                        .await?;
+                    Ok(tag_details_from_proto(response))
+                }
+            }
+        })
+    }
+
     pub fn cherry_pick(
         &mut self,
         commits: Vec<String>,
@@ -9228,6 +9355,65 @@ impl Repository {
                             })
                             .await?;
 
+                        Ok(RemoteCommandOutput {
+                            stdout: response.stdout,
+                            stderr: response.stderr,
+                        })
+                    }
+                }
+            },
+        )
+    }
+
+    /// Explicitly deletes the given fully-qualified refs on the remote server
+    /// (`git push <remote> --delete <ref>…`). Never deletes the local
+    /// remote-tracking refs. Dispatches to the local or remote-project backend.
+    pub fn delete_refs_on_remote(
+        &mut self,
+        remote: SharedString,
+        refs: Vec<String>,
+        askpass: AskPassDelegate,
+        _cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<RemoteCommandOutput>> {
+        let askpass_delegates = self.askpass_delegates.clone();
+        let askpass_id = util::post_inc(&mut self.latest_askpass_id);
+        let id = self.id;
+
+        let status = format!("git push {} --delete ({} refs)", remote, refs.len()).into();
+        self.send_job(
+            "delete_refs_on_remote",
+            Some(status),
+            move |git_repo, cx| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend
+                        .delete_refs_on_remote(
+                            remote.to_string(),
+                            refs,
+                            askpass,
+                            environment,
+                            cx,
+                        )
+                        .await,
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        askpass_delegates.lock().insert(askpass_id, askpass);
+                        let _defer = util::defer(|| {
+                            let askpass_delegate =
+                                askpass_delegates.lock().remove(&askpass_id);
+                            debug_assert!(askpass_delegate.is_some());
+                        });
+                        let response = client
+                            .request(proto::GitDeleteRefsOnRemote {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                askpass_id,
+                                remote_name: remote.to_string(),
+                                refs,
+                            })
+                            .await?;
                         Ok(RemoteCommandOutput {
                             stdout: response.stdout,
                             stderr: response.stderr,
@@ -11752,6 +11938,70 @@ fn branch_to_proto(branch: &git::repository::Branch) -> proto::Branch {
                 commit_timestamp: commit.commit_timestamp,
                 author_name: commit.author_name.to_string(),
             }),
+    }
+}
+
+fn tag_details_to_proto(details: git::repository::TagDetails) -> proto::GitTagDetailsResponse {
+    let object_type = tag_object_type_to_proto(details.object_type) as i32;
+    proto::GitTagDetailsResponse {
+        ref_name: details.ref_name.to_string(),
+        name: details.name.to_string(),
+        target_oid: details.target_oid.to_string(),
+        object_type,
+        tagger: details.tagger.map(|tagger| {
+            proto::git_tag_details_response::TagTagger {
+                name: tagger.name.to_string(),
+                email: tagger.email.to_string(),
+                time: tagger.time,
+            }
+        }),
+        message: details.message,
+    }
+}
+
+fn tag_object_type_to_proto(
+    object_type: git::repository::TagObjectType,
+) -> proto::git_tag_details_response::TagObjectType {
+    match object_type {
+        git::repository::TagObjectType::Commit => {
+            proto::git_tag_details_response::TagObjectType::Commit
+        }
+        git::repository::TagObjectType::Tag => proto::git_tag_details_response::TagObjectType::Tag,
+        git::repository::TagObjectType::Tree => {
+            proto::git_tag_details_response::TagObjectType::Tree
+        }
+        git::repository::TagObjectType::Blob => {
+            proto::git_tag_details_response::TagObjectType::Blob
+        }
+    }
+}
+
+fn tag_details_from_proto(response: proto::GitTagDetailsResponse) -> git::repository::TagDetails {
+    let object_type = match response.object_type {
+        x if x == proto::git_tag_details_response::TagObjectType::Tag as i32 => {
+            git::repository::TagObjectType::Tag
+        }
+        x if x == proto::git_tag_details_response::TagObjectType::Tree as i32 => {
+            git::repository::TagObjectType::Tree
+        }
+        x if x == proto::git_tag_details_response::TagObjectType::Blob as i32 => {
+            git::repository::TagObjectType::Blob
+        }
+        _ => git::repository::TagObjectType::Commit,
+    };
+    git::repository::TagDetails {
+        ref_name: response.ref_name.into(),
+        name: response.name.into(),
+        target_oid: Oid::try_from(response.target_oid.as_str()).unwrap_or_else(|_| Oid::default()),
+        object_type,
+        tagger: response.tagger.map(|tagger| {
+            git::repository::TagTagger {
+                name: tagger.name.into(),
+                email: tagger.email.into(),
+                time: tagger.time,
+            }
+        }),
+        message: response.message,
     }
 }
 

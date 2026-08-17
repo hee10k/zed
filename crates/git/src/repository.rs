@@ -518,6 +518,49 @@ impl RemoteCommandOutput {
     }
 }
 
+/// The object type a Git tag ultimately points at (after peeling a chain of
+/// annotated tag objects). Used by tag details to distinguish a lightweight tag
+/// (points directly at a commit/tree/blob) from an annotated tag (a `tag`
+/// object carrying tagger metadata and a message).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TagObjectType {
+    Commit,
+    Tag,
+    Tree,
+    Blob,
+}
+
+/// Structured metadata about a single Git tag, resolved from its canonical
+/// `refs/tags/<name>` ref. Individual fields are parsed from Git's own output
+/// (via `git cat-file`), not by splitting on a custom delimiter, so an
+/// annotated-tag message containing arbitrary bytes is returned verbatim.
+#[derive(Clone, Debug)]
+pub struct TagDetails {
+    /// The canonical fully-qualified tag ref (`refs/tags/<name>`).
+    pub ref_name: SharedString,
+    /// The display-shortened tag name.
+    pub name: SharedString,
+    /// The OID the tag points at — the peeled target object (`^{}`) for an
+    /// annotated tag, or the direct target for a lightweight tag.
+    pub target_oid: Oid,
+    /// The type of the ultimate target object. `TagObjectType::Tag` is only
+    /// returned when the tag points at another tag (a nested annotated tag);
+    /// ordinary annotated tags peel to `Commit`/`Tree`/`Blob`.
+    pub object_type: TagObjectType,
+    /// Tagger metadata, present only for annotated tags.
+    pub tagger: Option<TagTagger>,
+    /// The tag message, present only for annotated tags.
+    pub message: Option<String>,
+}
+
+/// Author/tagger identity plus signature timestamp from an annotated tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagTagger {
+    pub name: SharedString,
+    pub email: SharedString,
+    pub time: i64,
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct UpstreamTrackingStatus {
     pub ahead: u32,
@@ -1229,6 +1272,30 @@ pub trait GitRepository: Send + Sync {
     fn delete_ref(&self, ref_name: String) -> BoxFuture<'_, Result<()>>;
 
     fn repair_worktrees(&self) -> BoxFuture<'_, Result<()>>;
+
+    /// Deletes the given fully-qualified refs on the given remote by issuing an
+    /// explicit remote push deletion (`git push <remote> --delete <ref>…`).
+    /// This mutates the remote's refs on the server — it never touches the
+    /// local remote-tracking namespace by itself. Each ref is passed as its own
+    /// argument so bridges/tag names containing unusual characters are never
+    /// interpreted by a shell.
+    fn delete_refs_on_remote(
+        &self,
+        remote_name: String,
+        refs: Vec<String>,
+        askpass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<RemoteCommandOutput>>;
+
+    /// Deletes the local tag `name` (`git tag -d <name>`). Only deletes a tag
+    /// ref in `refs/tags/`; never a branch.
+    fn delete_tag(&self, name: String) -> BoxFuture<'_, Result<()>>;
+
+    /// Reads structured metadata about the tag at the canonical
+    /// `refs/tags/<name>` ref, distinguishing lightweight from annotated tags
+    /// via `git cat-file` (not a custom delimiter).
+    fn tag_details(&self, ref_name: String) -> BoxFuture<'_, Result<TagDetails>>;
 
     fn set_trusted(&self, trusted: bool);
     fn is_trusted(&self) -> bool;
@@ -3262,6 +3329,135 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn delete_refs_on_remote(
+        &self,
+        remote_name: String,
+        refs: Vec<String>,
+        ask_pass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<RemoteCommandOutput>> {
+        let working_directory = self.command_directory();
+        let git_directory = self.path();
+        let executor = cx.background_executor().clone();
+        let git_binary_path = self.system_git_binary_path.clone();
+        let is_trusted = self.is_trusted();
+        // Note: Do not spawn this command on the background thread, it might pop open the credential helper
+        // which we want to block on.
+        async move {
+            let git_binary_path = git_binary_path.context("git not found on $PATH, can't delete refs on remote")?;
+            if refs.is_empty() {
+                anyhow::bail!("no refs provided to delete on remote {remote_name}");
+            }
+            let git = GitBinary::new(
+                git_binary_path,
+                working_directory,
+                git_directory,
+                executor.clone(),
+                is_trusted,
+            );
+            // `git push <remote> --delete <ref>…` — an explicit deletion on the
+            // server. Each ref is its own argument so unusual ref names are
+            // never shell-interpreted.
+            let mut command = git.build_command(&["push"]);
+            command.envs(env.iter()).arg(&remote_name).arg("--delete");
+            for ref_name in &refs {
+                command.arg(ref_name);
+            }
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            run_git_command(env, ask_pass, command, executor).await
+        }
+        .boxed()
+    }
+
+    fn delete_tag(&self, name: String) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                // `git tag -d <name>` refuses to delete a non-tag ref. The name
+                // is passed as its own argument so a tag containing an unusual
+                // but valid character (e.g. a slash) is never split.
+                if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+                    anyhow::bail!("invalid tag name {name:?}");
+                }
+                git.run(&["tag", "-d", &name]).await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn tag_details(&self, ref_name: String) -> BoxFuture<'_, Result<TagDetails>> {
+        let git = self.git_binary();
+        self.executor.spawn(async move {
+            if ref_name.is_empty() {
+                anyhow::bail!("empty tag ref");
+            }
+            // The display-shortened name is the bit after `refs/tags/`.
+            let name = ref_name
+                .strip_prefix("refs/tags/")
+                .context("tag details require a refs/tags/ ref")?
+                .to_string();
+            if name.is_empty() || name == "." || name == ".." {
+                anyhow::bail!("invalid tag name {name:?}");
+            }
+
+            // `git cat-file -t` reports whether the ref points at a `tag`
+            // object (annotated) or directly at a commit/tree/blob
+            // (lightweight). This is Git's own classification, not a custom
+            // delimiter parse, so it cannot be fooled by tag message content.
+            let raw_type = git.run(&["cat-file", "-t", ref_name.as_str()]).await?.trim().to_string();
+            let is_annotated = raw_type == "tag";
+
+            // The ultimate non-tag target the tag points at (works for both
+            // lightweight and annotated tags since `^{}` peels and a
+            // commit/tree/blob peels to itself).
+            let peeled_arg = format!("{ref_name}^{{}}");
+            let target_oid = Oid::try_from(
+                git.run(&["rev-parse", "--verify", peeled_arg.as_str()])
+                    .await?
+                    .trim(),
+            )
+            .context("failed to parse tag target oid")?;
+
+            if !is_annotated {
+                return Ok(TagDetails {
+                    ref_name: ref_name.clone().into(),
+                    name: name.into(),
+                    target_oid,
+                    object_type: tag_object_type(&raw_type)?,
+                    tagger: None,
+                    message: None,
+                });
+            }
+
+            // Annotated: the tag object body carries tagger metadata and a
+            // message, both parsed unambiguously off a single blank-line
+            // delimiter that separates the fixed header block from the message.
+            let tag_body = git.run(&["cat-file", "-p", ref_name.as_str()]).await?;
+            let (tagger, message) = parse_tag_body(&tag_body);
+            let target_oid_str = target_oid.to_string();
+            let object_type = tag_object_type(
+                &git.run(&["cat-file", "-t", target_oid_str.as_str()])
+                    .await?
+                    .trim()
+                    .to_string(),
+            )?;
+            Ok(TagDetails {
+                ref_name: ref_name.clone().into(),
+                name: name.into(),
+                target_oid,
+                object_type,
+                tagger,
+                message,
+            })
+        })
+        .boxed()
+    }
+
     fn push(
         &self,
         branch_name: String,
@@ -4475,6 +4671,70 @@ struct GitBinaryCommandError {
     stdout: String,
     stderr: String,
     status: ExitStatus,
+}
+
+/// Maps a `git cat-file -t` object-type string to its typed equivalent.
+fn tag_object_type(raw: &str) -> Result<TagObjectType> {
+    match raw {
+        "commit" => Ok(TagObjectType::Commit),
+        "tag" => Ok(TagObjectType::Tag),
+        "tree" => Ok(TagObjectType::Tree),
+        "blob" => Ok(TagObjectType::Blob),
+        other => anyhow::bail!("unexpected tag object type {other:?}"),
+    }
+}
+
+/// Parses the tagger metadata and message out of an annotated tag object body
+/// (`git cat-file -p` output). An annotated tag body has a fixed, ordered
+/// header block (`object`, `type`, `tag`, `tagger`) terminated by a single
+/// blank line, after which the message runs to the end of the body. The blank
+/// line is the only delimiter relied on, so a message containing arbitrary
+/// lines or any other text is preserved verbatim (no scanning for keywords or
+/// custom delimiters inside the message).
+///
+/// Returns `(tagger, message)`; both are `None` when the corresponding part is
+/// absent.
+fn parse_tag_body(body: &str) -> (Option<TagTagger>, Option<String>) {
+    let (header_block, message) = match body.split_once("\n\n") {
+        Some((header, message)) => (header, Some(message.trim_end().to_string())),
+        None => (body, None),
+    };
+
+    let tagger = header_block
+        .lines()
+        .find_map(|line| line.strip_prefix("tagger "))
+        .map(parse_tagger_line);
+
+    (tagger, message)
+}
+
+/// Parses a `tagger Name <email> <unixtime> <tz>` header line. The tagger line
+/// format is fixed by Git, so the name is everything before the first ` <` and
+/// the rest is `<email> <time> [<tz>]`.
+fn parse_tagger_line(line: &str) -> TagTagger {
+    let (name, rest) = match line.find(" <") {
+        Some(idx) => (&line[..idx], &line[idx + 1..]),
+        None => (line, ""),
+    };
+    let email = rest
+        .trim_start_matches('<')
+        .split('>')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    // After `<email> ` comes the unix timestamp (optionally followed by a
+    // timezone offset that Git accepts but does not require).
+    let time = rest
+        .split('>')
+        .nth(1)
+        .and_then(|after| after.trim().split_whitespace().next())
+        .and_then(|ts| ts.parse::<i64>().ok())
+        .unwrap_or(0);
+    TagTagger {
+        name: name.trim().into(),
+        email: email.into(),
+        time,
+    }
 }
 
 async fn run_git_command(
@@ -7262,6 +7522,162 @@ mod tests {
         assert_eq!(
             git_command_output(repo_dir.path(), ["cat-file", "-t", "annotated"]),
             "tag"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_tag_details_distinguishes_lightweight_from_annotated(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let target = graph_mutation_commit(repo_dir.path(), "file.txt", "one", "one");
+        let repo = graph_mutation_repository(repo_dir.path(), cx);
+
+        repo.create_tag(
+            CreateTagOptions {
+                name: "annotated".into(),
+                target: target.clone(),
+                message: Some("release notes\nsecond line".into()),
+            },
+            graph_mutation_env(),
+        )
+        .await
+        .unwrap();
+        repo.create_tag(
+            CreateTagOptions {
+                name: "lightweight".into(),
+                target: target.clone(),
+                message: None,
+            },
+            graph_mutation_env(),
+        )
+        .await
+        .unwrap();
+
+        // Annotated tag carries tagger metadata + full message; the target
+        // OID peels to the tagged commit.
+        let annotated = repo
+            .tag_details("refs/tags/annotated".into())
+            .await
+            .unwrap();
+        assert_eq!(annotated.name.as_ref(), "annotated");
+        assert_eq!(annotated.ref_name.as_ref(), "refs/tags/annotated");
+        assert_eq!(annotated.target_oid.to_string(), target);
+        assert_eq!(annotated.object_type, TagObjectType::Commit);
+        assert!(annotated.tagger.is_some(), "annotated tag should have a tagger");
+        assert_eq!(
+            annotated.message.as_deref(),
+            Some("release notes\nsecond line")
+        );
+
+        // Lightweight tag: no tagger, no message, same target.
+        let lightweight = repo
+            .tag_details("refs/tags/lightweight".into())
+            .await
+            .unwrap();
+        assert_eq!(lightweight.object_type, TagObjectType::Commit);
+        assert_eq!(lightweight.target_oid.to_string(), target);
+        assert_eq!(lightweight.tagger, None);
+        assert_eq!(lightweight.message, None);
+    }
+
+    #[gpui::test]
+    async fn test_delete_local_tag(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let target = graph_mutation_commit(repo_dir.path(), "file.txt", "one", "one");
+        let repo = graph_mutation_repository(repo_dir.path(), cx);
+        repo.create_tag(
+            CreateTagOptions {
+                name: "v1".into(),
+                target: target.clone(),
+                message: None,
+            },
+            graph_mutation_env(),
+        )
+        .await
+        .unwrap();
+
+        repo.delete_tag("v1".into()).await.unwrap();
+
+        // The tag ref no longer resolves (git_command_output panics on a
+        // failing rev-parse, so use the git crate path through the repo).
+        let gone = repo.delete_tag("v1".into()).await.unwrap_err();
+        assert!(gone.to_string().contains("error"), "{gone:?}");
+    }
+
+    #[gpui::test]
+    async fn test_delete_refs_on_remote_performs_server_deletion(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote_dir = temp_dir.path().join("remote.git");
+
+        // Bare remote so we can verify the server-side ref table.
+        git_command(
+            temp_dir.path(),
+            [
+                OsString::from("init"),
+                OsString::from("--bare"),
+                OsString::from("-b"),
+                OsString::from("main"),
+                remote_dir.as_os_str().into(),
+            ],
+        );
+
+        git_init_repo(&temp_dir.path().join("seed"));
+        let seed = temp_dir.path().join("seed");
+        fs::write(seed.join("file.txt"), "main").unwrap();
+        git_command(&seed, ["add", "file.txt"]);
+        git_command(&seed, ["commit", "-m", "initial"]);
+        git_command(
+            &seed,
+            [
+                OsString::from("remote"),
+                OsString::from("add"),
+                OsString::from("origin"),
+                remote_dir.as_os_str().into(),
+            ],
+        );
+        git_command(&seed, ["push", "-u", "origin", "main"]);
+
+        // Bare remotes refuse to delete their checked-out (HEAD) branch by
+        // default, so relax that guard to exercise the actual server deletion.
+        git_command(&remote_dir, ["config", "receive.denyDeleteCurrent", "ignore"]);
+
+        // Confirm the branch exists on the server before deletion.
+        assert!(
+            git_command_output(
+                &remote_dir,
+                ["for-each-ref", "--format=%(refname)", "refs/heads"],
+            )
+            .contains("refs/heads/main"),
+        );
+
+        let repo = graph_mutation_repository(&seed, cx);
+        let mut async_cx = cx.to_async();
+        let askpass = AskPassDelegate::new(&mut async_cx, |_prompt, _tx, _cx| {});
+
+        // Server deletion explicitly pushes a deletion of refs/heads/main on
+        // origin — it must not leave the local remote-tracking ref behind.
+        repo.delete_refs_on_remote(
+            "origin".into(),
+            vec!["refs/heads/main".into()],
+            askpass,
+            graph_mutation_env(),
+            cx.to_async(),
+        )
+        .await
+        .unwrap();
+
+        let remaining =
+            git_command_output(&remote_dir, ["for-each-ref", "--format=%(refname)", "refs/heads"]);
+        assert!(
+            !remaining.contains("refs/heads/main"),
+            "refs/heads/main should be deleted on the server, got {remaining:?}"
         );
     }
 

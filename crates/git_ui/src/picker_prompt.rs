@@ -48,6 +48,38 @@ pub fn prompt(
     })
 }
 
+/// Like [`prompt`], but always shows the picker so the user makes an explicit
+/// selection — a single option is NOT auto-selected. Used for destructive or
+/// irreversible remote operations where silently picking the only remote would
+/// skip the user's confirmation. Returns `None` when there are no options.
+pub fn prompt_explicit(
+    prompt: &str,
+    options: Vec<SharedString>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Option<usize>> {
+    if options.is_empty() {
+        return Task::ready(None);
+    }
+    let prompt = prompt.to_string().into();
+
+    window.spawn(cx, async move |cx| {
+        let (tx, rx) = oneshot::channel();
+        let delegate = PickerPromptDelegate::new(prompt, options, tx, 70);
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    PickerPrompt::new(delegate, 34., window, cx)
+                })
+            })
+            .ok();
+
+        (rx.await).ok()
+    })
+}
+
 impl PickerPrompt {
     fn new(
         delegate: PickerPromptDelegate,

@@ -275,6 +275,18 @@ impl Oid {
     }
 }
 
+impl Default for Oid {
+    fn default() -> Self {
+        // A zero SHA-1 OID, a valid all-zero object id (never resolves to a
+        // real object). Used as a fallback when a remote payload omits or
+        // corrupts a target id.
+        Self {
+            bytes: [0u8; SHA256_BYTE_LENGTH],
+            format: OidFormat::Sha1,
+        }
+    }
+}
+
 impl TryFrom<&str> for Oid {
     type Error = anyhow::Error;
 

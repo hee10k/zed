@@ -8464,8 +8464,8 @@ mod tests {
         let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
         cx.run_until_parked();
 
-        // A remote chip is typed to the remote ref and never shows the
-        // local-only actions.
+        // A remote chip is typed to the remote ref: it gains the remote actions
+        // (Checkout, Delete on Server) but never the local-only ones.
         deploy_ref_menu(
             &git_graph,
             ResolvedRef {
@@ -8477,18 +8477,21 @@ mod tests {
         );
         let remote_labels = ref_menu_labels(&git_graph, cx);
         assert!(
-            !remote_labels.iter().any(|label| label == "Checkout")
-                && !remote_labels.iter().any(|label| label == "Rename…")
+            !remote_labels.iter().any(|label| label == "Rename…")
                 && !remote_labels.iter().any(|label| label == "Delete…"),
-            "remote chip should not offer local-only actions, got {remote_labels:?}"
+            "remote chip should not offer local-only rename/delete, got {remote_labels:?}"
         );
         assert!(
-            remote_labels.iter().any(|label| label == "Merge into Current")
+            remote_labels.iter().any(|label| label == "Checkout")
+                && remote_labels.iter().any(|label| label == "Delete on Server…")
+                && remote_labels.iter().any(|label| label == "Merge into Current")
+                && remote_labels.iter().any(|label| label == "Create Detached Worktree")
                 && remote_labels.iter().any(|label| label == "Copy Name"),
-            "remote chip should offer merge + copy, got {remote_labels:?}"
+            "remote chip should offer checkout/delete-on-server/merge/create/copy, got {remote_labels:?}"
         );
 
-        // Tag chip similarly typed.
+        // Tag chip: remains a commit-target chip (no remote/local branch
+        // actions) until the tag-lifecycle ticket lands.
         deploy_ref_menu(
             &git_graph,
             ResolvedRef {
@@ -8501,12 +8504,14 @@ mod tests {
         let tag_labels = ref_menu_labels(&git_graph, cx);
         assert!(
             !tag_labels.iter().any(|label| label == "Checkout")
-                && !tag_labels.iter().any(|label| label == "Delete…"),
-            "tag chip should not offer checkout/delete, got {tag_labels:?}"
+                && !tag_labels.iter().any(|label| label == "Delete…")
+                && !tag_labels.iter().any(|label| label == "Delete on Server…"),
+            "tag chip should not offer branch/remote actions, got {tag_labels:?}"
         );
         assert!(
-            tag_labels.iter().any(|label| label == "Copy Name"),
-            "tag chip should offer Copy Name, got {tag_labels:?}"
+            tag_labels.iter().any(|label| label == "Merge into Current")
+                && tag_labels.iter().any(|label| label == "Copy Name"),
+            "tag chip should keep commit-target actions, got {tag_labels:?}"
         );
     }
 
@@ -8888,6 +8893,96 @@ mod tests {
 
         let copied = cx.read_from_clipboard().and_then(|item| item.text());
         assert_eq!(copied.as_deref(), Some("origin/main"));
+    }
+
+    #[gpui::test]
+    async fn test_ref_remote_checkout_reuses_exact_tracker(cx: &mut TestAppContext) {
+        let (fs, project, repository, _head_sha) = seed_ref_menu_repo(cx).await;
+        // A local `feature` already tracks `refs/remotes/origin/main`: checking
+        // out `origin/main` must switch to that exact tracker, never create a
+        // new branch.
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state
+                .branch_upstreams
+                .insert("feature".into(), "refs/remotes/origin/main".into());
+        })
+        .unwrap();
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/remotes/origin/main".into(),
+                display_name: "origin/main".into(),
+                kind: RefKind::RemoteBranch,
+            },
+            cx,
+        );
+        select_and_confirm_menu_entry(&git_graph, "Checkout", cx);
+
+        let current = fs
+            .with_git_state(Path::new("/project/.git"), false, |state| {
+                state.current_branch_name.clone()
+            })
+            .unwrap();
+        assert_eq!(current.as_deref(), Some("feature"));
+        let branches = fs
+            .with_git_state(Path::new("/project/.git"), false, |state| state.branches.clone())
+            .unwrap();
+        assert!(
+            !branches.iter().any(|b| b.starts_with("main-")),
+            "exact-tracker checkout must switch (not create), got {branches:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_remote_checkout_uses_distinct_name_on_collision(cx: &mut TestAppContext) {
+        let (fs, project, repository, _head_sha) = seed_ref_menu_repo(cx).await;
+        // No local branch tracks `origin/main`, and `main` (a same-name local
+        // collision whose upstream is absent/different) must never be repointed:
+        // Zed proposes a distinct local name instead.
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/remotes/origin/main".into(),
+                display_name: "origin/main".into(),
+                kind: RefKind::RemoteBranch,
+            },
+            cx,
+        );
+        select_and_confirm_menu_entry(&git_graph, "Checkout", cx);
+
+        let branches = fs
+            .with_git_state(Path::new("/project/.git"), false, |state| {
+                let branches = state.branches.clone();
+                (branches, state.branch_upstreams.clone())
+            })
+            .unwrap();
+        assert!(
+            branches.0.contains("main-2"),
+            "collision should produce a distinct local name, got {:?}",
+            branches.0
+        );
+        assert!(
+            branches.0.contains("main"),
+            "the pre-existing 'main' branch must not be repointed/removed, got {:?}",
+            branches.0
+        );
     }
 
     #[gpui::test]

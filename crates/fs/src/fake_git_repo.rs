@@ -74,6 +74,14 @@ pub enum FakeGitMutation {
         operation: GitOperationKind,
         action: GitOperationAction,
     },
+    /// An explicit remote push deletion (`git push <remote> --delete <ref>…`).
+    /// `refs` are the fully-qualified refs deleted on the remote server.
+    DeleteRefsOnRemote {
+        remote_name: String,
+        refs: Vec<String>,
+    },
+    /// A local tag deletion (`git tag -d <name>`).
+    DeleteTag(String),
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +118,16 @@ pub struct FakeGitRepositoryState {
     pub commit_template: Option<GitCommitTemplate>,
     pub graph_mutations: Vec<FakeGitMutation>,
     pub active_operation: Option<GitOperationKind>,
+    /// Records explicit remote push deletions as `(remote_name, ref)` pairs,
+    /// mirroring what `git push <remote> --delete <ref>` would do on the server.
+    pub remote_deleted_refs: Vec<(String, String)>,
+    /// Canned tag details keyed by the canonical `refs/tags/<name>` ref; when
+    /// absent, `tag_details` synthesizes a lightweight entry from `refs`.
+    pub tag_details: HashMap<String, git::repository::TagDetails>,
+    /// Maps a local branch name to the upstream ref it tracks (e.g.
+    /// `feature -> refs/remotes/origin/feature`). Drive for exact-tracker remote
+    /// checkout resolution.
+    pub branch_upstreams: HashMap<String, String>,
 }
 
 impl FakeGitRepositoryState {
@@ -139,6 +157,9 @@ impl FakeGitRepositoryState {
             commit_template: None,
             graph_mutations: Vec::new(),
             active_operation: None,
+            remote_deleted_refs: Vec::new(),
+            tag_details: Default::default(),
+            branch_upstreams: Default::default(),
         }
     }
 }
@@ -766,11 +787,23 @@ impl GitRepository for FakeGitRepository {
                     } else {
                         format!("refs/heads/{branch_name}").into()
                     };
+                    let upstream = state
+                        .branch_upstreams
+                        .get(branch_name)
+                        .map(|ref_name| git::repository::Upstream {
+                            ref_name: ref_name.clone().into(),
+                            tracking: git::repository::UpstreamTracking::Tracked(
+                                git::repository::UpstreamTrackingStatus {
+                                    ahead: 0,
+                                    behind: 0,
+                                },
+                            ),
+                        });
                     Branch {
                         is_head: Some(branch_name) == current_branch.as_ref(),
                         ref_name,
                         most_recent_commit: None,
-                        upstream: None,
+                        upstream,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -1214,6 +1247,77 @@ impl GitRepository for FakeGitRepository {
             }
             state.branches_requiring_force_delete.remove(&name);
             Ok(())
+        })
+    }
+
+    fn delete_refs_on_remote(
+        &self,
+        remote_name: String,
+        refs: Vec<String>,
+        _askpass: AskPassDelegate,
+        _env: Arc<HashMap<String, String>>,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
+        self.with_state_async(true, move |state| {
+            state
+                .graph_mutations
+                .push(FakeGitMutation::DeleteRefsOnRemote {
+                    remote_name: remote_name.clone(),
+                    refs: refs.clone(),
+                });
+            for ref_name in &refs {
+                state.remote_deleted_refs.push((remote_name.clone(), ref_name.clone()));
+            }
+            Ok(git::repository::RemoteCommandOutput {
+                stdout: String::new(),
+                stderr: format!(
+                    " - [deleted]         {}",
+                    refs.last().cloned().unwrap_or_default()
+                ),
+            })
+        })
+    }
+
+    fn delete_tag(&self, name: String) -> BoxFuture<'_, Result<()>> {
+        self.with_state_async(true, move |state| {
+            state
+                .graph_mutations
+                .push(FakeGitMutation::DeleteTag(name.clone()));
+            let ref_name = format!("refs/tags/{name}");
+            if state.refs.remove(&ref_name).is_none() {
+                bail!("tag {name:?} does not exist");
+            }
+            Ok(())
+        })
+    }
+
+    fn tag_details(
+        &self,
+        ref_name: String,
+    ) -> BoxFuture<'_, Result<git::repository::TagDetails>> {
+        self.with_state_async(false, move |state| {
+            if let Some(details) = state.tag_details.get(&ref_name) {
+                return Ok(details.clone());
+            }
+            // Synthesize a lightweight tag entry from the fake ref table so the
+            // menu can display View Details without a real object database.
+            let name = ref_name
+                .strip_prefix("refs/tags/")
+                .map(str::to_owned)
+                .unwrap_or_else(|| ref_name.clone());
+            let target_oid = state
+                .refs
+                .get(&ref_name)
+                .and_then(|sha| Oid::try_from(sha.as_str()).ok())
+                .unwrap_or(Oid::default());
+            Ok(git::repository::TagDetails {
+                ref_name: ref_name.clone().into(),
+                name: name.into(),
+                target_oid,
+                object_type: git::repository::TagObjectType::Commit,
+                tagger: None,
+                message: None,
+            })
         })
     }
 
