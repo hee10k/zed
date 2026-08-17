@@ -554,6 +554,23 @@ fn rename_current_branch(
     });
 }
 
+/// Opens the single shared prefill renaming modal for `branch_name` (the exact
+/// canonical branch captured by a per-ref chip). Cancellation dispatches nothing
+/// and retains state; Git errors are surfaced by the modal. This is the
+/// per-ref-chip entry point into the same modal used by the Git Panel's
+/// "Rename" action, so the current branch is never silently substituted.
+pub(crate) fn open_branch_rename_modal(
+    workspace: &mut Workspace,
+    branch_name: String,
+    repo: Entity<Repository>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.toggle_modal(window, cx, |window, cx| {
+        RenameBranchModal::new(branch_name, repo, window, cx)
+    });
+}
+
 fn copy_branch_name(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
     let Some(panel) = workspace.panel::<GitPanel>(cx) else {
         return;

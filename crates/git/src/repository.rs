@@ -50,6 +50,16 @@ pub const REMOTE_CANCELLED_BY_USER: &str = "Operation cancelled by user";
 /// %P - Parent hashes
 /// %D - Ref names
 /// %x00 - Null byte separator, used to split up commit data
+///
+/// NOTE: we combine this with `--decorate=full` when building the log command so
+/// that `%D` emits fully-qualified ref names (`refs/heads/main`,
+/// `refs/remotes/origin/main`, `tag: refs/tags/v1.0`) rather than git's
+/// display-shortened form. `%D` by itself shortens remote-tracking and local
+/// refs the same way (e.g. both `refs/heads/origin/main` and
+/// `refs/remotes/origin/main` render as `origin/main`), which makes a local
+/// branch literally named `origin/main` indistinguishable from the
+/// remote-tracking `origin/main`. Consumers classify against the full ref name
+/// and only shorten for display after classification (see git_graph.rs).
 static GRAPH_COMMIT_FORMAT: &str = "--format=%H%x00%P%x00%D";
 
 /// Used to get commits that match with a search
@@ -120,12 +130,16 @@ impl InitialGraphCommitData {
         self.ref_names
             .iter()
             .filter_map(|ref_name| {
-                let tag_name = ref_name.strip_prefix("tag: ")?;
+                // With `--decorate=full` a tag decoration is `tag: refs/tags/<name>`.
+                // Fall back to the legacy shortened `tag: <name>` form for graph
+                // data produced before the full-decoration change.
+                let tag_name = ref_name
+                    .strip_prefix("tag: refs/tags/")
+                    .or_else(|| ref_name.strip_prefix("tag: "))?;
 
                 if tag_name.is_empty() {
                     return None;
                 }
-
                 Some(tag_name)
             })
             .collect()
@@ -3736,7 +3750,12 @@ impl GitRepository for RealGitRepository {
 
         async move {
             let log_source_args = log_source.get_args();
-            let mut git_log_command = vec!["log", GRAPH_COMMIT_FORMAT, log_order.as_arg()];
+            let mut git_log_command = vec![
+                "log",
+                GRAPH_COMMIT_FORMAT,
+                "--decorate=full",
+                log_order.as_arg(),
+            ];
             git_log_command.extend(log_source_args.iter().map(|arg| arg.as_ref()));
             let mut command = git.build_command(&git_log_command);
             command.stdout(Stdio::piped());
@@ -5532,16 +5551,30 @@ mod tests {
             sha: Oid::from_bytes(&[0; 20]).unwrap(),
             parents: SmallVec::new(),
             ref_names: vec![
-                SharedString::from("HEAD -> main"),
-                SharedString::from("origin/main"),
-                SharedString::from("tag: v1.0.0"),
-                SharedString::from("tag: v1.1.0"),
+                SharedString::from("HEAD -> refs/heads/main"),
+                SharedString::from("refs/remotes/origin/main"),
+                SharedString::from("tag: refs/tags/v1.0.0"),
+                SharedString::from("tag: refs/tags/v1.1.0"),
                 SharedString::from("tag: "),
                 SharedString::from("refs/heads/feature"),
             ],
         };
 
         assert_eq!(commit.tag_names(), ["v1.0.0", "v1.1.0"]);
+    }
+
+    #[test]
+    fn test_initial_graph_commit_data_tag_names_legacy_short_form() {
+        // Graph data produced before the `--decorate=full` change (or directly
+        // constructed) may carry the shortened `tag: <name>` decoration; the
+        // accessor must keep stripping it so legacy consumers are unaffected.
+        let commit = InitialGraphCommitData {
+            sha: Oid::from_bytes(&[0; 20]).unwrap(),
+            parents: SmallVec::new(),
+            ref_names: vec![SharedString::from("tag: legacy-tag"), SharedString::from("main")],
+        };
+
+        assert_eq!(commit.tag_names(), ["legacy-tag"]);
     }
 
     #[test]

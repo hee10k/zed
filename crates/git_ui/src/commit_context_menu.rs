@@ -1,8 +1,9 @@
 use crate::{
     commit_view::CommitView,
-    git_graph::GitGraph,
-    git_graph_actions::GraphMutation,
+    git_graph::{GitGraph, RefKind, ResolvedRef},
+    git_graph_actions::{GraphMutation, GraphMutationError},
     git_ref_modal::{GitRefModal, GitRefModalKind, GitRefModalResult},
+    open_branch_rename_modal,
 };
 use anyhow::anyhow;
 use git::Oid;
@@ -562,6 +563,269 @@ pub(crate) fn commit_context_menu(
                 menu
             })
     })
+}
+
+/// Schedules a per-ref operation through the graph with a duplicate-dispatch
+/// guard. While one ref operation is in flight, further dispatches are
+/// suppressed; the guard is cleared when the operation settles (success or
+/// error) or the graph is no longer available. Errors are propagated to the UI
+/// through `detach_and_prompt_err` — never silently dropped.
+fn schedule_ref_operation(
+    graph: Option<WeakEntity<GitGraph>>,
+    make_task: impl FnOnce(
+        &mut GitGraph,
+        &mut gpui::Context<GitGraph>,
+    ) -> Result<Task<anyhow::Result<()>>, GraphMutationError>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(graph) = graph.and_then(|graph| graph.upgrade()) else {
+        log::error!("ref action: git graph is no longer available");
+        return;
+    };
+    let (task, weak) = graph.update(cx, |graph, graph_cx| {
+        let weak = graph_cx.entity().downgrade();
+        if !graph.begin_ref_operation() {
+            // A ref operation is already in flight; suppress the duplicate
+            // dispatch rather than queueing another mutation.
+            return (None, weak);
+        }
+        let result = match make_task(graph, graph_cx) {
+            Ok(task) => task,
+            Err(error) => {
+                graph.end_ref_operation();
+                Task::ready(Err(anyhow!(error.to_string())))
+            }
+        };
+        (Some(result), weak)
+    });
+    let Some(task) = task else {
+        // Duplicate dispatch suppressed while a ref operation is in flight.
+        return;
+    };
+    window
+        .spawn(cx, async move |cx| {
+            let result = task.await;
+            weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err("Git graph action failed", window, cx, |error, _, _| {
+            Some(error.to_string())
+        });
+}
+
+/// Builds the typed, per-ref context menu deployed from a Git Graph ref-chip
+/// right-click. The menu is keyed to one fully-qualified canonical ref
+/// (`ResolvedRef`) and the clicked commit's SHA; every action targets that exact
+/// ref — never a fallback to the current/first branch.
+///
+/// Local branches get Checkout, Merge into Current, Create Detached Worktree,
+/// Rename, Delete, and Copy Name. The current branch omits Checkout and Delete.
+/// Remote refs and tags get the commit-target actions (Merge into Current,
+/// Create Detached Worktree) and Copy Name; their chips are still typed to the
+/// exact ref so Copy Name never mixes local/remote same-name refs.
+pub(crate) fn ref_chip_context_menu(
+    resolved_ref: ResolvedRef,
+    commit_sha: git::Oid,
+    is_current_branch: bool,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    let is_local_branch = resolved_ref.kind == RefKind::LocalBranch;
+    let display_name = resolved_ref.display_name.clone();
+    let header = format!("Ref {display_name}");
+
+    ContextMenu::build(window, cx, move |menu, _window, _cx| {
+        let mut menu = menu.header(header);
+
+        if is_local_branch {
+            if !is_current_branch {
+                menu = menu.entry("Checkout", None, {
+                    let graph = graph.clone();
+                    let display_name = display_name.clone();
+                    move |window, cx| {
+                        schedule_ref_operation(
+                            graph.clone(),
+                            |graph, graph_cx| {
+                                graph.schedule_branch_checkout(
+                                    display_name.clone().into(),
+                                    commit_sha,
+                                    graph_cx,
+                                )
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                });
+            }
+            menu = menu.entry("Merge into Current", None, {
+                let graph = graph.clone();
+                move |window, cx| schedule_ref_merge(graph.clone(), commit_sha, window, cx)
+            });
+            menu = menu.entry("Create Detached Worktree", None, {
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    create_detached_worktree_for_commit(
+                        repository.clone(),
+                        workspace.clone(),
+                        commit_sha,
+                        window,
+                        cx,
+                    );
+                }
+            });
+            menu = menu.entry("Rename…", None, {
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                let display_name = display_name.clone();
+                move |window, cx| {
+                    rename_ref_branch(repository.clone(), workspace.clone(), display_name.as_ref(), window, cx);
+                }
+            });
+            if !is_current_branch {
+                menu = menu.entry("Delete…", None, {
+                    let repository = repository.clone();
+                    let workspace = workspace.clone();
+                    let display_name = display_name.clone();
+                    move |window, cx| {
+                        delete_ref_branch(repository.clone(), workspace.clone(), display_name.as_ref(), window, cx);
+                    }
+                });
+            }
+        } else {
+            // Remote / tag refs share the commit-target actions but never
+            // rename/delete/checkout the local branch namespace.
+            menu = menu.entry("Merge into Current", None, {
+                let graph = graph.clone();
+                move |window, cx| schedule_ref_merge(graph.clone(), commit_sha, window, cx)
+            });
+            menu = menu.entry("Create Detached Worktree", None, {
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    create_detached_worktree_for_commit(
+                        repository.clone(),
+                        workspace.clone(),
+                        commit_sha,
+                        window,
+                        cx,
+                    );
+                }
+            });
+        }
+
+        menu.entry("Copy Name", None, move |_window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(display_name.to_string()));
+        })
+    })
+}
+
+/// Merges the clicked ref's commit into the current branch, reusing the graph's
+/// `Merge` mutation (clicked SHA) with the duplicate-dispatch guard.
+fn schedule_ref_merge(
+    graph: Option<WeakEntity<GitGraph>>,
+    commit_sha: git::Oid,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    schedule_ref_operation(
+        graph.clone(),
+        |graph, graph_cx| {
+            graph.schedule_mutation(
+                GraphMutation::Merge {
+                    commit: commit_sha,
+                    mode: MergeMode::Default,
+                },
+                Some(commit_sha),
+                graph_cx,
+            )
+        },
+        window,
+        cx,
+    );
+}
+
+/// Opens the single shared prefill renaming modal for the exact canonical
+/// branch captured by the chip. Cancellation dispatches nothing and retains
+/// state; Git errors are surfaced by the modal's own error handling.
+fn rename_ref_branch(
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    branch_name: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(repository) = repository.and_then(|repository| repository.upgrade()) else {
+        if let Some(workspace) = workspace.upgrade() {
+            show_error_toast(
+                workspace,
+                "rename branch",
+                anyhow!("The repository is no longer available"),
+                cx,
+            );
+        }
+        return;
+    };
+    let Some(workspace) = workspace.upgrade() else {
+        log::error!("rename branch: workspace is no longer available");
+        return;
+    };
+    let branch_name = branch_name.to_string();
+    // Spawn into the window so we get a visual context through which we can
+    // open the modal on the workspace entity.
+    window
+        .spawn(cx, async move |cx| {
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                open_branch_rename_modal(
+                    workspace,
+                    branch_name.clone(),
+                    repository.clone(),
+                    window,
+                    cx,
+                )
+            });
+        })
+        .detach();
+}
+
+/// Deletes the exact branch captured by the chip via the shared store-backed
+/// delete + force-confirm service. The service surfaces git errors (and the
+/// unmerged-branch force-delete prompt) itself.
+fn delete_ref_branch(
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    branch_name: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(repository) = repository.and_then(|repository| repository.upgrade()) else {
+        if let Some(workspace) = workspace.upgrade() {
+            show_error_toast(
+                workspace,
+                "delete branch",
+                anyhow!("The repository is no longer available"),
+                cx,
+            );
+        }
+        return;
+    };
+    let display_name = SharedString::from(branch_name.to_string());
+    let task = delete_service::delete_branch(
+        repository,
+        false,
+        branch_name.to_string(),
+        display_name,
+        false,
+        workspace,
+        window,
+        cx,
+    );
+    task.detach();
 }
 
 fn create_detached_worktree_for_commit(

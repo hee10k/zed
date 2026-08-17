@@ -91,6 +91,7 @@ search.workspace = true
 settings = { workspace = true, features = ["test-support"] }
 task.workspace = true
 unindent.workspace = true
+ui = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }
 zlog.workspace = true
 

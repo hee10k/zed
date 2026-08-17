@@ -551,6 +551,25 @@ impl ContextMenu {
         self.items.push(item.into());
     }
 
+    /// Build-order labels of every labeled item (headers, labels, entries, and
+    /// submenu triggers), in the same order they were appended. Separators and
+    /// custom rows are omitted (they carry no label). Primarily used by tests
+    /// and callers that need to introspect menu composition, e.g. to assert
+    /// that a per-ref menu shows exactly the expected actions.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn entry_labels(&self) -> Vec<SharedString> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                ContextMenuItem::Header(label) | ContextMenuItem::Label(label) => Some(label.clone()),
+                ContextMenuItem::HeaderWithLink(title, _, _) => Some(title.clone()),
+                ContextMenuItem::Entry(entry) => Some(entry.label.clone()),
+                ContextMenuItem::Submenu { label, .. } => Some(label.clone()),
+                ContextMenuItem::Separator | ContextMenuItem::CustomEntry { .. } => None,
+            })
+            .collect()
+    }
+
     pub fn entry(
         mut self,
         label: impl Into<SharedString>,
