@@ -301,6 +301,7 @@ mod tests {
             }),
             lane: 0,
             color_idx: 0,
+            is_stash: false,
         }
     }
 

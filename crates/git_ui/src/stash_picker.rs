@@ -1,10 +1,10 @@
 use fuzzy::StringMatchCandidate;
 
-use git::stash::StashEntry;
+use git::stash::{StashEntry, StashIdentity, StashMutationResult};
 use gpui::{
     Action, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent, ParentElement, Render,
-    SharedString, Styled, Subscription, Task, TaskExt, WeakEntity, Window, actions, rems,
+    InteractiveElement, IntoElement, Modifiers, ModifiersChangedEvent, ParentElement, PromptLevel,
+    Render, SharedString, Styled, Subscription, Task, TaskExt, WeakEntity, Window, actions, rems,
 };
 use picker::{Picker, PickerDelegate};
 use project::git_store::{Repository, RepositoryEvent};
@@ -299,13 +299,13 @@ impl StashListDelegate {
         let Some(entry_match) = self.matches.get(ix) else {
             return;
         };
-        let stash_index = entry_match.entry.index;
+        let identity = StashIdentity::for_entry(&entry_match.entry);
         let Some(repo) = self.repo.clone() else {
             return;
         };
 
         cx.spawn(async move |_, cx| {
-            repo.update(cx, |repo, cx| repo.stash_drop(Some(stash_index), cx))
+            repo.update(cx, |repo, cx| repo.stash_drop(Some(identity), cx))
                 .await??;
             Ok(())
         })
@@ -319,7 +319,7 @@ impl StashListDelegate {
             return;
         };
         let stash_sha = entry_match.entry.oid.to_string();
-        let stash_index = entry_match.entry.index;
+        let identity = StashIdentity::for_entry(&entry_match.entry);
         let Some(repo) = self.repo.clone() else {
             return;
         };
@@ -327,36 +327,56 @@ impl StashListDelegate {
             stash_sha,
             repo.downgrade(),
             self.workspace.clone(),
-            Some(stash_index),
+            Some(identity),
             None,
             window,
             cx,
         );
     }
 
-    fn pop_stash(&self, stash_index: usize, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+    fn pop_stash(&self, entry: &StashEntry, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let identity = StashIdentity::for_entry(entry);
         let Some(repo) = self.repo.clone() else {
             return;
         };
+        let workspace = self.workspace.clone();
 
-        cx.spawn(async move |_, cx| {
-            repo.update(cx, |repo, cx| repo.stash_pop(Some(stash_index), cx))
-                .await?;
-            Ok(())
-        })
-        .detach_and_prompt_err("Failed to pop stash", window, cx, |e, _, _| {
-            Some(e.to_string())
-        });
+        window
+            .spawn(cx, async move |cx| {
+                let outcome = repo
+                    .update(cx, |repo, cx| repo.stash_pop(Some(identity), cx))
+                    .await?;
+                if outcome == StashMutationResult::AppliedButRetained
+                    && let Some(workspace) = workspace.upgrade()
+                {
+                    workspace.update_in(cx, |_, window, cx| {
+                        let _ = window.prompt(
+                            PromptLevel::Info,
+                            "Stash popped",
+                            Some(
+                                "The stash was applied but could not be dropped;\nit has been retained.",
+                            ),
+                            &["OK"],
+                            cx,
+                        );
+                    })?;
+                }
+                Ok(())
+            })
+            .detach_and_prompt_err("Failed to pop stash", window, cx, |e, _, _| {
+                Some(e.to_string())
+            });
         cx.emit(DismissEvent);
     }
 
-    fn apply_stash(&self, stash_index: usize, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+    fn apply_stash(&self, entry: &StashEntry, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let identity = StashIdentity::for_entry(entry);
         let Some(repo) = self.repo.clone() else {
             return;
         };
 
         cx.spawn(async move |_, cx| {
-            repo.update(cx, |repo, cx| repo.stash_apply(Some(stash_index), cx))
+            repo.update(cx, |repo, cx| repo.stash_apply(Some(identity), cx))
                 .await?;
             Ok(())
         })
@@ -482,11 +502,10 @@ impl PickerDelegate for StashListDelegate {
         let Some(entry_match) = self.matches.get(self.selected_index()) else {
             return;
         };
-        let stash_index = entry_match.entry.index;
         if secondary {
-            self.pop_stash(stash_index, window, cx);
+            self.pop_stash(&entry_match.entry, window, cx);
         } else {
-            self.apply_stash(stash_index, window, cx);
+            self.apply_stash(&entry_match.entry, window, cx);
         }
     }
 

@@ -9,16 +9,18 @@ use anyhow::anyhow;
 use futures::channel::oneshot;
 use git::Oid;
 use git::repository::{AskPassDelegate, CreateTagOptions, MergeMode, Remote, ResetMode};
+use git::stash::{StashIdentity, StashMutationResult, StashRenameResult, resolve_stash_identity};
 use git_ui_core::askpass_modal::AskPassModal;
 use git_ui_core::delete_service::{self as delete_service, WorktreeRemovalOutcome};
 use git_ui_core::notifications::show_error_toast;
+use git_ui_core::stash_rename_modal::StashRenameModal;
 use git_ui_core::worktree_name_modal::WorktreeNameModal;
 use git_ui_core::worktree_service::{
     HostScopedRepositoryIdentity, handle_create_worktree, linked_worktree_label, switch_to_worktree,
 };
 use gpui::{
-    Action, AnyWindowHandle, App, AsyncWindowContext, ClipboardItem, Entity, FocusHandle,
-    SharedString, Task, WeakEntity, Window, actions,
+Action, AnyWindowHandle, App, AsyncWindowContext, ClipboardItem, Entity, FocusHandle,
+    PromptLevel, SharedString, Task, WeakEntity, Window, actions,
 };
 use gpui::{DismissEvent, EventEmitter, Focusable, InteractiveElement, ParentElement};
 use menu;
@@ -53,6 +55,18 @@ const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
 pub(crate) struct CommitContextMenuData {
     pub(crate) sha: Oid,
     pub(crate) tag_names: Vec<SharedString>,
+    /// True for a stash-reflog row. Commit-oriented actions (checkout,
+    /// cherry-pick, revert, reset, merge, ref/worktree operations) are never
+    /// offered for a stash row; only the commit view/diff seam and the stash
+    /// actions (View/Apply/Pop/Drop) are shown.
+    pub(crate) is_stash: bool,
+    /// The composite stash target captured for a stash-reflog row at deploy
+    /// time. Present exactly when `is_stash`. It stays stable while the menu is
+    /// open so a later mutation always targets this entry; backends refresh
+    /// `refs/stash` and re-resolve exactly one current entry from it at the
+    /// mutation boundary. Destructive authority is never derived from the
+    /// current row index or OID alone.
+    pub(crate) stash_identity: Option<StashIdentity>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,6 +88,7 @@ pub(crate) fn commit_context_menu(
     cx: &mut App,
 ) -> Entity<ContextMenu> {
     let sha = commit.sha;
+    let is_stash = commit.is_stash;
     let cherry_pick_commits = if selected_commits.is_empty() {
         vec![sha]
     } else {
@@ -217,26 +232,135 @@ pub(crate) fn commit_context_menu(
                                 },
                             )
                         }
-                        _ => menu.submenu(copy_tag_label, move |menu, _window, _cx| {
-                            let mut menu = menu.fixed_width(COMMIT_TAG_LIST_WIDTH_IN_REMS.into());
+_ => menu.submenu(copy_tag_label, move |menu, _window, _cx| {
+                        let mut menu = menu.fixed_width(COMMIT_TAG_LIST_WIDTH_IN_REMS.into());
 
-                            for tag_name in tag_names.clone() {
-                                let tag_name_to_copy = tag_name.clone();
-                                menu = menu.entry(tag_name, None, move |_window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        tag_name_to_copy.to_string(),
-                                    ));
-                                });
+                        for tag_name in tag_names.clone() {
+                            let tag_name_to_copy = tag_name.clone();
+                            menu = menu.entry(tag_name, None, move |_window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    tag_name_to_copy.to_string(),
+                                ));
+                            });
+                        }
+                        menu
+                    }),
+                }
+            })
+            })
+            .when_some(commit.stash_identity.clone(), |menu, stash_identity| {
+                // Stash-only actions for a stash-reflog row. The composite
+                // stash target and its repository are captured here at deploy
+                // time and stay stable while the menu is open; the backends
+                // refresh `refs/stash` and re-resolve exactly one current entry
+                // from the identity at the mutation boundary — destructive
+                // authority is never the current row index or OID alone.
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                let graph = graph.clone();
+                menu.separator()
+                    .submenu("Stash", move |menu, _window, _cx| {
+                        let repository = repository.clone();
+                        let workspace = workspace.clone();
+                        menu.entry("View", None, {
+                            let stash_identity = stash_identity.clone();
+                            let repository = repository.clone();
+                            let workspace = workspace.clone();
+                            move |window, cx| {
+                                let stash_identity = stash_identity.clone();
+                                let Some(repository) = repository.clone() else {
+                                    return;
+                                };
+                                // Reuse the existing stash Commit View so the
+                                // diff and the stash toolbar match other stash
+                                // entry points.
+                                CommitView::open(
+                                    sha.to_string(),
+                                    repository,
+                                    workspace.clone(),
+                                    Some(stash_identity),
+                                    None,
+                                    window,
+                                    cx,
+                                );
                             }
-                            menu
-                        }),
-                    }
-                })
+                        })
+                        .entry("Apply", None, {
+                            let stash_identity = stash_identity.clone();
+                            let repository = repository.clone();
+                            let workspace = workspace.clone();
+                            let graph = graph.clone();
+                            move |window, cx| {
+                                schedule_stash_mutation(
+                                    graph.clone(),
+                                    repository.clone(),
+                                    workspace.clone(),
+                                    stash_identity.clone(),
+                                    StashMenuOp::Apply,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })
+                        .entry("Pop", None, {
+                            let stash_identity = stash_identity.clone();
+                            let repository = repository.clone();
+                            let workspace = workspace.clone();
+                            let graph = graph.clone();
+                            move |window, cx| {
+                                schedule_stash_mutation(
+                                    graph.clone(),
+                                    repository.clone(),
+                                    workspace.clone(),
+                                    stash_identity.clone(),
+                                    StashMenuOp::Pop,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })
+                        .entry("Rename…", None, {
+                            let stash_identity = stash_identity.clone();
+                            let repository = repository.clone();
+                            let workspace = workspace.clone();
+                            let graph = graph.clone();
+                            move |window, cx| {
+                                schedule_stash_rename(
+                                    graph.clone(),
+                                    repository.clone(),
+                                    workspace.clone(),
+                                    stash_identity.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })
+                        .entry("Drop…", None, {
+                            let stash_identity = stash_identity.clone();
+                            let repository = repository.clone();
+                            let workspace = workspace.clone();
+                            let graph = graph.clone();
+                            move |window, cx| {
+                                schedule_stash_mutation(
+                                    graph.clone(),
+                                    repository.clone(),
+                                    workspace.clone(),
+                                    stash_identity.clone(),
+                                    StashMenuOp::Drop,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })
+                    })
             })
             .when_some(graph.clone(), |menu, graph| {
                 let repository = repository.clone();
                 let workspace = workspace.clone();
                 let reset_graph = graph.clone();
+                if is_stash {
+                    return menu;
+                }
                 menu.separator()
                     .header("Git Actions")
                     .entry("Checkout Commit", None, {
@@ -409,6 +533,9 @@ pub(crate) fn commit_context_menu(
                     })
             })
             .when(source == CommitContextMenuSource::GitGraph, |menu| {
+                if is_stash {
+                    return menu;
+                }
                 let workspace = workspace.clone();
                 #[allow(clippy::redundant_clone)]
                 let workspace_for_entry = workspace.clone();
@@ -534,6 +661,9 @@ pub(crate) fn commit_context_menu(
                 })
             })
             .map(|mut menu| {
+                if is_stash {
+                    return menu;
+                }
                 menu = menu.separator().header("Custom Commands");
 
                 if git_tasks.is_empty() {
@@ -620,6 +750,316 @@ fn schedule_ref_operation(
         .detach_and_prompt_err("Git graph action failed", window, cx, |error, _, _| {
             Some(error.to_string())
         });
+}
+
+/// A stash mutation the stash-row submenu can dispatch. Each op has distinct
+/// result plumbing and, for `Drop`, a mandatory pre-mutation confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StashMenuOp {
+    Apply,
+    Pop,
+    /// Drop requires an explicit confirmation naming the selected stash before
+    /// any mutation is dispatched.
+    Drop,
+}
+
+/// Runs a stash mutation from the stash-row submenu through the graph's
+/// duplicate-dispatch guard. While the mutation is in flight, further
+/// dispatches are suppressed; the guard is cleared when it settles (success,
+/// partial `AppliedButRetained`, error, or the graph/repository goes away).
+///
+/// The mutation targets the *captured* composite `StashIdentity`; the
+/// Repository refreshes `refs/stash` and re-resolves exactly one current entry
+/// at the mutation boundary, so external reorders or duplicate OIDs between
+/// menu deployment and dispatch either mutate the same uniquely-resolved entry
+/// or fail safely as missing/ambiguous. Destructive authority is never the
+/// current row index or OID alone. On a successful mutation the backend
+/// refreshes the stash snapshot event-driven (`StashEntriesChanged`), which
+/// reloads the graph and other stash surfaces in local and remote projects
+/// alike.
+fn schedule_stash_mutation(
+    graph: Option<WeakEntity<GitGraph>>,
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    identity: StashIdentity,
+    op: StashMenuOp,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // Pre-flight: the repository must be reachable to dispatch anything;
+    // otherwise surface an explicit error rather than a silent no-op.
+    let Some(_) = repository.as_ref().and_then(|repository| repository.upgrade()) else {
+        if let Some(workspace) = workspace.upgrade() {
+            show_error_toast(
+                workspace,
+                "stash action",
+                anyhow!("The repository is no longer available"),
+                cx,
+            );
+        }
+        return;
+    };
+    // Resolve a human-facing label for the selected stash from live repository
+    // state, used only to name the Drop confirmation. Cosmetic: the mutation
+    // authority is the captured identity, re-resolved fresh by the backend.
+    let stash_label = if op == StashMenuOp::Drop {
+        repository
+            .as_ref()
+            .and_then(|repository| repository.upgrade())
+            .and_then(|repository| {
+                resolve_stash_identity(&repository.read(cx).stash_entries.entries, &identity)
+                    .ok()
+                    .map(|entry| format!("{} ({})", entry.message, identity.selector))
+            })
+            .unwrap_or_else(|| identity.selector.clone())
+    } else {
+        String::new()
+    };
+
+    window
+        .spawn(cx, async move |cx| {
+            // Drop requires an explicit confirmation naming the selected stash.
+            // Cancellation dispatches nothing (the in-flight guard below is
+            // never set), so no pending state lingers.
+            if op == StashMenuOp::Drop {
+                let prompt_message = format!("Drop stash {stash_label}? This cannot be undone.");
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        "Drop stash",
+                        Some(&prompt_message),
+                        &["Drop", "Cancel"],
+                        cx,
+                    )
+                })?;
+                if answer.await != Ok(0) {
+                    return Ok(());
+                }
+            }
+
+            let Some(graph) = graph.and_then(|graph| graph.upgrade()) else {
+                return Ok(());
+            };
+            let weak_graph = graph.downgrade();
+            if !graph.update(cx, |graph, _| graph.begin_ref_operation()) {
+                // A ref/stash operation is already in flight; suppress the
+                // duplicate dispatch rather than queueing another mutation.
+                return Ok(());
+            }
+            let Some(repository) = repository.and_then(|repository| repository.upgrade()) else {
+                weak_graph
+                    .update(cx, |graph, _| graph.end_ref_operation())
+                    .ok();
+                return Err(anyhow!("The repository is no longer available"));
+            };
+            let outcome = async {
+                match op {
+                    StashMenuOp::Apply => {
+                        repository
+                            .update(cx, |repo, cx| {
+                                repo.stash_apply(Some(identity.clone()), cx)
+                            })
+                            .await?;
+                        Ok::<_, anyhow::Error>(StashMutationResult::Success)
+                    }
+                    StashMenuOp::Pop => {
+                        let outcome = repository
+                            .update(cx, |repo, cx| {
+                                repo.stash_pop(Some(identity.clone()), cx)
+                            })
+                            .await?;
+                        Ok(outcome)
+                    }
+                    StashMenuOp::Drop => {
+                        repository
+                            .update(cx, |repo, cx| {
+                                repo.stash_drop(Some(identity.clone()), cx)
+                            })
+                            .await??;
+                        Ok(StashMutationResult::Success)
+                    }
+                }
+            }
+            .await;
+            // Clear the guard on success, partial result, error, or expiry.
+            weak_graph
+                .update(cx, |graph, _| graph.end_ref_operation())
+                .ok();
+
+            let outcome = outcome?;
+            if op == StashMenuOp::Pop
+                && outcome == StashMutationResult::AppliedButRetained
+                && let Some(workspace) = workspace.upgrade()
+            {
+                workspace.update_in(cx, |_, window, cx| {
+                    let _ = window.prompt(
+                        PromptLevel::Info,
+                        "Stash popped",
+                        Some(
+                            "The stash was applied but could not be dropped;\nit has been \
+                             retained.",
+                        ),
+                        &["OK"],
+                        cx,
+                    );
+                })?;
+            }
+            Ok(())
+        })
+        .detach_and_prompt_err(
+            "Git graph stash action failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
+/// Human-readable guidance for an unfinished/recovered stash rename: the exact
+/// manifest + recovery ref names plus the current observed stack, so a user (or
+/// a future retry/recover/cleanup) can act instead of guessing.
+fn stash_rename_recovery_guidance(recovery: &git::stash::StashRenameRecovery) -> String {
+    let mut lines = vec![
+        format!("Manifest: {}", recovery.manifest_ref),
+        format!("Recovery refs: {}", recovery.recovery_refs.join(", ")),
+    ];
+    if recovery.rename_applied {
+        lines.push("The rename applied but its recovery refs were not cleaned up.".into());
+    } else {
+        lines.push(if recovery.observed_entries.is_empty() {
+            "The rename did not complete; the stash stack is empty until recovered.".into()
+        } else {
+            format!(
+                "The rename did not complete. Observed stack ({}): {}",
+                recovery.observed_entries.len(),
+                recovery
+                    .observed_entries
+                    .iter()
+                    .map(|entry| format!("{} ({})", entry.message, entry.oid))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+    lines.join("\n")
+}
+
+/// Runs a stash rename from the stash-row submenu: opens a focused
+/// required-message modal for the exact composite target, then (on confirm)
+/// dispatches through the graph's duplicate-dispatch guard. Cancellation
+/// dispatches nothing. A destructive-boundary or cleanup outcome surfaces the
+/// retained recovery refs + observed stack rather than hiding the partial
+/// result.
+fn schedule_stash_rename(
+    graph: Option<WeakEntity<GitGraph>>,
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    identity: StashIdentity,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // Pre-flight: the repository must be reachable to dispatch anything;
+    // otherwise surface an explicit error rather than a silent no-op.
+    let Some(_) = repository.as_ref().and_then(|repository| repository.upgrade()) else {
+        if let Some(workspace) = workspace.upgrade() {
+            show_error_toast(
+                workspace,
+                "stash action",
+                anyhow!("The repository is no longer available"),
+                cx,
+            );
+        }
+        return;
+    };
+    // Resolve a human-facing label for the selected stash from live repository
+    // state for the modal header. Cosmetic: mutation authority is the captured
+    // identity, re-resolved fresh by the backend.
+    let stash_label = repository
+        .as_ref()
+        .and_then(|repository| repository.upgrade())
+        .and_then(|repository| {
+            resolve_stash_identity(&repository.read(cx).stash_entries.entries, &identity)
+                .ok()
+                .map(|entry| format!("{} ({})", entry.message, identity.selector))
+        })
+        .unwrap_or_else(|| identity.selector.clone());
+
+    // Open the focused required-message modal for the exact composite target
+    // before spawning the dispatch task; the modal itself is window-spawned.
+    let modal = StashRenameModal::open(
+        workspace.clone(),
+        None,
+        Some(format!("Rename {stash_label}").into()),
+        window,
+        cx,
+    );
+
+    window.spawn(cx, async move |cx| {
+        let new_message = modal.await;
+        // Cancellation (or a dismissed modal) dispatches nothing.
+        let Some(new_message) = new_message else {
+            return Ok::<(), anyhow::Error>(());
+        };
+
+        let Some(graph) = graph.and_then(|graph| graph.upgrade()) else {
+            return Ok(());
+        };
+        let weak_graph = graph.downgrade();
+        if !graph.update(cx, |graph, _| graph.begin_ref_operation()) {
+            // A ref/stash operation is already in flight; suppress the
+            // duplicate dispatch rather than queueing another mutation.
+            return Ok(());
+        }
+        let Some(repository) = repository.and_then(|repository| repository.upgrade()) else {
+            weak_graph
+                .update(cx, |graph, _| graph.end_ref_operation())
+                .ok();
+            return Err(anyhow!("The repository is no longer available"));
+        };
+        let outcome = repository
+            .update(cx, |repo, cx| {
+                repo.stash_rename(Some(identity), new_message, cx)
+            })
+            .await;
+        // Clear the guard on success, recovery-outcome, error, or expiry.
+        weak_graph
+            .update(cx, |graph, _| graph.end_ref_operation())
+            .ok();
+
+        let result = outcome?;
+        match result {
+            StashRenameResult::Success => {}
+            succeeded @ (StashRenameResult::SuccessWithRecoveryRefs(_)
+            | StashRenameResult::FailedWithRecovery(_)) => {
+                let recovery = match succeeded {
+                    StashRenameResult::SuccessWithRecoveryRefs(recovery)
+                    | StashRenameResult::FailedWithRecovery(recovery) => recovery,
+                    StashRenameResult::Success => unreachable!(),
+                };
+                log::warn!(
+                    "stash rename left recovery refs behind: {}",
+                    recovery.manifest_ref
+                );
+                if let Some(workspace) = workspace.upgrade() {
+                    workspace.update_in(cx, |_, window, cx| {
+                        let _ = window.prompt(
+                            PromptLevel::Critical,
+                            "Stash rename needs recovery",
+                            Some(&stash_rename_recovery_guidance(&recovery)),
+                            &["OK"],
+                            cx,
+                        );
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    })
+    .detach_and_prompt_err(
+        "Git graph stash rename failed",
+        window,
+        cx,
+        |error, _, _| Some(error.to_string()),
+    );
 }
 
 /// Builds the typed, per-ref context menu deployed from a Git Graph ref-chip
@@ -2207,13 +2647,14 @@ mod tests {
     use git_ui_core::delete_service::{
         WorktreeRemovalConfirmModal, WorktreeRemovalOutcome,
     };
+    use git::stash::{GitStash, StashEntry, StashIdentity};
     use gpui::{TestAppContext, VisualTestContext};
     use menu::Confirm;
     use project::Project;
     use serde_json::json;
     use settings::Settings;
     use settings::SettingsStore;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use util::path;
     use workspace::MultiWorkspace;
@@ -2644,4 +3085,221 @@ mod tests {
             .unwrap();
         assert!(!worktrees.iter().any(|wt| wt.path == linked_wt.path));
     }
+
+    #[gpui::test]
+    async fn test_stash_drop_confirmation_names_stash_and_cancel_keeps_it(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let head = Oid::from_bytes(&[1; 20]).unwrap();
+        let stash_oid = Oid::from_bytes(&[2; 20]).unwrap();
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head.to_string(),
+        );
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.stash_entries = GitStash {
+                entries: vec![StashEntry {
+                    index: 0,
+                    oid: stash_oid,
+                    message: "WIP on main: selected stash".to_string(),
+                    branch: Some("main".to_string()),
+                    timestamp: 1,
+                }]
+                .into(),
+            };
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        // The stash snapshot is loaded from the backend during repository init.
+        assert_eq!(
+            repository.read_with(cx, |repo, _| repo.stash_entries.entries.len()),
+            1
+        );
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+
+        let identity = StashIdentity {
+            oid: stash_oid,
+            ref_name: git::stash::STASH_REF.to_string(),
+            selector: "refs/stash@{0}".to_string(),
+        };
+
+        // Dispatch Drop: an explicit confirmation naming the selected stash must
+        // appear before any mutation is dispatched.
+        cx.update(|window, cx| {
+            schedule_stash_mutation(
+                None,
+                Some(repository.downgrade()),
+                workspace_weak.clone(),
+                identity.clone(),
+                StashMenuOp::Drop,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "drop must prompt for confirmation");
+        let (message, detail) = cx.pending_prompt().expect("pending drop prompt");
+        assert_eq!(message, "Drop stash");
+        assert!(
+            detail.contains("selected stash") || detail.contains("refs/stash@{0}"),
+            "drop confirmation must name the selected stash, got detail: {detail:?}"
+        );
+
+        // Cancelling dispatches nothing, leaves the stash intact, and clears the
+        // pending state.
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt(), "no pending prompt after cancel");
+        assert_eq!(
+            repository.read_with(&*cx, |repo, _| repo.stash_entries.entries.len()),
+            1,
+            "cancelled drop must not drop the stash"
+        );
+
+        // A subsequent dispatch prompts again: no lingering pending/guard state.
+        cx.update(|window, cx| {
+            schedule_stash_mutation(
+                None,
+                Some(repository.downgrade()),
+                workspace_weak.clone(),
+                identity.clone(),
+                StashMenuOp::Drop,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "second drop must prompt again");
+        let (_message, detail) = cx.pending_prompt().expect("pending drop prompt");
+        assert!(detail.contains("refs/stash@{0}"), "second prompt names the stash");
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+    }
+
+    #[gpui::test]
+    async fn test_stash_rename_modal_cancel_dispatches_nothing(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let head = Oid::from_bytes(&[1; 20]).unwrap();
+        let stash_oid = Oid::from_bytes(&[2; 20]).unwrap();
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head.to_string(),
+        );
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.stash_entries = GitStash {
+                entries: vec![StashEntry {
+                    index: 0,
+                    oid: stash_oid,
+                    message: "WIP on main: selected stash".to_string(),
+                    branch: Some("main".to_string()),
+                    timestamp: 1,
+                }]
+                .into(),
+            };
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            repository.read_with(cx, |repo, _| repo.stash_entries.entries.len()),
+            1
+        );
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+
+        let identity = StashIdentity {
+            oid: stash_oid,
+            ref_name: git::stash::STASH_REF.to_string(),
+            selector: "refs/stash@{0}".to_string(),
+        };
+
+        cx.update(|window, cx| {
+            schedule_stash_rename(
+                None,
+                Some(repository.downgrade()),
+                workspace_weak.clone(),
+                identity.clone(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // The rename modal opens for the exact composite target.
+        assert!(
+            workspace_weak
+                .read_with(&*cx, |workspace, cx| {
+                    workspace.active_modal::<StashRenameModal>(cx)
+                })
+                .unwrap()
+                .is_some(),
+            "rename modal should open"
+        );
+
+        // Cancelling dispatches nothing: the stash stays untouched and no
+        // in-flight ref operation is left behind.
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+
+        assert!(
+            workspace_weak
+                .read_with(&*cx, |workspace, cx| workspace.active_modal::<StashRenameModal>(cx))
+                .unwrap()
+                .is_none(),
+            "modal dismissed after cancel"
+        );
+        assert_eq!(
+            repository.read_with(&*cx, |repo, _| repo.stash_entries.entries[0].message.clone()),
+            "WIP on main: selected stash",
+            "cancel must not rename the stash"
+        );
+    }
+
 }
