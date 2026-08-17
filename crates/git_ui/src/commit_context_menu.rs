@@ -644,6 +644,7 @@ pub(crate) fn ref_chip_context_menu(
 ) -> Entity<ContextMenu> {
     let is_local_branch = resolved_ref.kind == RefKind::LocalBranch;
     let is_remote_branch = resolved_ref.kind == RefKind::RemoteBranch;
+    let is_tag = resolved_ref.kind == RefKind::Tag;
     let display_name = resolved_ref.display_name.clone();
     let header = format!("Ref {display_name}");
 
@@ -879,21 +880,70 @@ pub(crate) fn ref_chip_context_menu(
                     );
                 }
             });
-        } else {
-            // Tags and other non-branch refs keep the commit-target actions;
-            // the remote branch actions above are remote-chip-specific.
-            menu = menu.entry("Merge into Current", None, {
-                let graph = graph.clone();
-                move |window, cx| schedule_ref_merge(graph.clone(), commit_sha, window, cx)
-            });
-            menu = menu.entry("Create Detached Worktree", None, {
+        } else if is_tag {
+            // Tag: a complete, explicit lifecycle menu — inspect, push, and
+            // delete locally or on the server. Remote operations always require
+            // explicit remote selection; local and server deletes have distinct
+            // confirmations and distinct operations.
+            menu = menu.entry("View Details…", None, {
+                let resolved_ref = resolved_ref.clone();
                 let repository = repository.clone();
+                let graph = graph.clone();
                 let workspace = workspace.clone();
                 move |window, cx| {
-                    create_detached_worktree_for_commit(
+                    schedule_tag_view_details(
+                        &resolved_ref,
                         repository.clone(),
+                        graph.clone(),
                         workspace.clone(),
-                        commit_sha,
+                        window,
+                        cx,
+                    );
+                }
+            });
+            menu = menu.entry("Push to Remote…", None, {
+                let resolved_ref = resolved_ref.clone();
+                let repository = repository.clone();
+                let graph = graph.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    schedule_tag_push_to_remote(
+                        &resolved_ref,
+                        repository.clone(),
+                        graph.clone(),
+                        workspace.clone(),
+                        window,
+                        cx,
+                    );
+                }
+            });
+            menu = menu.entry("Delete Local…", None, {
+                let resolved_ref = resolved_ref.clone();
+                let repository = repository.clone();
+                let graph = graph.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    schedule_tag_delete_local(
+                        &resolved_ref,
+                        repository.clone(),
+                        graph.clone(),
+                        workspace.clone(),
+                        window,
+                        cx,
+                    );
+                }
+            });
+            menu = menu.entry("Delete on Remote…", None, {
+                let resolved_ref = resolved_ref.clone();
+                let repository = repository.clone();
+                let graph = graph.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    schedule_tag_delete_on_remote(
+                        &resolved_ref,
+                        repository.clone(),
+                        graph.clone(),
+                        workspace.clone(),
                         window,
                         cx,
                     );
@@ -942,6 +992,15 @@ fn remote_ref_parts(ref_name: &str) -> Option<(String, String)> {
         return None;
     }
     Some((remote.to_string(), branch.to_string()))
+}
+
+/// Derives the short tag name from a canonical `refs/tags/<name>` ref.
+fn tag_name_from_ref(ref_name: &str) -> Option<String> {
+    let name = ref_name.strip_prefix("refs/tags/")?;
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// Acquires the ref-operation duplicate-dispatch guard from the graph. Returns
@@ -1394,6 +1453,337 @@ fn schedule_remote_branch_delete_on_server(
         );
 }
 
+
+/// Opens the tag details view (established by the `tag_details` backend):
+/// distinguishes lightweight vs annotated tags and reports the tag name, target
+/// OID, object type, tagger metadata, and message.
+fn schedule_tag_view_details(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ref_name = resolved_ref.ref_name.as_ref().to_string();
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "tag details",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let details = repository_entity
+                    .update(cx, |repository, cx| repository.tag_details(ref_name.clone(), cx))
+                    .await
+                    .map_err(|e| anyhow!("tag details cancelled: {e}"))??;
+                emit_toast(&workspace, cx, format_tag_details(&details));
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph tag details failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
+fn format_tag_details(details: &git::repository::TagDetails) -> String {
+    let kind = if details.tagger.is_some() {
+        "annotated"
+    } else {
+        "lightweight"
+    };
+    let mut out = format!(
+        "Tag \"{}\" ({kind})\nTarget: {} ({:?})",
+        details.name, details.target_oid, details.object_type
+    );
+    if let Some(tagger) = &details.tagger {
+        out.push_str(&format!("\nTagged by {} <{}>", tagger.name, tagger.email));
+    }
+    if let Some(message) = &details.message {
+        out.push_str(&format!("\nMessage: {message}"));
+    }
+    out
+}
+
+/// Pushes the clicked local tag to an explicitly chosen remote. Always requires
+/// selection, even with one remote; zero remotes is informational with no
+/// dispatch.
+fn schedule_tag_push_to_remote(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ref_name = resolved_ref.ref_name.as_ref().to_string();
+    let Some(tag_name) = tag_name_from_ref(&ref_name) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "push tag",
+            anyhow!("Malformed tag ref {ref_name}"),
+        );
+        return;
+    };
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "push tag",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    let window_handle = window.window_handle();
+    let askpass = askpass_delegate(&workspace, window_handle, cx, "git push");
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let remote_name =
+                    match select_remote_explicit(
+                        &repository_entity,
+                        workspace.clone(),
+                        window_handle,
+                        cx,
+                        "Pick which remote to push the tag to",
+                    )
+                    .await?
+                    {
+                        Some(remote) => remote.name,
+                        None => {
+                            emit_toast(
+                                &workspace,
+                                cx,
+                                format!("No configured remote to push tag {tag_name} to."),
+                            );
+                            return Ok(());
+                        }
+                    };
+                let tag_ref = format!("refs/tags/{tag_name}");
+                let output = repository_entity
+                    .update(cx, |repository, cx| {
+                        repository.push(
+                            tag_ref.clone().into(),
+                            tag_ref.into(),
+                            remote_name.clone(),
+                            None,
+                            askpass,
+                            cx,
+                        )
+                    })
+                    .await
+                    .map_err(|e| anyhow!("push cancelled: {e}"))?;
+                let output = output?;
+                emit_toast(
+                    &workspace,
+                    cx,
+                    format!("Pushed tag {tag_name} to {remote_name}\n{}", output.stderr.trim()),
+                );
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph tag push failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
+/// Deletes the clicked tag locally (`git tag -d <name>`). Uses a distinct
+/// destructive confirmation and a distinct operation from server deletion.
+fn schedule_tag_delete_local(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ref_name = resolved_ref.ref_name.as_ref().to_string();
+    let Some(tag_name) = tag_name_from_ref(&ref_name) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "delete tag",
+            anyhow!("Malformed tag ref {ref_name}"),
+        );
+        return;
+    };
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "delete tag",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let confirmed = open_destructive_confirmation(
+                    &workspace,
+                    cx,
+                    "Delete Tag".into(),
+                    format!(
+                        "Delete local tag \"{tag_name}\"? This removes it from this repository only."
+                    )
+                    .into(),
+                    format!("Delete {tag_name}").into(),
+                )
+                .await
+                .unwrap_or(false);
+                if !confirmed {
+                    return Ok(());
+                }
+                repository_entity
+                    .update(cx, |repository, cx| repository.delete_tag(tag_name.clone(), cx))
+                    .await
+                    .map_err(|e| anyhow!("delete tag cancelled: {e}"))??;
+                emit_toast(&workspace, cx, format!("Deleted local tag {tag_name}"));
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph tag delete failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
+/// Deletes the clicked tag on the chosen remote server via an explicit
+/// `git push <remote> --delete refs/tags/<name>`; never relies on a local
+/// snapshot of the tag. Uses a destructive confirmation distinct from local
+/// deletion and always requires explicit remote selection.
+fn schedule_tag_delete_on_remote(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ref_name = resolved_ref.ref_name.as_ref().to_string();
+    let Some(tag_name) = tag_name_from_ref(&ref_name) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "delete tag on remote",
+            anyhow!("Malformed tag ref {ref_name}"),
+        );
+        return;
+    };
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "delete tag on remote",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    let window_handle = window.window_handle();
+    let askpass = askpass_delegate(&workspace, window_handle, cx, "git push");
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let remote_name =
+                    match select_remote_explicit(
+                        &repository_entity,
+                        workspace.clone(),
+                        window_handle,
+                        cx,
+                        "Pick which remote to delete the tag from",
+                    )
+                    .await?
+                    {
+                        Some(remote) => remote.name,
+                        None => {
+                            emit_toast(
+                                &workspace,
+                                cx,
+                                format!("No configured remote to delete tag {tag_name} from."),
+                            );
+                            return Ok(());
+                        }
+                    };
+                let confirmed = open_destructive_confirmation(
+                    &workspace,
+                    cx,
+                    "Delete Tag on Remote".into(),
+                    format!(
+                        "Delete tag \"{tag_name}\" on remote \"{remote_name}\"? This removes it on the server and cannot be undone."
+                    )
+                    .into(),
+                    format!("Delete {remote_name}/{tag_name}").into(),
+                )
+                .await
+                .unwrap_or(false);
+                if !confirmed {
+                    return Ok(());
+                }
+                let output = repository_entity
+                    .update(cx, |repository, cx| {
+                        repository.delete_refs_on_remote(
+                            remote_name.clone(),
+                            vec![format!("refs/tags/{tag_name}")],
+                            askpass,
+                            cx,
+                        )
+                    })
+                    .await
+                    .map_err(|e| anyhow!("remote delete cancelled: {e}"))?;
+                let output = output?;
+                emit_toast(
+                    &workspace,
+                    cx,
+                    format!("Deleted tag {tag_name} on {remote_name}\n{}", output.stderr.trim()),
+                );
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph tag remote delete failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
 
 /// Opens the single shared prefill renaming modal for the exact canonical
 /// branch captured by the chip. Cancellation dispatches nothing and retains
