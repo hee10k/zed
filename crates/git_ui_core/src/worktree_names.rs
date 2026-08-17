@@ -1,5 +1,15 @@
+use anyhow::anyhow;
 use collections::HashSet;
 use rand::Rng;
+
+/// Case-insensitive reserved Windows device names. A single path component
+/// with one of these names (with or without a file extension) cannot be
+/// created on Windows and would break cross-platform worktree open/remove.
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "CONIN$",
+    "CONOUT$",
+];
 
 const ADJECTIVES: &[&str] = &[
     "able", "agate", "airy", "alpine", "amber", "ample", "aqua", "arctic", "arid", "ashen",
@@ -72,6 +82,66 @@ pub fn generate_worktree_name(existing_names: &[&str], rng: &mut impl Rng) -> Op
     }
 
     None
+}
+
+/// Normalizes a user-supplied worktree name into a single portable path
+/// component, or returns an error explaining why the input is unsuitable.
+///
+/// Leading/trailing and interior whitespace runs collapse into a single
+/// hyphen. The result must be a single path component: it may not be empty,
+/// may not be `.` or `..`, may not contain path separators or control
+/// characters, may not contain characters that are invalid in a directory
+/// name on Windows, and may not be a reserved Windows device name or end in a
+/// dot. Valid Unicode (including multi-byte and non-ASCII characters) is
+/// preserved exactly.
+pub fn normalize_worktree_name(input: &str) -> anyhow::Result<String> {
+    let normalized = input.split_whitespace().collect::<Vec<_>>().join("-");
+
+    if normalized.is_empty() {
+        return Err(anyhow!("Enter a worktree name."));
+    }
+    if normalized == "." || normalized == ".." {
+        return Err(anyhow!(
+            "A worktree name cannot be a relative path component."
+        ));
+    }
+    if normalized.contains('/') || normalized.contains('\\') {
+        return Err(anyhow!(
+            "A worktree name cannot contain path separators."
+        ));
+    }
+    if normalized.chars().any(|character| character.is_control()) {
+        return Err(anyhow!("A worktree name cannot contain control characters."));
+    }
+    if let Some(character) = normalized
+        .chars()
+        .find(|character| matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return Err(anyhow!(
+            "Worktree name contains the invalid character {character:?}."
+        ));
+    }
+    if normalized.ends_with('.') {
+        return Err(anyhow!(
+            "A worktree name cannot end with a dot."
+        ));
+    }
+    if is_windows_reserved_name(&normalized) {
+        return Err(anyhow!(
+            "{normalized:?} is a reserved name on Windows; choose another name."
+        ));
+    }
+
+    Ok(normalized)
+}
+
+fn is_windows_reserved_name(component: &str) -> bool {
+    let stem = component
+        .split_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(component)
+        .to_ascii_uppercase();
+    WINDOWS_RESERVED_NAMES.contains(&stem.as_str())
 }
 
 #[cfg(test)]
@@ -167,5 +237,84 @@ mod tests {
                 "NOUNS entry is not all lowercase: {word:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_normalize_worktree_name_normalizes_whitespace() {
+        assert_eq!(normalize_worktree_name("feature").unwrap(), "feature");
+        assert_eq!(normalize_worktree_name("  feature  ").unwrap(), "feature");
+        assert_eq!(
+            normalize_worktree_name("feature  work").unwrap(),
+            "feature-work"
+        );
+        assert_eq!(
+            normalize_worktree_name("  hotfix\nbranch\twork ").unwrap(),
+            "hotfix-branch-work"
+        );
+    }
+
+    #[test]
+    fn test_normalize_worktree_name_preserves_valid_unicode() {
+        assert_eq!(normalize_worktree_name("práce").unwrap(), "práce");
+        assert_eq!(normalize_worktree_name("工作分支").unwrap(), "工作分支");
+        assert_eq!(
+            normalize_worktree_name("emoji-🦀-branch").unwrap(),
+            "emoji-🦀-branch"
+        );
+    }
+
+    #[test]
+    fn test_normalize_worktree_name_rejects_empty_and_whitespace() {
+        assert!(normalize_worktree_name("").is_err());
+        assert!(normalize_worktree_name("   ").is_err());
+        assert!(normalize_worktree_name("\t\n").is_err());
+    }
+
+    #[test]
+    fn test_normalize_worktree_name_rejects_traversal_and_separators() {
+        assert!(normalize_worktree_name("..").is_err());
+        assert!(normalize_worktree_name(".").is_err());
+        assert!(normalize_worktree_name("../escape").is_err());
+        assert!(normalize_worktree_name("a/b").is_err());
+        assert!(normalize_worktree_name(r"a\b").is_err());
+        assert!(normalize_worktree_name("/abs").is_err());
+    }
+
+    #[test]
+    fn test_normalize_worktree_name_rejects_control_characters() {
+        assert!(normalize_worktree_name("bad\u{0}").is_err());
+        assert!(normalize_worktree_name("bad\u{7}name").is_err());
+        assert!(normalize_worktree_name("bad\u{1}name").is_err());
+        assert!(normalize_worktree_name("bad\u{1f}name").is_err());
+        // Whitespace-like control characters normalize to hyphens instead.
+        assert_eq!(
+            normalize_worktree_name("tab\tname").unwrap(),
+            "tab-name"
+        );
+    }
+
+    #[test]
+    fn test_normalize_worktree_name_rejects_windows_invalid_characters() {
+        for character in ['<', '>', ':', '"', '|', '?', '*'] {
+            assert!(
+                normalize_worktree_name(&format!("bad{character}name")).is_err(),
+                "expected {character:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_worktree_name_rejects_reserved_names_and_trailing_dot() {
+        for name in ["CON", "con", "PrN", "AUX", "NUL", "COM1", "com7", "LPT9"] {
+            assert!(
+                normalize_worktree_name(name).is_err(),
+                "expected reserved name {name:?} to be rejected"
+            );
+            assert!(
+                normalize_worktree_name(&format!("{name}.txt")).is_err(),
+                "expected reserved name with extension {name:?} to be rejected"
+            );
+        }
+        assert!(normalize_worktree_name("feature.").is_err());
     }
 }

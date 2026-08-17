@@ -1,20 +1,41 @@
 use crate::{
     commit_view::CommitView,
-    git_graph::GitGraph,
-    git_graph_actions::GraphMutation,
+    git_graph::{GitGraph, RefKind, ResolvedRef},
+    git_graph_actions::{GraphMutation, GraphMutationError},
     git_ref_modal::{GitRefModal, GitRefModalKind, GitRefModalResult},
+    open_branch_rename_modal,
 };
 use anyhow::anyhow;
+use futures::channel::oneshot;
 use git::Oid;
-use git::repository::{CreateTagOptions, MergeMode, ResetMode};
-use gpui::{
-    Action, App, ClipboardItem, Entity, FocusHandle, SharedString, Task, WeakEntity, Window,
-    actions,
+use git::repository::{AskPassDelegate, CreateTagOptions, MergeMode, Remote, ResetMode};
+use git::stash::{StashIdentity, StashMutationResult, StashRenameResult, resolve_stash_identity};
+use git_ui_core::askpass_modal::AskPassModal;
+use git_ui_core::delete_service::{self as delete_service, WorktreeRemovalOutcome};
+use git_ui_core::notifications::show_error_toast;
+use git_ui_core::stash_rename_modal::StashRenameModal;
+use git_ui_core::worktree_name_modal::WorktreeNameModal;
+use git_ui_core::worktree_service::{
+    HostScopedRepositoryIdentity, handle_create_worktree, linked_worktree_label, switch_to_worktree,
 };
+use gpui::{
+Action, AnyWindowHandle, App, AsyncWindowContext, ClipboardItem, Entity, FocusHandle,
+    PromptLevel, SharedString, Task, WeakEntity, Window, actions,
+};
+use gpui::{DismissEvent, EventEmitter, Focusable, InteractiveElement, ParentElement};
+use menu;
+use notifications::status_toast::StatusToast;
 use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
 use task::{TaskContext, TaskVariables, VariableName};
-use ui::{Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
-use workspace::{Workspace, notifications::DetachAndPromptErr};
+use ui::{
+    Button, ButtonStyle, Color, ContextMenu, ContextMenuEntry, Headline, HeadlineSize, IconName,
+    IconPosition, Label, prelude::*,
+};
+use workspace::{
+    OpenMode, Workspace,
+    notifications::DetachAndPromptErr,
+};
+use zed_actions::{NewWorktreeBranchTarget, OpenWorktreeInNewWindow};
 
 actions!(
     git_graph,
@@ -34,6 +55,18 @@ const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
 pub(crate) struct CommitContextMenuData {
     pub(crate) sha: Oid,
     pub(crate) tag_names: Vec<SharedString>,
+    /// True for a stash-reflog row. Commit-oriented actions (checkout,
+    /// cherry-pick, revert, reset, merge, ref/worktree operations) are never
+    /// offered for a stash row; only the commit view/diff seam and the stash
+    /// actions (View/Apply/Pop/Drop) are shown.
+    pub(crate) is_stash: bool,
+    /// The composite stash target captured for a stash-reflog row at deploy
+    /// time. Present exactly when `is_stash`. It stays stable while the menu is
+    /// open so a later mutation always targets this entry; backends refresh
+    /// `refs/stash` and re-resolve exactly one current entry from it at the
+    /// mutation boundary. Destructive authority is never derived from the
+    /// current row index or OID alone.
+    pub(crate) stash_identity: Option<StashIdentity>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -55,12 +88,82 @@ pub(crate) fn commit_context_menu(
     cx: &mut App,
 ) -> Entity<ContextMenu> {
     let sha = commit.sha;
+    let is_stash = commit.is_stash;
     let cherry_pick_commits = if selected_commits.is_empty() {
         vec![sha]
     } else {
         selected_commits
     };
     let sha_short = sha.display_short();
+    // Linked worktrees checked out at this exact commit, captured from live
+    // repository state so the Worktree submenu can offer one-entry-per-worktree
+    // navigation. Only surfaced in the Git Graph; the Git Panel history menu
+    // stays commit-only.
+    let matching_worktrees: Vec<git::repository::Worktree> = if source
+        == CommitContextMenuSource::GitGraph
+    {
+        repository
+            .as_ref()
+            .and_then(|repository| repository.upgrade())
+            .map(|repository| {
+                repository
+                    .read(cx)
+                    .linked_worktrees
+                    .iter()
+                    .filter(|worktree| worktree.sha.as_ref() == sha.to_string())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Per-worktree build-time "potentially eligible" flag for the Git Graph
+    // Worktree submenu's `Remove Worktree…` actions. A worktree is potentially
+    // eligible when it is not the main worktree and is not open in any Zed
+    // window (including the current workspace). The optimistic sync open-check
+    // never canonicalizes symlinks; the authoritative async re-check in the
+    // shared remove service re-validates immediately before mutation, and
+    // disappeared / stale-replaced targets are blocked there. This is computed
+    // at the function top (Window + App are available here) and captured into
+    // the build closure below, whose `.when(...GitGraph...)` builder only
+    // threads `Window, App` to entry handlers.
+    let matching_worktrees_eligible: Vec<(git::repository::Worktree, bool)> = if source
+        == CommitContextMenuSource::GitGraph
+    {
+        // Reborrow the function's `&mut` handles as shared references so they
+        // can be captured by the eligibility closure below without moving them
+        // (the build closure still needs the mutable handles afterward).
+        let window = &*window;
+        let cx = &*cx;
+        let workspace_entity = workspace.upgrade();
+        let identity = repository
+            .as_ref()
+            .and_then(|repository| repository.upgrade())
+            .map(|repository| {
+                let common_identity = repository.read(cx).common_repository_identity();
+                let remote_options = workspace_entity
+                    .as_ref()
+                    .and_then(|workspace| {
+                        workspace
+                            .read(cx)
+                            .project()
+                            .read(cx)
+                            .remote_connection_options(cx)
+                    });
+                HostScopedRepositoryIdentity::new(common_identity, remote_options.as_ref())
+            });
+        matching_worktrees
+            .iter()
+            .map(|worktree| {
+                let eligible = worktree_removal_eligible(worktree, identity.as_ref(), window, cx);
+                (worktree.clone(), eligible)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let git_tasks = git_context_menu_tasks(
         git_task_context(&repository, sha, ref_name.as_deref(), cx),
         &workspace,
@@ -129,26 +232,135 @@ pub(crate) fn commit_context_menu(
                                 },
                             )
                         }
-                        _ => menu.submenu(copy_tag_label, move |menu, _window, _cx| {
-                            let mut menu = menu.fixed_width(COMMIT_TAG_LIST_WIDTH_IN_REMS.into());
+_ => menu.submenu(copy_tag_label, move |menu, _window, _cx| {
+                        let mut menu = menu.fixed_width(COMMIT_TAG_LIST_WIDTH_IN_REMS.into());
 
-                            for tag_name in tag_names.clone() {
-                                let tag_name_to_copy = tag_name.clone();
-                                menu = menu.entry(tag_name, None, move |_window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        tag_name_to_copy.to_string(),
-                                    ));
-                                });
+                        for tag_name in tag_names.clone() {
+                            let tag_name_to_copy = tag_name.clone();
+                            menu = menu.entry(tag_name, None, move |_window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    tag_name_to_copy.to_string(),
+                                ));
+                            });
+                        }
+                        menu
+                    }),
+                }
+            })
+            })
+            .when_some(commit.stash_identity.clone(), |menu, stash_identity| {
+                // Stash-only actions for a stash-reflog row. The composite
+                // stash target and its repository are captured here at deploy
+                // time and stay stable while the menu is open; the backends
+                // refresh `refs/stash` and re-resolve exactly one current entry
+                // from the identity at the mutation boundary — destructive
+                // authority is never the current row index or OID alone.
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                let graph = graph.clone();
+                menu.separator()
+                    .submenu("Stash", move |menu, _window, _cx| {
+                        let repository = repository.clone();
+                        let workspace = workspace.clone();
+                        menu.entry("View", None, {
+                            let stash_identity = stash_identity.clone();
+                            let repository = repository.clone();
+                            let workspace = workspace.clone();
+                            move |window, cx| {
+                                let stash_identity = stash_identity.clone();
+                                let Some(repository) = repository.clone() else {
+                                    return;
+                                };
+                                // Reuse the existing stash Commit View so the
+                                // diff and the stash toolbar match other stash
+                                // entry points.
+                                CommitView::open(
+                                    sha.to_string(),
+                                    repository,
+                                    workspace.clone(),
+                                    Some(stash_identity),
+                                    None,
+                                    window,
+                                    cx,
+                                );
                             }
-                            menu
-                        }),
-                    }
-                })
+                        })
+                        .entry("Apply", None, {
+                            let stash_identity = stash_identity.clone();
+                            let repository = repository.clone();
+                            let workspace = workspace.clone();
+                            let graph = graph.clone();
+                            move |window, cx| {
+                                schedule_stash_mutation(
+                                    graph.clone(),
+                                    repository.clone(),
+                                    workspace.clone(),
+                                    stash_identity.clone(),
+                                    StashMenuOp::Apply,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })
+                        .entry("Pop", None, {
+                            let stash_identity = stash_identity.clone();
+                            let repository = repository.clone();
+                            let workspace = workspace.clone();
+                            let graph = graph.clone();
+                            move |window, cx| {
+                                schedule_stash_mutation(
+                                    graph.clone(),
+                                    repository.clone(),
+                                    workspace.clone(),
+                                    stash_identity.clone(),
+                                    StashMenuOp::Pop,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })
+                        .entry("Rename…", None, {
+                            let stash_identity = stash_identity.clone();
+                            let repository = repository.clone();
+                            let workspace = workspace.clone();
+                            let graph = graph.clone();
+                            move |window, cx| {
+                                schedule_stash_rename(
+                                    graph.clone(),
+                                    repository.clone(),
+                                    workspace.clone(),
+                                    stash_identity.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })
+                        .entry("Drop…", None, {
+                            let stash_identity = stash_identity.clone();
+                            let repository = repository.clone();
+                            let workspace = workspace.clone();
+                            let graph = graph.clone();
+                            move |window, cx| {
+                                schedule_stash_mutation(
+                                    graph.clone(),
+                                    repository.clone(),
+                                    workspace.clone(),
+                                    stash_identity.clone(),
+                                    StashMenuOp::Drop,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })
+                    })
             })
             .when_some(graph.clone(), |menu, graph| {
                 let repository = repository.clone();
                 let workspace = workspace.clone();
                 let reset_graph = graph.clone();
+                if is_stash {
+                    return menu;
+                }
                 menu.separator()
                     .header("Git Actions")
                     .entry("Checkout Commit", None, {
@@ -320,6 +532,124 @@ pub(crate) fn commit_context_menu(
                         );
                     })
             })
+            .when(source == CommitContextMenuSource::GitGraph, |menu| {
+                if is_stash {
+                    return menu;
+                }
+                let workspace = workspace.clone();
+                #[allow(clippy::redundant_clone)]
+                let workspace_for_entry = workspace.clone();
+                let worktrees = matching_worktrees_eligible.clone();
+                let mut menu = menu.separator().header("Worktree");
+                menu = menu.submenu(
+                    "Create Detached Worktree",
+                    {
+                        let repository = repository.clone();
+                        let workspace = workspace_for_entry.clone();
+                        move |menu, _window, _cx| {
+                            #[allow(clippy::redundant_clone)]
+                            let repository = repository.clone();
+                            #[allow(clippy::redundant_clone)]
+                            let workspace = workspace.clone();
+                            menu.entry("Create…", None, move |window, cx| {
+                                create_detached_worktree_for_commit(
+                                    repository.clone(),
+                                    workspace.clone(),
+                                    sha,
+                                    window,
+                                    cx,
+                                );
+                            })
+                        }
+                    },
+                );
+                if !worktrees.is_empty() {
+                    for (worktree, eligible) in &worktrees {
+                        let path = worktree.path.clone();
+                        // Each entry is distinguishable by its checked-out
+                        // branch and a portable short path, so worktrees that
+                        // share the clicked commit stay separately addressable.
+                        let display_name = linked_worktree_label(worktree).to_string();
+                        let switch_workspace = workspace_for_entry.clone();
+                        let switch_path = path.clone();
+                        let switch_display_name = display_name.clone();
+                        let switch_offer_sha = sha.to_string();
+                        menu = menu.entry(
+                            format!("Switch to {display_name}"),
+                            None,
+                            move |window, cx| {
+                                // This is also the shared worktree service switch
+                                // (same OS window, never a terminal `cd`), catching
+                                // current-target, disappeared-target, and
+                                // stale-snapshot as explicit no-ops via toasts.
+                                let Some(workspace) = switch_workspace.upgrade() else {
+                                    // Missing-window-handle: explicit error state,
+                                    // never a silent `if let Some` fallback.
+                                    log::error!(
+                                        "worktree switch: source window handle for {} is no \
+                                         longer available",
+                                        switch_path.display()
+                                    );
+                                    return;
+                                };
+                                workspace.update(cx, |workspace, cx| {
+                                    switch_to_worktree(
+                                        workspace,
+                                        switch_path.clone(),
+                                        switch_display_name.clone().into(),
+                                        Some(switch_offer_sha.clone().into()),
+                                        window,
+                                        None,
+                                        OpenMode::Activate,
+                                        cx,
+                                    );
+                                });
+                            },
+                        );
+                        let new_window_path = path.clone();
+                        menu = menu.entry(
+                            format!("Open {display_name} in New Window"),
+                            None,
+                            move |window, cx| {
+                                // Routes through the shared open-in-new-window seam:
+                                // a distinct OS window, no file/dock transfer.
+                                window.dispatch_action(
+                                    Box::new(OpenWorktreeInNewWindow {
+                                        path: new_window_path.clone(),
+                                    }),
+                                    cx,
+                                );
+                            },
+                        );
+                        if *eligible {
+                            // Per-worktree removal reuses the shared guarded service
+                            // (confirmation, open-guard, safe/force removal, optional
+                            // linked-branch cleanup, partial result). Only this entry's
+                            // path is ever targeted, so duplicate-SHA worktrees stay
+                            // independently addressable.
+                            let remove_repository = repository.clone();
+                            let remove_graph = graph.clone();
+                            let remove_workspace = workspace_for_entry.clone();
+                            let remove_worktree = worktree.clone();
+                            menu = menu.entry(
+                                "Remove Worktree…",
+                                None,
+                                move |window, cx| {
+                                    remove_worktree_from_graph(
+                                        remove_repository.clone(),
+                                        remove_graph.clone(),
+                                        remove_workspace.clone(),
+                                        remove_worktree.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            );
+                        }
+                    }
+                }
+                menu
+            })
             .when(source == CommitContextMenuSource::GitPanel, |menu| {
                 menu.entry("Show in Git Graph", None, move |window, cx| {
                     window.dispatch_action(
@@ -331,6 +661,9 @@ pub(crate) fn commit_context_menu(
                 })
             })
             .map(|mut menu| {
+                if is_stash {
+                    return menu;
+                }
                 menu = menu.separator().header("Custom Commands");
 
                 if git_tasks.is_empty() {
@@ -368,6 +701,1807 @@ pub(crate) fn commit_context_menu(
                 menu
             })
     })
+}
+
+/// Schedules a per-ref operation through the graph with a duplicate-dispatch
+/// guard. While one ref operation is in flight, further dispatches are
+/// suppressed; the guard is cleared when the operation settles (success or
+/// error) or the graph is no longer available. Errors are propagated to the UI
+/// through `detach_and_prompt_err` — never silently dropped.
+fn schedule_ref_operation(
+    graph: Option<WeakEntity<GitGraph>>,
+    make_task: impl FnOnce(
+        &mut GitGraph,
+        &mut gpui::Context<GitGraph>,
+    ) -> Result<Task<anyhow::Result<()>>, GraphMutationError>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(graph) = graph.and_then(|graph| graph.upgrade()) else {
+        log::error!("ref action: git graph is no longer available");
+        return;
+    };
+    let (task, weak) = graph.update(cx, |graph, graph_cx| {
+        let weak = graph_cx.entity().downgrade();
+        if !graph.begin_ref_operation() {
+            // A ref operation is already in flight; suppress the duplicate
+            // dispatch rather than queueing another mutation.
+            return (None, weak);
+        }
+        let result = match make_task(graph, graph_cx) {
+            Ok(task) => task,
+            Err(error) => {
+                graph.end_ref_operation();
+                Task::ready(Err(anyhow!(error.to_string())))
+            }
+        };
+        (Some(result), weak)
+    });
+    let Some(task) = task else {
+        // Duplicate dispatch suppressed while a ref operation is in flight.
+        return;
+    };
+    window
+        .spawn(cx, async move |cx| {
+            let result = task.await;
+            weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err("Git graph action failed", window, cx, |error, _, _| {
+            Some(error.to_string())
+        });
+}
+
+/// A stash mutation the stash-row submenu can dispatch. Each op has distinct
+/// result plumbing and, for `Drop`, a mandatory pre-mutation confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StashMenuOp {
+    Apply,
+    Pop,
+    /// Drop requires an explicit confirmation naming the selected stash before
+    /// any mutation is dispatched.
+    Drop,
+}
+
+/// Runs a stash mutation from the stash-row submenu through the graph's
+/// duplicate-dispatch guard. While the mutation is in flight, further
+/// dispatches are suppressed; the guard is cleared when it settles (success,
+/// partial `AppliedButRetained`, error, or the graph/repository goes away).
+///
+/// The mutation targets the *captured* composite `StashIdentity`; the
+/// Repository refreshes `refs/stash` and re-resolves exactly one current entry
+/// at the mutation boundary, so external reorders or duplicate OIDs between
+/// menu deployment and dispatch either mutate the same uniquely-resolved entry
+/// or fail safely as missing/ambiguous. Destructive authority is never the
+/// current row index or OID alone. On a successful mutation the backend
+/// refreshes the stash snapshot event-driven (`StashEntriesChanged`), which
+/// reloads the graph and other stash surfaces in local and remote projects
+/// alike.
+fn schedule_stash_mutation(
+    graph: Option<WeakEntity<GitGraph>>,
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    identity: StashIdentity,
+    op: StashMenuOp,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // Pre-flight: the repository must be reachable to dispatch anything;
+    // otherwise surface an explicit error rather than a silent no-op.
+    let Some(_) = repository.as_ref().and_then(|repository| repository.upgrade()) else {
+        if let Some(workspace) = workspace.upgrade() {
+            show_error_toast(
+                workspace,
+                "stash action",
+                anyhow!("The repository is no longer available"),
+                cx,
+            );
+        }
+        return;
+    };
+    // Resolve a human-facing label for the selected stash from live repository
+    // state, used only to name the Drop confirmation. Cosmetic: the mutation
+    // authority is the captured identity, re-resolved fresh by the backend.
+    let stash_label = if op == StashMenuOp::Drop {
+        repository
+            .as_ref()
+            .and_then(|repository| repository.upgrade())
+            .and_then(|repository| {
+                resolve_stash_identity(&repository.read(cx).stash_entries.entries, &identity)
+                    .ok()
+                    .map(|entry| format!("{} ({})", entry.message, identity.selector))
+            })
+            .unwrap_or_else(|| identity.selector.clone())
+    } else {
+        String::new()
+    };
+
+    window
+        .spawn(cx, async move |cx| {
+            // Drop requires an explicit confirmation naming the selected stash.
+            // Cancellation dispatches nothing (the in-flight guard below is
+            // never set), so no pending state lingers.
+            if op == StashMenuOp::Drop {
+                let prompt_message = format!("Drop stash {stash_label}? This cannot be undone.");
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        "Drop stash",
+                        Some(&prompt_message),
+                        &["Drop", "Cancel"],
+                        cx,
+                    )
+                })?;
+                if answer.await != Ok(0) {
+                    return Ok(());
+                }
+            }
+
+            let Some(graph) = graph.and_then(|graph| graph.upgrade()) else {
+                return Ok(());
+            };
+            let weak_graph = graph.downgrade();
+            if !graph.update(cx, |graph, _| graph.begin_ref_operation()) {
+                // A ref/stash operation is already in flight; suppress the
+                // duplicate dispatch rather than queueing another mutation.
+                return Ok(());
+            }
+            let Some(repository) = repository.and_then(|repository| repository.upgrade()) else {
+                weak_graph
+                    .update(cx, |graph, _| graph.end_ref_operation())
+                    .ok();
+                return Err(anyhow!("The repository is no longer available"));
+            };
+            let outcome = async {
+                match op {
+                    StashMenuOp::Apply => {
+                        repository
+                            .update(cx, |repo, cx| {
+                                repo.stash_apply(Some(identity.clone()), cx)
+                            })
+                            .await?;
+                        Ok::<_, anyhow::Error>(StashMutationResult::Success)
+                    }
+                    StashMenuOp::Pop => {
+                        let outcome = repository
+                            .update(cx, |repo, cx| {
+                                repo.stash_pop(Some(identity.clone()), cx)
+                            })
+                            .await?;
+                        Ok(outcome)
+                    }
+                    StashMenuOp::Drop => {
+                        repository
+                            .update(cx, |repo, cx| {
+                                repo.stash_drop(Some(identity.clone()), cx)
+                            })
+                            .await??;
+                        Ok(StashMutationResult::Success)
+                    }
+                }
+            }
+            .await;
+            // Clear the guard on success, partial result, error, or expiry.
+            weak_graph
+                .update(cx, |graph, _| graph.end_ref_operation())
+                .ok();
+
+            let outcome = outcome?;
+            if op == StashMenuOp::Pop
+                && outcome == StashMutationResult::AppliedButRetained
+                && let Some(workspace) = workspace.upgrade()
+            {
+                workspace.update_in(cx, |_, window, cx| {
+                    let _ = window.prompt(
+                        PromptLevel::Info,
+                        "Stash popped",
+                        Some(
+                            "The stash was applied but could not be dropped;\nit has been \
+                             retained.",
+                        ),
+                        &["OK"],
+                        cx,
+                    );
+                })?;
+            }
+            Ok(())
+        })
+        .detach_and_prompt_err(
+            "Git graph stash action failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
+/// Human-readable guidance for an unfinished/recovered stash rename: the exact
+/// manifest + recovery ref names plus the current observed stack, so a user (or
+/// a future retry/recover/cleanup) can act instead of guessing.
+fn stash_rename_recovery_guidance(recovery: &git::stash::StashRenameRecovery) -> String {
+    let mut lines = vec![
+        format!("Manifest: {}", recovery.manifest_ref),
+        format!("Recovery refs: {}", recovery.recovery_refs.join(", ")),
+    ];
+    if recovery.rename_applied {
+        lines.push("The rename applied but its recovery refs were not cleaned up.".into());
+    } else {
+        lines.push(if recovery.observed_entries.is_empty() {
+            "The rename did not complete; the stash stack is empty until recovered.".into()
+        } else {
+            format!(
+                "The rename did not complete. Observed stack ({}): {}",
+                recovery.observed_entries.len(),
+                recovery
+                    .observed_entries
+                    .iter()
+                    .map(|entry| format!("{} ({})", entry.message, entry.oid))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+    lines.join("\n")
+}
+
+/// Runs a stash rename from the stash-row submenu: opens a focused
+/// required-message modal for the exact composite target, then (on confirm)
+/// dispatches through the graph's duplicate-dispatch guard. Cancellation
+/// dispatches nothing. A destructive-boundary or cleanup outcome surfaces the
+/// retained recovery refs + observed stack rather than hiding the partial
+/// result.
+fn schedule_stash_rename(
+    graph: Option<WeakEntity<GitGraph>>,
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    identity: StashIdentity,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // Pre-flight: the repository must be reachable to dispatch anything;
+    // otherwise surface an explicit error rather than a silent no-op.
+    let Some(_) = repository.as_ref().and_then(|repository| repository.upgrade()) else {
+        if let Some(workspace) = workspace.upgrade() {
+            show_error_toast(
+                workspace,
+                "stash action",
+                anyhow!("The repository is no longer available"),
+                cx,
+            );
+        }
+        return;
+    };
+    // Resolve a human-facing label for the selected stash from live repository
+    // state for the modal header. Cosmetic: mutation authority is the captured
+    // identity, re-resolved fresh by the backend.
+    let stash_label = repository
+        .as_ref()
+        .and_then(|repository| repository.upgrade())
+        .and_then(|repository| {
+            resolve_stash_identity(&repository.read(cx).stash_entries.entries, &identity)
+                .ok()
+                .map(|entry| format!("{} ({})", entry.message, identity.selector))
+        })
+        .unwrap_or_else(|| identity.selector.clone());
+
+    // Open the focused required-message modal for the exact composite target
+    // before spawning the dispatch task; the modal itself is window-spawned.
+    let modal = StashRenameModal::open(
+        workspace.clone(),
+        None,
+        Some(format!("Rename {stash_label}").into()),
+        window,
+        cx,
+    );
+
+    window.spawn(cx, async move |cx| {
+        let new_message = modal.await;
+        // Cancellation (or a dismissed modal) dispatches nothing.
+        let Some(new_message) = new_message else {
+            return Ok::<(), anyhow::Error>(());
+        };
+
+        let Some(graph) = graph.and_then(|graph| graph.upgrade()) else {
+            return Ok(());
+        };
+        let weak_graph = graph.downgrade();
+        if !graph.update(cx, |graph, _| graph.begin_ref_operation()) {
+            // A ref/stash operation is already in flight; suppress the
+            // duplicate dispatch rather than queueing another mutation.
+            return Ok(());
+        }
+        let Some(repository) = repository.and_then(|repository| repository.upgrade()) else {
+            weak_graph
+                .update(cx, |graph, _| graph.end_ref_operation())
+                .ok();
+            return Err(anyhow!("The repository is no longer available"));
+        };
+        let outcome = repository
+            .update(cx, |repo, cx| {
+                repo.stash_rename(Some(identity), new_message, cx)
+            })
+            .await;
+        // Clear the guard on success, recovery-outcome, error, or expiry.
+        weak_graph
+            .update(cx, |graph, _| graph.end_ref_operation())
+            .ok();
+
+        let result = outcome?;
+        match result {
+            StashRenameResult::Success => {}
+            succeeded @ (StashRenameResult::SuccessWithRecoveryRefs(_)
+            | StashRenameResult::FailedWithRecovery(_)) => {
+                let recovery = match succeeded {
+                    StashRenameResult::SuccessWithRecoveryRefs(recovery)
+                    | StashRenameResult::FailedWithRecovery(recovery) => recovery,
+                    StashRenameResult::Success => unreachable!(),
+                };
+                log::warn!(
+                    "stash rename left recovery refs behind: {}",
+                    recovery.manifest_ref
+                );
+                if let Some(workspace) = workspace.upgrade() {
+                    workspace.update_in(cx, |_, window, cx| {
+                        let _ = window.prompt(
+                            PromptLevel::Critical,
+                            "Stash rename needs recovery",
+                            Some(&stash_rename_recovery_guidance(&recovery)),
+                            &["OK"],
+                            cx,
+                        );
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    })
+    .detach_and_prompt_err(
+        "Git graph stash rename failed",
+        window,
+        cx,
+        |error, _, _| Some(error.to_string()),
+    );
+}
+
+/// Builds the typed, per-ref context menu deployed from a Git Graph ref-chip
+/// right-click. The menu is keyed to one fully-qualified canonical ref
+/// (`ResolvedRef`) and the clicked commit's SHA; every action targets that exact
+/// ref — never a fallback to the current/first branch.
+///
+/// Local branches get Checkout, Merge into Current, Create Detached Worktree,
+/// Rename, Delete, and Copy Name. The current branch omits Checkout and Delete.
+/// Remote refs and tags get the commit-target actions (Merge into Current,
+/// Create Detached Worktree) and Copy Name; their chips are still typed to the
+/// exact ref so Copy Name never mixes local/remote same-name refs.
+pub(crate) fn ref_chip_context_menu(
+    resolved_ref: ResolvedRef,
+    commit_sha: git::Oid,
+    is_current_branch: bool,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    let is_local_branch = resolved_ref.kind == RefKind::LocalBranch;
+    let is_remote_branch = resolved_ref.kind == RefKind::RemoteBranch;
+    let is_tag = resolved_ref.kind == RefKind::Tag;
+    let display_name = resolved_ref.display_name.clone();
+    let header = format!("Ref {display_name}");
+
+    // A local branch checked out in another (non-main) linked worktree is a
+    // worktree destination, not an ordinary checkout target. Resolved from the
+    // live repository snapshot against the worktree's exact fully-qualified
+    // ref (`refs/heads/<name>`), never by the shortened display text — so a
+    // local branch literally named `origin/main` is never confused with the
+    // unrelated `refs/remotes/origin/main` remote-tracking ref. The snapshot
+    // already excludes the main worktree, and the `!is_main` guard keeps this a
+    // linked destination even if a snapshot ever carried the main worktree.
+    let linked_worktree: Option<git::repository::Worktree> = if is_local_branch {
+        let full_ref = resolved_ref.ref_name.clone();
+        repository
+            .as_ref()
+            .and_then(|repository| repository.upgrade())
+            .and_then(|repository| {
+                repository
+                    .read(cx)
+                    .linked_worktrees
+                    .iter()
+                    .find(|worktree| {
+                        !worktree.is_main && worktree.ref_name.as_deref() == Some(full_ref.as_ref())
+                    })
+                    .cloned()
+            })
+    } else {
+        None
+    };
+    // Build-time "potentially eligible" flag for the linked-branch `Remove
+    // Worktree…` entry, mirroring the commit menu's linked-worktree eligibility
+    // logic (not the main worktree, and not open in any Zed window). The
+    // authoritative open/disappearance re-check happens in the shared remove
+    // service immediately before mutation, so a stale menu never mutates
+    // against a worktree that vanished or was replaced while the menu was open.
+    let linked_worktree_eligible = linked_worktree.as_ref().map(|worktree| {
+        let window = &*window;
+        let cx = &*cx;
+        let workspace_entity = workspace.upgrade();
+        let identity = repository
+            .as_ref()
+            .and_then(|repository| repository.upgrade())
+            .map(|repository| {
+                let common_identity = repository.read(cx).common_repository_identity();
+                let remote_options = workspace_entity.as_ref().and_then(|workspace| {
+                    workspace
+                        .read(cx)
+                        .project()
+                        .read(cx)
+                        .remote_connection_options(cx)
+                });
+                HostScopedRepositoryIdentity::new(common_identity, remote_options.as_ref())
+            });
+        worktree_removal_eligible(worktree, identity.as_ref(), window, cx)
+    });
+    let linked_worktree_label = linked_worktree.as_ref().map(linked_worktree_label);
+
+    ContextMenu::build(window, cx, move |menu, _window, _cx| {
+        let mut menu = menu.header(header);
+
+        if let Some(worktree) = &linked_worktree {
+            // Linked-worktree branch: route to the exact worktree instead of
+            // offering ordinary Checkout / Rename / direct branch Delete. The
+            // `Switch Here` path reuses the shared worktree service switch,
+            // which fails safely (toast) when the target is already current,
+            // has disappeared, or the snapshot is stale.
+            let switch_workspace = workspace.clone();
+            let switch_path = worktree.path.clone();
+            let switch_label = linked_worktree_label
+                .clone()
+                .unwrap_or_else(|| display_name.clone().into());
+            let switch_offer_sha = commit_sha.to_string();
+            menu = menu.entry("Switch Here", None, move |window, cx| {
+                let Some(workspace) = switch_workspace.upgrade() else {
+                    log::error!(
+                        "linked branch switch: source window handle for {} is no longer \
+                         available",
+                        switch_path.display()
+                    );
+                    return;
+                };
+                workspace.update(cx, |workspace, cx| {
+                    switch_to_worktree(
+                        workspace,
+                        switch_path.clone(),
+                        switch_label.clone(),
+                        Some(switch_offer_sha.clone().into()),
+                        window,
+                        None,
+                        OpenMode::Activate,
+                        cx,
+                    );
+                });
+            });
+            menu = menu.entry(
+                format!("Open {display_name} in New Window"),
+                None,
+                {
+                    let new_window_path = worktree.path.clone();
+                    move |window, cx| {
+                        window.dispatch_action(
+                            Box::new(OpenWorktreeInNewWindow {
+                                path: new_window_path.clone(),
+                            }),
+                            cx,
+                        );
+                    }
+                },
+            );
+            if linked_worktree_eligible == Some(true) {
+                let remove_repository = repository.clone();
+                let remove_graph = graph.clone();
+                let remove_workspace = workspace.clone();
+                let remove_worktree = worktree.clone();
+                menu = menu.entry("Remove Worktree…", None, move |window, cx| {
+                    remove_worktree_from_graph(
+                        remove_repository.clone(),
+                        remove_graph.clone(),
+                        remove_workspace.clone(),
+                        remove_worktree.clone(),
+                        window,
+                        cx,
+                    );
+                });
+            }
+        } else if is_local_branch {
+            if !is_current_branch {
+                menu = menu.entry("Checkout", None, {
+                    let graph = graph.clone();
+                    let display_name = display_name.clone();
+                    move |window, cx| {
+                        schedule_ref_operation(
+                            graph.clone(),
+                            |graph, graph_cx| {
+                                graph.schedule_branch_checkout(
+                                    display_name.clone().into(),
+                                    commit_sha,
+                                    graph_cx,
+                                )
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                });
+            }
+            menu = menu.entry("Merge into Current", None, {
+                let graph = graph.clone();
+                move |window, cx| schedule_ref_merge(graph.clone(), commit_sha, window, cx)
+            });
+            menu = menu.entry("Create Detached Worktree", None, {
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    create_detached_worktree_for_commit(
+                        repository.clone(),
+                        workspace.clone(),
+                        commit_sha,
+                        window,
+                        cx,
+                    );
+                }
+            });
+            menu = menu.entry("Rename…", None, {
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                let display_name = display_name.clone();
+                move |window, cx| {
+                    rename_ref_branch(repository.clone(), workspace.clone(), display_name.as_ref(), window, cx);
+                }
+            });
+            if !is_current_branch {
+                menu = menu.entry("Delete…", None, {
+                    let repository = repository.clone();
+                    let workspace = workspace.clone();
+                    let display_name = display_name.clone();
+                    move |window, cx| {
+                        delete_ref_branch(repository.clone(), workspace.clone(), display_name.as_ref(), window, cx);
+                    }
+                });
+            }
+        } else if is_remote_branch {
+            // Remote-tracking branch: check out the exact clicked upstream (with
+            // exact-tracker reuse, else a distinct local name that never repoints
+            // an existing branch) and delete it on its server remote. Local-only
+            // Rename/Delete are never offered for a remote chip.
+            menu = menu.entry("Checkout", None, {
+                let resolved_ref = resolved_ref.clone();
+                let repository = repository.clone();
+                let graph = graph.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    schedule_remote_branch_checkout(
+                        &resolved_ref,
+                        repository.clone(),
+                        graph.clone(),
+                        workspace.clone(),
+                        window,
+                        cx,
+                    );
+                }
+            });
+            menu = menu.entry("Merge into Current", None, {
+                let graph = graph.clone();
+                move |window, cx| schedule_ref_merge(graph.clone(), commit_sha, window, cx)
+            });
+            menu = menu.entry("Create Detached Worktree", None, {
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    create_detached_worktree_for_commit(
+                        repository.clone(),
+                        workspace.clone(),
+                        commit_sha,
+                        window,
+                        cx,
+                    );
+                }
+            });
+            menu = menu.entry("Delete on Server…", None, {
+                let resolved_ref = resolved_ref.clone();
+                let repository = repository.clone();
+                let graph = graph.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    schedule_remote_branch_delete_on_server(
+                        &resolved_ref,
+                        repository.clone(),
+                        graph.clone(),
+                        workspace.clone(),
+                        window,
+                        cx,
+                    );
+                }
+            });
+        } else if is_tag {
+            // Tag: a complete, explicit lifecycle menu — inspect, push, and
+            // delete locally or on the server. Remote operations always require
+            // explicit remote selection; local and server deletes have distinct
+            // confirmations and distinct operations.
+            menu = menu.entry("View Details…", None, {
+                let resolved_ref = resolved_ref.clone();
+                let repository = repository.clone();
+                let graph = graph.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    schedule_tag_view_details(
+                        &resolved_ref,
+                        repository.clone(),
+                        graph.clone(),
+                        workspace.clone(),
+                        window,
+                        cx,
+                    );
+                }
+            });
+            menu = menu.entry("Push to Remote…", None, {
+                let resolved_ref = resolved_ref.clone();
+                let repository = repository.clone();
+                let graph = graph.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    schedule_tag_push_to_remote(
+                        &resolved_ref,
+                        repository.clone(),
+                        graph.clone(),
+                        workspace.clone(),
+                        window,
+                        cx,
+                    );
+                }
+            });
+            menu = menu.entry("Delete Local…", None, {
+                let resolved_ref = resolved_ref.clone();
+                let repository = repository.clone();
+                let graph = graph.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    schedule_tag_delete_local(
+                        &resolved_ref,
+                        repository.clone(),
+                        graph.clone(),
+                        workspace.clone(),
+                        window,
+                        cx,
+                    );
+                }
+            });
+            menu = menu.entry("Delete on Remote…", None, {
+                let resolved_ref = resolved_ref.clone();
+                let repository = repository.clone();
+                let graph = graph.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    schedule_tag_delete_on_remote(
+                        &resolved_ref,
+                        repository.clone(),
+                        graph.clone(),
+                        workspace.clone(),
+                        window,
+                        cx,
+                    );
+                }
+            });
+        }
+
+        menu.entry("Copy Name", None, move |_window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(display_name.to_string()));
+        })
+    })
+}
+
+/// Merges the clicked ref's commit into the current branch, reusing the graph's
+/// `Merge` mutation (clicked SHA) with the duplicate-dispatch guard.
+fn schedule_ref_merge(
+    graph: Option<WeakEntity<GitGraph>>,
+    commit_sha: git::Oid,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    schedule_ref_operation(
+        graph.clone(),
+        |graph, graph_cx| {
+            graph.schedule_mutation(
+                GraphMutation::Merge {
+                    commit: commit_sha,
+                    mode: MergeMode::Default,
+                },
+                Some(commit_sha),
+                graph_cx,
+            )
+        },
+        window,
+        cx,
+    );
+}
+
+/// Splits a canonical `refs/remotes/<remote>/<branch>` ref into its remote and
+/// branch names. Returns `None` for malformed/empty refs (the caller then fails
+/// visibly rather than guessing at a remote).
+fn remote_ref_parts(ref_name: &str) -> Option<(String, String)> {
+    let stripped = ref_name.strip_prefix("refs/remotes/")?;
+    let (remote, branch) = stripped.split_once('/')?;
+    if remote.is_empty() || branch.is_empty() {
+        return None;
+    }
+    Some((remote.to_string(), branch.to_string()))
+}
+
+/// Derives the short tag name from a canonical `refs/tags/<name>` ref.
+fn tag_name_from_ref(ref_name: &str) -> Option<String> {
+    let name = ref_name.strip_prefix("refs/tags/")?;
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Acquires the ref-operation duplicate-dispatch guard from the graph. Returns
+/// the graph's weak handle when the guard was acquired (the caller MUST call
+/// `end_ref_operation` once the operation settles), or `None` when a ref
+/// operation is already in flight (the dispatch is suppressed) or the graph is
+/// gone.
+fn begin_graph_ref_operation(
+    graph: &Option<WeakEntity<GitGraph>>,
+    cx: &mut App,
+) -> Option<WeakEntity<GitGraph>> {
+    let graph = graph.as_ref().and_then(|graph| graph.upgrade())?;
+    if !graph.update(cx, |graph, _| graph.begin_ref_operation()) {
+        return None;
+    }
+    Some(graph.downgrade())
+}
+
+/// A compact destructive-confirmation modal naming exactly what will be
+/// destroyed. Distinct from the worktree-removal modal and reused for
+/// branch-server-delete and tag-delete confirmations, which must be worded
+/// differently and must never be implied by a generic "Delete".
+pub(crate) struct RefDestroyConfirmModal {
+    title: SharedString,
+    body: SharedString,
+    confirm_label: SharedString,
+    focus_handle: FocusHandle,
+    tx: Option<oneshot::Sender<bool>>,
+}
+
+impl EventEmitter<DismissEvent> for RefDestroyConfirmModal {}
+
+impl Focusable for RefDestroyConfirmModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl workspace::ModalView for RefDestroyConfirmModal {}
+
+impl Render for RefDestroyConfirmModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self.title.clone();
+        let body = self.body.clone();
+        let confirm_label = self.confirm_label.clone();
+
+        v_flex()
+            .key_context("RefDestroyConfirmModal")
+            .elevation_3(cx)
+            .p_4()
+            .gap_4()
+            .w(rems(30.))
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                this.cancel(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                this.confirm(window, cx);
+            }))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(Headline::new(title).size(HeadlineSize::Small))
+                    .child(Label::new(body).color(Color::Muted)),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(Button::new("cancel", "Cancel").on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.cancel(window, cx);
+                        },
+                    )))
+                    .child(
+                        Button::new("destroy", confirm_label.clone())
+                            .style(ButtonStyle::Filled)
+                            .color(Color::Error)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(window, cx);
+                            })),
+                    ),
+            )
+    }
+}
+
+impl RefDestroyConfirmModal {
+    fn confirm(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(true);
+        }
+        cx.emit(DismissEvent);
+    }
+
+    fn cancel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(false);
+        }
+        cx.emit(DismissEvent);
+    }
+}
+
+/// Opens the destructive-confirmation modal from inside an async flow and
+/// awaits the user's decision (or `false` if the workspace/graph is gone).
+/// Opens the destructive-confirmation modal from inside an async flow and
+/// returns a oneshot that yields the user's decision (`true` = confirmed,
+/// `false` = cancelled or the workspace/graph disappeared).
+/// Opens the destructive-confirmation modal from inside an async flow and
+/// returns a oneshot that yields the user's decision (`true` = confirmed,
+/// `false` = cancelled or the workspace/graph disappeared).
+fn open_destructive_confirmation(
+    workspace: &WeakEntity<Workspace>,
+    cx: &mut AsyncWindowContext,
+    title: SharedString,
+    body: SharedString,
+    confirm_label: SharedString,
+) -> oneshot::Receiver<bool> {
+    let (tx, rx) = oneshot::channel();
+    if let Some(workspace_entity) = workspace.upgrade() {
+        let _ = workspace_entity.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_modal(window, cx, |_window, cx| {
+                let focus_handle = cx.focus_handle();
+                RefDestroyConfirmModal {
+                    title: title.clone(),
+                    body: body.clone(),
+                    confirm_label: confirm_label.clone(),
+                    focus_handle,
+                    tx: Some(tx),
+                }
+            })
+        });
+    }
+    rx
+}
+
+/// Surfaces an actionable error toast from inside an async flow (e.g. expired
+/// repository, auth/network failure, or an unknown error).
+fn emit_error_async(
+    workspace: &WeakEntity<Workspace>,
+    cx: &mut AsyncWindowContext,
+    action: &str,
+    e: anyhow::Error,
+) {
+    if let Some(workspace_entity) = workspace.upgrade() {
+        let action = action.to_string();
+        let for_toast = workspace_entity.clone();
+        let _ = workspace_entity.update(cx, |_, app_cx| {
+            show_error_toast(for_toast, action, e, app_cx)
+        });
+    }
+}
+
+/// Surfaces a plain informational/success toast from inside an async flow.
+fn emit_toast(
+    workspace: &WeakEntity<Workspace>,
+    cx: &mut AsyncWindowContext,
+    message: impl Into<SharedString>,
+) {
+    let message = message.into();
+    if let Some(workspace_entity) = workspace.upgrade() {
+        let for_toast = workspace_entity.clone();
+        let _ = for_toast.update(cx, |workspace, app_cx| {
+            let status_toast =
+                StatusToast::new(message.clone(), app_cx, |this, _| this.dismiss_button(true));
+            workspace.toggle_status_toast(status_toast, app_cx);
+        });
+    }
+}
+
+/// Checkout of a clicked remote-tracking branch (`refs/remotes/<remote>/<b>`),
+/// locked to the exact clicked ref. If a local branch already tracks that exact
+/// upstream, switches to it; otherwise Zed proposes a local name and creates a
+/// tracking branch, never repointing an existing branch whose upstream differs
+/// or is absent (a same-name collision yields a distinct proposed name).
+fn schedule_remote_branch_checkout(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ref_name = resolved_ref.ref_name.as_ref().to_string();
+    let Some((remote, branch)) = remote_ref_parts(&ref_name) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "checkout remote branch",
+            anyhow!("Malformed remote branch ref {ref_name}"),
+        );
+        return;
+    };
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "checkout remote branch",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let scan = repository_entity
+                    .update(cx, |repository, _| repository.branches())
+                    .await
+                    .map_err(|e| anyhow!("branch scan cancelled: {e}"))??;
+
+                // 1. Exact tracker: a local branch whose upstream is this very
+                //    remote ref. Switching to it preserves existing tracking.
+                let target_upstream = format!("refs/remotes/{remote}/{branch}");
+                let exact_tracker = scan.branches.iter().find(|b| {
+                    !b.is_remote()
+                        && b.upstream
+                            .as_ref()
+                            .map(|u| u.ref_name.as_ref())
+                            == Some(target_upstream.as_str())
+                });
+                if let Some(tracker) = exact_tracker {
+                    let local_name = tracker.name().to_string();
+                    repository_entity
+                        .update(cx, |repository, _| repository.change_branch(local_name.clone()))
+                        .await
+                        .map_err(|e| anyhow!("checkout cancelled: {e}"))??;
+                    emit_toast(&workspace, cx, format!("Switched to \"{local_name}\""));
+                    return Ok(());
+                }
+
+                // 2. No exact tracker. Propose `<branch>` unless a local branch
+                //    of that name already exists (tracking something else or an
+                //    absent upstream) — then use a distinct collision-free
+                //    name. Never repoint the existing branch.
+                let local_names: std::collections::HashSet<String> = scan
+                    .branches
+                    .iter()
+                    .filter(|b| !b.is_remote())
+                    .map(|b| b.name().to_string())
+                    .collect();
+                let mut proposed = branch.clone();
+                let mut suffix = 2;
+                while local_names.contains(&proposed) {
+                    proposed = format!("{branch}-{suffix}");
+                    suffix += 1;
+                }
+                // Creating a local branch from the remote-tracking ref sets up
+                // exact upstream tracking and checks it out.
+                repository_entity
+                    .update(cx, |repository, _| {
+                        repository.create_branch(proposed.clone(), Some(target_upstream.clone()))
+                    })
+                    .await
+                    .map_err(|e| anyhow!("create branch cancelled: {e}"))??;
+                emit_toast(
+                    &workspace,
+                    cx,
+                    format!("Checked out \"{proposed}\" tracking {remote}/{branch}"),
+                );
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph remote branch checkout failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
+/// Collects the configured remote names for the repository.
+async fn configured_remote_names(
+    repository_entity: &Entity<Repository>,
+    cx: &mut AsyncWindowContext,
+) -> anyhow::Result<Vec<SharedString>> {
+    let remotes = repository_entity
+        .update(cx, |repository, _| repository.get_remotes(None, true))
+        .await
+        .map_err(|e| anyhow!("get remotes cancelled: {e}"))??;
+    Ok(remotes.into_iter().map(|r| r.name).collect())
+}
+
+/// Explicitly prompts the user to pick a configured remote, even when only one
+/// exists. Returns `None` when there are no remotes or the selection is
+/// cancelled.
+async fn select_remote_explicit(
+    repository_entity: &Entity<Repository>,
+    workspace: WeakEntity<Workspace>,
+    window_handle: AnyWindowHandle,
+    cx: &mut AsyncWindowContext,
+    prompt: &str,
+) -> anyhow::Result<Option<Remote>> {
+    let names = configured_remote_names(repository_entity, cx).await?;
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let selection = window_handle
+        .update(cx, |_, window, app_cx| {
+            crate::picker_prompt::prompt_explicit(prompt, names.clone(), workspace, window, app_cx)
+        })
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(selection
+        .await
+        .map(|index| Remote {
+            name: names[index].clone(),
+        }))
+}
+
+fn remote_delete_summary(remote: &str, stderr: String) -> String {
+    let detail = if stderr.trim().is_empty() {
+        "deleted".to_string()
+    } else {
+        stderr.trim().to_string()
+    };
+    format!("{remote}: {detail}")
+}
+
+/// Builds an [`AskPassDelegate`] wired to the `AskPassModal`, reusing Zed's
+/// existing AskPass seam. Constructed in the synchronous flow (where a live
+/// `&mut App` is available) and moved into the async operation.
+fn askpass_delegate(
+    workspace: &WeakEntity<Workspace>,
+    window_handle: AnyWindowHandle,
+    cx: &mut App,
+    operation: &str,
+) -> AskPassDelegate {
+    let workspace = workspace.clone();
+    let operation: SharedString = operation.to_string().into();
+    AskPassDelegate::new(&mut cx.to_async(), move |prompt, tx, cx| {
+        let workspace = workspace.clone();
+        let operation = operation.clone();
+        window_handle
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        AskPassModal::new(operation.clone(), prompt.into(), tx, window, cx)
+                    });
+                })
+            })
+            .ok();
+    })
+}
+
+/// Deletes the clicked remote-tracking branch on its server remote via an
+/// explicit `git push <remote> --delete refs/heads/<branch>` — never a local-only
+/// remote-tracking deletion. Requires a destructive confirmation naming the
+/// remote and branch; clears the pending guard on success, cancellation,
+/// expired repository, and any error.
+fn schedule_remote_branch_delete_on_server(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ref_name = resolved_ref.ref_name.as_ref().to_string();
+    let Some((remote, branch)) = remote_ref_parts(&ref_name) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "delete remote branch",
+            anyhow!("Malformed remote branch ref {ref_name}"),
+        );
+        return;
+    };
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "delete remote branch",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    let window_handle = window.window_handle();
+    let askpass = askpass_delegate(&workspace, window_handle, cx, "git push");
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let confirmed = open_destructive_confirmation(
+                    &workspace,
+                    cx,
+                    "Delete Branch on Remote".into(),
+                    format!(
+                        "Delete branch \"{branch}\" on remote \"{remote}\"? This removes it on the server and cannot be undone."
+                    )
+                    .into(),
+                    format!("Delete {remote}/{branch}").into(),
+                )
+                .await
+                .unwrap_or(false);
+                if !confirmed {
+                    // Cancellation clears pending state without dispatch.
+                    return Ok(());
+                }
+                let remote_name =
+                    match select_remote_explicit(
+                        &repository_entity,
+                        workspace.clone(),
+                        window_handle,
+                        cx,
+                        "Pick which remote to delete the branch from",
+                    )
+                    .await?
+                    {
+                        Some(remote) => remote.name,
+                        None => {
+                            // Zero remotes: informational, no dispatch.
+                            emit_toast(
+                                &workspace,
+                                cx,
+                                format!("No configured remote to delete {branch} from."),
+                            );
+                            return Ok(());
+                        }
+                    };
+                let output = repository_entity
+                    .update(cx, |repository, cx| {
+                        repository.delete_refs_on_remote(
+                            remote_name.clone(),
+                            vec![format!("refs/heads/{branch}")],
+                            askpass,
+                            cx,
+                        )
+                    })
+                    .await
+                    .map_err(|e| anyhow!("remote delete cancelled: {e}"))?;
+                let output = output?;
+                emit_toast(&workspace, cx, remote_delete_summary(&remote_name, output.stderr));
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph remote branch delete failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
+
+/// Opens the tag details view (established by the `tag_details` backend):
+/// distinguishes lightweight vs annotated tags and reports the tag name, target
+/// OID, object type, tagger metadata, and message.
+fn schedule_tag_view_details(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ref_name = resolved_ref.ref_name.as_ref().to_string();
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "tag details",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let details = repository_entity
+                    .update(cx, |repository, cx| repository.tag_details(ref_name.clone(), cx))
+                    .await
+                    .map_err(|e| anyhow!("tag details cancelled: {e}"))??;
+                emit_toast(&workspace, cx, format_tag_details(&details));
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph tag details failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
+fn format_tag_details(details: &git::repository::TagDetails) -> String {
+    let kind = if details.tagger.is_some() {
+        "annotated"
+    } else {
+        "lightweight"
+    };
+    let mut out = format!(
+        "Tag \"{}\" ({kind})\nTarget: {} ({:?})",
+        details.name, details.target_oid, details.object_type
+    );
+    if let Some(tagger) = &details.tagger {
+        out.push_str(&format!("\nTagged by {} <{}>", tagger.name, tagger.email));
+    }
+    if let Some(message) = &details.message {
+        out.push_str(&format!("\nMessage: {message}"));
+    }
+    out
+}
+
+/// Pushes the clicked local tag to an explicitly chosen remote. Always requires
+/// selection, even with one remote; zero remotes is informational with no
+/// dispatch.
+fn schedule_tag_push_to_remote(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ref_name = resolved_ref.ref_name.as_ref().to_string();
+    let Some(tag_name) = tag_name_from_ref(&ref_name) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "push tag",
+            anyhow!("Malformed tag ref {ref_name}"),
+        );
+        return;
+    };
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "push tag",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    let window_handle = window.window_handle();
+    let askpass = askpass_delegate(&workspace, window_handle, cx, "git push");
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let remote_name =
+                    match select_remote_explicit(
+                        &repository_entity,
+                        workspace.clone(),
+                        window_handle,
+                        cx,
+                        "Pick which remote to push the tag to",
+                    )
+                    .await?
+                    {
+                        Some(remote) => remote.name,
+                        None => {
+                            emit_toast(
+                                &workspace,
+                                cx,
+                                format!("No configured remote to push tag {tag_name} to."),
+                            );
+                            return Ok(());
+                        }
+                    };
+                let tag_ref = format!("refs/tags/{tag_name}");
+                let output = repository_entity
+                    .update(cx, |repository, cx| {
+                        repository.push(
+                            tag_ref.clone().into(),
+                            tag_ref.into(),
+                            remote_name.clone(),
+                            None,
+                            askpass,
+                            cx,
+                        )
+                    })
+                    .await
+                    .map_err(|e| anyhow!("push cancelled: {e}"))?;
+                let output = output?;
+                emit_toast(
+                    &workspace,
+                    cx,
+                    format!("Pushed tag {tag_name} to {remote_name}\n{}", output.stderr.trim()),
+                );
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph tag push failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
+/// Deletes the clicked tag locally (`git tag -d <name>`). Uses a distinct
+/// destructive confirmation and a distinct operation from server deletion.
+fn schedule_tag_delete_local(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ref_name = resolved_ref.ref_name.as_ref().to_string();
+    let Some(tag_name) = tag_name_from_ref(&ref_name) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "delete tag",
+            anyhow!("Malformed tag ref {ref_name}"),
+        );
+        return;
+    };
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "delete tag",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let confirmed = open_destructive_confirmation(
+                    &workspace,
+                    cx,
+                    "Delete Tag".into(),
+                    format!(
+                        "Delete local tag \"{tag_name}\"? This removes it from this repository only."
+                    )
+                    .into(),
+                    format!("Delete {tag_name}").into(),
+                )
+                .await
+                .unwrap_or(false);
+                if !confirmed {
+                    return Ok(());
+                }
+                repository_entity
+                    .update(cx, |repository, cx| repository.delete_tag(tag_name.clone(), cx))
+                    .await
+                    .map_err(|e| anyhow!("delete tag cancelled: {e}"))??;
+                emit_toast(&workspace, cx, format!("Deleted local tag {tag_name}"));
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph tag delete failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
+/// Deletes the clicked tag on the chosen remote server via an explicit
+/// `git push <remote> --delete refs/tags/<name>`; never relies on a local
+/// snapshot of the tag. Uses a destructive confirmation distinct from local
+/// deletion and always requires explicit remote selection.
+fn schedule_tag_delete_on_remote(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ref_name = resolved_ref.ref_name.as_ref().to_string();
+    let Some(tag_name) = tag_name_from_ref(&ref_name) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "delete tag on remote",
+            anyhow!("Malformed tag ref {ref_name}"),
+        );
+        return;
+    };
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "delete tag on remote",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    let window_handle = window.window_handle();
+    let askpass = askpass_delegate(&workspace, window_handle, cx, "git push");
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let remote_name =
+                    match select_remote_explicit(
+                        &repository_entity,
+                        workspace.clone(),
+                        window_handle,
+                        cx,
+                        "Pick which remote to delete the tag from",
+                    )
+                    .await?
+                    {
+                        Some(remote) => remote.name,
+                        None => {
+                            emit_toast(
+                                &workspace,
+                                cx,
+                                format!("No configured remote to delete tag {tag_name} from."),
+                            );
+                            return Ok(());
+                        }
+                    };
+                let confirmed = open_destructive_confirmation(
+                    &workspace,
+                    cx,
+                    "Delete Tag on Remote".into(),
+                    format!(
+                        "Delete tag \"{tag_name}\" on remote \"{remote_name}\"? This removes it on the server and cannot be undone."
+                    )
+                    .into(),
+                    format!("Delete {remote_name}/{tag_name}").into(),
+                )
+                .await
+                .unwrap_or(false);
+                if !confirmed {
+                    return Ok(());
+                }
+                let output = repository_entity
+                    .update(cx, |repository, cx| {
+                        repository.delete_refs_on_remote(
+                            remote_name.clone(),
+                            vec![format!("refs/tags/{tag_name}")],
+                            askpass,
+                            cx,
+                        )
+                    })
+                    .await
+                    .map_err(|e| anyhow!("remote delete cancelled: {e}"))?;
+                let output = output?;
+                emit_toast(
+                    &workspace,
+                    cx,
+                    format!("Deleted tag {tag_name} on {remote_name}\n{}", output.stderr.trim()),
+                );
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph tag remote delete failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+}
+
+/// Opens the single shared prefill renaming modal for the exact canonical
+/// branch captured by the chip. Cancellation dispatches nothing and retains
+/// state; Git errors are surfaced by the modal's own error handling.
+fn rename_ref_branch(
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    branch_name: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(repository) = repository.and_then(|repository| repository.upgrade()) else {
+        if let Some(workspace) = workspace.upgrade() {
+            show_error_toast(
+                workspace,
+                "rename branch",
+                anyhow!("The repository is no longer available"),
+                cx,
+            );
+        }
+        return;
+    };
+    let Some(workspace) = workspace.upgrade() else {
+        log::error!("rename branch: workspace is no longer available");
+        return;
+    };
+    let branch_name = branch_name.to_string();
+    // Spawn into the window so we get a visual context through which we can
+    // open the modal on the workspace entity.
+    window
+        .spawn(cx, async move |cx| {
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                open_branch_rename_modal(
+                    workspace,
+                    branch_name.clone(),
+                    repository.clone(),
+                    window,
+                    cx,
+                )
+            });
+        })
+        .detach();
+}
+
+/// Deletes the exact branch captured by the chip via the shared store-backed
+/// delete + force-confirm service. The service surfaces git errors (and the
+/// unmerged-branch force-delete prompt) itself.
+fn delete_ref_branch(
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    branch_name: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(repository) = repository.and_then(|repository| repository.upgrade()) else {
+        if let Some(workspace) = workspace.upgrade() {
+            show_error_toast(
+                workspace,
+                "delete branch",
+                anyhow!("The repository is no longer available"),
+                cx,
+            );
+        }
+        return;
+    };
+    let display_name = SharedString::from(branch_name.to_string());
+    let task = delete_service::delete_branch(
+        repository,
+        false,
+        branch_name.to_string(),
+        display_name,
+        false,
+        workspace,
+        window,
+        cx,
+    );
+    task.detach();
+}
+
+fn create_detached_worktree_for_commit(
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    sha: git::Oid,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(repository_id) = repository
+        .as_ref()
+        .and_then(|repository| repository.upgrade())
+        .map(|repository| repository.read(cx).id.to_proto())
+    else {
+        if let Some(workspace) = workspace.upgrade() {
+            show_error_toast(
+                workspace,
+                "worktree create",
+                anyhow!("The repository is no longer available"),
+                cx,
+            );
+        }
+        return;
+    };
+    let repository_name = repository
+        .as_ref()
+        .and_then(|repository| repository.upgrade())
+        .and_then(|repository| {
+            repository
+                .read(cx)
+                .work_directory_abs_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToString::to_string)
+        });
+    let context_label = match repository_name {
+        Some(repository_name) => {
+            Some(format!("from {} in {repository_name}", sha.display_short()).into())
+        }
+        None => Some(format!("from {}", sha.display_short()).into()),
+    };
+
+    let modal = WorktreeNameModal::open(workspace.clone(), None, context_label, window, cx);
+    window
+        .spawn(cx, async move |cx| {
+            let Some(name) = modal.await else {
+                return Ok(());
+            };
+            let action = zed_actions::CreateWorktree {
+                worktree_name: Some(name),
+                branch_target: NewWorktreeBranchTarget::Commit {
+                    repository_id,
+                    sha: sha.to_string(),
+                },
+            };
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    handle_create_worktree(workspace, &action, window, None, OpenMode::Activate, cx);
+                })
+                .map_err(|error| anyhow!(error))?;
+            Ok(())
+        })
+        .detach_and_prompt_err("Git graph worktree action failed", window, cx, |error, _, _| {
+            Some(error.to_string())
+        });
+}
+
+fn worktree_removal_eligible(
+    worktree: &git::repository::Worktree,
+    identity: Option<&HostScopedRepositoryIdentity>,
+    window: &Window,
+    cx: &App,
+) -> bool {
+    let Some(identity) = identity else {
+        return false;
+    };
+    if worktree.is_main {
+        return false;
+    }
+    // Conservative: if the sync open-check errors, do not offer removal here;
+    // the shared service revalidates on a confirm from the Worktree Picker.
+    delete_service::worktree_is_open_in_window_sync(Some(window), identity.clone(), &worktree.path, cx)
+        .map(|is_open| !is_open)
+        .unwrap_or(false)
+}
+
+fn remove_worktree_from_graph(
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    worktree: git::repository::Worktree,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(repository_entity) = repository.as_ref().and_then(|repository| repository.upgrade())
+    else {
+        if let Some(workspace) = workspace.upgrade() {
+            show_error_toast(
+                workspace,
+                "worktree remove",
+                anyhow!("The repository is no longer available"),
+                cx,
+            );
+        }
+        return;
+    };
+    let Some(workspace_entity) = workspace.upgrade() else {
+        // No workspace handle means no valid UI surface for a toast; report the
+        // error explicitly rather than falling through silently.
+        log::error!(
+            "worktree remove: source window handle for {} is no longer available",
+            worktree.path.display()
+        );
+        return;
+    };
+    let identity = HostScopedRepositoryIdentity::new(
+        repository_entity.read(cx).common_repository_identity(),
+        workspace_entity
+            .read(cx)
+            .project()
+            .read(cx)
+            .remote_connection_options(cx)
+            .as_ref(),
+    );
+    let display_name = worktree
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("worktree")
+        .to_string();
+
+    window
+        .spawn(cx, async move |cx| {
+            // The shared guarded removal service owns the confirmation modal,
+            // open-guard (async canonicalize), main/current re-check, safe/force
+            // removal, optional linked-branch cleanup, and partial result. We
+            // never reimplement any of the picker's removal logic here.
+            let outcome = cx
+                .update(|window, cx| {
+                    delete_service::confirm_remove_worktree(
+                        repository_entity,
+                        identity,
+                        worktree,
+                        workspace.clone(),
+                        window,
+                        cx,
+                    )
+                })?
+                .await;
+
+            match outcome {
+                Ok(WorktreeRemovalOutcome::Removed { branch_error }) => {
+                    // Success (or partial success). Worktree removal updates the
+                    // repository's linked-worktree snapshot event-driven, so the
+                    // next open of this submenu re-captures `linked_worktrees`
+                    // fresh and the removed path is gone. Nudge the graph and the
+                    // workspace to re-render so any surfaces derived from
+                    // worktree state stay consistent; the commit graph itself is
+                    // not reloaded (removal does not change history).
+                    if let Some(graph) = graph.as_ref().and_then(|graph| graph.upgrade()) {
+                        graph.update(cx, |_graph, cx| cx.notify());
+                    }
+                    if let Some(workspace) = workspace.upgrade() {
+                        workspace.update(cx, |_workspace, cx| cx.notify());
+                    }
+                    if let Some(branch_error) = branch_error {
+                        // Partial result: the worktree was removed but the linked
+                        // branch could not be deleted. Surface the concrete error.
+                        if let Some(workspace) = workspace.upgrade() {
+                            cx.update(|_window, cx| {
+                                show_error_toast(workspace, "delete branch", branch_error, cx)
+                            })?;
+                        }
+                    }
+                }
+                Ok(WorktreeRemovalOutcome::BlockedOpen) => {
+                    // Selection is preserved; report the concrete outcome instead
+                    // of silently ignoring the request.
+                    if let Some(workspace) = workspace.upgrade() {
+                        let message = anyhow!(
+                            "Worktree \"{display_name}\" is currently open in a Zed window \
+                             (or is the main worktree) and cannot be removed. Please close or \
+                             switch away from it first."
+                        );
+                        cx.update(|_window, cx| {
+                            show_error_toast(workspace, "worktree remove", message, cx)
+                        })?;
+                    }
+                }
+                Ok(WorktreeRemovalOutcome::Cancelled) => {
+                    // User cancelled the confirmation (or the force-delete prompt);
+                    // nothing mutated. Selection is preserved and we stay silent.
+                }
+                Err(error) => return Err(error),
+            }
+
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err("Git graph worktree removal failed", window, cx, |error, _, _| {
+            Some(error.to_string())
+        });
 }
 
 fn schedule_graph_mutation(
@@ -503,4 +2637,669 @@ fn git_context_menu_tasks(
     task_inventory
         .read(cx)
         .resolve_global_tasks_with_tag(GIT_COMMAND_TASK_TAG, &task_context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+    use fs::Fs;
+    use git_ui_core::delete_service::{
+        WorktreeRemovalConfirmModal, WorktreeRemovalOutcome,
+    };
+    use git::stash::{GitStash, StashEntry, StashIdentity};
+    use gpui::{TestAppContext, VisualTestContext};
+    use menu::Confirm;
+    use project::Project;
+    use serde_json::json;
+    use settings::Settings;
+    use settings::SettingsStore;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            project::project_settings::ProjectSettings::register(cx);
+            project::WorktreeSettings::register(cx);
+        });
+    }
+
+    async fn init_test_repo(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<FakeFs>,
+        Entity<Project>,
+        Entity<Repository>,
+        git::repository::Worktree,
+        Entity<Workspace>,
+        VisualTestContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {
+                    ".git": {},
+                    "file.txt": "buffer_text",
+                },
+                "worktrees": {},
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            path!("/root/project/.git").as_ref(),
+            &[("file.txt", "buffer_text".to_string())],
+            "deadbeef",
+        );
+
+        let project = Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project.repositories(cx).values().next().unwrap().clone()
+        });
+        let worktree_path = PathBuf::from(path!("/root/worktrees/linked-wt"));
+
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.create_worktree(
+                    git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: "linked-wt".to_string(),
+                        base_sha: Some("deadbeef".to_string()),
+                    },
+                    worktree_path.clone(),
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let worktrees = repository
+            .update(cx, |repo, _| repo.worktrees())
+            .await
+            .unwrap()
+            .unwrap();
+        let linked_wt = worktrees
+            .into_iter()
+            .find(|wt| wt.path == worktree_path)
+            .unwrap();
+
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        cx.executor().run_until_parked();
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+
+        let cx = VisualTestContext::from_window(window_handle.into(), cx);
+        (fs, project, repository, linked_wt, workspace, cx)
+    }
+
+    fn repo_identity(
+        repository: &Entity<Repository>,
+        cx: &VisualTestContext,
+    ) -> HostScopedRepositoryIdentity {
+        HostScopedRepositoryIdentity::new(
+            repository.read_with(cx, |repo, _| repo.common_repository_identity()),
+            None,
+        )
+    }
+
+    fn eligible_in_menu(
+        worktree: &git::repository::Worktree,
+        identity: &HostScopedRepositoryIdentity,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        worktree_removal_eligible(worktree, Some(identity), window, cx)
+    }
+
+    #[gpui::test]
+    async fn test_menu_eligible_linked_worktree_shown(cx: &mut TestAppContext) {
+        let (_fs, _project, repository, linked_wt, _workspace, mut cx) = init_test_repo(cx).await;
+        let identity = repo_identity(&repository, &cx);
+
+        // A linked worktree checked out at the graph commit that is not open in
+        // any window (only the main repo's root workspace is open) gets a
+        // "Remove Worktree…" entry: build-time eligible.
+        let eligible =
+            cx.update(|window, cx| eligible_in_menu(&linked_wt, &identity, window, cx));
+        assert!(eligible, "unopened linked worktree should be removable from the menu");
+    }
+
+    #[gpui::test]
+    async fn test_menu_main_worktree_blocked(cx: &mut TestAppContext) {
+        let (_fs, _project, repository, _linked_wt, _workspace, mut cx) = init_test_repo(cx).await;
+        let identity = repo_identity(&repository, &cx);
+
+        let main_wt = repository
+            .update(&mut cx, |repo, _| repo.worktrees())
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .find(|wt| wt.is_main)
+            .unwrap();
+
+        // The main worktree never shows a "Remove Worktree…" entry.
+        let eligible = cx.update(|window, cx| eligible_in_menu(&main_wt, &identity, window, cx));
+        assert!(!eligible, "main worktree must never be removable from the menu");
+    }
+
+    #[gpui::test]
+    async fn test_menu_current_workspace_blocked(cx: &mut TestAppContext) {
+        let (_fs, _project, repository, _linked_wt, _workspace, mut cx) = init_test_repo(cx).await;
+        let identity = repo_identity(&repository, &cx);
+
+        let main_wt = repository
+            .update(&mut cx, |repo, _| repo.worktrees())
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .find(|wt| wt.is_main)
+            .unwrap();
+
+        // The main worktree is open in the *current* workspace; the sync seam
+        // (which enumerates the active window's workspaces too) must report it
+        // open so the menu hides the entry.
+        let is_open = cx.update(|window, cx| {
+            delete_service::worktree_is_open_in_window_sync(
+                Some(window),
+                identity.clone(),
+                &main_wt.path,
+                cx,
+            )
+        });
+        assert!(is_open.unwrap(), "open-in-current-workspace must be detected");
+        let eligible = cx.update(|window, cx| eligible_in_menu(&main_wt, &identity, window, cx));
+        assert!(!eligible);
+    }
+
+    #[gpui::test]
+    async fn test_menu_open_elsewhere_blocked(cx: &mut TestAppContext) {
+        let (fs, _project, repository, linked_wt, _workspace, mut cx) = init_test_repo(cx).await;
+        let identity = repo_identity(&repository, &cx);
+
+        // Open the linked worktree in a second window -> no longer eligible.
+        let second_project = Project::test(fs.clone(), [linked_wt.path.as_path()], &mut cx).await;
+        cx.executor().run_until_parked();
+        let window_handle2 =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(second_project.clone(), window, cx));
+        cx.executor().run_until_parked();
+
+        let eligible =
+            cx.update(|window, cx| eligible_in_menu(&linked_wt, &identity, window, cx));
+        assert!(!eligible, "worktree open in another window must not be removable");
+
+        let _ = window_handle2;
+    }
+
+    #[gpui::test]
+    async fn test_menu_duplicate_sha_entries_independently_removable(cx: &mut TestAppContext) {
+        let (_fs, _project, repository, linked_wt, workspace, mut cx) = init_test_repo(cx).await;
+        let identity = repo_identity(&repository, &cx);
+
+        // A second worktree checked out at the *same* SHA as the first.
+        let second_path = PathBuf::from(path!("/root/worktrees/linked-wt2"));
+        cx.update(|_window, cx| {
+            repository.update(cx, |repository, _| {
+                repository.create_worktree(
+                    git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: "linked-wt2".to_string(),
+                        base_sha: Some("deadbeef".to_string()),
+                    },
+                    second_path.clone(),
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let worktrees = repository
+            .update(&mut cx, |repo, _| repo.worktrees())
+            .await
+            .unwrap()
+            .unwrap();
+        let wt1 = worktrees.iter().find(|wt| wt.path == linked_wt.path).unwrap().clone();
+        let wt2 = worktrees.iter().find(|wt| wt.path == second_path).unwrap().clone();
+        assert_eq!(wt1.sha.to_string(), "deadbeef");
+        assert_eq!(wt2.sha.to_string(), "deadbeef");
+
+        // The menu captures one entry per matching worktree and each is
+        // independently eligible (none open).
+        let both_eligible = cx.update(|window, cx| {
+            eligible_in_menu(&wt1, &identity, window, cx)
+                && eligible_in_menu(&wt2, &identity, window, cx)
+        });
+        assert!(both_eligible);
+
+        // Removing the first worktree targets only its path: the second
+        // duplicate-SHA worktree must survive.
+        let task = cx.update(|window, cx| {
+            delete_service::confirm_remove_worktree(
+                repository.clone(),
+                identity,
+                wt1.clone(),
+                workspace.downgrade(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(Confirm);
+        cx.run_until_parked();
+        let outcome = task.await.unwrap();
+        assert_eq!(outcome, WorktreeRemovalOutcome::Removed { branch_error: None });
+
+        let linked = repository.read_with(&cx, |repo, _| repo.linked_worktrees.clone());
+        assert!(
+            !linked.iter().any(|wt| wt.path == wt1.path),
+            "removed entry's path must be gone"
+        );
+        assert!(
+            linked.iter().any(|wt| wt.path == wt2.path),
+            "duplicate-SHA sibling must remain independently addressable"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_menu_remove_worktree_deletes_linked_branch(cx: &mut TestAppContext) {
+        let (_fs, _project, repository, linked_wt, workspace, mut cx) = init_test_repo(cx).await;
+        let identity = repo_identity(&repository, &cx);
+
+        let task = cx.update(|window, cx| {
+            delete_service::confirm_remove_worktree(
+                repository.clone(),
+                identity,
+                linked_wt,
+                workspace.downgrade(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Request optional linked-branch deletion through the shared modal.
+        let modal = workspace
+            .read_with(&cx, |ws, cx| ws.active_modal::<WorktreeRemovalConfirmModal>(cx).unwrap());
+        modal.update(&mut cx, |modal, cx| {
+            modal.test_set_delete_linked_branch(true);
+            cx.notify();
+        });
+        cx.dispatch_action(Confirm);
+        cx.run_until_parked();
+
+        let outcome = task.await.unwrap();
+        assert_eq!(outcome, WorktreeRemovalOutcome::Removed { branch_error: None });
+
+        let branches = repository
+            .update(&mut cx, |repo, _| repo.branches())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !branches.branches.iter().any(|b| b.name() == "linked-wt"),
+            "linked branch should be removed alongside the worktree"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_menu_force_remove_cancel_keeps_worktree(cx: &mut TestAppContext) {
+        let (fs, _project, repository, linked_wt, workspace, mut cx) = init_test_repo(cx).await;
+        let identity = repo_identity(&repository, &cx);
+
+        // Dirty worktree requires a force-delete confirmation.
+        fs.with_git_state(path!("/root/project/.git").as_ref(), true, |state| {
+            state.worktrees_requiring_force_delete.insert(linked_wt.path.clone());
+        })
+        .unwrap();
+
+        let task = cx.update(|window, cx| {
+            delete_service::confirm_remove_worktree(
+                repository.clone(),
+                identity,
+                linked_wt.clone(),
+                workspace.downgrade(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        cx.dispatch_action(Confirm);
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        let outcome = task.await.unwrap();
+        assert_eq!(outcome, WorktreeRemovalOutcome::Cancelled);
+
+        let worktrees = repository
+            .update(&mut cx, |repo, _| repo.worktrees())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(worktrees.iter().any(|wt| wt.path == linked_wt.path));
+    }
+
+    #[gpui::test]
+    async fn test_menu_force_remove_accept_removes_worktree(cx: &mut TestAppContext) {
+        let (fs, _project, repository, linked_wt, workspace, mut cx) = init_test_repo(cx).await;
+        let identity = repo_identity(&repository, &cx);
+
+        fs.with_git_state(path!("/root/project/.git").as_ref(), true, |state| {
+            state.worktrees_requiring_force_delete.insert(linked_wt.path.clone());
+        })
+        .unwrap();
+
+        let task = cx.update(|window, cx| {
+            delete_service::confirm_remove_worktree(
+                repository.clone(),
+                identity,
+                linked_wt.clone(),
+                workspace.downgrade(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        cx.dispatch_action(Confirm);
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Force Remove");
+        cx.run_until_parked();
+
+        let outcome = task.await.unwrap();
+        assert_eq!(outcome, WorktreeRemovalOutcome::Removed { branch_error: None });
+
+        let worktrees = repository
+            .update(&mut cx, |repo, _| repo.worktrees())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!worktrees.iter().any(|wt| wt.path == linked_wt.path));
+    }
+
+    #[gpui::test]
+    async fn test_menu_partial_success_branch_failure(cx: &mut TestAppContext) {
+        let (fs, _project, repository, linked_wt, workspace, mut cx) = init_test_repo(cx).await;
+        let identity = repo_identity(&repository, &cx);
+
+        // Force the linked branch delete to fail (requires force that we deny),
+        // producing the partial result: worktree removed, branch_error set.
+        fs.with_git_state(path!("/root/project/.git").as_ref(), true, |state| {
+            state.branches_requiring_force_delete.insert("linked-wt".to_string());
+        })
+        .unwrap();
+
+        let task = cx.update(|window, cx| {
+            delete_service::confirm_remove_worktree(
+                repository.clone(),
+                identity,
+                linked_wt.clone(),
+                workspace.downgrade(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let modal = workspace
+            .read_with(&cx, |ws, cx| ws.active_modal::<WorktreeRemovalConfirmModal>(cx).unwrap());
+        modal.update(&mut cx, |modal, cx| {
+            modal.test_set_delete_linked_branch(true);
+            cx.notify();
+        });
+        cx.dispatch_action(Confirm);
+        cx.run_until_parked();
+
+        // Branch requires force; cancel it -> partial success.
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        let outcome = task.await.unwrap();
+        assert!(
+            matches!(outcome, WorktreeRemovalOutcome::Removed { branch_error: Some(_) }),
+            "worktree removed but linked-branch deletion failed should be a partial success"
+        );
+
+        let worktrees = repository
+            .update(&mut cx, |repo, _| repo.worktrees())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!worktrees.iter().any(|wt| wt.path == linked_wt.path));
+    }
+
+    #[gpui::test]
+    async fn test_stash_drop_confirmation_names_stash_and_cancel_keeps_it(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let head = Oid::from_bytes(&[1; 20]).unwrap();
+        let stash_oid = Oid::from_bytes(&[2; 20]).unwrap();
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head.to_string(),
+        );
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.stash_entries = GitStash {
+                entries: vec![StashEntry {
+                    index: 0,
+                    oid: stash_oid,
+                    message: "WIP on main: selected stash".to_string(),
+                    branch: Some("main".to_string()),
+                    timestamp: 1,
+                }]
+                .into(),
+            };
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        // The stash snapshot is loaded from the backend during repository init.
+        assert_eq!(
+            repository.read_with(cx, |repo, _| repo.stash_entries.entries.len()),
+            1
+        );
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+
+        let identity = StashIdentity {
+            oid: stash_oid,
+            ref_name: git::stash::STASH_REF.to_string(),
+            selector: "refs/stash@{0}".to_string(),
+        };
+
+        // Dispatch Drop: an explicit confirmation naming the selected stash must
+        // appear before any mutation is dispatched.
+        cx.update(|window, cx| {
+            schedule_stash_mutation(
+                None,
+                Some(repository.downgrade()),
+                workspace_weak.clone(),
+                identity.clone(),
+                StashMenuOp::Drop,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "drop must prompt for confirmation");
+        let (message, detail) = cx.pending_prompt().expect("pending drop prompt");
+        assert_eq!(message, "Drop stash");
+        assert!(
+            detail.contains("selected stash") || detail.contains("refs/stash@{0}"),
+            "drop confirmation must name the selected stash, got detail: {detail:?}"
+        );
+
+        // Cancelling dispatches nothing, leaves the stash intact, and clears the
+        // pending state.
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt(), "no pending prompt after cancel");
+        assert_eq!(
+            repository.read_with(&*cx, |repo, _| repo.stash_entries.entries.len()),
+            1,
+            "cancelled drop must not drop the stash"
+        );
+
+        // A subsequent dispatch prompts again: no lingering pending/guard state.
+        cx.update(|window, cx| {
+            schedule_stash_mutation(
+                None,
+                Some(repository.downgrade()),
+                workspace_weak.clone(),
+                identity.clone(),
+                StashMenuOp::Drop,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "second drop must prompt again");
+        let (_message, detail) = cx.pending_prompt().expect("pending drop prompt");
+        assert!(detail.contains("refs/stash@{0}"), "second prompt names the stash");
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+    }
+
+    #[gpui::test]
+    async fn test_stash_rename_modal_cancel_dispatches_nothing(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let head = Oid::from_bytes(&[1; 20]).unwrap();
+        let stash_oid = Oid::from_bytes(&[2; 20]).unwrap();
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head.to_string(),
+        );
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.stash_entries = GitStash {
+                entries: vec![StashEntry {
+                    index: 0,
+                    oid: stash_oid,
+                    message: "WIP on main: selected stash".to_string(),
+                    branch: Some("main".to_string()),
+                    timestamp: 1,
+                }]
+                .into(),
+            };
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            repository.read_with(cx, |repo, _| repo.stash_entries.entries.len()),
+            1
+        );
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+
+        let identity = StashIdentity {
+            oid: stash_oid,
+            ref_name: git::stash::STASH_REF.to_string(),
+            selector: "refs/stash@{0}".to_string(),
+        };
+
+        cx.update(|window, cx| {
+            schedule_stash_rename(
+                None,
+                Some(repository.downgrade()),
+                workspace_weak.clone(),
+                identity.clone(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // The rename modal opens for the exact composite target.
+        assert!(
+            workspace_weak
+                .read_with(&*cx, |workspace, cx| {
+                    workspace.active_modal::<StashRenameModal>(cx)
+                })
+                .unwrap()
+                .is_some(),
+            "rename modal should open"
+        );
+
+        // Cancelling dispatches nothing: the stash stays untouched and no
+        // in-flight ref operation is left behind.
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+
+        assert!(
+            workspace_weak
+                .read_with(&*cx, |workspace, cx| workspace.active_modal::<StashRenameModal>(cx))
+                .unwrap()
+                .is_none(),
+            "modal dismissed after cancel"
+        );
+        assert_eq!(
+            repository.read_with(&*cx, |repo, _| repo.stash_entries.entries[0].message.clone()),
+            "WIP on main: selected stash",
+            "cancel must not rename the stash"
+        );
+    }
+
 }

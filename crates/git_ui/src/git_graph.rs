@@ -1,6 +1,8 @@
 pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitView};
 use crate::{
-    commit_context_menu::{CommitContextMenuData, CommitContextMenuSource, commit_context_menu},
+    commit_context_menu::{
+        CommitContextMenuData, CommitContextMenuSource, commit_context_menu, ref_chip_context_menu,
+    },
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
     git_graph_actions::{
@@ -8,6 +10,7 @@ use crate::{
     },
     git_status_icon,
 };
+use git::stash::{STASH_REF, StashIdentity};
 use collections::{BTreeMap, HashMap, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
@@ -799,6 +802,11 @@ pub(crate) struct GraphCommit {
     pub(crate) data: Arc<InitialGraphCommitData>,
     pub(crate) lane: usize,
     pub(crate) color_idx: usize,
+    /// True when this row is a stash-reflog row (`refs/stash@{N}`). Stash rows
+    /// select by row identity (so duplicate OIDs render/select/schedule
+    /// independently) while commit metadata stays OID-keyed, render a stash
+    /// icon, and gate commit-oriented actions off.
+    pub(crate) is_stash: bool,
 }
 
 type ActiveLaneIdx = usize;
@@ -1046,6 +1054,7 @@ impl GraphData {
                 data: commit.clone(),
                 lane: commit_lane,
                 color_idx: commit_color.0 as usize,
+                is_stash: commit.stash_selector().is_some(),
             }));
         }
 
@@ -1294,6 +1303,25 @@ fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RefKind {
+    LocalBranch,
+    RemoteBranch,
+    Tag,
+}
+
+/// A ref resolved from a fully-qualified `%D` decoration. `ref_name` is the
+/// canonical, collision-safe full ref (`refs/heads/origin/main`); `display_name`
+/// is the shortened form shown in the UI, produced only after classification so
+/// a local branch literally named `origin/main` is never confused with the
+/// remote-tracking `refs/remotes/origin/main`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedRef {
+    pub(crate) ref_name: SharedString,
+    pub(crate) display_name: SharedString,
+    pub(crate) kind: RefKind,
+}
+
 struct GitGraphContextMenu {
     menu: Entity<ContextMenu>,
     position: Point<Pixels>,
@@ -1342,6 +1370,9 @@ pub struct GitGraph {
     changed_files_view_mode: ChangedFilesViewMode,
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
     pending_select_sha: Option<Oid>,
+    /// True while a per-ref operation (checkout / merge) is in flight. Guards
+    /// against duplicate dispatch from a second click before the first settles.
+    ref_operation_in_progress: bool,
 }
 
 impl GitGraph {
@@ -1599,6 +1630,7 @@ impl GitGraph {
             changed_files_view_mode: ChangedFilesViewMode::default(),
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
+            ref_operation_in_progress: false,
         };
 
         this.fetch_initial_graph_data(cx);
@@ -1677,7 +1709,9 @@ impl GitGraph {
                     }
                 }
             }
-            RepositoryEvent::HeadChanged | RepositoryEvent::BranchListChanged => {
+            RepositoryEvent::HeadChanged
+            | RepositoryEvent::BranchListChanged
+            | RepositoryEvent::GitWorktreeListChanged => {
                 // Only invalidate if we scanned atleast once,
                 // meaning we are not inside the initial repo loading state
                 // NOTE: this fixes an loading performance regression
@@ -1718,21 +1752,59 @@ impl GitGraph {
     ///  format refers to the currently checked-out branch.
     fn is_head_ref(ref_name: &str, head_branch_name: &Option<SharedString>) -> bool {
         head_branch_name.as_ref().is_some_and(|head| {
-            ref_name == head.as_ref() || ref_name.strip_prefix("HEAD -> ") == Some(head.as_ref())
+            // With `--decorate=full` the decoration is `HEAD -> refs/heads/<name>`;
+            // fall back to handling legacy shortened `HEAD -> <name>` inputs too.
+            ref_name
+                .strip_prefix("HEAD -> ")
+                .or_else(|| Some(ref_name))
+                .and_then(|full| {
+                    let name = full.strip_prefix("refs/heads/").unwrap_or(full);
+                    (name == head.as_ref()).then_some(())
+                })
+                .is_some()
         })
     }
 
-    /// Extracts a ref name (branch, remote ref, or tag) from a decoration in
-    /// git's `%D` format, returning `None` for a detached `HEAD`.
-    fn ref_name_from_decoration(decoration: &str) -> Option<SharedString> {
-        let name = decoration
+    /// Extracts a ref chip's display name from a `%D` decoration, for use as the
+    /// label shown on the chip itself (shortened after classification).
+    fn ref_chip_display_name(decoration: &str) -> SharedString {
+        let resolved = Self::resolve_ref_from_decoration(decoration);
+        resolved
+            .as_ref()
+            .map(|resolved| resolved.display_name.clone())
+            .unwrap_or_else(|| SharedString::from(decoration.to_string()))
+    }
+
+    /// Resolves a raw `%D` decoration (emitted with `--decorate=full`, e.g.
+    /// `refs/heads/origin/main`, `refs/remotes/origin/main`,
+    /// `tag: refs/tags/v1.0`, `HEAD -> refs/heads/main`) to a typed, fully
+    /// qualified ref. Returns `None` for a detached `HEAD` and for decorations
+    /// that do not resolve to a known ref namespace.
+    pub(crate) fn resolve_ref_from_decoration(decoration: &str) -> Option<ResolvedRef> {
+        let full = decoration
             .strip_prefix("tag: ")
             .or_else(|| decoration.strip_prefix("HEAD -> "))
             .unwrap_or(decoration);
-        if name.is_empty() || name == "HEAD" {
+        if full.is_empty() || full == "HEAD" {
             return None;
         }
-        Some(SharedString::from(name.to_string()))
+        let (kind, display_name) = if let Some(name) = full.strip_prefix("refs/heads/") {
+            (RefKind::LocalBranch, name)
+        } else if let Some(name) = full.strip_prefix("refs/remotes/") {
+            (RefKind::RemoteBranch, name)
+        } else if let Some(name) = full.strip_prefix("refs/tags/") {
+            (RefKind::Tag, name)
+        } else {
+            return None;
+        };
+        if display_name.is_empty() {
+            return None;
+        }
+        Some(ResolvedRef {
+            ref_name: SharedString::from(full.to_string()),
+            display_name: SharedString::from(display_name.to_string()),
+            kind,
+        })
     }
 
     fn render_chip(
@@ -1762,8 +1834,10 @@ impl GitGraph {
 
     /// Renders a ref chip for the commit at `commit_idx`. Chips that name a ref
     /// (branch, remote ref, or tag) get a right-click handler that opens a
-    /// ref-specific context menu, so that custom commands can be resolved
-    /// against the clicked ref.
+    /// typed, per-ref context menu carrying the clicked ref as a fully-qualified
+    /// canonical ref. The chip label is the display-shortened name; the ref that
+    /// the menu targets is resolved/classified from the full decoration, never
+    /// reparsed from the shortened label.
     fn render_ref_chip(
         &self,
         name: &SharedString,
@@ -1772,8 +1846,9 @@ impl GitGraph {
         commit_idx: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let chip = self.render_chip(name, accent_color, is_head);
-        let Some(ref_name) = Self::ref_name_from_decoration(name) else {
+        let display_name = Self::ref_chip_display_name(name);
+        let chip = self.render_chip(&display_name, accent_color, is_head);
+        let Some(resolved_ref) = Self::resolve_ref_from_decoration(name) else {
             return chip.into_any_element();
         };
         div()
@@ -1782,10 +1857,10 @@ impl GitGraph {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.deploy_entry_context_menu(
+                    this.deploy_ref_context_menu(
                         event.position,
                         commit_idx,
-                        Some(ref_name.clone()),
+                        resolved_ref.clone(),
                         window,
                         cx,
                     );
@@ -1793,6 +1868,52 @@ impl GitGraph {
                 }),
             )
             .into_any_element()
+    }
+
+    fn deploy_ref_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        index: usize,
+        resolved_ref: ResolvedRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(commit) = self.graph_data.commits.get(index) else {
+            return;
+        };
+        let repository = self
+            .get_repository(cx)
+            .map(|repository| repository.downgrade());
+        // A ref is the current branch only if it is the local branch HEAD points
+        // at (identified via the `HEAD -> refs/heads/<name>` decoration). Remote
+        // refs and tags are never the current branch.
+        let is_current_branch = matches!(resolved_ref.kind, RefKind::LocalBranch)
+            && Self::is_head_ref(
+                &format!("HEAD -> {}", resolved_ref.ref_name),
+                &repository
+                    .as_ref()
+                    .and_then(|repository| repository.upgrade())
+                    .map(|repository| {
+                        repository
+                            .read(cx)
+                            .snapshot()
+                            .branch
+                            .as_ref()
+                            .map(|branch| SharedString::from(branch.name().to_string()))
+                    })
+                    .unwrap_or_default(),
+            );
+        let context_menu = ref_chip_context_menu(
+            resolved_ref,
+            commit.data.sha,
+            is_current_branch,
+            repository,
+            Some(cx.entity().downgrade()),
+            self.workspace.clone(),
+            window,
+            cx,
+        );
+        self.set_context_menu(context_menu, position, Some(index), window, cx);
     }
 
     fn render_table_rows(
@@ -1923,20 +2044,32 @@ impl GitGraph {
                             h_flex()
                                 .gap_2()
                                 .overflow_hidden()
-                                .children((!commit.data.ref_names.is_empty()).then(|| {
-                                    h_flex().gap_1().children(commit.data.ref_names.iter().map(
-                                        |name| {
-                                            let is_head =
-                                                Self::is_head_ref(name.as_ref(), &head_branch_name);
-                                            self.render_ref_chip(
-                                                name,
-                                                accent_color,
-                                                is_head,
-                                                idx,
-                                                cx,
-                                            )
-                                        },
-                                    ))
+                                .children(
+                                    // Stash rows do not render their reflog
+                                    // selector as a ref chip; they show a stash
+                                    // icon before the message instead.
+                                    (!commit.is_stash && !commit.data.ref_names.is_empty()).then(|| {
+                                        h_flex().gap_1().children(commit.data.ref_names.iter().map(
+                                            |name| {
+                                                let is_head = Self::is_head_ref(
+                                                    name.as_ref(),
+                                                    &head_branch_name,
+                                                );
+                                                self.render_ref_chip(
+                                                    name,
+                                                    accent_color,
+                                                    is_head,
+                                                    idx,
+                                                    cx,
+                                                )
+                                            },
+                                        ))
+                                    }),
+                                )
+                                .children(commit.is_stash.then(|| {
+                                    Icon::new(IconName::BoxOpen)
+                                        .size(IconSize::Small)
+                                        .color(Color::Custom(accent_color))
                                 }))
                                 .child(subject_label),
                         )
@@ -2369,6 +2502,56 @@ impl GitGraph {
         ))
     }
 
+    /// Attempts to begin a per-ref operation, suppressing duplicate dispatch if
+    /// one is already in flight. Returns `false` when a ref operation is pending.
+    pub(crate) fn begin_ref_operation(&mut self) -> bool {
+        if self.ref_operation_in_progress {
+            return false;
+        }
+        self.ref_operation_in_progress = true;
+        true
+    }
+
+    /// Clears the in-flight ref-operation guard. Called when a ref operation
+    /// settles (success or error) or the repository/graph goes away.
+    pub(crate) fn end_ref_operation(&mut self) {
+        self.ref_operation_in_progress = false;
+    }
+
+    /// Checks out a local branch by name (the exact canonical branch captured by
+    /// a per-ref chip), reusing the existing dirty-worktree / active-operation
+    /// preflight that the graph applies to Checkout mutations. The preflight
+    /// result is surfaced through the returned [`Result`] (e.g. a
+    /// [`GraphMutationError::DirtyWorktree`] when the working tree is dirty).
+    pub(crate) fn schedule_branch_checkout(
+        &mut self,
+        branch_name: String,
+        commit: Oid,
+        cx: &mut Context<Self>,
+    ) -> Result<Task<anyhow::Result<()>>, GraphMutationError> {
+        let repository = self
+            .get_repository(cx)
+            .ok_or(GraphMutationError::MissingHead)?;
+        // Plan against the snapshot to enforce the same clean-worktree guard
+        // used for Checkout Commit; a per-ref Checkout must not silently switch
+        // away from changes the user hasn't committed or stashed.
+        let _preflight = GraphMutationController::plan(
+            &repository.read(cx).snapshot(),
+            GraphMutation::Checkout { commit },
+        )?;
+        let repository = repository.downgrade();
+        Ok(cx.spawn(async move |_, cx| {
+            let repository = repository
+                .upgrade()
+                .ok_or_else(|| anyhow::anyhow!("Repository is no longer available"))?;
+            let receiver = repository.update(cx, |repository, _| {
+                repository.change_branch(branch_name)
+            });
+            receiver.await??;
+            Ok(())
+        }))
+    }
+
     pub fn select_commit_by_sha(&mut self, sha: impl TryInto<Oid>, cx: &mut Context<Self>) {
         fn inner(this: &mut GitGraph, oid: Oid, cx: &mut Context<GitGraph>) {
             let Some(selected_repository) = this.get_repository(cx) else {
@@ -2572,6 +2755,19 @@ impl GitGraph {
         } else {
             vec![commit.data.sha]
         };
+        // For a stash row, capture the composite stash target (exact OID +
+        // reflog selector) at deploy time so the open menu targets this entry —
+        // never the current row index or OID alone. Duplicate OIDs stay
+        // independently addressable through their distinct selectors.
+        let stash_identity = if commit.is_stash {
+            commit.data.stash_selector().map(|selector| StashIdentity {
+                oid: commit.data.sha,
+                ref_name: STASH_REF.to_string(),
+                selector: selector.to_string(),
+            })
+        } else {
+            None
+        };
         let context_menu = commit_context_menu(
             CommitContextMenuData {
                 sha: commit.data.sha,
@@ -2581,6 +2777,8 @@ impl GitGraph {
                     .into_iter()
                     .map(|tag_name| SharedString::from(tag_name.to_string()))
                     .collect(),
+                is_stash: commit.is_stash,
+                stash_identity,
             },
             selected_commits,
             CommitContextMenuSource::GitGraph,
@@ -4876,10 +5074,10 @@ mod tests {
     use super::*;
     use anyhow::{Context, Result, bail};
     use collections::{HashMap, HashSet};
-    use fs::FakeFs;
+    use fs::{FakeFs, Fs};
     use git::Oid;
-    use git::repository::{CommitData, InitialGraphCommitData};
-    use gpui::{TestAppContext, UpdateGlobal};
+    use git::repository::{CommitData, InitialGraphCommitData, Worktree};
+    use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
     use project::git_store::{GitStoreEvent, RepositoryEvent};
     use project::{
         GIT_COMMAND_TASK_TAG, Project, TaskSourceKind, task_store::TaskSettingsLocation,
@@ -4888,7 +5086,7 @@ mod tests {
     use serde_json::json;
     use settings::{SettingsStore, ThemeSettingsContent};
     use smallvec::{SmallVec, smallvec};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     fn init_test(cx: &mut TestAppContext) {
@@ -6426,28 +6624,30 @@ mod tests {
 
         fs.set_graph_commits(
             Path::new("/project/.git"),
-            vec![
-                Arc::new(InitialGraphCommitData {
-                    sha: initial_head,
-                    parents: smallvec![initial_stash],
-                    ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
-                }),
-                Arc::new(InitialGraphCommitData {
-                    sha: initial_stash,
-                    parents: smallvec![],
-                    ref_names: vec!["refs/stash".into()],
-                }),
-            ],
+            vec![Arc::new(InitialGraphCommitData {
+                sha: initial_head,
+                parents: smallvec![Oid::from_bytes(&[7; 20]).unwrap()],
+                ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+            })],
         );
         fs.with_git_state(Path::new("/project/.git"), true, |state| {
             state.stash_entries = git::stash::GitStash {
-                entries: vec![git::stash::StashEntry {
-                    index: 0,
-                    oid: initial_stash,
-                    message: "initial stash".to_string(),
-                    branch: Some("main".to_string()),
-                    timestamp: 1,
-                }]
+                entries: vec![
+                    git::stash::StashEntry {
+                        index: 0,
+                        oid: initial_stash,
+                        message: "initial stash".to_string(),
+                        branch: Some("main".to_string()),
+                        timestamp: 2,
+                    },
+                    git::stash::StashEntry {
+                        index: 1,
+                        oid: Oid::from_bytes(&[5; 20]).unwrap(),
+                        message: "older stash".to_string(),
+                        branch: Some("main".to_string()),
+                        timestamp: 1,
+                    },
+                ]
                 .into(),
             };
         })
@@ -6487,22 +6687,24 @@ mod tests {
                 .map(|commit| commit.data.sha)
                 .collect::<Vec<_>>()
         });
-        assert_eq!(initial_shas, vec![initial_head, initial_stash]);
+        // Stash rows are derived from the stash reflog (newest first) and emitted
+        // ahead of the regular commits so their child→parent lanes connect.
+        assert_eq!(
+            initial_shas,
+            vec![
+                initial_stash,
+                Oid::from_bytes(&[5; 20]).unwrap(),
+                initial_head
+            ]
+        );
 
         fs.set_graph_commits(
             Path::new("/project/.git"),
-            vec![
-                Arc::new(InitialGraphCommitData {
-                    sha: updated_head,
-                    parents: smallvec![updated_stash],
-                    ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
-                }),
-                Arc::new(InitialGraphCommitData {
-                    sha: updated_stash,
-                    parents: smallvec![],
-                    ref_names: vec!["refs/stash".into()],
-                }),
-            ],
+            vec![Arc::new(InitialGraphCommitData {
+                sha: updated_head,
+                parents: smallvec![Oid::from_bytes(&[8; 20]).unwrap()],
+                ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+            })],
         );
         fs.with_git_state(Path::new("/project/.git"), true, |state| {
             state.stash_entries = git::stash::GitStash {
@@ -6538,7 +6740,7 @@ mod tests {
                 .map(|commit| commit.data.sha)
                 .collect::<Vec<_>>()
         });
-        assert_eq!(reloaded_shas, vec![updated_head, updated_stash]);
+        assert_eq!(reloaded_shas, vec![updated_stash, updated_head]);
     }
 
     #[gpui::test]
@@ -7419,23 +7621,26 @@ mod tests {
 
     #[test]
     fn test_ref_name_from_decoration() {
+        // Display-shortened names, classified after the fully-qualified form.
         assert_eq!(
-            GitGraph::ref_name_from_decoration("HEAD -> main"),
+            GitGraph::resolve_ref_from_decoration("HEAD -> refs/heads/main")
+                .map(|r| r.display_name),
             Some("main".into())
         );
         assert_eq!(
-            GitGraph::ref_name_from_decoration("main"),
+            GitGraph::resolve_ref_from_decoration("refs/heads/main").map(|r| r.display_name),
             Some("main".into())
         );
         assert_eq!(
-            GitGraph::ref_name_from_decoration("origin/main"),
+            GitGraph::resolve_ref_from_decoration("refs/remotes/origin/main")
+                .map(|r| r.display_name),
             Some("origin/main".into())
         );
         assert_eq!(
-            GitGraph::ref_name_from_decoration("tag: v1.0"),
+            GitGraph::resolve_ref_from_decoration("tag: refs/tags/v1.0").map(|r| r.display_name),
             Some("v1.0".into())
         );
-        assert_eq!(GitGraph::ref_name_from_decoration("HEAD"), None);
+        assert_eq!(GitGraph::resolve_ref_from_decoration("HEAD"), None);
     }
 
     #[gpui::test]
@@ -7738,5 +7943,1397 @@ mod tests {
                 .map(|m| m.message.entity_id());
             assert_eq!(message_entity_id, new_entity_id);
         });
+    }
+
+    #[test]
+    fn test_resolve_ref_classifies_full_decorations() {
+        // Local branch sharing a name with a remote-tracking branch must
+        // classify distinctly (collision-safety, criterion 1).
+        let local = GitGraph::resolve_ref_from_decoration("refs/heads/origin/main").unwrap();
+        assert_eq!(local.kind, RefKind::LocalBranch);
+        assert_eq!(local.ref_name, "refs/heads/origin/main");
+        assert_eq!(local.display_name, "origin/main");
+
+        let remote = GitGraph::resolve_ref_from_decoration("refs/remotes/origin/main").unwrap();
+        assert_eq!(remote.kind, RefKind::RemoteBranch);
+        assert_eq!(remote.ref_name, "refs/remotes/origin/main");
+        assert_eq!(remote.display_name, "origin/main");
+        assert_ne!(local.ref_name, remote.ref_name);
+
+        let slash_branch =
+            GitGraph::resolve_ref_from_decoration("refs/heads/feature/auth").unwrap();
+        assert_eq!(slash_branch.kind, RefKind::LocalBranch);
+        assert_eq!(slash_branch.display_name, "feature/auth");
+
+        let tag = GitGraph::resolve_ref_from_decoration("tag: refs/tags/v1.0").unwrap();
+        assert_eq!(tag.kind, RefKind::Tag);
+        assert_eq!(tag.ref_name, "refs/tags/v1.0");
+        assert_eq!(tag.display_name, "v1.0");
+
+        let head = GitGraph::resolve_ref_from_decoration("HEAD -> refs/heads/main").unwrap();
+        assert_eq!(head.kind, RefKind::LocalBranch);
+        assert_eq!(head.display_name, "main");
+
+        // Detached HEAD carries a bare `HEAD` decoration and never targets a ref.
+        assert_eq!(GitGraph::resolve_ref_from_decoration("HEAD"), None);
+        assert_eq!(GitGraph::resolve_ref_from_decoration("refs/custom/hidden"), None);
+    }
+
+    #[test]
+    fn test_is_head_ref_full_format() {
+        let some_main = Some(SharedString::from("main"));
+        assert!(GitGraph::is_head_ref("HEAD -> refs/heads/main", &some_main));
+        assert!(!GitGraph::is_head_ref("refs/heads/feature", &some_main));
+        assert!(!GitGraph::is_head_ref("refs/remotes/origin/main", &some_main));
+        assert!(!GitGraph::is_head_ref("HEAD", &some_main));
+
+        // Detached HEAD -> no branch is the head ref.
+        assert!(!GitGraph::is_head_ref("HEAD", &None));
+
+        // Collision: the remote-tracking `origin/main` is never the local head.
+        assert!(!GitGraph::is_head_ref("refs/remotes/origin/main", &Some("origin/main".into())));
+        // ...but the local one is.
+        assert!(GitGraph::is_head_ref("HEAD -> refs/heads/origin/main", &Some("origin/main".into())));
+    }
+
+    #[test]
+    fn test_ref_chip_display_name_shortens_after_classification() {
+        assert_eq!(
+            GitGraph::ref_chip_display_name("refs/heads/origin/main"),
+            "origin/main"
+        );
+        assert_eq!(
+            GitGraph::ref_chip_display_name("refs/remotes/origin/main"),
+            "origin/main"
+        );
+        assert_eq!(
+            GitGraph::ref_chip_display_name("tag: refs/tags/v1.0"),
+            "v1.0"
+        );
+        // Unresolvable decorations (e.g. detached HEAD) fall back to the raw
+        // decoration so the chip still renders a readable label.
+        assert_eq!(GitGraph::ref_chip_display_name("HEAD"), "HEAD");
+    }
+
+    /// Sets up a fake repository + GitGraph whose single top commit carries
+    /// multiple fully-qualified decorations (a head run, a plain local branch,
+    /// a remote branch, a local colliding with the remote, and a tag).
+    async fn seed_ref_menu_repo(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<FakeFs>,
+        Entity<Project>,
+        Entity<Repository>,
+        Oid,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.insert_branches(Path::new("/project/.git"), &["feature"]);
+
+        let head_sha = Oid::try_from("abcdef1234567890abcdef1234567890abcdef12")
+            .expect("HEAD sha should parse");
+        let second_sha = Oid::try_from("1111111111111111111111111111111111111111")
+            .expect("second sha should parse");
+        // Make HEAD point at the graph tip so the repository snapshot's
+        // head_commit is populated (the checkout/merge preflight requires one).
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head_sha.to_string(),
+        );
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: head_sha,
+                    parents: smallvec![second_sha],
+                    ref_names: vec![
+                        "HEAD -> refs/heads/main".into(),
+                        "refs/heads/feature".into(),
+                        "refs/remotes/origin/main".into(),
+                        "refs/heads/origin/main".into(),
+                        "tag: refs/tags/v1.0".into(),
+                    ],
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: second_sha,
+                    parents: smallvec![],
+                    ref_names: vec![],
+                }),
+            ],
+        );
+        fs.set_status_for_repo(Path::new("/project/.git"), &[]);
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have an active repository")
+        });
+
+        (fs, project, repository, head_sha)
+    }
+
+    /// Seeds a repo like [`seed_ref_menu_repo`] but additionally checks the
+    /// local `feature` branch out in a linked worktree (path != the main
+    /// worktree), so the ref menu must classify it as a worktree destination.
+    async fn seed_ref_menu_repo_with_linked_feature(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<FakeFs>,
+        Entity<Project>,
+        Entity<Repository>,
+        Oid,
+        Worktree,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.insert_branches(Path::new("/project/.git"), &["feature"]);
+
+        let head_sha = Oid::try_from("abcdef1234567890abcdef1234567890abcdef12")
+            .expect("HEAD sha should parse");
+        let second_sha = Oid::try_from("1111111111111111111111111111111111111111")
+            .expect("second sha should parse");
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head_sha.to_string(),
+        );
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: head_sha,
+                    parents: smallvec![second_sha],
+                    ref_names: vec![
+                        "HEAD -> refs/heads/main".into(),
+                        "refs/heads/feature".into(),
+                        "refs/remotes/origin/main".into(),
+                        "refs/heads/origin/main".into(),
+                        "tag: refs/tags/v1.0".into(),
+                    ],
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: second_sha,
+                    parents: smallvec![],
+                    ref_names: vec![],
+                }),
+            ],
+        );
+        fs.set_status_for_repo(Path::new("/project/.git"), &[]);
+
+        let linked_worktree = Worktree {
+            path: PathBuf::from("/project-worktrees/feature"),
+            ref_name: Some("refs/heads/feature".into()),
+            sha: head_sha.to_string().into(),
+            is_main: false,
+            is_bare: false,
+        };
+        fs.add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            false,
+            linked_worktree.clone(),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have an active repository")
+        });
+
+        (fs, project, repository, head_sha, linked_worktree)
+    }
+
+    /// Seeds a repo whose *local* branch `origin/main` is checked out in a
+    /// linked worktree while the remote-tracking `refs/remotes/origin/main`
+    /// (same display text) is not, exercising exact-ref classification.
+    async fn seed_ref_menu_repo_with_linked_origin_main(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<FakeFs>,
+        Entity<Project>,
+        Entity<Repository>,
+        Oid,
+        Worktree,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.insert_branches(Path::new("/project/.git"), &["origin/main"]);
+
+        let head_sha = Oid::try_from("abcdef1234567890abcdef1234567890abcdef12")
+            .expect("HEAD sha should parse");
+        let second_sha = Oid::try_from("1111111111111111111111111111111111111111")
+            .expect("second sha should parse");
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head_sha.to_string(),
+        );
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                Arc::new(InitialGraphCommitData {
+                    sha: head_sha,
+                    parents: smallvec![second_sha],
+                    ref_names: vec![
+                        "HEAD -> refs/heads/main".into(),
+                        "refs/heads/origin/main".into(),
+                        "refs/remotes/origin/main".into(),
+                    ],
+                }),
+                Arc::new(InitialGraphCommitData {
+                    sha: second_sha,
+                    parents: smallvec![],
+                    ref_names: vec![],
+                }),
+            ],
+        );
+        fs.set_status_for_repo(Path::new("/project/.git"), &[]);
+
+        // Hand-seed a flat `.git/worktrees/` entry (the fake scanner only reads
+        // single-level dirs, so a `refs/heads/origin/main` entry must use a
+        // flat admin name while its HEAD points at the nested local ref). This
+        // produces a linked worktree whose ref is `refs/heads/origin/main` —
+        // the exact collision case: same display text as the remote-tracking
+        // `refs/remotes/origin/main`, but a distinct fully-qualified ref.
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state
+                .refs
+                .insert("refs/heads/origin/main".to_string(), head_sha.to_string());
+        })
+        .unwrap();
+        let entry_dir = Path::new("/project/.git/worktrees/collision");
+        fs.create_dir(entry_dir).await.unwrap();
+        fs.write(entry_dir.join("HEAD").as_path(), b"ref: refs/heads/origin/main")
+            .await
+            .unwrap();
+        fs.write(entry_dir.join("commondir").as_path(), b"/project/.git")
+            .await
+            .unwrap();
+        fs.write(entry_dir.join("gitdir").as_path(), b"/project-worktrees/collision/.git")
+            .await
+            .unwrap();
+        fs.create_dir(Path::new("/project-worktrees/collision"))
+            .await
+            .unwrap();
+        fs.write(
+            Path::new("/project-worktrees/collision/.git"),
+            b"gitdir: /project/.git/worktrees/collision",
+        )
+        .await
+        .unwrap();
+
+        let linked_worktree = Worktree {
+            path: PathBuf::from("/project-worktrees/collision"),
+            ref_name: Some("refs/heads/origin/main".into()),
+            sha: head_sha.to_string().into(),
+            is_main: false,
+            is_bare: false,
+        };
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have an active repository")
+        });
+
+        (fs, project, repository, head_sha, linked_worktree)
+    }
+
+    /// Opens the git graph in a fresh window and returns it alongside the
+    /// window's visual test context (needed to drive context menus).
+    fn open_graph_window(
+        project: &Entity<Project>,
+        repository: &Entity<Repository>,
+        workspace_weak: WeakEntity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<GitGraph> {
+        cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        })
+    }
+
+    fn deploy_ref_menu(
+        git_graph: &Entity<GitGraph>,
+        resolved: ResolvedRef,
+        cx: &mut VisualTestContext,
+    ) {
+        git_graph.update_in(cx, |git_graph, window, cx| {
+            assert_eq!(git_graph.graph_data.commits.len(), 2);
+            git_graph.deploy_ref_context_menu(point(px(20.), px(20.)), 0, resolved, window, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn ref_menu_labels(
+        git_graph: &Entity<GitGraph>,
+        cx: &VisualTestContext,
+    ) -> Vec<String> {
+        git_graph.read_with(&*cx, |git_graph, app_cx| {
+            git_graph
+                .context_menu
+                .as_ref()
+                .map(|menu| {
+                    menu.menu
+                        .read(app_cx)
+                        .entry_labels()
+                        .into_iter()
+                        .map(|label| label.to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// Selects a specific selectable menu entry by label and confirms it,
+    /// navigating from the first selectable item. Headers/labels are skipped by
+    /// the menu's own selection logic, so the selected index equals the entry's
+    /// position among the non-`Ref` labels.
+    fn select_and_confirm_menu_entry(
+        git_graph: &Entity<GitGraph>,
+        target: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        let menu = git_graph.read_with(&*cx, |git_graph, _| {
+            git_graph
+                .context_menu
+                .as_ref()
+                .expect("context menu should be open")
+                .menu
+                .clone()
+        });
+        let labels: Vec<String> =
+            menu.read_with(&*cx, |menu, _| {
+                menu.entry_labels()
+                    .into_iter()
+                    .map(|label| label.to_string())
+                    .collect()
+            });
+        let selectable: Vec<&str> = labels
+            .iter()
+            .map(|label| label.as_str())
+            .filter(|label| !label.starts_with("Ref "))
+            .collect();
+        let index = selectable
+            .iter()
+            .position(|label| *label == target)
+            .unwrap_or_else(|| panic!("menu entry {target:?} not found in {selectable:?}"));
+        menu.update_in(cx, |menu, window, cx| {
+            menu.select_first(&menu::SelectFirst, window, cx);
+            for _ in 0..index {
+                menu.select_next(&menu::SelectNext, window, cx);
+            }
+            menu.confirm(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_ref_menu_local_branch_entries_and_current_omission(
+        cx: &mut TestAppContext,
+    ) {
+        let (_fs, project, repository, _head_sha) = seed_ref_menu_repo(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        // Non-current local branch: full typed menu.
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/feature".into(),
+                display_name: "feature".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        let labels = ref_menu_labels(&git_graph, cx);
+        assert!(
+            labels.iter().any(|label| label == "Checkout")
+                && labels.iter().any(|label| label == "Merge into Current")
+                && labels.iter().any(|label| label == "Create Detached Worktree")
+                && labels.iter().any(|label| label == "Rename…")
+                && labels.iter().any(|label| label == "Delete…")
+                && labels.iter().any(|label| label == "Copy Name"),
+            "non-current local branch menu should offer checkout/merge/create/rename/delete/copy, got {labels:?}"
+        );
+
+        // Current branch (main): Checkout and Delete omitted.
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/main".into(),
+                display_name: "main".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        let current_labels = ref_menu_labels(&git_graph, cx);
+        assert!(
+            !current_labels.iter().any(|label| label == "Checkout")
+                && !current_labels.iter().any(|label| label == "Delete…"),
+            "current branch menu should omit Checkout and Delete, got {current_labels:?}"
+        );
+        assert!(
+            current_labels.iter().any(|label| label == "Merge into Current")
+                && current_labels.iter().any(|label| label == "Create Detached Worktree")
+                && current_labels.iter().any(|label| label == "Rename…")
+                && current_labels.iter().any(|label| label == "Copy Name"),
+            "current branch menu should keep merge/create/rename/copy, got {current_labels:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_menu_remote_and_tag_are_typed(cx: &mut TestAppContext) {
+        let (_fs, project, repository, _head_sha) = seed_ref_menu_repo(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        // A remote chip is typed to the remote ref: it gains the remote actions
+        // (Checkout, Delete on Server) but never the local-only ones.
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/remotes/origin/main".into(),
+                display_name: "origin/main".into(),
+                kind: RefKind::RemoteBranch,
+            },
+            cx,
+        );
+        let remote_labels = ref_menu_labels(&git_graph, cx);
+        assert!(
+            !remote_labels.iter().any(|label| label == "Rename…")
+                && !remote_labels.iter().any(|label| label == "Delete…"),
+            "remote chip should not offer local-only rename/delete, got {remote_labels:?}"
+        );
+        assert!(
+            remote_labels.iter().any(|label| label == "Checkout")
+                && remote_labels.iter().any(|label| label == "Delete on Server…")
+                && remote_labels.iter().any(|label| label == "Merge into Current")
+                && remote_labels.iter().any(|label| label == "Create Detached Worktree")
+                && remote_labels.iter().any(|label| label == "Copy Name"),
+            "remote chip should offer checkout/delete-on-server/merge/create/copy, got {remote_labels:?}"
+        );
+
+        // Tag chip: the full lifecycle menu (inspect, push, delete local/server).
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/tags/v1.0".into(),
+                display_name: "v1.0".into(),
+                kind: RefKind::Tag,
+            },
+            cx,
+        );
+        let tag_labels = ref_menu_labels(&git_graph, cx);
+        assert!(
+            !tag_labels.iter().any(|label| label == "Checkout")
+                && !tag_labels.iter().any(|label| label == "Rename…")
+                && !tag_labels.iter().any(|label| label == "Delete…"),
+            "tag chip should not offer branch checkout/rename/local-delete labels, got {tag_labels:?}"
+        );
+        assert!(
+            tag_labels.iter().any(|label| label == "View Details…")
+                && tag_labels.iter().any(|label| label == "Push to Remote…")
+                && tag_labels.iter().any(|label| label == "Delete Local…")
+                && tag_labels.iter().any(|label| label == "Delete on Remote…")
+                && tag_labels.iter().any(|label| label == "Copy Name"),
+            "tag chip should offer the full lifecycle, got {tag_labels:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_menu_linked_branch_is_worktree_destination(cx: &mut TestAppContext) {
+        let (_fs, project, repository, _head_sha, linked_worktree) =
+            seed_ref_menu_repo_with_linked_feature(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        // Confirm the seed actually populated the linked worktree in the live
+        // snapshot.
+        let linked_paths = repository.read_with(&*cx, |repo, _| {
+            repo.linked_worktrees
+                .iter()
+                .map(|wt| wt.path.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            linked_paths.contains(&linked_worktree.path),
+            "seed should place feature in a linked worktree, got {linked_paths:?}"
+        );
+
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/feature".into(),
+                display_name: "feature".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        let labels = ref_menu_labels(&git_graph, cx);
+        assert!(
+            labels.iter().any(|label| label == "Switch Here")
+                && labels.iter().any(|label| label.ends_with("in New Window"))
+                && labels.iter().any(|label| label == "Remove Worktree…")
+                && labels.iter().any(|label| label == "Copy Name"),
+            "linked branch should offer switch/new-window/remove/copy, got {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "Checkout")
+                && !labels.iter().any(|label| label == "Rename…")
+                && !labels.iter().any(|label| label == "Delete…")
+                && !labels.iter().any(|label| label == "Merge into Current")
+                && !labels.iter().any(|label| label == "Create Detached Worktree"),
+            "linked branch must omit checkout/rename/delete/merge/create-detached, got {labels:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_menu_linked_branch_matches_exact_full_ref(cx: &mut TestAppContext) {
+        let (_fs, project, repository, _head_sha, _linked_worktree) =
+            seed_ref_menu_repo_with_linked_feature(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        // The local `feature` is linked; its remote-tracking counterpart stays
+        // an ordinary remote chip (switch/remove omitted). The linked state is
+        // resolved by the fully-qualified ref, never by the shortened display
+        // text that could be shared by two refs (local `origin/main` vs remote
+        // `refs/remotes/origin/main` on the same commit).
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/remotes/origin/main".into(),
+                display_name: "origin/main".into(),
+                kind: RefKind::RemoteBranch,
+            },
+            cx,
+        );
+        let remote_labels = ref_menu_labels(&git_graph, cx);
+        assert!(
+            !remote_labels.iter().any(|label| label == "Switch Here")
+                && !remote_labels.iter().any(|label| label == "Remove Worktree…"),
+            "remote ref must never route to a worktree destination, got {remote_labels:?}"
+        );
+        assert!(
+            remote_labels.iter().any(|label| label == "Merge into Current")
+                && remote_labels.iter().any(|label| label == "Copy Name"),
+            "remote ref should keep the ordinary commit-target actions, got {remote_labels:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_menu_linked_branch_same_name_collision(cx: &mut TestAppContext) {
+        // A local branch literally named `origin/main` checked out in a linked
+        // worktree must be classified by its exact `refs/heads/origin/main`
+        // ref — never confused with the `refs/remotes/origin/main`
+        // remote-tracking ref, even though both share the display text
+        // `origin/main` and decorate the same commit.
+        let (_fs, project, repository, _head_sha, _linked) =
+            seed_ref_menu_repo_with_linked_origin_main(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        // The local `refs/heads/origin/main` is checked out in a linked
+        // worktree -> worktree destination.
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/origin/main".into(),
+                display_name: "origin/main".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        let local_labels = ref_menu_labels(&git_graph, cx);
+        assert!(
+            local_labels.iter().any(|label| label == "Switch Here"),
+            "local refs/heads/origin/main linked in a worktree should be a destination, got {local_labels:?}"
+        );
+        assert!(
+            !local_labels.iter().any(|label| label == "Checkout"),
+            "linked same-name local branch should omit Checkout, got {local_labels:?}"
+        );
+
+        // The remote-tracking `refs/remotes/origin/main` is untouched -> still an
+        // ordinary remote chip, never a worktree destination.
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/remotes/origin/main".into(),
+                display_name: "origin/main".into(),
+                kind: RefKind::RemoteBranch,
+            },
+            cx,
+        );
+        let remote_labels = ref_menu_labels(&git_graph, cx);
+        assert!(
+            !remote_labels.iter().any(|label| label == "Switch Here")
+                && !remote_labels.iter().any(|label| label == "Remove Worktree…"),
+            "remote same-name ref must not inherit local linked state, got {remote_labels:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_menu_linked_branch_stale_worktree_returns_to_ordinary(cx: &mut TestAppContext) {
+        // Once the linked worktree leaves the live snapshot (filled another
+        // branch, or removed), a freshly deployed menu falls back to the
+        // ordinary local-branch actions — it never dispatches against a stale
+        // destination captured by an older snapshot.
+        let (fs, project, repository, _head_sha, _linked_worktree) =
+            seed_ref_menu_repo_with_linked_feature(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak.clone(), cx);
+        cx.run_until_parked();
+
+        // First confirm the linked classification while the worktree is live.
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/feature".into(),
+                display_name: "feature".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        assert!(
+            ref_menu_labels(&git_graph, cx).iter().any(|label| label == "Switch Here"),
+            "linked feature should be a destination while the worktree is live"
+        );
+
+        // Remove the linked worktree and refresh the repository snapshot, so a
+        // subsequently deployed menu must no longer treat `feature` as a
+        // worktree destination.
+        fs.remove_worktree_for_repo(Path::new("/project/.git"), true, "refs/heads/feature")
+            .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        cx.run_until_parked();
+
+        // Deploy a fresh graph window against the refreshed snapshot: the menu
+        // is re-classified from the live linked-worktree state and falls back to
+        // the ordinary local-branch actions.
+        drop(git_graph);
+        let git_graph2 = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+        deploy_ref_menu(
+            &git_graph2,
+            ResolvedRef {
+                ref_name: "refs/heads/feature".into(),
+                display_name: "feature".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        let labels = ref_menu_labels(&git_graph2, cx);
+        assert!(
+            !labels.iter().any(|label| label == "Switch Here"),
+            "stale linked destination must not be offered after removal, got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label == "Checkout"),
+            "stale linked branch should fall back to an ordinary checkout target, got {labels:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_checkout_switches_branch(cx: &mut TestAppContext) {
+        let (fs, project, repository, _head_sha) = seed_ref_menu_repo(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/feature".into(),
+                display_name: "feature".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        select_and_confirm_menu_entry(&git_graph, "Checkout", cx);
+
+        let current_branch = fs
+            .with_git_state(Path::new("/project/.git"), false, |state| {
+                state.current_branch_name.clone()
+            })
+            .unwrap();
+        assert_eq!(current_branch.as_deref(), Some("feature"));
+    }
+
+    #[gpui::test]
+    async fn test_ref_checkout_blocked_when_worktree_dirty(cx: &mut TestAppContext) {
+        let (fs, project, repository, head_sha) = seed_ref_menu_repo(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        // Dirty the working tree; the checkout preflight must refuse.
+        fs.set_status_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", git::status::StatusCode::Modified.worktree())],
+        );
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        let result = git_graph.update(cx, |git_graph, cx| {
+            git_graph.schedule_branch_checkout("feature".into(), head_sha, cx)
+        });
+        assert!(
+            matches!(result, Err(GraphMutationError::DirtyWorktree)),
+            "checkout of 'feature' with a dirty worktree should be refused by the preflight, got {result:?}"
+        );
+
+        // Nothing was switched.
+        let current_branch = fs
+            .with_git_state(Path::new("/project/.git"), false, |state| {
+                state.current_branch_name.clone()
+            })
+            .unwrap();
+        assert_eq!(current_branch.as_deref(), Some("main"));
+    }
+
+    #[gpui::test]
+    async fn test_ref_delete_removes_exact_branch(cx: &mut TestAppContext) {
+        let (fs, project, repository, _head_sha) = seed_ref_menu_repo(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/feature".into(),
+                display_name: "feature".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        select_and_confirm_menu_entry(&git_graph, "Delete…", cx);
+
+        let branches = fs
+            .with_git_state(Path::new("/project/.git"), false, |state| state.branches.clone())
+            .unwrap();
+        assert!(
+            !branches.contains("feature"),
+            "delete should remove the exact clicked branch, remaining: {branches:?}"
+        );
+        assert!(branches.contains("main"), "other branches are untouched");
+    }
+
+    #[gpui::test]
+    async fn test_ref_merge_uses_clicked_sha(cx: &mut TestAppContext) {
+        let (fs, project, repository, head_sha) = seed_ref_menu_repo(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/feature".into(),
+                display_name: "feature".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        select_and_confirm_menu_entry(&git_graph, "Merge into Current", cx);
+
+        // The merge targets the clicked commit's SHA, never a fallback.
+        let mutations = fs
+            .with_git_state(Path::new("/project/.git"), false, |state| {
+                state.graph_mutations.clone()
+            })
+            .unwrap();
+        assert!(
+            mutations.iter().any(|mutation| matches!(
+                mutation,
+                fs::FakeGitMutation::Merge { commit, mode: git::repository::MergeMode::Default }
+                    if commit == &head_sha.to_string()
+            )),
+            "merge should target the clicked commit SHA {head_sha}, got {mutations:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_copy_name_copies_display_name(cx: &mut TestAppContext) {
+        let (_fs, project, repository, _head_sha) = seed_ref_menu_repo(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/remotes/origin/main".into(),
+                display_name: "origin/main".into(),
+                kind: RefKind::RemoteBranch,
+            },
+            cx,
+        );
+        select_and_confirm_menu_entry(&git_graph, "Copy Name", cx);
+
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("origin/main"));
+    }
+
+    #[gpui::test]
+    async fn test_ref_remote_checkout_reuses_exact_tracker(cx: &mut TestAppContext) {
+        let (fs, project, repository, _head_sha) = seed_ref_menu_repo(cx).await;
+        // A local `feature` already tracks `refs/remotes/origin/main`: checking
+        // out `origin/main` must switch to that exact tracker, never create a
+        // new branch.
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state
+                .branch_upstreams
+                .insert("feature".into(), "refs/remotes/origin/main".into());
+        })
+        .unwrap();
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/remotes/origin/main".into(),
+                display_name: "origin/main".into(),
+                kind: RefKind::RemoteBranch,
+            },
+            cx,
+        );
+        select_and_confirm_menu_entry(&git_graph, "Checkout", cx);
+
+        let current = fs
+            .with_git_state(Path::new("/project/.git"), false, |state| {
+                state.current_branch_name.clone()
+            })
+            .unwrap();
+        assert_eq!(current.as_deref(), Some("feature"));
+        let branches = fs
+            .with_git_state(Path::new("/project/.git"), false, |state| state.branches.clone())
+            .unwrap();
+        assert!(
+            !branches.iter().any(|b| b.starts_with("main-")),
+            "exact-tracker checkout must switch (not create), got {branches:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_remote_checkout_uses_distinct_name_on_collision(cx: &mut TestAppContext) {
+        let (fs, project, repository, _head_sha) = seed_ref_menu_repo(cx).await;
+        // No local branch tracks `origin/main`, and `main` (a same-name local
+        // collision whose upstream is absent/different) must never be repointed:
+        // Zed proposes a distinct local name instead.
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/remotes/origin/main".into(),
+                display_name: "origin/main".into(),
+                kind: RefKind::RemoteBranch,
+            },
+            cx,
+        );
+        select_and_confirm_menu_entry(&git_graph, "Checkout", cx);
+
+        let branches = fs
+            .with_git_state(Path::new("/project/.git"), false, |state| {
+                let branches = state.branches.clone();
+                (branches, state.branch_upstreams.clone())
+            })
+            .unwrap();
+        assert!(
+            branches.0.contains("main-2"),
+            "collision should produce a distinct local name, got {:?}",
+            branches.0
+        );
+        assert!(
+            branches.0.contains("main"),
+            "the pre-existing 'main' branch must not be repointed/removed, got {:?}",
+            branches.0
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ref_operation_guard_suppresses_duplicate_dispatch(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, project, repository, _head_sha) = seed_ref_menu_repo(cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = open_graph_window(&project, &repository, workspace_weak, cx);
+        cx.run_until_parked();
+
+        // Simulate an in-flight ref operation: begin the guard directly, then
+        // attempt to dispatch another checkout/mutation — it must be suppressed.
+        git_graph.update(cx, |git_graph, _| {
+            assert!(git_graph.begin_ref_operation());
+            assert!(
+                !git_graph.begin_ref_operation(),
+                "second begin while one op is in flight should be suppressed"
+            );
+        });
+
+        // Dispatching a merge through the menu while the guard is held should
+        // not record a mutation.
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/feature".into(),
+                display_name: "feature".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        select_and_confirm_menu_entry(&git_graph, "Merge into Current", cx);
+
+        let mutations = fs
+            .with_git_state(Path::new("/project/.git"), false, |state| {
+                state.graph_mutations.clone()
+            })
+            .unwrap();
+        assert!(
+            mutations.is_empty(),
+            "duplicate ref operation should be suppressed, got {mutations:?}"
+        );
+
+        // Clearing the guard allows the next dispatch through.
+        git_graph.update(cx, |git_graph, _| git_graph.end_ref_operation());
+        deploy_ref_menu(
+            &git_graph,
+            ResolvedRef {
+                ref_name: "refs/heads/feature".into(),
+                display_name: "feature".into(),
+                kind: RefKind::LocalBranch,
+            },
+            cx,
+        );
+        select_and_confirm_menu_entry(&git_graph, "Merge into Current", cx);
+        let mutations = fs
+            .with_git_state(Path::new("/project/.git"), false, |state| {
+                state.graph_mutations.clone()
+            })
+            .unwrap();
+        assert_eq!(mutations.len(), 1, "after the op settles, a merge dispatches");
+    }
+
+    #[gpui::test]
+    #[gpui::test]
+    async fn test_graph_invalidated_on_worktree_list_change(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let head = Oid::from_bytes(&[1; 20]).unwrap();
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head.to_string(),
+        );
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: head,
+                parents: smallvec![],
+                ref_names: vec!["HEAD -> refs/heads/main".into()],
+            })],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have an active repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let initial_count = git_graph.read_with(&*cx, |graph, _| graph.graph_data.commits.len());
+        assert_eq!(initial_count, 1);
+
+        // Ensure a completed scan has run so `scan_id > 1` (the invalidation
+        // guard skips the initial loading state).
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        let scan_id = repository.read_with(cx, |repository, _| repository.snapshot().scan_id);
+        assert!(scan_id > 1, "expected a completed scan, got scan_id {scan_id}");
+
+        // A worktree-list change (no branch/HEAD change) must invalidate the
+        // graph so it reloads fresh worktree-aware state.
+        git_graph.update(cx, |git_graph, cx| {
+            git_graph.on_repository_event(
+                repository.clone(),
+                &RepositoryEvent::GitWorktreeListChanged,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let cleared = git_graph.read_with(&*cx, |graph, _| graph.graph_data.commits.is_empty());
+        assert!(
+            cleared,
+            "GitWorktreeListChanged should invalidate the graph (clear its commits)"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_stash_rows_render_select_by_row_identity(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        // A regular commit plus two stash entries that share the exact same OID
+        // (to prove stash rows render/select/schedule by row identity, not OID).
+        let head = Oid::from_bytes(&[1; 20]).unwrap();
+        let duplicated_stash_oid = Oid::from_bytes(&[2; 20]).unwrap();
+        let other = Oid::from_bytes(&[3; 20]).unwrap();
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head.to_string(),
+        );
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: head,
+                parents: smallvec![other],
+                ref_names: vec!["HEAD -> refs/heads/main".into()],
+            })],
+        );
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.stash_entries = git::stash::GitStash {
+                entries: vec![
+                    git::stash::StashEntry {
+                        index: 0,
+                        oid: duplicated_stash_oid,
+                        message: "newest stash".to_string(),
+                        branch: Some("main".to_string()),
+                        timestamp: 2,
+                    },
+                    git::stash::StashEntry {
+                        index: 1,
+                        oid: duplicated_stash_oid,
+                        message: "older identical stash".to_string(),
+                        branch: Some("main".to_string()),
+                        timestamp: 1,
+                    },
+                ]
+                .into(),
+            };
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| git_graph.clone().into_any_element(),
+        );
+        cx.run_until_parked();
+
+        let commits = git_graph.read_with(&*cx, |graph, _| {
+            graph.graph_data.commits.iter().map(|c| c.clone()).collect::<Vec<_>>()
+        });
+        // Stash rows derived from the reflog are emitted ahead of regular commits.
+        assert_eq!(commits.len(), 3);
+        assert!(commits[0].is_stash, "row 0 must be a stash row");
+        assert!(commits[1].is_stash, "row 1 must be a stash row");
+        assert!(!commits[2].is_stash, "row 2 is the regular HEAD");
+        // Duplicate OIDs are distinct rows: identical sha, different selectors.
+        assert_eq!(commits[0].data.sha, duplicated_stash_oid);
+        assert_eq!(commits[1].data.sha, duplicated_stash_oid);
+        assert_ne!(
+            commits[0].data.stash_selector(),
+            commits[1].data.stash_selector()
+        );
+
+        // Selecting by row identity: each stash row is independently selectable.
+        git_graph.update_in(cx, |graph, _window, cx| {
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+            assert_eq!(graph.selection.primary, Some(0));
+            graph.select_entry(1, ScrollStrategy::Nearest, cx);
+            assert_eq!(graph.selection.primary, Some(1));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_stash_row_context_menu_gates_commit_actions(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let head = Oid::from_bytes(&[1; 20]).unwrap();
+        let stash_oid = Oid::from_bytes(&[2; 20]).unwrap();
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head.to_string(),
+        );
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: head,
+                parents: smallvec![],
+                ref_names: vec!["HEAD -> refs/heads/main".into()],
+            })],
+        );
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.stash_entries = git::stash::GitStash {
+                entries: vec![git::stash::StashEntry {
+                    index: 0,
+                    oid: stash_oid,
+                    message: "stash".to_string(),
+                    branch: Some("main".to_string()),
+                    timestamp: 1,
+                }]
+                .into(),
+            };
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| git_graph.clone().into_any_element(),
+        );
+        cx.run_until_parked();
+
+        // Deploy the context menu on the stash row (row 0).
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.deploy_entry_context_menu(
+                point(px(20.), px(20.)),
+                0,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let labels = ref_menu_labels(&git_graph, cx);
+        // A stash row offers the stash-only actions submenu.
+        assert!(
+            labels.iter().any(|label| label == "Stash"),
+            "stash row must offer the stash-only actions submenu, got {labels:?}"
+        );
+        // A stash row must not offer commit-oriented actions.
+        for forbidden in ["Checkout", "Cherry-pick", "Revert", "Reset", "Merge", "Create Branch", "Git Actions", "Worktree", "Custom Commands"] {
+            assert!(
+                !labels.iter().any(|label| label.contains(forbidden)),
+                "stash row context menu must not offer '{forbidden}', got {labels:?}"
+            );
+        }
+        // The commit view/diff seam stays available.
+        assert!(labels.iter().any(|label| label == "View Diff"));
     }
 }

@@ -42,7 +42,10 @@ use git::{
         SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
         is_binary_content,
     },
-    stash::{GitStash, StashEntry},
+    stash::{
+        GitStash, StashEntry, StashIdentity, StashMutationResult, StashRenameRecovery,
+        StashRenameResult,
+    },
     status::{
         self, DiffStat, DiffTreeType, FileStatus, GitSummary, StatusCode, TrackedStatus, TreeDiff,
         TreeDiffStatus, UnmergedStatus, UnmergedStatusCode,
@@ -433,6 +436,27 @@ impl sum_tree::KeyedItem for StatusEntry {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepositoryId(pub u64);
+
+/// Opaque project-owned identity of the Git common directory shared by one or
+/// more repositories (e.g. a main checkout plus its linked worktrees, or
+/// open sub-directories of one checkout).
+///
+/// The same physical common directory is represented identically for every
+/// repository that shares it, so callers can group repositories by this
+/// identity to avoid creating multiple worktrees for one underlying
+/// repository. It is intentionally opaque: code outside this crate must not
+/// derive host scope or compare common paths across Projects from it.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CommonRepositoryIdentity(Arc<Path>);
+
+impl CommonRepositoryIdentity {
+    /// Constructs an identity from a raw path. Only intended for tests that
+    /// exercise grouping logic without a live [`Repository`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_path_for_tests(path: impl Into<Arc<Path>>) -> Self {
+        Self(path.into())
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MergeDetails {
@@ -825,6 +849,9 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_create_remote);
         client.add_entity_request_handler(Self::handle_remove_remote);
         client.add_entity_request_handler(Self::handle_delete_branch);
+        client.add_entity_request_handler(Self::handle_delete_tag);
+        client.add_entity_request_handler(Self::handle_tag_details);
+        client.add_entity_request_handler(Self::handle_delete_refs_on_remote);
         client.add_entity_request_handler(Self::handle_git_init);
         client.add_entity_request_handler(Self::handle_push);
         client.add_entity_request_handler(Self::handle_pull);
@@ -835,6 +862,8 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_stash_pop);
         client.add_entity_request_handler(Self::handle_stash_apply);
         client.add_entity_request_handler(Self::handle_stash_drop);
+        client.add_entity_request_handler(Self::handle_stash_rename);
+        client.add_entity_request_handler(Self::handle_pending_stash_rename_recovers);
         client.add_entity_request_handler(Self::handle_commit);
         client.add_entity_request_handler(Self::handle_run_hook);
         client.add_entity_request_handler(Self::handle_reset);
@@ -3386,18 +3415,23 @@ impl GitStore {
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::StashPop>,
         mut cx: AsyncApp,
-    ) -> Result<proto::Ack> {
+    ) -> Result<proto::StashPopReply> {
         let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
-        let stash_index = envelope.payload.stash_index.map(|i| i as usize);
+        let identity = resolve_incoming_stash_identity(
+            envelope.payload.identity.as_ref(),
+            envelope.payload.stash_index,
+        )?;
 
-        repository_handle
+        let outcome = repository_handle
             .update(&mut cx, |repository_handle, cx| {
-                repository_handle.stash_pop(stash_index, cx)
+                repository_handle.stash_pop(identity, cx)
             })
             .await?;
 
-        Ok(proto::Ack {})
+        Ok(proto::StashPopReply {
+            applied_but_retained: outcome == StashMutationResult::AppliedButRetained,
+        })
     }
 
     async fn handle_stash_apply(
@@ -3407,11 +3441,14 @@ impl GitStore {
     ) -> Result<proto::Ack> {
         let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
-        let stash_index = envelope.payload.stash_index.map(|i| i as usize);
+        let identity = resolve_incoming_stash_identity(
+            envelope.payload.identity.as_ref(),
+            envelope.payload.stash_index,
+        )?;
 
         repository_handle
             .update(&mut cx, |repository_handle, cx| {
-                repository_handle.stash_apply(stash_index, cx)
+                repository_handle.stash_apply(identity, cx)
             })
             .await?;
 
@@ -3425,15 +3462,65 @@ impl GitStore {
     ) -> Result<proto::Ack> {
         let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
-        let stash_index = envelope.payload.stash_index.map(|i| i as usize);
+        let identity = resolve_incoming_stash_identity(
+            envelope.payload.identity.as_ref(),
+            envelope.payload.stash_index,
+        )?;
 
         repository_handle
             .update(&mut cx, |repository_handle, cx| {
-                repository_handle.stash_drop(stash_index, cx)
+                repository_handle.stash_drop(identity, cx)
             })
             .await??;
 
         Ok(proto::Ack {})
+    }
+
+    async fn handle_stash_rename(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::StashRename>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::StashRenameReply> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let identity = resolve_incoming_stash_identity(
+            envelope.payload.identity.as_ref(),
+            envelope.payload.stash_index,
+        )?;
+
+        let result = repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.stash_rename(
+                    identity,
+                    envelope.payload.message.clone(),
+                    cx,
+                )
+            })
+            .await?;
+
+        Ok(stash_rename_result_to_reply(&result))
+    }
+
+    async fn handle_pending_stash_rename_recovers(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::PendingStashRenameRecoveries>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::PendingStashRenameRecoveriesReply> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+
+        let recovers = repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.pending_stash_rename_recovers(cx)
+            })
+            .await?;
+
+        Ok(proto::PendingStashRenameRecoveriesReply {
+            recovers: recovers
+                .iter()
+                .map(stash_rename_recovery_to_proto)
+                .collect(),
+        })
     }
 
     async fn handle_set_index_text(
@@ -4050,6 +4137,74 @@ impl GitStore {
             .await??;
 
         Ok(proto::Ack {})
+    }
+
+    async fn handle_delete_tag(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitDeleteTag>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+
+        repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.delete_tag(envelope.payload.name, cx)
+            })
+            .await??;
+
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_tag_details(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitTagDetails>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitTagDetailsResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+
+        let details = repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.tag_details(envelope.payload.ref_name, cx)
+            })
+            .await??;
+
+        Ok(tag_details_to_proto(details))
+    }
+
+    async fn handle_delete_refs_on_remote(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitDeleteRefsOnRemote>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::RemoteMessageResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+
+        let askpass_id = envelope.payload.askpass_id;
+        let askpass = make_remote_delegate(
+            this,
+            envelope.payload.project_id,
+            repository_id,
+            askpass_id,
+            &mut cx,
+        );
+
+        let remote_output = repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.delete_refs_on_remote(
+                    envelope.payload.remote_name.into(),
+                    envelope.payload.refs,
+                    askpass,
+                    cx,
+                )
+            })
+            .await??;
+
+        Ok(proto::RemoteMessageResponse {
+            stdout: remote_output.stdout,
+            stderr: remote_output.stderr,
+        })
     }
 
     async fn handle_remove_remote(
@@ -6151,6 +6306,132 @@ pub fn proto_to_stash(entry: &proto::StashEntry) -> Result<StashEntry> {
     })
 }
 
+fn stash_identity_to_proto(identity: &StashIdentity) -> proto::StashIdentity {
+    proto::StashIdentity {
+        ref_name: identity.ref_name.clone(),
+        oid: identity.oid.to_string(),
+        selector: identity.selector.clone(),
+    }
+}
+
+fn proto_to_stash_identity(identity: &proto::StashIdentity) -> Result<StashIdentity> {
+    Ok(StashIdentity {
+        ref_name: identity.ref_name.clone(),
+        oid: Oid::from_str(&identity.oid).context("invalid stash OID in identity")?,
+        selector: identity.selector.clone(),
+    })
+}
+
+/// Map a decoded `StashPopReply` back to the typed mutation result so a remote
+/// client reports the same outcome as a local one — notably surfacing the
+/// `applied but retained` partial success instead of fabricating full success.
+fn stash_pop_reply_to_result(reply: &proto::StashPopReply) -> StashMutationResult {
+    if reply.applied_but_retained {
+        StashMutationResult::AppliedButRetained
+    } else {
+        StashMutationResult::Success
+    }
+}
+
+fn stash_rename_recovery_to_proto(recovery: &StashRenameRecovery) -> proto::StashRenameRecovery {
+    proto::StashRenameRecovery {
+        manifest_ref: recovery.manifest_ref.clone(),
+        recovery_refs: recovery.recovery_refs.clone(),
+        rename_applied: recovery.rename_applied,
+        observed_entries: recovery
+            .observed_entries
+            .iter()
+            .map(stash_to_proto)
+            .collect(),
+    }
+}
+
+fn stash_rename_recovery_from_proto(
+    recovery: &proto::StashRenameRecovery,
+) -> Result<StashRenameRecovery> {
+    Ok(StashRenameRecovery {
+        manifest_ref: recovery.manifest_ref.clone(),
+        recovery_refs: recovery.recovery_refs.clone(),
+        rename_applied: recovery.rename_applied,
+        observed_entries: recovery
+            .observed_entries
+            .iter()
+            .filter_map(|entry| proto_to_stash(entry).ok())
+            .collect(),
+    })
+}
+
+/// Map a decoded `StashRenameReply` back to the typed rename result so a remote
+/// client reports the same outcome as a local one — crucially surfacing the
+/// retained recovery refs + observed stack on a destructive-boundary failure or
+/// applied-but-uncleaned rename, never fabricating full Success.
+fn stash_rename_reply_to_result(reply: &proto::StashRenameReply) -> StashRenameResult {
+    let recovery = reply
+        .recovery
+        .as_ref()
+        .and_then(|recovery| stash_rename_recovery_from_proto(recovery).ok());
+    if reply.success {
+        StashRenameResult::Success
+    } else if reply.success_with_recovery_refs {
+        StashRenameResult::SuccessWithRecoveryRefs(
+            recovery.unwrap_or_else(|| StashRenameRecovery {
+                manifest_ref: String::new(),
+                recovery_refs: Vec::new(),
+                observed_entries: Vec::new(),
+                rename_applied: true,
+            }),
+        )
+    } else {
+        StashRenameResult::FailedWithRecovery(
+            recovery.unwrap_or_else(|| StashRenameRecovery {
+                manifest_ref: String::new(),
+                recovery_refs: Vec::new(),
+                observed_entries: Vec::new(),
+                rename_applied: false,
+            }),
+        )
+    }
+}
+
+/// Encode a typed rename result into the wire reply.
+fn stash_rename_result_to_reply(result: &StashRenameResult) -> proto::StashRenameReply {
+    match result {
+        StashRenameResult::Success => proto::StashRenameReply {
+            success: true,
+            ..Default::default()
+        },
+        StashRenameResult::SuccessWithRecoveryRefs(recovery) => proto::StashRenameReply {
+            success_with_recovery_refs: true,
+            recovery: Some(stash_rename_recovery_to_proto(recovery)),
+            ..Default::default()
+        },
+        StashRenameResult::FailedWithRecovery(recovery) => proto::StashRenameReply {
+            recovery: Some(stash_rename_recovery_to_proto(recovery)),
+            ..Default::default()
+        },
+    }
+}
+
+/// Resolve the stash identity a peer asked to mutate. New peers always send a
+/// composite `identity`; an incoming request that carries only the obsolete
+/// index-authoritative `stash_index` is rejected for version skew rather than
+/// acted on. A request with neither targets the current top of stack.
+fn resolve_incoming_stash_identity(
+    identity: Option<&proto::StashIdentity>,
+    stash_index: Option<u64>,
+) -> Result<Option<StashIdentity>> {
+    if let Some(identity) = identity {
+        return proto_to_stash_identity(identity).map(Some);
+    }
+    if stash_index.is_some() {
+        anyhow::bail!(
+            "stash mutation from an outdated peer used an index-authoritative selector; \
+             refusing to apply (please upgrade the peer)"
+        );
+    }
+    Ok(None)
+}
+
 impl MergeDetails {
     async fn update(
         &mut self,
@@ -6948,6 +7229,62 @@ impl Repository {
             }
         });
         self.finish_graph_mutation(receiver, cx)
+    }
+
+    /// Deletes the local tag `name` (`git tag -d`). Dispatches to the local or
+    /// remote-project backend and refreshes the graph on success.
+    pub fn delete_tag(
+        &mut self,
+        name: String,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        let receiver = self.send_job("delete_tag", None, move |git_repo, _| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.delete_tag(name).await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    client
+                        .request(proto::GitDeleteTag {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            name,
+                        })
+                        .await?;
+                    Ok(())
+                }
+            }
+        });
+        self.finish_graph_mutation(receiver, cx)
+    }
+
+    /// Reads structured metadata about the tag at the canonical
+    /// `refs/tags/<name>` ref (lightweight vs annotated distinction, tagger
+    /// metadata, message). Read-only; does not refresh the graph.
+    pub fn tag_details(
+        &mut self,
+        ref_name: String,
+        _cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<git::repository::TagDetails>> {
+        let id = self.id;
+        self.send_job("tag_details", None, move |git_repo, _| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.tag_details(ref_name).await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let response: proto::GitTagDetailsResponse = client
+                        .request(proto::GitTagDetails {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            ref_name,
+                        })
+                        .await?;
+                    Ok(tag_details_from_proto(response))
+                }
+            }
+        })
     }
 
     pub fn cherry_pick(
@@ -8228,59 +8565,113 @@ impl Repository {
 
     pub fn stash_pop(
         &mut self,
-        index: Option<usize>,
+        identity: Option<StashIdentity>,
         cx: &mut Context<Self>,
-    ) -> Task<anyhow::Result<()>> {
+    ) -> Task<anyhow::Result<StashMutationResult>> {
         let id = self.id;
+        let updates_tx = self
+            .git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            });
+        let weak_repository = cx.weak_entity();
         cx.spawn(async move |this, cx| {
-            this.update(cx, |this, _| {
-                this.send_job("stash_pop", None, move |git_repo, _cx| async move {
+            let outcome = this.update(cx, |this, _| {
+                    this.send_job("stash_pop", None, move |git_repo, mut cx| async move {
                     match git_repo {
                         RepositoryState::Local(LocalRepositoryState {
                             backend,
                             environment,
                             ..
-                        }) => backend.stash_pop(index, environment).await,
+                        }) => {
+                            let result = backend.stash_pop(identity, environment).await;
+                            if result.is_ok()
+                                && let Ok(stash_entries) = backend.stash_entries().await
+                            {
+                                let snapshot = weak_repository.update(&mut cx, |this, cx| {
+                                    this.snapshot.stash_entries = stash_entries;
+                                    cx.emit(RepositoryEvent::StashEntriesChanged);
+                                    this.snapshot.clone()
+                                })?;
+                                if let Some(updates_tx) = updates_tx {
+                                    updates_tx
+                                        .unbounded_send(DownstreamUpdate::UpdateRepository(snapshot))
+                                        .ok();
+                                }
+                            }
+                            result
+                        }
                         RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
-                            client
+                            let reply: proto::StashPopReply = client
                                 .request(proto::StashPop {
                                     project_id: project_id.0,
                                     repository_id: id.to_proto(),
-                                    stash_index: index.map(|i| i as u64),
+                                    stash_index: None,
+                                    identity: identity.as_ref().map(stash_identity_to_proto),
                                 })
                                 .await
                                 .context("sending stash pop request")?;
-                            Ok(())
+                            Ok(stash_pop_reply_to_result(&reply))
                         }
                     }
                 })
             })?
             .await??;
-            Ok(())
+            Ok(outcome)
         })
     }
 
     pub fn stash_apply(
         &mut self,
-        index: Option<usize>,
+        identity: Option<StashIdentity>,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
         let id = self.id;
+        let updates_tx = self
+            .git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            });
+        let weak_repository = cx.weak_entity();
         cx.spawn(async move |this, cx| {
             this.update(cx, |this, _| {
-                this.send_job("stash_apply", None, move |git_repo, _cx| async move {
+                this.send_job("stash_apply", None, move |git_repo, mut cx| async move {
                     match git_repo {
                         RepositoryState::Local(LocalRepositoryState {
                             backend,
                             environment,
                             ..
-                        }) => backend.stash_apply(index, environment).await,
+                        }) => {
+                            let result = backend.stash_apply(identity, environment).await;
+                            if result.is_ok()
+                                && let Ok(stash_entries) = backend.stash_entries().await
+                            {
+                                let snapshot = weak_repository.update(&mut cx, |this, cx| {
+                                    this.snapshot.stash_entries = stash_entries;
+                                    cx.emit(RepositoryEvent::StashEntriesChanged);
+                                    this.snapshot.clone()
+                                })?;
+                                if let Some(updates_tx) = updates_tx {
+                                    updates_tx
+                                        .unbounded_send(DownstreamUpdate::UpdateRepository(snapshot))
+                                        .ok();
+                                }
+                            }
+                            result
+                        }
                         RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                             client
                                 .request(proto::StashApply {
                                     project_id: project_id.0,
                                     repository_id: id.to_proto(),
-                                    stash_index: index.map(|i| i as u64),
+                                    stash_index: None,
+                                    identity: identity.as_ref().map(stash_identity_to_proto),
                                 })
                                 .await
                                 .context("sending stash apply request")?;
@@ -8386,7 +8777,7 @@ impl Repository {
 
     pub fn stash_drop(
         &mut self,
-        index: Option<usize>,
+        identity: Option<StashIdentity>,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<anyhow::Result<()>> {
         let id = self.id;
@@ -8406,8 +8797,7 @@ impl Repository {
                     environment,
                     ..
                 }) => {
-                    // TODO would be nice to not have to do this manually
-                    let result = backend.stash_drop(index, environment).await;
+                    let result = backend.stash_drop(identity, environment).await;
                     if result.is_ok()
                         && let Ok(stash_entries) = backend.stash_entries().await
                     {
@@ -8430,13 +8820,129 @@ impl Repository {
                         .request(proto::StashDrop {
                             project_id: project_id.0,
                             repository_id: id.to_proto(),
-                            stash_index: index.map(|i| i as u64),
+                            stash_index: None,
+                            identity: identity.as_ref().map(stash_identity_to_proto),
                         })
                         .await
-                        .context("sending stash pop request")?;
+                        .context("sending stash drop request")?;
                     Ok(())
                 }
             }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn stash_rename(
+        &mut self,
+        identity: Option<StashIdentity>,
+        message: String,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<StashRenameResult>> {
+        let id = self.id;
+        let updates_tx = self
+            .git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            });
+        let weak_repository = cx.weak_entity();
+        cx.spawn(async move |this, cx| {
+            let result = this
+                .update(cx, |this, _| {
+                    this.send_job("stash_rename", None, move |git_repo, mut cx| async move {
+                        match git_repo {
+                            RepositoryState::Local(LocalRepositoryState {
+                                backend,
+                                environment,
+                                ..
+                            }) => {
+                                let result =
+                                    backend.stash_rename(identity, message, environment).await;
+                                if result.is_ok()
+                                    && let Ok(stash_entries) = backend.stash_entries().await
+                                {
+                                    let snapshot = weak_repository.update(&mut cx, |this, cx| {
+                                        this.snapshot.stash_entries = stash_entries;
+                                        cx.emit(RepositoryEvent::StashEntriesChanged);
+                                        this.snapshot.clone()
+                                    })?;
+                                    if let Some(updates_tx) = updates_tx {
+                                        updates_tx
+                                            .unbounded_send(
+                                                DownstreamUpdate::UpdateRepository(snapshot),
+                                            )
+                                            .ok();
+                                    }
+                                }
+                                result
+                            }
+                            RepositoryState::Remote(RemoteRepositoryState {
+                                project_id,
+                                client,
+                            }) => {
+                                let reply: proto::StashRenameReply = client
+                                    .request(proto::StashRename {
+                                        project_id: project_id.0,
+                                        repository_id: id.to_proto(),
+                                        stash_index: None,
+                                        identity: identity.as_ref().map(stash_identity_to_proto),
+                                        message,
+                                    })
+                                    .await
+                                    .context("sending stash rename request")?;
+                                Ok(stash_rename_reply_to_result(&reply))
+                            }
+                        }
+                    })
+                })?
+                .await??;
+            Ok(result)
+        })
+    }
+
+    pub fn pending_stash_rename_recovers(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<Vec<StashRenameRecovery>>> {
+        let id = self.id;
+        cx.spawn(async move |this, cx| {
+            let result = this
+                .update(cx, |this, _| {
+                    this.send_job(
+                        "pending_stash_rename_recovers",
+                        None,
+                        move |git_repo, _cx| async move {
+                            match git_repo {
+                                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                                    backend.pending_stash_rename_recovers().await
+                                }
+                                RepositoryState::Remote(RemoteRepositoryState {
+                                    project_id,
+                                    client,
+                                }) => {
+                                    let reply: proto::PendingStashRenameRecoveriesReply = client
+                                        .request(proto::PendingStashRenameRecoveries {
+                                            project_id: project_id.0,
+                                            repository_id: id.to_proto(),
+                                        })
+                                        .await
+                                        .context("sending pending stash rename recoveries request")?;
+                                    Ok(reply
+                                        .recovers
+                                        .iter()
+                                        .filter_map(|recovery| {
+                                            stash_rename_recovery_from_proto(recovery).ok()
+                                        })
+                                        .collect())
+                                }
+                            }
+                        },
+                    )
+                })?
+                .await??;
+            Ok(result)
         })
     }
 
@@ -8709,6 +9215,65 @@ impl Repository {
                             })
                             .await?;
 
+                        Ok(RemoteCommandOutput {
+                            stdout: response.stdout,
+                            stderr: response.stderr,
+                        })
+                    }
+                }
+            },
+        )
+    }
+
+    /// Explicitly deletes the given fully-qualified refs on the remote server
+    /// (`git push <remote> --delete <ref>…`). Never deletes the local
+    /// remote-tracking refs. Dispatches to the local or remote-project backend.
+    pub fn delete_refs_on_remote(
+        &mut self,
+        remote: SharedString,
+        refs: Vec<String>,
+        askpass: AskPassDelegate,
+        _cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<RemoteCommandOutput>> {
+        let askpass_delegates = self.askpass_delegates.clone();
+        let askpass_id = util::post_inc(&mut self.latest_askpass_id);
+        let id = self.id;
+
+        let status = format!("git push {} --delete ({} refs)", remote, refs.len()).into();
+        self.send_job(
+            "delete_refs_on_remote",
+            Some(status),
+            move |git_repo, cx| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend
+                        .delete_refs_on_remote(
+                            remote.to_string(),
+                            refs,
+                            askpass,
+                            environment,
+                            cx,
+                        )
+                        .await,
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        askpass_delegates.lock().insert(askpass_id, askpass);
+                        let _defer = util::defer(|| {
+                            let askpass_delegate =
+                                askpass_delegates.lock().remove(&askpass_id);
+                            debug_assert!(askpass_delegate.is_some());
+                        });
+                        let response = client
+                            .request(proto::GitDeleteRefsOnRemote {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                askpass_id,
+                                remote_name: remote.to_string(),
+                                refs,
+                            })
+                            .await?;
                         Ok(RemoteCommandOutput {
                             stdout: response.stdout,
                             stderr: response.stderr,
@@ -9038,6 +9603,16 @@ impl Repository {
         self.snapshot
             .is_linked_worktree()
             .then_some(&self.work_directory_abs_path)
+    }
+
+    /// The identity of the Git common directory this repository belongs to.
+    ///
+    /// All repositories sharing one underlying Git repository (a main
+    /// checkout, its linked worktrees, or open sub-directories of either)
+    /// compare equal here, so callers can deduplicate worktree creation
+    /// across project roots.
+    pub fn common_repository_identity(&self) -> CommonRepositoryIdentity {
+        CommonRepositoryIdentity(self.snapshot.common_dir_abs_path.clone())
     }
 
     pub fn path_for_new_linked_worktree(
@@ -11204,6 +11779,70 @@ fn branch_to_proto(branch: &git::repository::Branch) -> proto::Branch {
     }
 }
 
+fn tag_details_to_proto(details: git::repository::TagDetails) -> proto::GitTagDetailsResponse {
+    let object_type = tag_object_type_to_proto(details.object_type) as i32;
+    proto::GitTagDetailsResponse {
+        ref_name: details.ref_name.to_string(),
+        name: details.name.to_string(),
+        target_oid: details.target_oid.to_string(),
+        object_type,
+        tagger: details.tagger.map(|tagger| {
+            proto::git_tag_details_response::TagTagger {
+                name: tagger.name.to_string(),
+                email: tagger.email.to_string(),
+                time: tagger.time,
+            }
+        }),
+        message: details.message,
+    }
+}
+
+fn tag_object_type_to_proto(
+    object_type: git::repository::TagObjectType,
+) -> proto::git_tag_details_response::TagObjectType {
+    match object_type {
+        git::repository::TagObjectType::Commit => {
+            proto::git_tag_details_response::TagObjectType::Commit
+        }
+        git::repository::TagObjectType::Tag => proto::git_tag_details_response::TagObjectType::Tag,
+        git::repository::TagObjectType::Tree => {
+            proto::git_tag_details_response::TagObjectType::Tree
+        }
+        git::repository::TagObjectType::Blob => {
+            proto::git_tag_details_response::TagObjectType::Blob
+        }
+    }
+}
+
+fn tag_details_from_proto(response: proto::GitTagDetailsResponse) -> git::repository::TagDetails {
+    let object_type = match response.object_type {
+        x if x == proto::git_tag_details_response::TagObjectType::Tag as i32 => {
+            git::repository::TagObjectType::Tag
+        }
+        x if x == proto::git_tag_details_response::TagObjectType::Tree as i32 => {
+            git::repository::TagObjectType::Tree
+        }
+        x if x == proto::git_tag_details_response::TagObjectType::Blob as i32 => {
+            git::repository::TagObjectType::Blob
+        }
+        _ => git::repository::TagObjectType::Commit,
+    };
+    git::repository::TagDetails {
+        ref_name: response.ref_name.into(),
+        name: response.name.into(),
+        target_oid: Oid::try_from(response.target_oid.as_str()).unwrap_or_else(|_| Oid::default()),
+        object_type,
+        tagger: response.tagger.map(|tagger| {
+            git::repository::TagTagger {
+                name: tagger.name.into(),
+                email: tagger.email.into(),
+                time: tagger.time,
+            }
+        }),
+        message: response.message,
+    }
+}
+
 fn worktree_to_proto(worktree: &git::repository::Worktree) -> proto::Worktree {
     proto::Worktree {
         path: worktree.path.to_string_lossy().to_string(),
@@ -12313,14 +12952,43 @@ async fn compute_snapshot(
         let backend = backend.clone();
         async move { backend.stash_entries().await.log_err().unwrap_or_default() }
     };
+    let pending_recovery_future = {
+        let backend = backend.clone();
+        async move { backend.pending_stash_rename_recovers().await }
+    };
 
-    let (statuses, diff_stats, stash_entries) =
-        futures::future::join3(statuses_future, diff_stats_future, stash_entries_future).await;
+    let (statuses, diff_stats, stash_entries, pending_recovery) = futures::future::join4(
+        statuses_future,
+        diff_stats_future,
+        stash_entries_future,
+        pending_recovery_future,
+    )
+    .await;
     let (diff_stats, staged_diff_stats, unstaged_diff_stats) = diff_stats;
     let diff_stats = diff_stats.log_err().unwrap_or_default();
     let staged_diff_stats = staged_diff_stats.log_err().unwrap_or_default();
     let unstaged_diff_stats = unstaged_diff_stats.log_err().unwrap_or_default();
     log::debug!("fetched statuses, diff stats, stash entries");
+
+    // After a restart (or a previous crash), a repository refresh discovers any
+    // unfinished crash-recoverable stash rename and exposes clear guidance:
+    // the exact manifest + recovery ref names and the current observed stack,
+    // so a user can retry, recover, or clean up rather than lose the stash.
+    if let Ok(pending) = pending_recovery
+        && !pending.is_empty()
+    {
+        for recovery in &pending {
+            log::error!(
+                "unfinished stash rename discovered after refresh — manifest ref: {}; \
+                 recovery refs: [{}]; observed stack: {:?}. Retry the rename, recover the \
+                 entries by resetting refs/stash from the recovery refs, or delete the \
+                 recovery refs to abandon.",
+                recovery.manifest_ref,
+                recovery.recovery_refs.join(", "),
+                recovery.observed_entries
+            );
+        }
+    }
 
     let diff_stat_map: HashMap<&RepoPath, DiffStat> =
         diff_stats.entries.iter().map(|(p, s)| (p, *s)).collect();
@@ -12509,5 +13177,120 @@ fn tracked_status_to_proto(code: StatusCode) -> i32 {
         StatusCode::TypeChanged => proto::GitStatus::TypeChanged as _,
         StatusCode::Copied => proto::GitStatus::Copied as _,
         StatusCode::Unmodified => proto::GitStatus::Unmodified as _,
+    }
+}
+
+#[cfg(test)]
+mod stash_identity_tests {
+    use super::*;
+
+    fn identity() -> StashIdentity {
+        StashIdentity {
+            oid: Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            ref_name: "refs/stash".to_string(),
+            selector: "refs/stash@{3}".to_string(),
+        }
+    }
+
+    fn recovery() -> StashRenameRecovery {
+        StashRenameRecovery {
+            manifest_ref: "refs/zed-git/stash-rename/abc/manifest".to_string(),
+            recovery_refs: vec![
+                "refs/zed-git/stash-rename/abc/entry/0".to_string(),
+                "refs/zed-git/stash-rename/abc/entry/target".to_string(),
+            ],
+            rename_applied: false,
+            observed_entries: vec![StashEntry {
+                index: 0,
+                oid: identity().oid,
+                message: "On main: partial".to_string(),
+                branch: Some("main".to_string()),
+                timestamp: 123,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_stash_rename_reply_round_trip_parity() {
+        // Success mirrors locally.
+        assert_eq!(
+            stash_rename_reply_to_result(&stash_rename_result_to_reply(
+                &StashRenameResult::Success
+            )),
+            StashRenameResult::Success
+        );
+        // Applied-but-uncleaned mirrors locally, carrying the recovery.
+        let uncleaned = StashRenameRecovery {
+            rename_applied: true,
+            ..recovery()
+        };
+        assert_eq!(
+            stash_rename_reply_to_result(&stash_rename_result_to_reply(
+                &StashRenameResult::SuccessWithRecoveryRefs(uncleaned.clone())
+            )),
+            StashRenameResult::SuccessWithRecoveryRefs(uncleaned)
+        );
+        // Destructive-boundary failure mirrors locally with refs + observed stack.
+        let failed = recovery();
+        assert_eq!(
+            stash_rename_reply_to_result(&stash_rename_result_to_reply(
+                &StashRenameResult::FailedWithRecovery(failed.clone())
+            )),
+            StashRenameResult::FailedWithRecovery(failed)
+        );
+    }
+
+    #[test]
+    fn test_stash_identity_proto_round_trip() {
+        let identity = identity();
+        let proto = stash_identity_to_proto(&identity);
+        assert_eq!(proto.oid, identity.oid.to_string());
+        assert_eq!(proto.ref_name, identity.ref_name);
+        assert_eq!(proto.selector, identity.selector);
+        let parsed = proto_to_stash_identity(&proto).unwrap();
+        assert_eq!(parsed, identity);
+    }
+
+    #[test]
+    fn test_resolve_incoming_stash_identity_accepts_composite() {
+        let identity = identity();
+        let proto = stash_identity_to_proto(&identity);
+        let resolved = resolve_incoming_stash_identity(Some(&proto), None).unwrap();
+        assert_eq!(resolved, Some(identity));
+    }
+
+    #[test]
+    fn test_resolve_incoming_stash_identity_rejects_old_client_index() {
+        // An outdated peer sent only an index-authoritative selector: refuse it.
+        let err = resolve_incoming_stash_identity(None, Some(2)).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("outdated peer"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_incoming_stash_identity_top_when_both_empty() {
+        let resolved = resolve_incoming_stash_identity(None, None).unwrap();
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn test_stash_pop_reply_remote_parity() {
+        // Local pop returns the real outcome; the remote client must mirror it
+        // from the decoded `StashPopReply` rather than fabricating Success.
+        assert_eq!(
+            stash_pop_reply_to_result(&proto::StashPopReply {
+                applied_but_retained: false
+            }),
+            StashMutationResult::Success
+        );
+        assert_eq!(
+            stash_pop_reply_to_result(&proto::StashPopReply {
+                applied_but_retained: true
+            }),
+            StashMutationResult::AppliedButRetained
+        );
     }
 }

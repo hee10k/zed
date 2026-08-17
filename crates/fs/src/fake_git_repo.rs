@@ -18,7 +18,10 @@ use git::{
         PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
         commit_hash_search_query,
     },
-    stash::GitStash,
+    stash::{
+        GitStash, STASH_RENAME_RECOVERY_PREFIX, STASH_REF, StashIdentity, StashRenameRecovery,
+        StashRenameResult, renamed_stash_subject, resolve_stash_identity,
+    },
     status::{
         DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus,
         UnmergedStatus,
@@ -28,11 +31,32 @@ use gpui::{AsyncApp, BackgroundExecutor, SharedString, Task};
 use ignore::gitignore::GitignoreBuilder;
 use parking_lot::Mutex;
 use rope::Rope;
+use smallvec::SmallVec;
 use std::{path::PathBuf, sync::Arc, sync::atomic::AtomicBool, time::SystemTime};
 use text::LineEnding;
 use util::{paths::PathStyle, rel_path::RelPath};
 
-#[derive(Clone)]
+fn stash_rows_from_entries(
+    stash: &git::stash::GitStash,
+) -> Vec<Arc<InitialGraphCommitData>> {
+    stash
+        .entries
+        .iter()
+        .map(|entry| {
+            Arc::new(InitialGraphCommitData {
+                sha: entry.oid,
+                parents: SmallVec::new(),
+                // The reflog selector is the row identity, mirroring `%gD` from
+                // the real backend's `git log -g refs/stash`.
+                ref_names: vec![SharedString::from(format!(
+                    "{}@{{{}}}",
+                    STASH_REF, entry.index
+                ))],
+            })
+        })
+        .collect()
+}
+
 pub struct FakeGitRepository {
     pub(crate) fs: Arc<FakeFs>,
     pub(crate) checkpoints: Arc<Mutex<HashMap<Oid, FakeFsEntry>>>,
@@ -74,6 +98,14 @@ pub enum FakeGitMutation {
         operation: GitOperationKind,
         action: GitOperationAction,
     },
+    /// An explicit remote push deletion (`git push <remote> --delete <ref>…`).
+    /// `refs` are the fully-qualified refs deleted on the remote server.
+    DeleteRefsOnRemote {
+        remote_name: String,
+        refs: Vec<String>,
+    },
+    /// A local tag deletion (`git tag -d <name>`).
+    DeleteTag(String),
 }
 
 #[derive(Debug, Clone)]
@@ -107,9 +139,22 @@ pub struct FakeGitRepositoryState {
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     pub stash_entries: GitStash,
+    /// Unfinished crash-recoverable stash renames discovered after a simulated
+    /// restart, surfaced by `pending_stash_rename_recovers`.
+    pub pending_stash_rename_recovers: Vec<git::stash::StashRenameRecovery>,
     pub commit_template: Option<GitCommitTemplate>,
     pub graph_mutations: Vec<FakeGitMutation>,
     pub active_operation: Option<GitOperationKind>,
+    /// Records explicit remote push deletions as `(remote_name, ref)` pairs,
+    /// mirroring what `git push <remote> --delete <ref>` would do on the server.
+    pub remote_deleted_refs: Vec<(String, String)>,
+    /// Canned tag details keyed by the canonical `refs/tags/<name>` ref; when
+    /// absent, `tag_details` synthesizes a lightweight entry from `refs`.
+    pub tag_details: HashMap<String, git::repository::TagDetails>,
+    /// Maps a local branch name to the upstream ref it tracks (e.g.
+    /// `feature -> refs/remotes/origin/feature`). Drive for exact-tracker remote
+    /// checkout resolution.
+    pub branch_upstreams: HashMap<String, String>,
 }
 
 impl FakeGitRepositoryState {
@@ -136,9 +181,13 @@ impl FakeGitRepositoryState {
             commit_data: Default::default(),
             commit_history: Vec::new(),
             stash_entries: Default::default(),
+            pending_stash_rename_recovers: Vec::new(),
             commit_template: None,
             graph_mutations: Vec::new(),
             active_operation: None,
+            remote_deleted_refs: Vec::new(),
+            tag_details: Default::default(),
+            branch_upstreams: Default::default(),
         }
     }
 }
@@ -746,6 +795,37 @@ impl GitRepository for FakeGitRepository {
         self.with_state_async(false, |state| Ok(state.stash_entries.clone()))
     }
 
+    fn stash_graph_data(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<Arc<InitialGraphCommitData>>>> {
+        let fs = self.fs.clone();
+        let dot_git_path = self.dot_git_path.clone();
+        async move {
+            fs.with_git_state(&dot_git_path, false, |state| {
+                stash_rows_from_entries(&state.stash_entries)
+            })
+        }
+        .boxed()
+    }
+
+    fn graph_commit_for_base(
+        &self,
+        sha: Oid,
+    ) -> BoxFuture<'_, Result<Option<Arc<InitialGraphCommitData>>>> {
+        let fs = self.fs.clone();
+        let dot_git_path = self.dot_git_path.clone();
+        async move {
+            fs.with_git_state(&dot_git_path, false, |state| {
+                state
+                    .graph_commits
+                    .iter()
+                    .find(|commit| commit.sha == sha)
+                    .cloned()
+            })
+        }
+        .boxed()
+    }
+
     fn branches(&self) -> BoxFuture<'_, Result<git::repository::BranchesScanResult>> {
         self.with_state_async(false, move |state| {
             let current_branch = &state.current_branch_name;
@@ -760,11 +840,23 @@ impl GitRepository for FakeGitRepository {
                     } else {
                         format!("refs/heads/{branch_name}").into()
                     };
+                    let upstream = state
+                        .branch_upstreams
+                        .get(branch_name)
+                        .map(|ref_name| git::repository::Upstream {
+                            ref_name: ref_name.clone().into(),
+                            tracking: git::repository::UpstreamTracking::Tracked(
+                                git::repository::UpstreamTrackingStatus {
+                                    ahead: 0,
+                                    behind: 0,
+                                },
+                            ),
+                        });
                     Branch {
                         is_head: Some(branch_name) == current_branch.as_ref(),
                         ref_name,
                         most_recent_commit: None,
-                        upstream: None,
+                        upstream,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -1211,6 +1303,77 @@ impl GitRepository for FakeGitRepository {
         })
     }
 
+    fn delete_refs_on_remote(
+        &self,
+        remote_name: String,
+        refs: Vec<String>,
+        _askpass: AskPassDelegate,
+        _env: Arc<HashMap<String, String>>,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
+        self.with_state_async(true, move |state| {
+            state
+                .graph_mutations
+                .push(FakeGitMutation::DeleteRefsOnRemote {
+                    remote_name: remote_name.clone(),
+                    refs: refs.clone(),
+                });
+            for ref_name in &refs {
+                state.remote_deleted_refs.push((remote_name.clone(), ref_name.clone()));
+            }
+            Ok(git::repository::RemoteCommandOutput {
+                stdout: String::new(),
+                stderr: format!(
+                    " - [deleted]         {}",
+                    refs.last().cloned().unwrap_or_default()
+                ),
+            })
+        })
+    }
+
+    fn delete_tag(&self, name: String) -> BoxFuture<'_, Result<()>> {
+        self.with_state_async(true, move |state| {
+            state
+                .graph_mutations
+                .push(FakeGitMutation::DeleteTag(name.clone()));
+            let ref_name = format!("refs/tags/{name}");
+            if state.refs.remove(&ref_name).is_none() {
+                bail!("tag {name:?} does not exist");
+            }
+            Ok(())
+        })
+    }
+
+    fn tag_details(
+        &self,
+        ref_name: String,
+    ) -> BoxFuture<'_, Result<git::repository::TagDetails>> {
+        self.with_state_async(false, move |state| {
+            if let Some(details) = state.tag_details.get(&ref_name) {
+                return Ok(details.clone());
+            }
+            // Synthesize a lightweight tag entry from the fake ref table so the
+            // menu can display View Details without a real object database.
+            let name = ref_name
+                .strip_prefix("refs/tags/")
+                .map(str::to_owned)
+                .unwrap_or_else(|| ref_name.clone());
+            let target_oid = state
+                .refs
+                .get(&ref_name)
+                .and_then(|sha| Oid::try_from(sha.as_str()).ok())
+                .unwrap_or(Oid::default());
+            Ok(git::repository::TagDetails {
+                ref_name: ref_name.clone().into(),
+                name: name.into(),
+                target_oid,
+                object_type: git::repository::TagObjectType::Commit,
+                tagger: None,
+                message: None,
+            })
+        })
+    }
+
     fn blame(
         &self,
         path: RepoPath,
@@ -1299,26 +1462,72 @@ impl GitRepository for FakeGitRepository {
 
     fn stash_pop(
         &self,
-        _index: Option<usize>,
+        _identity: Option<git::stash::StashIdentity>,
         _env: Arc<HashMap<String, String>>,
-    ) -> BoxFuture<'_, Result<()>> {
+    ) -> BoxFuture<'_, Result<git::stash::StashMutationResult>> {
         unimplemented!()
     }
 
     fn stash_apply(
         &self,
-        _index: Option<usize>,
+        _identity: Option<git::stash::StashIdentity>,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         unimplemented!()
     }
 
-    fn stash_drop(
+fn stash_drop(
         &self,
-        _index: Option<usize>,
+        _identity: Option<StashIdentity>,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         unimplemented!()
+    }
+
+    fn stash_rename(
+        &self,
+        identity: Option<StashIdentity>,
+        message: String,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<StashRenameResult>> {
+        self.with_state_async(true, move |state| {
+            let message = message.trim();
+            anyhow::ensure!(!message.is_empty(), "stash rename requires a non-empty message");
+            let entries = state.stash_entries.entries.to_vec();
+            let target = match identity {
+                Some(identity) => resolve_stash_identity(&entries, &identity)
+                    .cloned()
+                    .map_err(|err| anyhow::anyhow!("{err}"))?,
+                None => entries
+                    .first()
+                    .context("no stash entry to rename")?
+                    .clone(),
+            };
+            // Fake backend models the UI-observable part of a rename: only the
+            // selected entry's message changes, order and other entries are
+            // untouched (the real backend additionally rewrites the commit OID
+            // and drives crash recovery through real Git refs).
+            let new_entries: Vec<git::stash::StashEntry> = entries
+                .into_iter()
+                .map(|mut entry| {
+                    if entry.index == target.index {
+                        let original_subject =
+                            format!("On {}: {}", entry.branch.as_deref().unwrap_or(""), entry.message);
+                        entry.message =
+                            renamed_stash_subject(&original_subject, message).to_string();
+                    }
+                    entry
+                })
+                .collect();
+            state.stash_entries = GitStash {
+                entries: new_entries.into(),
+            };
+            Ok(StashRenameResult::Success)
+        })
+    }
+
+    fn pending_stash_rename_recovers(&self) -> BoxFuture<'_, Result<Vec<StashRenameRecovery>>> {
+        self.with_state_async(false, |state| Ok(state.pending_stash_rename_recovers.clone()))
     }
 
     fn commit(
@@ -1756,26 +1965,37 @@ impl GitRepository for FakeGitRepository {
 
     fn initial_graph_data(
         &self,
-        _log_source: LogSource,
+        log_source: LogSource,
         _log_order: LogOrder,
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>> {
         let fs = self.fs.clone();
         let dot_git_path = self.dot_git_path.clone();
         async move {
-            let (graph_commits, simulated_error) =
+            let (mut graph_commits, simulated_error) =
                 fs.with_git_state(&dot_git_path, false, |state| {
-                    (
-                        state.graph_commits.clone(),
-                        state.simulated_graph_error.clone(),
-                    )
+                    (state.graph_commits.clone(), state.simulated_graph_error.clone())
                 })?;
 
             if let Some(error) = simulated_error {
                 anyhow::bail!("{}", error);
             }
 
-            for chunk in graph_commits.chunks(GRAPH_CHUNK_SIZE) {
+            // `LogSource::All` additionally renders the current stash reflog as
+            // connected stash rows (mirroring the real backend). Stash rows must
+            // appear above their base so the child→parent lane connects, so we
+            // emit them before the regular commits.
+            let mut stash_rows = Vec::new();
+            if log_source == LogSource::All {
+                stash_rows = fs.with_git_state(&dot_git_path, false, |state| {
+                    stash_rows_from_entries(&state.stash_entries)
+                })?;
+            }
+            let mut ordered = Vec::with_capacity(stash_rows.len() + graph_commits.len());
+            ordered.extend(stash_rows);
+            ordered.append(&mut graph_commits);
+
+            for chunk in ordered.chunks(GRAPH_CHUNK_SIZE) {
                 request_tx.send(chunk.to_vec()).await.ok();
             }
             Ok(())

@@ -136,14 +136,14 @@ pub fn init(cx: &mut App) {
         workspace.register_action(
             |workspace, action: &zed_actions::CreateWorktree, window, cx| {
                 git_ui_core::worktree_service::handle_create_worktree(
-                    workspace, action, window, None, cx,
+                    workspace, action, window, None, OpenMode::Activate, cx,
                 );
             },
         );
         workspace.register_action(
             |workspace, action: &zed_actions::SwitchWorktree, window, cx| {
                 git_ui_core::worktree_service::handle_switch_worktree(
-                    workspace, action, window, None, cx,
+                    workspace, action, window, None, OpenMode::Activate, cx,
                 );
             },
         );
@@ -165,33 +165,13 @@ pub fn init(cx: &mut App) {
 
         workspace.register_action(
             |workspace, action: &zed_actions::OpenWorktreeInNewWindow, window, cx| {
-                let path = action.path.clone();
-                let is_remote = !workspace.project().read(cx).is_local();
-
-                if is_remote {
-                    let connection_options =
-                        workspace.project().read(cx).remote_connection_options(cx);
-                    let app_state = workspace.app_state().clone();
-                    let workspace_handle = workspace.weak_handle();
-                    cx.spawn_in(window, async move |_, cx| {
-                        if let Some(connection_options) = connection_options {
-                            git_ui_core::worktree_picker::open_remote_worktree(
-                                connection_options,
-                                vec![path],
-                                app_state,
-                                workspace_handle,
-                                cx,
-                            )
-                            .await?;
-                        }
-                        anyhow::Ok(())
-                    })
-                    .detach_and_log_err(cx);
-                } else {
-                    workspace
-                        .open_workspace_for_paths(OpenMode::NewWindow, vec![path], window, cx)
-                        .detach_and_log_err(cx);
-                }
+                git_ui_core::worktree_service::open_worktree_in_new_window(
+                    workspace,
+                    action.path.clone(),
+                    window,
+                    cx,
+                )
+                .detach_and_log_err(cx);
             },
         );
 
@@ -555,6 +535,23 @@ fn rename_current_branch(
 
     workspace.toggle_modal(window, cx, |window, cx| {
         RenameBranchModal::new(current_branch_name, repo, window, cx)
+    });
+}
+
+/// Opens the single shared prefill renaming modal for `branch_name` (the exact
+/// canonical branch captured by a per-ref chip). Cancellation dispatches nothing
+/// and retains state; Git errors are surfaced by the modal. This is the
+/// per-ref-chip entry point into the same modal used by the Git Panel's
+/// "Rename" action, so the current branch is never silently substituted.
+pub(crate) fn open_branch_rename_modal(
+    workspace: &mut Workspace,
+    branch_name: String,
+    repo: Entity<Repository>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.toggle_modal(window, cx, |window, cx| {
+        RenameBranchModal::new(branch_name, repo, window, cx)
     });
 }
 
