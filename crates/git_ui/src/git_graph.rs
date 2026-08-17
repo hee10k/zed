@@ -802,6 +802,11 @@ pub(crate) struct GraphCommit {
     pub(crate) data: Arc<InitialGraphCommitData>,
     pub(crate) lane: usize,
     pub(crate) color_idx: usize,
+    /// True when this row is a stash-reflog row (`refs/stash@{N}`). Stash rows
+    /// select by row identity (so duplicate OIDs render/select/schedule
+    /// independently) while commit metadata stays OID-keyed, render a stash
+    /// icon, and gate commit-oriented actions off.
+    pub(crate) is_stash: bool,
 }
 
 type ActiveLaneIdx = usize;
@@ -1049,6 +1054,7 @@ impl GraphData {
                 data: commit.clone(),
                 lane: commit_lane,
                 color_idx: commit_color.0 as usize,
+                is_stash: commit.stash_selector().is_some(),
             }));
         }
 
@@ -2038,20 +2044,32 @@ impl GitGraph {
                             h_flex()
                                 .gap_2()
                                 .overflow_hidden()
-                                .children((!commit.data.ref_names.is_empty()).then(|| {
-                                    h_flex().gap_1().children(commit.data.ref_names.iter().map(
-                                        |name| {
-                                            let is_head =
-                                                Self::is_head_ref(name.as_ref(), &head_branch_name);
-                                            self.render_ref_chip(
-                                                name,
-                                                accent_color,
-                                                is_head,
-                                                idx,
-                                                cx,
-                                            )
-                                        },
-                                    ))
+                                .children(
+                                    // Stash rows do not render their reflog
+                                    // selector as a ref chip; they show a stash
+                                    // icon before the message instead.
+                                    (!commit.is_stash && !commit.data.ref_names.is_empty()).then(|| {
+                                        h_flex().gap_1().children(commit.data.ref_names.iter().map(
+                                            |name| {
+                                                let is_head = Self::is_head_ref(
+                                                    name.as_ref(),
+                                                    &head_branch_name,
+                                                );
+                                                self.render_ref_chip(
+                                                    name,
+                                                    accent_color,
+                                                    is_head,
+                                                    idx,
+                                                    cx,
+                                                )
+                                            },
+                                        ))
+                                    }),
+                                )
+                                .children(commit.is_stash.then(|| {
+                                    Icon::new(IconName::BoxOpen)
+                                        .size(IconSize::Small)
+                                        .color(Color::Custom(accent_color))
                                 }))
                                 .child(subject_label),
                         )
@@ -2747,6 +2765,7 @@ impl GitGraph {
                     .into_iter()
                     .map(|tag_name| SharedString::from(tag_name.to_string()))
                     .collect(),
+                is_stash: commit.is_stash,
             },
             selected_commits,
             CommitContextMenuSource::GitGraph,
@@ -6591,28 +6610,30 @@ mod tests {
 
         fs.set_graph_commits(
             Path::new("/project/.git"),
-            vec![
-                Arc::new(InitialGraphCommitData {
-                    sha: initial_head,
-                    parents: smallvec![initial_stash],
-                    ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
-                }),
-                Arc::new(InitialGraphCommitData {
-                    sha: initial_stash,
-                    parents: smallvec![],
-                    ref_names: vec!["refs/stash".into()],
-                }),
-            ],
+            vec![Arc::new(InitialGraphCommitData {
+                sha: initial_head,
+                parents: smallvec![Oid::from_bytes(&[7; 20]).unwrap()],
+                ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+            })],
         );
         fs.with_git_state(Path::new("/project/.git"), true, |state| {
             state.stash_entries = git::stash::GitStash {
-                entries: vec![git::stash::StashEntry {
-                    index: 0,
-                    oid: initial_stash,
-                    message: "initial stash".to_string(),
-                    branch: Some("main".to_string()),
-                    timestamp: 1,
-                }]
+                entries: vec![
+                    git::stash::StashEntry {
+                        index: 0,
+                        oid: initial_stash,
+                        message: "initial stash".to_string(),
+                        branch: Some("main".to_string()),
+                        timestamp: 2,
+                    },
+                    git::stash::StashEntry {
+                        index: 1,
+                        oid: Oid::from_bytes(&[5; 20]).unwrap(),
+                        message: "older stash".to_string(),
+                        branch: Some("main".to_string()),
+                        timestamp: 1,
+                    },
+                ]
                 .into(),
             };
         })
@@ -6652,22 +6673,24 @@ mod tests {
                 .map(|commit| commit.data.sha)
                 .collect::<Vec<_>>()
         });
-        assert_eq!(initial_shas, vec![initial_head, initial_stash]);
+        // Stash rows are derived from the stash reflog (newest first) and emitted
+        // ahead of the regular commits so their child→parent lanes connect.
+        assert_eq!(
+            initial_shas,
+            vec![
+                initial_stash,
+                Oid::from_bytes(&[5; 20]).unwrap(),
+                initial_head
+            ]
+        );
 
         fs.set_graph_commits(
             Path::new("/project/.git"),
-            vec![
-                Arc::new(InitialGraphCommitData {
-                    sha: updated_head,
-                    parents: smallvec![updated_stash],
-                    ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
-                }),
-                Arc::new(InitialGraphCommitData {
-                    sha: updated_stash,
-                    parents: smallvec![],
-                    ref_names: vec!["refs/stash".into()],
-                }),
-            ],
+            vec![Arc::new(InitialGraphCommitData {
+                sha: updated_head,
+                parents: smallvec![Oid::from_bytes(&[8; 20]).unwrap()],
+                ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+            })],
         );
         fs.with_git_state(Path::new("/project/.git"), true, |state| {
             state.stash_entries = git::stash::GitStash {
@@ -6703,7 +6726,7 @@ mod tests {
                 .map(|commit| commit.data.sha)
                 .collect::<Vec<_>>()
         });
-        assert_eq!(reloaded_shas, vec![updated_head, updated_stash]);
+        assert_eq!(reloaded_shas, vec![updated_stash, updated_head]);
     }
 
     #[gpui::test]
@@ -9137,5 +9160,217 @@ mod tests {
             cleared,
             "GitWorktreeListChanged should invalidate the graph (clear its commits)"
         );
+    }
+
+    #[gpui::test]
+    async fn test_stash_rows_render_select_by_row_identity(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        // A regular commit plus two stash entries that share the exact same OID
+        // (to prove stash rows render/select/schedule by row identity, not OID).
+        let head = Oid::from_bytes(&[1; 20]).unwrap();
+        let duplicated_stash_oid = Oid::from_bytes(&[2; 20]).unwrap();
+        let other = Oid::from_bytes(&[3; 20]).unwrap();
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head.to_string(),
+        );
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: head,
+                parents: smallvec![other],
+                ref_names: vec!["HEAD -> refs/heads/main".into()],
+            })],
+        );
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.stash_entries = git::stash::GitStash {
+                entries: vec![
+                    git::stash::StashEntry {
+                        index: 0,
+                        oid: duplicated_stash_oid,
+                        message: "newest stash".to_string(),
+                        branch: Some("main".to_string()),
+                        timestamp: 2,
+                    },
+                    git::stash::StashEntry {
+                        index: 1,
+                        oid: duplicated_stash_oid,
+                        message: "older identical stash".to_string(),
+                        branch: Some("main".to_string()),
+                        timestamp: 1,
+                    },
+                ]
+                .into(),
+            };
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| git_graph.clone().into_any_element(),
+        );
+        cx.run_until_parked();
+
+        let commits = git_graph.read_with(&*cx, |graph, _| {
+            graph.graph_data.commits.iter().map(|c| c.clone()).collect::<Vec<_>>()
+        });
+        // Stash rows derived from the reflog are emitted ahead of regular commits.
+        assert_eq!(commits.len(), 3);
+        assert!(commits[0].is_stash, "row 0 must be a stash row");
+        assert!(commits[1].is_stash, "row 1 must be a stash row");
+        assert!(!commits[2].is_stash, "row 2 is the regular HEAD");
+        // Duplicate OIDs are distinct rows: identical sha, different selectors.
+        assert_eq!(commits[0].data.sha, duplicated_stash_oid);
+        assert_eq!(commits[1].data.sha, duplicated_stash_oid);
+        assert_ne!(
+            commits[0].data.stash_selector(),
+            commits[1].data.stash_selector()
+        );
+
+        // Selecting by row identity: each stash row is independently selectable.
+        git_graph.update_in(cx, |graph, _window, cx| {
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+            assert_eq!(graph.selection.primary, Some(0));
+            graph.select_entry(1, ScrollStrategy::Nearest, cx);
+            assert_eq!(graph.selection.primary, Some(1));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_stash_row_context_menu_gates_commit_actions(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let head = Oid::from_bytes(&[1; 20]).unwrap();
+        let stash_oid = Oid::from_bytes(&[2; 20]).unwrap();
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "content".to_string())],
+            head.to_string(),
+        );
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: head,
+                parents: smallvec![],
+                ref_names: vec!["HEAD -> refs/heads/main".into()],
+            })],
+        );
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.stash_entries = git::stash::GitStash {
+                entries: vec![git::stash::StashEntry {
+                    index: 0,
+                    oid: stash_oid,
+                    message: "stash".to_string(),
+                    branch: Some("main".to_string()),
+                    timestamp: 1,
+                }]
+                .into(),
+            };
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| git_graph.clone().into_any_element(),
+        );
+        cx.run_until_parked();
+
+        // Deploy the context menu on the stash row (row 0).
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.deploy_entry_context_menu(
+                point(px(20.), px(20.)),
+                0,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let labels = ref_menu_labels(&git_graph, cx);
+        // A stash row must not offer commit-oriented actions.
+        for forbidden in ["Checkout", "Cherry-pick", "Revert", "Reset", "Merge", "Create Branch", "Git Actions", "Worktree", "Custom Commands"] {
+            assert!(
+                !labels.iter().any(|label| label.contains(forbidden)),
+                "stash row context menu must not offer '{forbidden}', got {labels:?}"
+            );
+        }
+        // The commit view/diff seam stays available.
+        assert!(labels.iter().any(|label| label == "View Diff"));
     }
 }

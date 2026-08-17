@@ -53,6 +53,11 @@ const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
 pub(crate) struct CommitContextMenuData {
     pub(crate) sha: Oid,
     pub(crate) tag_names: Vec<SharedString>,
+    /// True for a stash-reflog row. Commit-oriented actions (checkout,
+    /// cherry-pick, revert, reset, merge, ref/worktree operations) are never
+    /// offered for a stash row; only the commit view/diff seam stays available
+    /// through single-click selection and `View`/double-click.
+    pub(crate) is_stash: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,6 +79,7 @@ pub(crate) fn commit_context_menu(
     cx: &mut App,
 ) -> Entity<ContextMenu> {
     let sha = commit.sha;
+    let is_stash = commit.is_stash;
     let cherry_pick_commits = if selected_commits.is_empty() {
         vec![sha]
     } else {
@@ -237,6 +243,9 @@ pub(crate) fn commit_context_menu(
                 let repository = repository.clone();
                 let workspace = workspace.clone();
                 let reset_graph = graph.clone();
+                if is_stash {
+                    return menu;
+                }
                 menu.separator()
                     .header("Git Actions")
                     .entry("Checkout Commit", None, {
@@ -409,6 +418,9 @@ pub(crate) fn commit_context_menu(
                     })
             })
             .when(source == CommitContextMenuSource::GitGraph, |menu| {
+                if is_stash {
+                    return menu;
+                }
                 let workspace = workspace.clone();
                 #[allow(clippy::redundant_clone)]
                 let workspace_for_entry = workspace.clone();
@@ -534,6 +546,9 @@ pub(crate) fn commit_context_menu(
                 })
             })
             .map(|mut menu| {
+                if is_stash {
+                    return menu;
+                }
                 menu = menu.separator().header("Custom Commands");
 
                 if git_tasks.is_empty() {

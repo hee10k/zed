@@ -128,6 +128,16 @@ pub struct InitialGraphCommitData {
 }
 
 impl InitialGraphCommitData {
+    /// If this row is a stash-reflog row, returns its reflog selector
+    /// (`refs/stash@{N}`), which is the row's distinct identity. Stash rows
+    /// carry the selector as their only ref name; regular commit rows return
+    /// `None`.
+    pub fn stash_selector(&self) -> Option<&SharedString> {
+        self.ref_names
+            .iter()
+            .find(|ref_name| ref_name.starts_with(&format!("{STASH_REF}@{{")))
+    }
+
     pub fn tag_names(&self) -> Vec<&str> {
         self.ref_names
             .iter()
@@ -1251,6 +1261,26 @@ pub trait GitRepository: Send + Sync {
         log_order: LogOrder,
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>>;
+
+    /// Enumerates the current `refs/stash` reflog as graph rows, one per stash
+    /// entry, using an explicit revision set (`refs/stash`) and reflog selectors
+    /// (`%gD`) that exclude normal refs and are correct for both SHA-1 and
+    /// SHA-256. Each row keeps only the stash commit's first parent (its base)
+    /// so the graph connects the stash row to the base without pulling
+    /// unrelated stash-only ancestors, and carries `refs/stash@{N}` as its
+    /// distinct row identity.
+    fn stash_graph_data(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<Arc<InitialGraphCommitData>>>>;
+
+    /// Fetches a single commit as one graph row (parents + decorations). Used to
+    /// surface an unreachable stash base as exactly one supplemental row rather
+    /// than pulling unrelated stash-only ancestors. Returns `None` when the
+    /// commit does not exist or is not a commit.
+    fn graph_commit_for_base(
+        &self,
+        sha: Oid,
+    ) -> BoxFuture<'_, Result<Option<Arc<InitialGraphCommitData>>>>;
 
     fn search_commits(
         &self,
@@ -4046,6 +4076,19 @@ impl GitRepository for RealGitRepository {
             let mut line_buffer = String::new();
             let mut lines: Vec<String> = Vec::with_capacity(GRAPH_CHUNK_SIZE);
 
+            // `LogSource::All` additionally renders the current stash reflog as
+            // connected stash rows. Stash rows must appear above their base so
+            // the child→parent lane connects downward, so we buffer the regular
+            // stream and emit stash rows first. Every other log source keeps the
+            // existing byte-for-byte streaming path below.
+            let mut regular_commits: Option<Vec<Arc<InitialGraphCommitData>>> = if log_source
+                == LogSource::All
+            {
+                Some(Vec::new())
+            } else {
+                None
+            };
+
             loop {
                 line_buffer.clear();
                 let bytes_read = reader.read_line(&mut line_buffer).await?;
@@ -4053,7 +4096,9 @@ impl GitRepository for RealGitRepository {
                 if bytes_read == 0 {
                     if !lines.is_empty() {
                         let commits = parse_initial_graph_output(lines.iter().map(|s| s.as_str()));
-                        if request_tx.send(commits).await.is_err() {
+                        if let Some(buffered) = regular_commits.as_mut() {
+                            buffered.extend(commits);
+                        } else if request_tx.send(commits).await.is_err() {
                             log::warn!(
                                 "initial_graph_data: receiver dropped while sending commits"
                             );
@@ -4067,7 +4112,9 @@ impl GitRepository for RealGitRepository {
 
                 if lines.len() >= GRAPH_CHUNK_SIZE {
                     let commits = parse_initial_graph_output(lines.iter().map(|s| s.as_str()));
-                    if request_tx.send(commits).await.is_err() {
+                    if let Some(buffered) = regular_commits.as_mut() {
+                        buffered.extend(commits);
+                    } else if request_tx.send(commits).await.is_err() {
                         log::warn!("initial_graph_data: receiver dropped while streaming commits");
                         break;
                     }
@@ -4089,8 +4136,159 @@ impl GitRepository for RealGitRepository {
                     anyhow::bail!("git log command failed with {}: {}", status, stderr_output);
                 }
             }
+
+            if let Some(regular_commits) = regular_commits {
+                // Stash rows carry `refs/stash@{N}` as their identity. An exact
+                // base that is not reachable from the loaded graph is fetched as
+                // one supplemental row placed directly below its stash row so the
+                // child→parent lane resolves; unrelated stash-only ancestors are
+                // never pulled in.
+                let stash_rows = self.stash_graph_data().await?;
+                let regular_oids: std::collections::HashSet<_> = regular_commits
+                    .iter()
+                    .map(|commit| commit.sha)
+                    .collect();
+
+                // Fetch each unreachable exact base once so adjacent stash rows
+                // referencing the same base never duplicate a supplemental row.
+                let bases_to_fetch: std::collections::HashSet<Oid> = stash_rows
+                    .iter()
+                    .filter_map(|stash| stash.parents.first().copied())
+                    .filter(|base| !regular_oids.contains(base))
+                    .collect();
+                let mut base_rows: std::collections::HashMap<Oid, Arc<InitialGraphCommitData>> =
+                    std::collections::HashMap::default();
+                for base in &bases_to_fetch {
+                    if let Some(row) = self.graph_commit_for_base(*base).await? {
+                        base_rows.insert(*base, row);
+                    }
+                }
+
+                let mut ordered = Vec::with_capacity(stash_rows.len() * 2 + regular_commits.len());
+                for stash in &stash_rows {
+                    ordered.push(stash.clone());
+                    if let Some(base) = stash.parents.first().copied()
+                        && !regular_oids.contains(&base)
+                        && let Some(base_row) = base_rows.remove(&base)
+                    {
+                        ordered.push(base_row);
+                    }
+                }
+                ordered.extend(regular_commits);
+
+                for chunk in ordered.chunks(GRAPH_CHUNK_SIZE) {
+                    if request_tx.send(chunk.to_vec()).await.is_err() {
+                        log::warn!(
+                            "initial_graph_data: receiver dropped while streaming commits"
+                        );
+                        break;
+                    }
+                }
+            }
+
             Ok(())
         }
+        .boxed()
+    }
+
+    fn stash_graph_data(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<Arc<InitialGraphCommitData>>>> {
+        let git = self.git_binary_in_worktree();
+        self.executor.spawn(async move {
+            let git = git?;
+            // The stash reflog may be absent (no stash entries); that is a valid
+            // empty result, not an error.
+            if git
+                .build_command(&["rev-parse", "-q", "--verify", STASH_REF])
+                .output()
+                .await?
+                .status
+                .success()
+            {
+                let output = git
+                    .run(&["log", "-g", STASH_REF, "--format=%H%x00%P%x00%gD"])
+                    .await?;
+                // Reflog rows carry the reflog selector (`refs/stash@{N}`) as a
+                // decoration; the existing graph parser understands that shape.
+                // Only the first parent (the base) is kept so the stash row
+                // connects to the base without pulling stash-only ancestors.
+                Ok(output
+                    .lines()
+                    .filter_map(|line| {
+                        let mut parts = line.split('\x00');
+                        let sha = Oid::from_str(parts.next()?).ok()?;
+                        let parents = parts.next()?;
+                        let first_parent = parents
+                            .split_whitespace()
+                            .filter_map(|p| Oid::from_str(p).ok())
+                            .next();
+                        let ref_names = parts.next().unwrap_or("");
+                        let ref_names = if ref_names.is_empty() {
+                            Vec::new()
+                        } else {
+                            ref_names
+                                .split(", ")
+                                .map(|s| SharedString::from(s.to_string()))
+                                .collect()
+                        };
+                        Some(Arc::new(InitialGraphCommitData {
+                            sha,
+                            parents: first_parent.into_iter().collect(),
+                            ref_names,
+                        }))
+                    })
+                    .collect())
+            } else {
+                Ok(Vec::new())
+            }
+        })
+        .boxed()
+    }
+
+    fn graph_commit_for_base(
+        &self,
+        sha: Oid,
+    ) -> BoxFuture<'_, Result<Option<Arc<InitialGraphCommitData>>>> {
+        let git = self.git_binary_in_worktree();
+        self.executor.spawn(async move {
+            let git = git?;
+            let output = git
+                .build_command(&[
+                    "log",
+                    "-n",
+                    "1",
+                    "--format=%H%x00%P%x00%D",
+                    "--decorate=full",
+                    &sha.to_string(),
+                ])
+                .output()
+                .await?;
+            let output = String::from_utf8_lossy(&output.stdout).to_string();
+            Ok(output.lines().filter_map(|line| {
+                let mut parts = line.split('\x00');
+                let sha = Oid::from_str(parts.next()?).ok()?;
+                let parents = parts.next()?;
+                let parents = parents
+                    .split_whitespace()
+                    .filter_map(|p| Oid::from_str(p).ok())
+                    .collect();
+                let ref_names = parts.next().unwrap_or("");
+                let ref_names = if ref_names.is_empty() {
+                    Vec::new()
+                } else {
+                    ref_names
+                        .split(", ")
+                        .map(|s| SharedString::from(s.to_string()))
+                        .collect()
+                };
+                Some(Arc::new(InitialGraphCommitData {
+                    sha,
+                    parents,
+                    ref_names,
+                }))
+            }).next())
+        })
         .boxed()
     }
 
@@ -8182,5 +8380,128 @@ mod tests {
         );
         // Holding on to the repo so the drop does not remove the whole temp dir early.
         drop(repository);
+    }
+
+    #[gpui::test]
+    async fn test_stash_graph_data_enumerates_reflog_rows(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+
+        let first = stash_with_marker(repo_dir.path(), "first");
+        stash_with_marker(repo_dir.path(), "second");
+
+        let repository = new_real_repo(repo_dir.path(), cx);
+        let rows = repository.stash_graph_data().await.unwrap();
+
+        // Newest stash first, each carrying its reflog selector identity and
+        // only its first parent (the base).
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].sha, second_stash_oid(repo_dir.path()));
+        assert_eq!(rows[1].sha, first);
+        assert_eq!(rows[0].ref_names.first().map(|n| n.as_str()), Some("refs/stash@{0}"));
+        assert_eq!(rows[1].ref_names.first().map(|n| n.as_str()), Some("refs/stash@{1}"));
+        assert!(
+            rows.iter().all(|row| row.parents.len() <= 1),
+            "stash rows must keep only the first parent"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_graph_commit_for_base_fetches_exact_commit(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        stash_with_marker(repo_dir.path(), "only");
+
+        let repository = new_real_repo(repo_dir.path(), cx);
+        let base_oid = Oid::from_str(&git_command_output(
+            repo_dir.path(),
+            ["rev-parse", "HEAD"],
+        ))
+        .unwrap();
+        // The base is a reachable regular commit: it exists as a commit.
+        let row = repository
+            .graph_commit_for_base(base_oid)
+            .await
+            .unwrap();
+        assert!(row.is_some());
+        assert_eq!(row.unwrap().sha, base_oid);
+
+        let missing = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            .parse()
+            .unwrap();
+        assert!(
+            repository
+                .graph_commit_for_base(missing)
+                .await
+                .unwrap()
+                .is_none(),
+            "a non-existent base must yield no row"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_log_source_all_includes_stash_rows_but_others_do_not(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("stash_file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "stash_file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        let stash_oid = stash_with_marker(repo_dir.path(), "only");
+
+        let repository = new_real_repo(repo_dir.path(), cx);
+        let (tx, rx) = smol::channel::unbounded();
+        repository
+            .initial_graph_data(LogSource::All, LogOrder::DateOrder, tx.clone())
+            .await
+            .unwrap();
+        let mut all_shas = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            all_shas.extend(chunk.iter().map(|c| c.sha));
+        }
+        // The stash row appears ahead of the regular commits, carrying its
+        // reflog-selector identity.
+        assert!(
+            all_shas.contains(&stash_oid),
+            "LogSource::All must render the stash row"
+        );
+
+        // A branch/path/sha load must not pull the stash row in.
+        let (tx, rx) = smol::channel::unbounded();
+        repository
+            .initial_graph_data(LogSource::Branch("main".into()), LogOrder::DateOrder, tx)
+            .await
+            .unwrap();
+        let mut branch_shas = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            branch_shas.extend(chunk.iter().map(|c| c.sha));
+        }
+        assert!(
+            !branch_shas.contains(&stash_oid),
+            "branch history must not include the stash row"
+        );
+    }
+
+    fn second_stash_oid(repo_dir: &Path) -> Oid {
+        git_command_output(repo_dir, ["rev-parse", "refs/stash"])
+            .trim()
+            .parse()
+            .unwrap()
     }
 }

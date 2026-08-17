@@ -18,7 +18,7 @@ use git::{
         PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
         commit_hash_search_query,
     },
-    stash::GitStash,
+    stash::{GitStash, STASH_REF},
     status::{
         DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus,
         UnmergedStatus,
@@ -28,11 +28,32 @@ use gpui::{AsyncApp, BackgroundExecutor, SharedString, Task};
 use ignore::gitignore::GitignoreBuilder;
 use parking_lot::Mutex;
 use rope::Rope;
+use smallvec::SmallVec;
 use std::{path::PathBuf, sync::Arc, sync::atomic::AtomicBool, time::SystemTime};
 use text::LineEnding;
 use util::{paths::PathStyle, rel_path::RelPath};
 
-#[derive(Clone)]
+fn stash_rows_from_entries(
+    stash: &git::stash::GitStash,
+) -> Vec<Arc<InitialGraphCommitData>> {
+    stash
+        .entries
+        .iter()
+        .map(|entry| {
+            Arc::new(InitialGraphCommitData {
+                sha: entry.oid,
+                parents: SmallVec::new(),
+                // The reflog selector is the row identity, mirroring `%gD` from
+                // the real backend's `git log -g refs/stash`.
+                ref_names: vec![SharedString::from(format!(
+                    "{}@{{{}}}",
+                    STASH_REF, entry.index
+                ))],
+            })
+        })
+        .collect()
+}
+
 pub struct FakeGitRepository {
     pub(crate) fs: Arc<FakeFs>,
     pub(crate) checkpoints: Arc<Mutex<HashMap<Oid, FakeFsEntry>>>,
@@ -771,6 +792,37 @@ impl GitRepository for FakeGitRepository {
 
     fn stash_entries(&self) -> BoxFuture<'static, Result<git::stash::GitStash>> {
         self.with_state_async(false, |state| Ok(state.stash_entries.clone()))
+    }
+
+    fn stash_graph_data(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<Arc<InitialGraphCommitData>>>> {
+        let fs = self.fs.clone();
+        let dot_git_path = self.dot_git_path.clone();
+        async move {
+            fs.with_git_state(&dot_git_path, false, |state| {
+                stash_rows_from_entries(&state.stash_entries)
+            })
+        }
+        .boxed()
+    }
+
+    fn graph_commit_for_base(
+        &self,
+        sha: Oid,
+    ) -> BoxFuture<'_, Result<Option<Arc<InitialGraphCommitData>>>> {
+        let fs = self.fs.clone();
+        let dot_git_path = self.dot_git_path.clone();
+        async move {
+            fs.with_git_state(&dot_git_path, false, |state| {
+                state
+                    .graph_commits
+                    .iter()
+                    .find(|commit| commit.sha == sha)
+                    .cloned()
+            })
+        }
+        .boxed()
     }
 
     fn branches(&self) -> BoxFuture<'_, Result<git::repository::BranchesScanResult>> {
@@ -1872,26 +1924,37 @@ impl GitRepository for FakeGitRepository {
 
     fn initial_graph_data(
         &self,
-        _log_source: LogSource,
+        log_source: LogSource,
         _log_order: LogOrder,
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>> {
         let fs = self.fs.clone();
         let dot_git_path = self.dot_git_path.clone();
         async move {
-            let (graph_commits, simulated_error) =
+            let (mut graph_commits, simulated_error) =
                 fs.with_git_state(&dot_git_path, false, |state| {
-                    (
-                        state.graph_commits.clone(),
-                        state.simulated_graph_error.clone(),
-                    )
+                    (state.graph_commits.clone(), state.simulated_graph_error.clone())
                 })?;
 
             if let Some(error) = simulated_error {
                 anyhow::bail!("{}", error);
             }
 
-            for chunk in graph_commits.chunks(GRAPH_CHUNK_SIZE) {
+            // `LogSource::All` additionally renders the current stash reflog as
+            // connected stash rows (mirroring the real backend). Stash rows must
+            // appear above their base so the child→parent lane connects, so we
+            // emit them before the regular commits.
+            let mut stash_rows = Vec::new();
+            if log_source == LogSource::All {
+                stash_rows = fs.with_git_state(&dot_git_path, false, |state| {
+                    stash_rows_from_entries(&state.stash_entries)
+                })?;
+            }
+            let mut ordered = Vec::with_capacity(stash_rows.len() + graph_commits.len());
+            ordered.extend(stash_rows);
+            ordered.append(&mut graph_commits);
+
+            for chunk in ordered.chunks(GRAPH_CHUNK_SIZE) {
                 request_tx.send(chunk.to_vec()).await.ok();
             }
             Ok(())
