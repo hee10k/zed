@@ -951,7 +951,7 @@ pub trait GitRepository: Send + Sync {
     /// Returns the contents of an entry in the repository's index, or None if there is no entry for the given path.
     ///
     /// Also returns `None` for symlinks.
-    fn load_index_text(&self, path: RepoPath) -> BoxFuture<'_, Option<String>> {
+    fn load_index_text(&self, path: RepoPath) -> BoxFuture<'_, Option<Vec<u8>>> {
         let future = self.load_revisions(vec![format!(":{}", path.as_unix_str())]);
         async move { future.await.ok()?.pop()? }.boxed()
     }
@@ -959,16 +959,16 @@ pub trait GitRepository: Send + Sync {
     /// Returns the contents of an entry in the repository's HEAD, or None if HEAD does not exist or has no entry for the given path.
     ///
     /// Also returns `None` for symlinks.
-    fn load_committed_text(&self, path: RepoPath) -> BoxFuture<'_, Option<String>> {
+    fn load_committed_text(&self, path: RepoPath) -> BoxFuture<'_, Option<Vec<u8>>> {
         let future = self.load_revisions(vec![format!("HEAD:{}", path.as_unix_str())]);
         async move { future.await.ok()?.pop()? }.boxed()
     }
-    fn load_blob_content(&self, oid: Oid) -> BoxFuture<'_, Result<String>>;
+    fn load_blob_content(&self, oid: Oid) -> BoxFuture<'_, Result<Vec<u8>>>;
 
     fn set_index_text(
         &self,
         path: RepoPath,
-        content: Option<String>,
+        content: Option<Vec<u8>>,
         env: Arc<HashMap<String, String>>,
         is_executable: bool,
     ) -> BoxFuture<'_, anyhow::Result<()>>;
@@ -986,7 +986,8 @@ pub trait GitRepository: Send + Sync {
     /// Resolve a list of refs to SHAs.
     fn revparse_batch(&self, revs: Vec<String>) -> BoxFuture<'_, Result<Vec<Option<String>>>>;
 
-    fn load_revisions(&self, revisions: Vec<String>) -> BoxFuture<'_, Result<Vec<Option<String>>>>;
+    fn load_revisions(&self, revisions: Vec<String>)
+    -> BoxFuture<'_, Result<Vec<Option<Vec<u8>>>>>;
 
     fn head_sha(&self) -> BoxFuture<'_, Option<String>> {
         async move {
@@ -1186,6 +1187,12 @@ pub trait GitRepository: Send + Sync {
     fn stash_paths(
         &self,
         paths: Vec<RepoPath>,
+        message: Option<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    fn stash_staged(
+        &self,
         message: Option<String>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>>;
@@ -2493,7 +2500,6 @@ impl GitRepository for RealGitRepository {
         cx.background_spawn(load_commit_diff_from_command(git, command))
             .boxed()
     }
-
     fn load_commit_range(
         &self,
         base: String,
@@ -2735,11 +2741,23 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
-    fn load_blob_content(&self, oid: Oid) -> BoxFuture<'_, Result<String>> {
+    fn load_blob_content(&self, oid: Oid) -> BoxFuture<'_, Result<Vec<u8>>> {
         let git_binary = self.git_binary();
         let oid_str = oid.to_string();
         self.executor
-            .spawn(async move { git_binary.run_raw(&["cat-file", "blob", &oid_str]).await })
+            .spawn(async move {
+                let mut command = git_binary.build_command(&["cat-file", "blob", &oid_str]);
+                let output = command.output().await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    GitBinaryCommandError {
+                        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                        status: output.status,
+                    }
+                );
+                Ok(output.stdout)
+            })
             .boxed()
     }
 
@@ -2788,7 +2806,7 @@ impl GitRepository for RealGitRepository {
     fn set_index_text(
         &self,
         path: RepoPath,
-        content: Option<String>,
+        content: Option<Vec<u8>>,
         env: Arc<HashMap<String, String>>,
         is_executable: bool,
     ) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -2799,17 +2817,32 @@ impl GitRepository for RealGitRepository {
 
                 if let Some(content) = content {
                     let mut child = git
-                        .build_command(&["hash-object", "-w", "--stdin"])
+                        .build_command(&[
+                            "hash-object",
+                            "-w",
+                            "--stdin",
+                            "--path",
+                            path.as_unix_str(),
+                        ])
                         .envs(env.iter())
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
                         .spawn()?;
-                    let mut stdin = child.stdin.take().unwrap();
-                    stdin.write_all(content.as_bytes()).await?;
+                    let mut stdin = child.stdin.take().context("hash-object has no stdin")?;
+                    stdin.write_all(&content).await?;
                     stdin.flush().await?;
                     drop(stdin);
-                    let output = child.output().await?.stdout;
-                    let sha = str::from_utf8(&output)?.trim();
+                    let output = child.output().await?;
+                    anyhow::ensure!(
+                        output.status.success(),
+                        GitBinaryCommandError {
+                            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                            status: output.status,
+                        }
+                    );
+                    let sha = str::from_utf8(&output.stdout)?.trim();
 
                     log::debug!("indexing SHA: {sha}, path {path:?}");
 
@@ -2910,7 +2943,10 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
-    fn load_revisions(&self, revisions: Vec<String>) -> BoxFuture<'_, Result<Vec<Option<String>>>> {
+    fn load_revisions(
+        &self,
+        revisions: Vec<String>,
+    ) -> BoxFuture<'_, Result<Vec<Option<Vec<u8>>>>> {
         let git = self.git_binary();
         self.executor
             .spawn(async move {
@@ -2961,7 +2997,7 @@ impl GitRepository for RealGitRepository {
                             stdout.read_exact(&mut newline).await?;
 
                             if object_type == "blob" {
-                                results.push(String::from_utf8(content).ok());
+                                results.push(Some(content));
                             } else {
                                 results.push(None);
                             }
@@ -3734,7 +3770,34 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
-fn stash_pop(
+    fn stash_staged(
+        &self,
+        message: Option<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                // `--staged` cannot be expressed as a pathspec: a partially staged
+                // file would otherwise have its unstaged hunks stashed too.
+                let mut args = vec!["stash", "push", "--quiet", "--staged"];
+                if let Some(message) = message.as_deref() {
+                    args.extend_from_slice(&["--message", message]);
+                }
+                let output = git.build_command(&args).envs(env.iter()).output().await?;
+
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Failed to stash staged changes (requires git 2.35 or newer):\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn stash_pop(
         &self,
         identity: Option<StashIdentity>,
         env: Arc<HashMap<String, String>>,
@@ -6207,7 +6270,8 @@ mod tests {
         assert_eq!(gitlink.old_text, None);
         assert_eq!(
             gitlink.new_text.as_deref(),
-            Some("Subproject commit 1111111111111111111111111111111111111111\n")
+            Some("Subproject commit 1111111111111111111111111111111111111111
+")
         );
         assert!(!gitlink.is_binary);
 
@@ -6233,11 +6297,13 @@ mod tests {
         assert_eq!(gitlink.status(), CommitFileStatus::Modified);
         assert_eq!(
             gitlink.old_text.as_deref(),
-            Some("Subproject commit 1111111111111111111111111111111111111111\n")
+            Some("Subproject commit 1111111111111111111111111111111111111111
+")
         );
         assert_eq!(
             gitlink.new_text.as_deref(),
-            Some("Subproject commit 2222222222222222222222222222222222222222\n")
+            Some("Subproject commit 2222222222222222222222222222222222222222
+")
         );
         assert!(!gitlink.is_binary);
 
@@ -6254,7 +6320,8 @@ mod tests {
         assert_eq!(gitlink.status(), CommitFileStatus::Deleted);
         assert_eq!(
             gitlink.old_text.as_deref(),
-            Some("Subproject commit 2222222222222222222222222222222222222222\n")
+            Some("Subproject commit 2222222222222222222222222222222222222222
+")
         );
         assert_eq!(gitlink.new_text, None);
         assert!(!gitlink.is_binary);
@@ -7122,12 +7189,12 @@ mod tests {
         assert_eq!(
             results,
             vec![
-                Some("file1 committed contents".into()),
-                Some("file1 index contents".into()),
-                Some("file2 committed contents".into()),
-                Some("file2 committed contents".into()), // untouched in index, should match HEAD
+                Some(b"file1 committed contents".to_vec()),
+                Some(b"file1 index contents".to_vec()),
+                Some(b"file2 committed contents".to_vec()),
+                Some(b"file2 committed contents".to_vec()), // untouched in index, should match HEAD
                 None,
-                Some("space file committed contents".into()),
+                Some(b"space file committed contents".to_vec()),
                 None,
             ]
         );

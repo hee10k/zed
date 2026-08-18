@@ -34,13 +34,12 @@ use git::{
     blame::Blame,
     parse_git_remote_url,
     repository::{
-        Branch, BranchesScanResult, CommitData, CommitDetails, CommitDiff, CommitFile,
-        CommitOptions, CreateTagOptions, CreateWorktreeTarget, DiffStatType, DiffType,
-        FetchOptions, FileHistoryChangedFileSets, GitCommitTemplate, GitOperationAction,
-        GitOperationKind, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder,
-        LogSource, MergeMode, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode,
-        SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
-        is_binary_content,
+Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
+        CreateTagOptions, CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions,
+        FileHistoryChangedFileSets, GitCommitTemplate, GitOperationAction, GitOperationKind,
+        GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
+        MergeMode, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
+        UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag, is_binary_content,
     },
     stash::{
         GitStash, StashEntry, StashIdentity, StashMutationResult, StashRenameRecovery,
@@ -56,7 +55,7 @@ use gpui::{
     Subscription, Task, TaskExt, WeakEntity,
 };
 use language::{
-    Anchor, Buffer, BufferEvent, Capability, Language, LanguageRegistry,
+    Anchor, Buffer, BufferEvent, Capability, Language, LanguageRegistry, decode_text, encode_text,
     proto::{deserialize_version, serialize_version},
 };
 use parking_lot::Mutex;
@@ -210,6 +209,66 @@ fn pending_hunks(
             )
         })
         .collect()
+}
+
+fn decode_git_text(bytes: Vec<u8>) -> Result<String> {
+    Ok(decode_text(bytes)?.text)
+}
+
+#[derive(Debug)]
+pub struct CommitDiff {
+    pub files: Vec<CommitFile>,
+}
+
+#[derive(Debug)]
+pub struct CommitFile {
+    pub path: RepoPath,
+    pub old_text: Option<String>,
+    pub new_text: Option<String>,
+    pub is_binary: bool,
+}
+
+impl CommitFile {
+    pub fn status(&self) -> CommitFileStatus {
+        match (&self.old_text, &self.new_text) {
+            (None, Some(_)) => CommitFileStatus::Added,
+            (Some(_), None) => CommitFileStatus::Deleted,
+            _ => CommitFileStatus::Modified,
+        }
+    }
+}
+
+fn decode_commit_diff(diff: git::repository::CommitDiff) -> CommitDiff {
+    let files = diff
+        .files
+        .into_iter()
+        .map(|file| {
+            let git::repository::CommitFile {
+                path,
+                old_text,
+                new_text,
+                is_binary,
+            } = file;
+
+            // The git crate already decoded file contents to text and flagged
+            // binary files. The project-side CommitFile mirrors it directly.
+            CommitFile {
+                path,
+                old_text: if is_binary {
+                    old_text.map(|_| String::new())
+                } else {
+                    old_text
+                },
+                new_text: if is_binary {
+                    new_text.map(|_| String::new())
+                } else {
+                    new_text
+                },
+                is_binary,
+            }
+        })
+        .collect();
+    CommitDiff { files }
 }
 
 #[derive(Clone, Debug)]
@@ -2903,11 +2962,22 @@ impl GitStore {
         let Some((repo, path)) = self.repository_and_path_for_buffer_id(buffer_id, cx) else {
             return;
         };
+        let (encoding, has_bom) = self
+            .buffer_store
+            .read(cx)
+            .get(buffer_id)
+            .map(|buffer| {
+                let buffer = buffer.read(cx);
+                (buffer.encoding(), buffer.has_bom())
+            })
+            .unwrap_or((encoding_rs::UTF_8, false));
         let recv = repo.update(cx, |repo, cx| {
             log::debug!("hunks changed for {}", path.as_unix_str());
             repo.spawn_set_index_text_job(
                 path,
                 new_index_text,
+                encoding,
+                has_bom,
                 Some(hunk_staging_operation_count),
                 cx,
             )
@@ -3395,6 +3465,15 @@ impl GitStore {
 
         let message = envelope.payload.message;
 
+        if envelope.payload.staged.unwrap_or(false) {
+            repository_handle
+                .update(&mut cx, |repository_handle, cx| {
+                    repository_handle.stash_staged(message, cx)
+                })
+                .await?;
+            return Ok(proto::Ack {});
+        }
+
         let entries = envelope
             .payload
             .paths
@@ -3532,11 +3611,30 @@ impl GitStore {
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
         let repo_path = RepoPath::from_proto(&envelope.payload.path)?;
 
+        let (encoding, has_bom) = cx.update(|cx| {
+            repository_handle
+                .read(cx)
+                .repo_path_to_project_path(&repo_path, cx)
+                .and_then(|project_path| {
+                    this.read(cx)
+                        .buffer_store
+                        .read(cx)
+                        .get_by_path(&project_path)
+                })
+                .map(|buffer| {
+                    let buffer = buffer.read(cx);
+                    (buffer.encoding(), buffer.has_bom())
+                })
+                .unwrap_or((encoding_rs::UTF_8, false))
+        });
+
         repository_handle
             .update(&mut cx, |repository_handle, cx| {
                 repository_handle.spawn_set_index_text_job(
                     repo_path,
                     envelope.payload.text,
+                    encoding,
+                    has_bom,
                     None,
                     cx,
                 )
@@ -6771,11 +6869,13 @@ impl Repository {
                         {
                             let index_text = (current_index_text.is_some() && !*is_symlink)
                                 .then(|| loaded_revisions.next().flatten())
-                                .flatten();
+                                .flatten()
+                                .and_then(|bytes| decode_git_text(bytes).log_err());
 
                             let head_text = (current_head_text.is_some() && !*is_symlink)
                                 .then(|| loaded_revisions.next().flatten())
-                                .flatten();
+                                .flatten()
+                                .and_then(|bytes| decode_git_text(bytes).log_err());
 
                             let change =
                                 match (current_index_text.as_ref(), current_head_text.as_ref()) {
@@ -7470,9 +7570,10 @@ impl Repository {
         let id = self.id;
         self.send_job("load_commit_diff", None, move |git_repo, cx| async move {
             match git_repo {
-                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    backend.load_commit(commit, cx).await
-                }
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
+                    .load_commit(commit, cx)
+                    .await
+                    .map(decode_commit_diff),
                 RepositoryState::Remote(RemoteRepositoryState {
                     client, project_id, ..
                 }) => {
@@ -7514,7 +7615,8 @@ impl Repository {
             move |git_repo, cx| async move {
                 match git_repo {
                     RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                        backend.load_commit_range(base, target, cx).await
+                        let diff = backend.load_commit_range(base, target, cx).await?;
+                        Ok(decode_commit_diff(diff))
                     }
                     RepositoryState::Remote(RemoteRepositoryState {
                         client, project_id, ..
@@ -8524,6 +8626,27 @@ impl Repository {
         self.stash_entries(to_stash, message, cx)
     }
 
+    pub fn stash_tracked(
+        &mut self,
+        message: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        // `is_created` rather than `is_untracked`, so that staging a new file does not
+        // move it out of the untracked set: `git add` makes it `Tracked { Added }`, but
+        // the panel still lists it under "Untracked" and the user expects it left alone.
+        let to_stash: Vec<_> = self
+            .cached_status()
+            .filter(|entry| !entry.status.is_created())
+            .map(|entry| entry.repo_path)
+            .collect();
+
+        // An empty pathspec would make `git stash push` stash everything.
+        if to_stash.is_empty() {
+            return Task::ready(Ok(()));
+        }
+        self.stash_entries(to_stash, message, cx)
+    }
+
     pub fn stash_entries(
         &mut self,
         entries: Vec<RepoPath>,
@@ -8551,6 +8674,43 @@ impl Repository {
                                         .map(|repo_path| repo_path.as_unix_str().to_owned())
                                         .collect(),
                                     message,
+                                    staged: None,
+                                })
+                                .await?;
+                            Ok(())
+                        }
+                    }
+                })
+            })?
+            .await??;
+            Ok(())
+        })
+    }
+
+    pub fn stash_staged(
+        &mut self,
+        message: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let id = self.id;
+
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, _| {
+                this.send_job("stash_staged", None, move |git_repo, _cx| async move {
+                    match git_repo {
+                        RepositoryState::Local(LocalRepositoryState {
+                            backend,
+                            environment,
+                            ..
+                        }) => backend.stash_staged(message, environment).await,
+                        RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                            client
+                                .request(proto::Stash {
+                                    project_id: project_id.0,
+                                    repository_id: id.to_proto(),
+                                    paths: Vec::new(),
+                                    message,
+                                    staged: Some(true),
                                 })
                                 .await?;
                             Ok(())
@@ -9357,6 +9517,8 @@ impl Repository {
         &mut self,
         path: RepoPath,
         content: Option<String>,
+        encoding: &'static encoding_rs::Encoding,
+        has_bom: bool,
         hunk_staging_operation_count: Option<usize>,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<anyhow::Result<()>> {
@@ -9386,6 +9548,8 @@ impl Repository {
                             Ok(None) => false,
                             Err(_err) => false,
                         };
+                        let content =
+                            content.map(|content| encode_text(content, encoding, has_bom));
                         backend
                             .set_index_text(path.clone(), content, environment.clone(), executable)
                             .await?;
@@ -10733,9 +10897,11 @@ impl Repository {
     ) -> Task<Result<Option<String>>> {
         let rx = self.send_job("load_staged_text", None, move |state, _| async move {
             match state {
-                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    anyhow::Ok(backend.load_index_text(repo_path).await)
-                }
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
+                    .load_index_text(repo_path)
+                    .await
+                    .map(decode_git_text)
+                    .transpose(),
                 RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                     let response = client
                         .request(proto::OpenUnstagedDiff {
@@ -10764,8 +10930,16 @@ impl Repository {
                         format!(":{}", repo_path.as_unix_str()),
                     ];
                     let mut loaded_revisions = backend.load_revisions(revisions).await?.into_iter();
-                    let committed_text = loaded_revisions.next().flatten();
-                    let staged_text = loaded_revisions.next().flatten();
+                    let committed_text = loaded_revisions
+                        .next()
+                        .flatten()
+                        .map(decode_git_text)
+                        .transpose()?;
+                    let staged_text = loaded_revisions
+                        .next()
+                        .flatten()
+                        .map(decode_git_text)
+                        .transpose()?;
                     let diff_bases_change = if committed_text == staged_text {
                         DiffBasesChange::SetBoth(committed_text)
                     } else {
@@ -10851,6 +11025,7 @@ impl Repository {
                                 path.as_ref()
                             )
                         })?;
+                        let content = decode_git_text(content)?;
                         anyhow::Ok((content, blame))
                     }
                     RepositoryState::Remote(RemoteRepositoryState { client, project_id }) => {
@@ -10888,7 +11063,7 @@ impl Repository {
         let rx = self.send_job("load_blob_content", None, move |state, _| async move {
             match state {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    backend.load_blob_content(oid).await
+                    decode_git_text(backend.load_blob_content(oid).await?)
                 }
                 RepositoryState::Remote(RemoteRepositoryState { client, project_id }) => {
                     let response = client
@@ -12197,6 +12372,31 @@ mod tests {
                     mode: ResetMode::Hard,
                 },
             ]
+        );
+    }
+
+    #[gpui::test]
+    fn test_decode_git_text_windows_1251_one_line_change(cx: &mut TestAppContext) {
+        let old_text = "строка один\nстрока два\n";
+        let new_text = "строка один\nстрока три\n";
+        let (old_bytes, _, _) = encoding_rs::WINDOWS_1251.encode(old_text);
+        let (new_bytes, _, _) = encoding_rs::WINDOWS_1251.encode(new_text);
+
+        let decoded_old = decode_git_text(old_bytes.into_owned()).unwrap();
+        let decoded_new = decode_git_text(new_bytes.into_owned()).unwrap();
+        let buffer = cx.new(|cx| Buffer::local(decoded_new, cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+        let diff = cx.new(|cx| BufferDiff::new_with_base_text(&decoded_old, &buffer_snapshot, cx));
+        let diff = diff.update(cx, |diff, cx| diff.snapshot(cx));
+        let hunks = diff.hunks(&buffer_snapshot).collect::<Vec<_>>();
+        let [hunk] = hunks.as_slice() else {
+            panic!("expected one modified hunk, got {hunks:?}");
+        };
+
+        assert_eq!(hunk.range, text::Point::new(1, 0)..text::Point::new(2, 0));
+        assert_eq!(
+            hunk.diff_base_byte_range,
+            old_text.find("строка два").unwrap()..old_text.len()
         );
     }
 

@@ -18,8 +18,7 @@ use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
     repository::{
-        CommitDiff, CommitFile, GitOperationKind, InitialGraphCommitData, LogOrder, LogSource,
-        RepoPath, SearchCommitArgs,
+        GitOperationKind, InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs,
     },
     status::{FileStatus, StatusCode, TrackedStatus},
 };
@@ -38,8 +37,8 @@ use picker::{Picker, PickerDelegate};
 use project::{
     ProjectPath,
     git_store::{
-        CommitDataState, GitGraphEvent, GitStore, GitStoreEvent, GraphDataResponse, Repository,
-        RepositoryEvent, RepositoryId,
+        CommitDataState, CommitDiff, CommitFile, GitGraphEvent, GitStore, GitStoreEvent,
+        GraphDataResponse, Repository, RepositoryEvent, RepositoryId,
     },
 };
 use smallvec::{SmallVec, smallvec};
