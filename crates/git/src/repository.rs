@@ -618,14 +618,14 @@ pub enum CommitFileStatus {
 #[derive(Debug)]
 pub struct CommitFile {
     pub path: RepoPath,
-    pub old_text: Option<String>,
-    pub new_text: Option<String>,
+    pub old_content: Option<Vec<u8>>,
+    pub new_content: Option<Vec<u8>>,
     pub is_binary: bool,
 }
 
 impl CommitFile {
     pub fn status(&self) -> CommitFileStatus {
-        match (&self.old_text, &self.new_text) {
+        match (&self.old_content, &self.new_content) {
             (None, Some(_)) => CommitFileStatus::Added,
             (Some(_), None) => CommitFileStatus::Deleted,
             _ => CommitFileStatus::Modified,
@@ -647,7 +647,7 @@ pub fn is_binary_content(content: &[u8]) -> bool {
 }
 
 struct LoadedCommitObject {
-    text: String,
+    content: Vec<u8>,
     is_binary: bool,
 }
 
@@ -670,11 +670,7 @@ async fn read_commit_blob<R: smol::io::AsyncBufRead + Unpin>(
 
     let is_binary = is_binary_content(&bytes);
     Ok(LoadedCommitObject {
-        text: if is_binary {
-            String::new()
-        } else {
-            String::from_utf8_lossy(&bytes).to_string()
-        },
+        content: bytes,
         is_binary,
     })
 }
@@ -688,7 +684,7 @@ async fn load_commit_object<R: smol::io::AsyncBufRead + Unpin>(
     match object {
         Some(object) if object.kind == CommitDiffObjectKind::Gitlink => {
             Ok(Some(LoadedCommitObject {
-                text: format!("Subproject commit {}\n", object.oid),
+                content: format!("Subproject commit {}\n", object.oid).into_bytes(),
                 is_binary: false,
             }))
         }
@@ -763,25 +759,13 @@ async fn load_commit_diff_from_command(
             load_commit_object(old_object, &mut stdout, &mut info_line, &mut newline).await?;
         let is_binary = new_object.as_ref().is_some_and(|object| object.is_binary)
             || old_object.as_ref().is_some_and(|object| object.is_binary);
-        let new_text = new_object.map(|object| {
-            if is_binary {
-                String::new()
-            } else {
-                object.text
-            }
-        });
-        let old_text = old_object.map(|object| {
-            if is_binary {
-                String::new()
-            } else {
-                object.text
-            }
-        });
+        let new_content = new_object.map(|object| object.content);
+        let old_content = old_object.map(|object| object.content);
 
         files.push(CommitFile {
             path: RepoPath(Arc::from(rel_path)),
-            old_text,
-            new_text,
+            old_content,
+            new_content,
             is_binary,
         });
     }
@@ -6217,8 +6201,11 @@ mod tests {
             .first()
             .expect("type-changed file should be present");
         assert_eq!(file.path.as_unix_str(), "file.txt");
-        assert_eq!(file.old_text.as_deref(), Some("regular contents\n"));
-        assert_eq!(file.new_text.as_deref(), Some("target"));
+        assert_eq!(
+            file.old_content.as_deref(),
+            Some(b"regular contents\n".as_slice())
+        );
+        assert_eq!(file.new_content.as_deref(), Some(b"target".as_slice()));
         assert_eq!(file.status(), CommitFileStatus::Modified);
     }
 
@@ -6267,11 +6254,10 @@ mod tests {
             .find(|file| file.path.as_unix_str() == "modules/example")
             .expect("gitlink should be present alongside the regular file");
         assert_eq!(gitlink.status(), CommitFileStatus::Added);
-        assert_eq!(gitlink.old_text, None);
+        assert_eq!(gitlink.old_content, None);
         assert_eq!(
-            gitlink.new_text.as_deref(),
-            Some("Subproject commit 1111111111111111111111111111111111111111
-")
+            gitlink.new_content.as_deref(),
+            Some(b"Subproject commit 1111111111111111111111111111111111111111\n".as_slice())
         );
         assert!(!gitlink.is_binary);
 
@@ -6296,14 +6282,12 @@ mod tests {
         };
         assert_eq!(gitlink.status(), CommitFileStatus::Modified);
         assert_eq!(
-            gitlink.old_text.as_deref(),
-            Some("Subproject commit 1111111111111111111111111111111111111111
-")
+            gitlink.old_content.as_deref(),
+            Some(b"Subproject commit 1111111111111111111111111111111111111111\n".as_slice())
         );
         assert_eq!(
-            gitlink.new_text.as_deref(),
-            Some("Subproject commit 2222222222222222222222222222222222222222
-")
+            gitlink.new_content.as_deref(),
+            Some(b"Subproject commit 2222222222222222222222222222222222222222\n".as_slice())
         );
         assert!(!gitlink.is_binary);
 
@@ -6319,11 +6303,10 @@ mod tests {
         };
         assert_eq!(gitlink.status(), CommitFileStatus::Deleted);
         assert_eq!(
-            gitlink.old_text.as_deref(),
-            Some("Subproject commit 2222222222222222222222222222222222222222
-")
+            gitlink.old_content.as_deref(),
+            Some(b"Subproject commit 2222222222222222222222222222222222222222\n".as_slice())
         );
-        assert_eq!(gitlink.new_text, None);
+        assert_eq!(gitlink.new_content, None);
         assert!(!gitlink.is_binary);
     }
 

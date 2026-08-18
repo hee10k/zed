@@ -245,25 +245,44 @@ fn decode_commit_diff(diff: git::repository::CommitDiff) -> CommitDiff {
         .map(|file| {
             let git::repository::CommitFile {
                 path,
-                old_text,
-                new_text,
-                is_binary,
+                old_content,
+                new_content,
+                mut is_binary,
             } = file;
 
-            // The git crate already decoded file contents to text and flagged
-            // binary files. The project-side CommitFile mirrors it directly.
+            if is_binary {
+                return CommitFile {
+                    path,
+                    old_text: old_content.map(|_| String::new()),
+                    new_text: new_content.map(|_| String::new()),
+                    is_binary,
+                };
+            }
+
+            let mut decode_content = |content: Option<Vec<u8>>| {
+                content.map(|content| match decode_git_text(content) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        log::debug!(
+                            "treating commit content for {} as binary after decoding failed: {error:#}",
+                            path.as_unix_str()
+                        );
+                        is_binary = true;
+                        String::new()
+                    }
+                })
+            };
+            let mut old_text = decode_content(old_content);
+            let mut new_text = decode_content(new_content);
+            if is_binary {
+                old_text = old_text.map(|_| String::new());
+                new_text = new_text.map(|_| String::new());
+            }
+
             CommitFile {
                 path,
-                old_text: if is_binary {
-                    old_text.map(|_| String::new())
-                } else {
-                    old_text
-                },
-                new_text: if is_binary {
-                    new_text.map(|_| String::new())
-                } else {
-                    new_text
-                },
+                old_text,
+                new_text,
                 is_binary,
             }
         })
