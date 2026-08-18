@@ -413,6 +413,7 @@ fn save_thread_metadata(
             interacted_at,
             worktree_paths,
             archived: false,
+            user_order: None,
             remote_connection,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -449,6 +450,7 @@ fn save_thread_metadata_with_main_paths(
         interacted_at: None,
         worktree_paths: WorktreePaths::from_path_lists(main_worktree_paths, folder_paths).unwrap(),
         archived: false,
+        user_order: None,
         remote_connection: None,
     };
     cx.update(|cx| {
@@ -476,6 +478,7 @@ fn save_draft_metadata_with_main_paths(
         interacted_at: None,
         worktree_paths: WorktreePaths::from_path_lists(main_worktree_paths, folder_paths).unwrap(),
         archived: false,
+        user_order: None,
         remote_connection: None,
     };
     cx.update(|cx| {
@@ -1081,6 +1084,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
                 created_at: Some(Utc::now()),
                 interacted_at: None,
                 archived: false,
+                user_order: None,
                 remote_connection: None,
             },
             icon: IconName::ZedAgent,
@@ -1173,6 +1177,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     created_at: Some(Utc::now()),
                     interacted_at: None,
                     archived: false,
+                    user_order: None,
                     remote_connection: None,
                 },
                 icon: IconName::ZedAgent,
@@ -1200,6 +1205,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     created_at: Some(Utc::now()),
                     interacted_at: None,
                     archived: false,
+                    user_order: None,
                     remote_connection: None,
                 },
                 icon: IconName::ZedAgent,
@@ -1227,6 +1233,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     created_at: Some(Utc::now()),
                     interacted_at: None,
                     archived: false,
+                    user_order: None,
                     remote_connection: None,
                 },
                 icon: IconName::ZedAgent,
@@ -1255,6 +1262,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     created_at: Some(Utc::now()),
                     interacted_at: None,
                     archived: false,
+                    user_order: None,
                     remote_connection: None,
                 },
                 icon: IconName::ZedAgent,
@@ -1283,6 +1291,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     created_at: Some(Utc::now()),
                     interacted_at: None,
                     archived: false,
+                    user_order: None,
                     remote_connection: None,
                 },
                 icon: IconName::ZedAgent,
@@ -1983,6 +1992,11 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        agent_profile: None,
+        resume_path: None,
+        session_boundary: None,
+        restore_on_tab_open: false,
+        user_order: None,
     };
 
     cx.update(|_, cx| {
@@ -3214,6 +3228,11 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        agent_profile: None,
+        resume_path: None,
+        session_boundary: None,
+        restore_on_tab_open: false,
+        user_order: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3321,6 +3340,11 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        agent_profile: None,
+        resume_path: None,
+        session_boundary: None,
+        restore_on_tab_open: false,
+        user_order: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3469,6 +3493,11 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        agent_profile: None,
+        resume_path: None,
+        session_boundary: None,
+        restore_on_tab_open: false,
+        user_order: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -4775,6 +4804,88 @@ async fn test_confirm_on_historical_thread_preserves_historical_timestamp_and_or
             "  Older Historical Thread  <== selected".to_string(),
         ],
         "activating an older historical thread should not reorder it ahead of a newer historical thread"
+    );
+}
+
+#[gpui::test]
+async fn test_user_ordered_threads_sort_before_recency_and_by_order(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let t1 = acp::SessionId::new(Arc::from("ordered-1"));
+    let t2 = acp::SessionId::new(Arc::from("ordered-2"));
+    let t3 = acp::SessionId::new(Arc::from("ordered-3"));
+    let older = chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 6, 1, 0, 0, 0).unwrap();
+    let newer = chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 6, 3, 0, 0, 0).unwrap();
+    let middle = chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 6, 2, 0, 0, 0).unwrap();
+    // Without explicit order the sidebar sorts by recency (newest first).
+    save_thread_metadata(
+        t1.clone(),
+        Some("One".into()),
+        older,
+        Some(older),
+        None,
+        &project,
+        cx,
+    );
+    save_thread_metadata(
+        t2.clone(),
+        Some("Two".into()),
+        middle,
+        Some(middle),
+        None,
+        &project,
+        cx,
+    );
+    save_thread_metadata(
+        t3.clone(),
+        Some("Three".into()),
+        newer,
+        Some(newer),
+        None,
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    // Assign explicit orders out of recency order: t2 top, t3 middle, t1 bottom.
+    cx.update(|_, cx| {
+        let store = ThreadMetadataStore::global(cx);
+        store.update(cx, |store, cx| {
+            for (session, order) in [(t2.clone(), 0.0), (t3.clone(), 1.0), (t1.clone(), 2.0)] {
+                let Some(mut metadata) = store
+                    .entry_by_session(&session)
+                    .cloned()
+                else {
+                    continue;
+                };
+                metadata.user_order = Some(order);
+                store.save(metadata, cx);
+            }
+        });
+    });
+    cx.run_until_parked();
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    let entry_titles: Vec<String> = visible_entries_as_strings(&sidebar, cx)
+        .into_iter()
+        .filter(|entry| ["One", "Two", "Three"].iter().any(|name| entry.contains(name)))
+        .collect();
+    assert_eq!(
+        entry_titles,
+        vec![
+            "  Two".to_string(),
+            "  Three".to_string(),
+            "  One".to_string(),
+        ],
+        "explicitly-ordered entries should sort by their user_order and bypass recency"
     );
 }
 
@@ -7533,6 +7644,7 @@ async fn test_sidebar_keeps_multi_root_thread_with_stale_main_paths(cx: &mut Tes
                     interacted_at: None,
                     worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
                     archived: false,
+                    user_order: None,
                     remote_connection: None,
                 },
                 cx,
@@ -7616,6 +7728,7 @@ async fn test_activate_archived_thread_with_saved_paths_activates_matching_works
                     "/project-b",
                 )])),
                 archived: false,
+                user_order: None,
                 remote_connection: None,
             },
             window,
@@ -7686,6 +7799,7 @@ async fn test_activate_archived_thread_cwd_fallback_with_matching_workspace(
                     std::path::PathBuf::from("/project-b"),
                 ])),
                 archived: false,
+                user_order: None,
                 remote_connection: None,
             },
             window,
@@ -7752,6 +7866,7 @@ async fn test_activate_archived_thread_no_paths_no_cwd_uses_active_workspace(
                 interacted_at: None,
                 worktree_paths: WorktreePaths::default(),
                 archived: false,
+                user_order: None,
                 remote_connection: None,
             },
             window,
@@ -7810,6 +7925,7 @@ async fn test_activate_archived_thread_saved_paths_opens_new_workspace(cx: &mut 
                 interacted_at: None,
                 worktree_paths: WorktreePaths::from_folder_paths(&path_list_b),
                 archived: false,
+                user_order: None,
                 remote_connection: None,
             },
             window,
@@ -7869,6 +7985,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window(cx: &m
                     "/project-b",
                 )])),
                 archived: false,
+                user_order: None,
                 remote_connection: None,
             },
             window,
@@ -7948,6 +8065,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window_with_t
             "/project-b",
         )])),
         archived: false,
+        user_order: None,
         remote_connection: None,
     };
     seed_thread_metadata(metadata.clone(), cx_a);
@@ -8031,6 +8149,7 @@ async fn test_activate_archived_thread_prefers_current_window_for_matching_paths
             "/project-a",
         )])),
         archived: false,
+        user_order: None,
         remote_connection: None,
     };
     seed_thread_metadata(metadata.clone(), cx_a);
@@ -8361,6 +8480,7 @@ async fn test_archive_last_worktree_thread_removes_workspace(cx: &mut TestAppCon
                 "/remote/project",
             )])),
             archived: false,
+            user_order: None,
             remote_connection: Some(remote_host),
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -9015,6 +9135,7 @@ async fn test_archive_last_worktree_thread_not_blocked_by_remote_thread_at_same_
                 "/wt-feature-a",
             )])),
             archived: false,
+            user_order: None,
             remote_connection: Some(remote_host),
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -9828,6 +9949,7 @@ async fn test_unarchive_first_thread_in_group_does_not_create_spurious_draft(
                     interacted_at: None,
                     worktree_paths: WorktreePaths::from_folder_paths(&path_list_b),
                     archived: true,
+                    user_order: None,
                     remote_connection: None,
                 },
                 cx,
@@ -9922,6 +10044,7 @@ async fn test_unarchive_into_new_workspace_does_not_create_duplicate_real_thread
                     interacted_at: None,
                     worktree_paths: WorktreePaths::from_folder_paths(&path_list_b),
                     archived: true,
+                    user_order: None,
                     remote_connection: None,
                 },
                 cx,
@@ -10151,6 +10274,7 @@ async fn test_unarchive_into_inactive_existing_workspace_does_not_leave_active_d
                         PathBuf::from("/project-b"),
                     ])),
                     archived: true,
+                    user_order: None,
                     remote_connection: None,
                 },
                 cx,
@@ -11004,6 +11128,7 @@ async fn test_unarchive_linked_worktree_thread_into_project_group_shows_only_res
                     )
                     .expect("main and folder paths should be well-formed"),
                     archived: true,
+                    user_order: None,
                     remote_connection: None,
                 },
                 cx,
@@ -11553,6 +11678,7 @@ async fn test_legacy_thread_with_canonical_path_opens_main_repo_workspace(cx: &m
                 "/project",
             )])),
             archived: false,
+            user_order: None,
             remote_connection: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -12541,6 +12667,7 @@ mod property_test {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_path_lists(main_worktree_paths, path_list).unwrap(),
             archived: false,
+            user_order: None,
             remote_connection: None,
         };
         cx.update(|_, cx| {
@@ -12614,6 +12741,7 @@ mod property_test {
                         interacted_at: None,
                         worktree_paths: project.read(cx).worktree_paths(cx),
                         archived: false,
+                        user_order: None,
                         remote_connection: project.read(cx).remote_connection_options(cx),
                     });
                     cx.update(|_, cx| {
@@ -13482,6 +13610,7 @@ async fn test_remote_project_integration_does_not_briefly_render_as_separate_pro
             )
             .unwrap(),
             archived: false,
+            user_order: None,
             remote_connection,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -14447,6 +14576,7 @@ async fn test_remote_archive_thread_with_active_connection(
             )
             .unwrap(),
             archived: false,
+            user_order: None,
             remote_connection,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -14588,6 +14718,7 @@ async fn test_remote_linked_worktree_workspace_to_remove_uses_remote_connection(
             )
             .unwrap(),
             archived: false,
+            user_order: None,
             remote_connection: Some(remote_connection.clone()),
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));

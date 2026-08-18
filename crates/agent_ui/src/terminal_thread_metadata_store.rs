@@ -87,6 +87,9 @@ pub struct TerminalThreadMetadata {
     /// When true, a sleeping session was slept manually and must only resume
     /// when its tab is opened (restore-on-tab-open), never on activation.
     pub restore_on_tab_open: bool,
+    /// User-assigned sidebar position (fractional midpoint) within its project
+    /// group. `None` means fall back to recency sorting.
+    pub user_order: Option<f64>,
 }
 
 impl TerminalThreadMetadata {
@@ -125,6 +128,49 @@ pub(crate) fn terminal_title_without_prefix(title: &str) -> &str {
     terminal_title_prefix(title)
         .map(|prefix| &title[prefix.len()..])
         .unwrap_or(title)
+}
+
+/// Deterministic status of a terminal-backed agent session, shown as a
+/// monotone badge on the terminal row. `WaitingForUserInput` is derived by
+/// debounced model inference (ADR 0005) and is not computed deterministically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TerminalAgentStatus {
+    #[default]
+    Idle,
+    Running,
+    WaitingForUserInput,
+    Completed,
+}
+
+impl TerminalAgentStatus {
+    /// Derives the status from the persisted session-boundary state and the
+    /// live terminal title. A live session whose title carries a busy prefix
+    /// (e.g. a braille spinner) is Running; an ended session is Completed;
+    /// otherwise Idle.
+    pub fn derive(session_boundary: Option<AgentSessionBoundary>, title: &str) -> Self {
+        match session_boundary {
+            Some(AgentSessionBoundary::Sleeping) | Some(AgentSessionBoundary::Cleared) => {
+                Self::Completed
+            }
+            _ => {
+                if terminal_title_prefix(title).is_some() {
+                    Self::Running
+                } else {
+                    Self::Idle
+                }
+            }
+        }
+    }
+
+    /// Applies a cached model-inference result: an Idle deterministic status
+    /// with a positive inference becomes `WaitingForUserInput`. Any other
+    /// combination is unchanged (Running/Completed never regress).
+    pub fn with_inferred_waiting(self, inferred_waiting: bool) -> Self {
+        match self {
+            Self::Idle if inferred_waiting => Self::WaitingForUserInput,
+            other => other,
+        }
+    }
 }
 
 pub fn terminal_title_prefix(title: &str) -> Option<&str> {
@@ -495,8 +541,9 @@ impl Domain for TerminalThreadMetadataDb {
     ),
     sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN agent_profile TEXT),
     sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN resume_path TEXT),
-    sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN session_boundary TEXT),
-    sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN restore_on_tab_open INTEGER NOT NULL DEFAULT 0)];
+sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN session_boundary TEXT),
+    sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN restore_on_tab_open INTEGER NOT NULL DEFAULT 0),
+    sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN user_order REAL)];
 }
 
 db::static_connection!(TerminalThreadMetadataDb, []);
@@ -507,7 +554,7 @@ impl TerminalThreadMetadataDb {
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
             main_worktree_paths_order, remote_connection, agent_profile, resume_path, \
-            session_boundary, restore_on_tab_open \
+            session_boundary, restore_on_tab_open, user_order \
             FROM sidebar_terminal_threads \
             ORDER BY created_at DESC",
         )?()
@@ -558,10 +605,11 @@ impl TerminalThreadMetadataDb {
             .transpose()
             .context("serialize terminal session boundary")?;
         let restore_on_tab_open = row.restore_on_tab_open;
+        let user_order = row.user_order;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, agent_profile, resume_path, session_boundary, restore_on_tab_open) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, agent_profile, resume_path, session_boundary, restore_on_tab_open, user_order) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -575,7 +623,8 @@ impl TerminalThreadMetadataDb {
                            agent_profile = excluded.agent_profile, \
                            resume_path = excluded.resume_path, \
                            session_boundary = excluded.session_boundary, \
-                           restore_on_tab_open = excluded.restore_on_tab_open";
+                           restore_on_tab_open = excluded.restore_on_tab_open, \
+                           user_order = excluded.user_order";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -590,7 +639,8 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&agent_profile, i)?;
             i = stmt.bind(&resume_path, i)?;
             i = stmt.bind(&session_boundary, i)?;
-            stmt.bind(&restore_on_tab_open, i)?;
+            i = stmt.bind(&restore_on_tab_open, i)?;
+            stmt.bind(&user_order, i)?;
             stmt.exec()
         })
         .await
@@ -630,6 +680,7 @@ impl Column for TerminalThreadMetadata {
         let (resume_path_str, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (session_boundary_json, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (restore_on_tab_open, next): (bool, i32) = Column::column(statement, next)?;
+        let (user_order, next): (Option<f64>, i32) = Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -683,6 +734,7 @@ impl Column for TerminalThreadMetadata {
                 resume_path: resume_path_str.map(PathBuf::from),
                 session_boundary,
                 restore_on_tab_open,
+                user_order,
             },
             next,
         ))
@@ -716,7 +768,62 @@ mod tests {
             resume_path: None,
             session_boundary: None,
             restore_on_tab_open: false,
+            user_order: None,
         }
+    }
+
+    #[test]
+    fn test_terminal_agent_status_with_inferred_waiting() {
+        // A positive inference promotes Idle to WaitingForUserInput.
+        assert_eq!(
+            TerminalAgentStatus::Idle.with_inferred_waiting(true),
+            TerminalAgentStatus::WaitingForUserInput
+        );
+        // A negative (or absent) inference leaves Idle alone.
+        assert_eq!(
+            TerminalAgentStatus::Idle.with_inferred_waiting(false),
+            TerminalAgentStatus::Idle
+        );
+        // Deterministic states never regress, even with a positive inference.
+        assert_eq!(
+            TerminalAgentStatus::Running.with_inferred_waiting(true),
+            TerminalAgentStatus::Running
+        );
+        assert_eq!(
+            TerminalAgentStatus::Completed.with_inferred_waiting(true),
+            TerminalAgentStatus::Completed
+        );
+    }
+
+    #[test]
+    fn test_terminal_agent_status_derivation() {
+        // Live session with a busy (spinner) prefix is Running.
+        assert_eq!(
+            TerminalAgentStatus::derive(None, "⠋ Thinking"),
+            TerminalAgentStatus::Running
+        );
+        assert_eq!(
+            TerminalAgentStatus::derive(Some(AgentSessionBoundary::Live), "⠙ Planning"),
+            TerminalAgentStatus::Running
+        );
+        // Live session with a stable title is Idle.
+        assert_eq!(
+            TerminalAgentStatus::derive(Some(AgentSessionBoundary::Live), "Dev Server"),
+            TerminalAgentStatus::Idle
+        );
+        assert_eq!(
+            TerminalAgentStatus::derive(None, "Shell"),
+            TerminalAgentStatus::Idle
+        );
+        // Ended sessions are Completed regardless of title.
+        assert_eq!(
+            TerminalAgentStatus::derive(Some(AgentSessionBoundary::Sleeping), "⠋ Thinking"),
+            TerminalAgentStatus::Completed
+        );
+        assert_eq!(
+            TerminalAgentStatus::derive(Some(AgentSessionBoundary::Cleared), "Dev Server"),
+            TerminalAgentStatus::Completed
+        );
     }
 
     #[test]
@@ -848,5 +955,59 @@ mod tests {
             !rows.into_iter().any(|row| row.terminal_id == terminal_id),
             "deleted terminal should no longer be listed"
         );
+    }
+
+    #[gpui::test]
+    async fn test_user_order_round_trips_through_db(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let db = cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            store.read(cx).db.clone()
+        });
+
+        let mut first = metadata("First", WorktreePaths::default());
+        let mut second = metadata("Second", WorktreePaths::default());
+        first.user_order = Some(0.0);
+        second.user_order = Some(1.5);
+        let first_id = first.terminal_id;
+        let second_id = second.terminal_id;
+
+        db.save(first).await.unwrap();
+        db.save(second).await.unwrap();
+
+        let rows = db.list().unwrap();
+        let first_row = rows
+            .iter()
+            .find(|row| row.terminal_id == first_id)
+            .expect("first terminal should be listed");
+        let second_row = rows
+            .iter()
+            .find(|row| row.terminal_id == second_id)
+            .expect("second terminal should be listed");
+        assert_eq!(first_row.user_order, Some(0.0));
+        assert_eq!(second_row.user_order, Some(1.5));
+
+        // Updating only the order (dropping a row at a new position) preserves
+        // the other fields through the upsert.
+        db.save(
+            rows.into_iter()
+                .find(|row| row.terminal_id == second_id)
+                .map(|mut row| {
+                    row.user_order = Some(3.0);
+                    row
+                })
+                .expect("second terminal re-saved"),
+        )
+        .await
+        .unwrap();
+
+        let rows = db.list().unwrap();
+        let second_row = rows
+            .into_iter()
+            .find(|row| row.terminal_id == second_id)
+            .expect("second terminal should be listed after re-save");
+        assert_eq!(second_row.user_order, Some(3.0));
+        assert_eq!(second_row.title.as_ref(), "Second");
     }
 }

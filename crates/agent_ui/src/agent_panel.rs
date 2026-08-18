@@ -43,7 +43,7 @@ use crate::terminal_agent_resume::{
     select_sessions_to_resume, session_claim_key, SleepingSessionRecord,
 };
 use crate::terminal_thread_metadata_store::{
-    AgentSessionBoundary, TerminalAgentProfile, TerminalThreadMetadata,
+    AgentSessionBoundary, TerminalAgentProfile, TerminalAgentStatus, TerminalThreadMetadata,
     TerminalThreadMetadataStore, compose_terminal_thread_title, terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
@@ -52,10 +52,11 @@ use crate::{
     NewNativeAgentThreadFromSummary,
 };
 use crate::{
-    AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
-    NewOmpAgentTerminal, NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff,
-    ResetFastModeWarnings, ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata,
-    ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
+    AgentDiffPane, CleanUpOrphans, ConversationView, CopyThreadToClipboard, Follow,
+    LoadThreadFromClipboard, NewOmpAgentTerminal, NewTerminalThread, NewThread,
+    OpenActiveThreadAsMarkdown, OpenAgentDiff, ResetFastModeWarnings, ResetTrialEndUpsell,
+    ResetTrialUpsell, ShowAllSidebarThreadMetadata, ShowThreadMetadata, ToggleNewThreadMenu,
+    ToggleOptionsMenu,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
@@ -77,20 +78,23 @@ use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
-    Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
-    Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
+    Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncApp, AsyncWindowContext,
+    ClipboardItem, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
     PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
     pulsating_between,
 };
 use language::LanguageRegistry;
-use language_model::LanguageModelRegistry;
+use language_model::{
+    LanguageModel, LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelToolChoice, Role,
+};
 use notifications::status_toast::StatusToast;
 use project::{Project, ProjectPath, Worktree};
 use settings::TerminalDockPosition;
 use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
-use terminal::{Event as TerminalEvent, terminal_settings::TerminalSettings};
+use terminal::{Event as TerminalEvent, orphan_cleanup::CapturedOrphan, terminal_settings::TerminalSettings};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
@@ -113,6 +117,9 @@ const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Interval between background orphan-reaping passes. Kept slow because each
+/// pass walks the full system process table.
+const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// Shown when a sleeping OMP session cannot be resumed because no usable resume
 /// locator is available. A plain shell is left instead; no fresh agent session
 /// is silently launched.
@@ -201,6 +208,8 @@ pub struct AgentPanelTerminalInfo {
     pub has_notification: bool,
     pub custom_title: Option<SharedString>,
     pub working_directory: Option<PathBuf>,
+    /// Deterministic agent-session status shown as a badge on the terminal row.
+    pub status: TerminalAgentStatus,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -555,6 +564,11 @@ pub fn init(cx: &mut App) {
                                 cx,
                             );
                         });
+                    }
+                })
+                .register_action(|workspace, _: &CleanUpOrphans, _window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| panel.reap_pending_orphans(cx));
                     }
                 })
                 .register_action(|workspace, action: &ReviewBranchDiff, window, cx| {
@@ -1226,6 +1240,16 @@ pub struct AgentPanel {
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
+    /// Descendant processes captured when a terminal closed, awaiting a sweep
+    /// to reap those still alive (verified against their capture-time start).
+    pending_orphans: Vec<CapturedOrphan>,
+    /// Debounced model-inference results distinguishing `Idle` from
+    /// `WaitingForUserInput` per terminal (ADR 0005). Cleared whenever a
+    /// deterministic transition (Running / Completed) or explicit close
+    /// happens; unused while a terminal is deterministically non-Idle.
+    inferred_terminal_waiting: HashMap<TerminalId, bool>,
+    /// In-flight debounced inference tasks keyed by terminal.
+    _terminal_inference_tasks: HashMap<TerminalId, Task<()>>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_panel_menu_handle: PopoverMenuHandle<ContextMenu>,
     _extension_subscription: Option<Subscription>,
@@ -1611,12 +1635,26 @@ impl AgentPanel {
         let _project_subscription =
             cx.subscribe(&project, |this, _project, event, cx| match event {
                 project::Event::WorktreeAdded(_)
-                | project::Event::WorktreeRemoved(_)
                 | project::Event::WorktreeOrderChanged
                 | project::Event::WorktreePathsChanged { .. } => {
                     this.ensure_native_agent_connection(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
+                    cx.notify();
+                }
+                project::Event::WorktreeRemoved(_) => {
+                    this.ensure_native_agent_connection(cx);
+                    this.update_thread_work_dirs(cx);
+                    this.persist_all_terminal_metadata(cx);
+                    // A closed worktree orphans the agent subprocesses still
+                    // running under it. Capture every active terminal's
+                    // descendants (never the shell root itself) so the sweep
+                    // can reap survivors. Safe: descendants are re-verified
+                    // by start time before killing.
+                    let terminal_ids = this.terminals.keys().copied().collect::<Vec<_>>();
+                    for terminal_id in terminal_ids {
+                        this.capture_terminal_orphans(terminal_id, cx);
+                    }
                     cx.notify();
                 }
                 _ => {}
@@ -1638,6 +1676,16 @@ impl AgentPanel {
         })
         .detach();
 
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(ORPHAN_SWEEP_INTERVAL).await;
+                if this.update(cx, |this, cx| this.reap_pending_orphans(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         let panel = Self {
             workspace_id,
             base_view,
@@ -1654,6 +1702,9 @@ impl AgentPanel {
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
+            pending_orphans: Vec::new(),
+            inferred_terminal_waiting: HashMap::default(),
+            _terminal_inference_tasks: HashMap::default(),
             new_thread_menu_handle: PopoverMenuHandle::default(),
             agent_panel_menu_handle: PopoverMenuHandle::default(),
 
@@ -2370,6 +2421,9 @@ impl AgentPanel {
                 | TerminalEvent::BreadcrumbsChanged => {
                     this.refresh_terminal_metadata(terminal_id, cx);
                     this.report_terminal_program(terminal_id, source, cx);
+                    // Debounced Idle-vs-waiting inference; cleared by
+                    // deterministic transitions elsewhere.
+                    this.schedule_terminal_status_inference(terminal_id, cx);
                 }
                 TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
                 TerminalEvent::ProcessExited => {
@@ -2550,6 +2604,11 @@ impl AgentPanel {
         // Capture revival metadata before removing the terminal so an explicit
         // close can clear the session's sleeping record.
         let metadata = self.terminal_metadata(terminal_id, cx);
+        // Capture the terminal's live descendant tree before it is dropped;
+        // once the terminal handle is gone its process is no longer reachable.
+        self.capture_terminal_orphans(terminal_id, cx);
+        // The terminal is closing: no badge, no pending inference.
+        self.clear_terminal_inferred_status(terminal_id);
         if self.terminals.remove(&terminal_id).is_none() {
             return;
         }
@@ -2592,6 +2651,52 @@ impl AgentPanel {
         }
     }
 
+    /// Captures the live descendant tree of a terminal's shell/agent process,
+    /// recording each descendant's PID plus its start time. Called while the
+    /// terminal is still in `self.terminals` so `Terminal::pid()` is reachable.
+    fn capture_terminal_orphans(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        let Some(AgentTerminal { view, .. }) = self.terminals.get(&terminal_id) else {
+            return;
+        };
+        let Some(pid) = view.read(cx).terminal().read(cx).pid() else {
+            return;
+        };
+        // The descendant walk takes a full process-table snapshot; run it off
+        // the UI thread. The pid was read while the terminal was still alive,
+        // and reaping re-verifies identity by start time anyway.
+        cx.spawn(async move |this, cx| {
+            let captured = cx.background_spawn(async move {
+                terminal::orphan_cleanup::capture_descendants(pid)
+            });
+            let captured = captured.await;
+            this.update(cx, |this, _cx| {
+                if !captured.is_empty() {
+                    this.pending_orphans.extend(captured);
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    /// Reaps pending orphans that are still alive *and* still match their
+    /// capture-time start time, then discards the captured set (any process
+    /// not reaped is either already gone or its PID was recycled — either way
+    /// it must not be retried as-is). Runs on a background executor.
+    pub fn reap_pending_orphans(&mut self, cx: &mut Context<Self>) {
+        if self.pending_orphans.is_empty() {
+            return;
+        }
+        let captured = std::mem::take(&mut self.pending_orphans);
+        cx.background_spawn(async move {
+            let reaped = terminal::orphan_cleanup::reap_orphans(&captured);
+            if reaped > 0 {
+                log::debug!("reaped {reaped} orphaned terminal descendant processes");
+            }
+        })
+        .detach();
+    }
+
     fn emit_terminal_thread_started(
         &self,
         terminal_id: TerminalId,
@@ -2612,6 +2717,16 @@ impl AgentPanel {
         if let Some(terminal) = self.terminals.get_mut(&terminal_id)
             && terminal.refresh_metadata(cx)
         {
+            // A deterministic transition away from Idle (spinner started →
+            // Running; session ended → Completed) invalidates any cached
+            // model inference for wait-vs-idle.
+            let deterministic = TerminalAgentStatus::derive(
+                terminal.session_boundary,
+                terminal.title(cx).as_ref(),
+            );
+            if !matches!(deterministic, TerminalAgentStatus::Idle) {
+                self.clear_terminal_inferred_status(terminal_id);
+            }
             self.persist_terminal_metadata(terminal_id, cx);
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
@@ -2648,6 +2763,133 @@ impl AgentPanel {
         });
     }
 
+    /// Re-derives a terminal's title from its live terminal view and commits
+    /// it to the metadata store, so a stale title (e.g. a spinner prefix that
+    /// never got cleared) is replaced with the current shell/breadcrumb title.
+    /// Returns false when the terminal is not live in this panel.
+    pub fn refresh_terminal_title(
+        &mut self,
+        terminal_id: TerminalId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+        terminal.refresh_metadata(cx);
+        self.persist_terminal_metadata(terminal_id, cx);
+        cx.notify();
+        true
+    }
+
+    const TERMINAL_STATUS_INFERENCE_DEBOUNCE: Duration = Duration::from_secs(3);
+
+    /// Schedules (or reschedules) a debounced model inference for a terminal,
+    /// distinguishing `Idle` from `WaitingForUserInput`. Only runs while the
+    /// terminal is deterministically Idle and no cached inference exists.
+    /// The cache is cleared on deterministic transitions by callers.
+    fn schedule_terminal_status_inference(
+        &mut self,
+        terminal_id: TerminalId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inferred_terminal_waiting.contains_key(&terminal_id) {
+            return;
+        }
+        let Some(AgentTerminal { view, .. }) = self.terminals.get(&terminal_id) else {
+            return;
+        };
+        let title = view.read(cx).terminal().read(cx).title(false);
+        let session_boundary = self
+            .terminal_metadata(terminal_id, cx)
+            .and_then(|m| m.session_boundary);
+        // Deterministic Running (busy title prefix, e.g. a spinner) or
+        // Completed (ended session) needs no inference.
+        if !matches!(
+            TerminalAgentStatus::derive(session_boundary, &title),
+            TerminalAgentStatus::Idle
+        ) {
+            return;
+        }
+
+        let terminal_entity = view.read(cx).terminal().clone();
+        // Resolve the model up front (needs an `App` read); the task awaits at
+        // least the debounce before calling it, so the model handle is cheap.
+        let model = LanguageModelRegistry::global(cx)
+            .read(cx)
+            .available_models(cx)
+            .next();
+        self._terminal_inference_tasks
+            .insert(terminal_id, cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Self::TERMINAL_STATUS_INFERENCE_DEBOUNCE)
+                    .await;
+                let content = terminal_entity.read_with(cx, |terminal, _| {
+                    terminal.get_content()
+                });
+                let waiting = match &model {
+                    Some(model) => {
+                        Self::infer_terminal_waiting(model, content, cx).await
+                    }
+                    None => false,
+                };
+                this.update(cx, |this, cx| {
+                    this.inferred_terminal_waiting.insert(terminal_id, waiting);
+                    this._terminal_inference_tasks.remove(&terminal_id);
+                    cx.notify();
+                })
+                .log_err();
+            }));
+    }
+
+    /// Asks the given language model whether the terminal content indicates an
+    /// agent waiting for user input. Answers `true` only for an explicit YES;
+    /// anything else (including model failure) conservatively reports Idle so
+    /// a pricey/uncertain call never fakes a waiting state.
+    async fn infer_terminal_waiting(
+        model: &Arc<dyn LanguageModel>,
+        content: String,
+        cx: &mut AsyncApp,
+    ) -> bool {
+        let prompt = format!(
+            "Look at the last lines of an AI coding agent's terminal output.\n\
+             Is the agent currently waiting for the user to type or reply?\n\
+             Answer with exactly YES or NO.\n\n\
+             TERMINAL OUTPUT:\n{}",
+            content.chars().take(4000).collect::<String>()
+        );
+        let request = LanguageModelRequest {
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![prompt.into()],
+                cache: false,
+                reasoning_details: None,
+            }],
+            tool_choice: Some(LanguageModelToolChoice::None),
+            tools: Vec::new(),
+            ..Default::default()
+        };
+        let Ok(response) = model.stream_completion_text(request, cx).await else {
+            return false;
+        };
+        let mut chunks = response.stream;
+        let mut text = String::new();
+        use futures::StreamExt as _;
+        while let Some(chunk) = chunks.next().await {
+            match chunk {
+                Ok(chunk) => text.push_str(&chunk),
+                Err(_) => return false,
+            }
+        }
+        text.trim().eq_ignore_ascii_case("yes")
+    }
+
+    /// Clears the inferred waiting state for a terminal (on any deterministic
+    /// transition or close). The badge falls back to the deterministic state.
+    fn clear_terminal_inferred_status(&mut self, terminal_id: TerminalId) {
+        self.inferred_terminal_waiting.remove(&terminal_id);
+        self._terminal_inference_tasks.remove(&terminal_id);
+    }
+
     fn terminal_metadata(
         &self,
         terminal_id: TerminalId,
@@ -2655,6 +2897,9 @@ impl AgentPanel {
     ) -> Option<TerminalThreadMetadata> {
         let terminal = self.terminals.get(&terminal_id)?;
         let project = self.project.read(cx);
+        let stored_user_order = TerminalThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry(terminal_id).cloned())
+            .and_then(|metadata| metadata.user_order);
         Some(TerminalThreadMetadata {
             terminal_id,
             title: terminal.terminal_title(cx),
@@ -2667,6 +2912,7 @@ impl AgentPanel {
             resume_path: terminal.resume_path.clone(),
             session_boundary: terminal.session_boundary,
             restore_on_tab_open: terminal.restore_on_tab_open,
+            user_order: stored_user_order,
         })
     }
 
@@ -2701,6 +2947,9 @@ impl AgentPanel {
             terminal.session_boundary = Some(AgentSessionBoundary::Sleeping);
             terminal.restore_on_tab_open = restore_on_tab_open;
         }
+        // The session has ended (deterministic Completed); drop any inferred
+        // waiting state so the badge reflects the boundary.
+        self.clear_terminal_inferred_status(terminal_id);
         self.persist_terminal_metadata(terminal_id, cx);
         cx.notify();
     }
@@ -3919,13 +4168,21 @@ impl AgentPanel {
     pub fn terminals(&self, cx: &App) -> Vec<AgentPanelTerminalInfo> {
         self.terminals
             .iter()
-            .map(|(id, terminal)| AgentPanelTerminalInfo {
-                id: *id,
-                title: terminal.title(cx),
-                created_at: terminal.created_at,
-                has_notification: terminal.has_notification,
-                custom_title: terminal.custom_title(cx),
-                working_directory: terminal.working_directory.clone(),
+            .map(|(id, terminal)| {
+                let status = TerminalAgentStatus::derive(
+                    terminal.session_boundary,
+                    terminal.title(cx).as_ref(),
+                )
+                .with_inferred_waiting(self.inferred_terminal_waiting.get(id) == Some(&true));
+                AgentPanelTerminalInfo {
+                    id: *id,
+                    title: terminal.title(cx),
+                    created_at: terminal.created_at,
+                    has_notification: terminal.has_notification,
+                    custom_title: terminal.custom_title(cx),
+                    working_directory: terminal.working_directory.clone(),
+                    status,
+                }
             })
             .collect()
     }
@@ -8295,6 +8552,7 @@ mod tests {
             resume_path: None,
             session_boundary: None,
             restore_on_tab_open: false,
+            user_order: None,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -8383,6 +8641,7 @@ mod tests {
             resume_path: None,
             session_boundary: None,
             restore_on_tab_open: false,
+            user_order: None,
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -8750,6 +9009,7 @@ mod tests {
             resume_path: None,
             session_boundary: Some(AgentSessionBoundary::Sleeping),
             restore_on_tab_open: false,
+            user_order: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -8854,6 +9114,7 @@ mod tests {
                 resume_path: Some(resume_path.clone()),
                 session_boundary: Some(AgentSessionBoundary::Sleeping),
                 restore_on_tab_open: false,
+                user_order: None,
             }
         };
         let older = build_record(older_id, now - chrono::Duration::minutes(5));
@@ -9085,6 +9346,7 @@ mod tests {
             resume_path: Some(resume_path.clone()),
             session_boundary: Some(AgentSessionBoundary::Sleeping),
             restore_on_tab_open: false,
+            user_order: None,
         };
         cx.update(|_, cx| {
             let store = TerminalThreadMetadataStore::global(cx);
@@ -9437,6 +9699,7 @@ mod tests {
             resume_path: None,
             session_boundary: None,
             restore_on_tab_open: false,
+            user_order: None,
         };
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -9655,6 +9918,7 @@ mod tests {
                         worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
                         remote_connection: None,
                         archived: false,
+                        user_order: None,
                     },
                     cx,
                 );
@@ -11406,6 +11670,7 @@ mod tests {
             resume_path: None,
             session_boundary: None,
             restore_on_tab_open: false,
+            user_order: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -11461,6 +11726,7 @@ mod tests {
             resume_path: None,
             session_boundary: None,
             restore_on_tab_open: false,
+            user_order: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {

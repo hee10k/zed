@@ -232,6 +232,8 @@ actions!(
         RemoveSelectedThread,
         /// Renames the currently selected thread.
         RenameSelectedThread,
+        /// Terminates any orphaned descendant processes of closed agent terminals.
+        CleanUpOrphans,
         /// Starts a chat conversation with follow-up enabled.
         ChatWithFollow,
         /// Cycles to the next inline assist suggestion.

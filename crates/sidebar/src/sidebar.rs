@@ -6,7 +6,7 @@ use agent::{ThreadStore, ZED_AGENT_ID};
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentSettings;
 use agent_ui::terminal_thread_metadata_store::{
-    TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
+    TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
 use agent_ui::thread_metadata_store::{
     ThreadMetadata, ThreadMetadataStore, WorktreePaths, worktree_info_from_thread_paths,
@@ -369,6 +369,7 @@ struct TerminalEntry {
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
+    status: TerminalAgentStatus,
     highlight_positions: Vec<usize>,
 }
 
@@ -481,6 +482,45 @@ struct SidebarContents {
     notified_terminals: HashSet<TerminalId>,
     project_header_indices: Vec<usize>,
     has_open_projects: bool,
+}
+
+/// Payload carried on a drag of a sidebar row, used to reorder entries within
+/// a project group. Retains the entry identity plus its group so a drop into
+/// another group is ignored.
+#[derive(Clone, Debug)]
+enum DraggedSidebarEntry {
+    Thread {
+        thread_id: ThreadId,
+        project_group_key: ProjectGroupKey,
+    },
+    Terminal {
+        terminal_id: TerminalId,
+        project_group_key: ProjectGroupKey,
+    },
+}
+
+impl DraggedSidebarEntry {
+    fn project_group_key(&self) -> &ProjectGroupKey {
+        match self {
+            Self::Thread {
+                project_group_key, ..
+            }
+            | Self::Terminal {
+                project_group_key, ..
+            } => project_group_key,
+        }
+    }
+}
+
+/// Ghost preview shown while dragging a sidebar row.
+struct DraggedSidebarEntryView {
+    title: SharedString,
+}
+
+impl Render for DraggedSidebarEntryView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        ui::Label::new(self.title.clone()).into_any_element()
+    }
 }
 
 /// Identity-and-layout key for a [`ListEntry`] used to preserve measured list items
@@ -1469,15 +1509,15 @@ impl Sidebar {
 
         let groups = mw.project_groups(cx);
         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        let mut live_terminal_statuses: HashMap<TerminalId, TerminalAgentStatus> = HashMap::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                live_notified_terminal_ids.extend(
-                    agent_panel
-                        .read(cx)
-                        .terminals(cx)
-                        .into_iter()
-                        .filter_map(|terminal| terminal.has_notification.then_some(terminal.id)),
-                );
+                for terminal in agent_panel.read(cx).terminals(cx) {
+                    if terminal.has_notification {
+                        live_notified_terminal_ids.insert(terminal.id);
+                    }
+                    live_terminal_statuses.insert(terminal.id, terminal.status);
+                }
             }
         }
 
@@ -1542,6 +1582,15 @@ impl Sidebar {
                     let has_notification =
                         live_notified_terminal_ids.contains(&metadata.terminal_id);
                     TerminalEntry {
+                        status: live_terminal_statuses
+                            .get(&metadata.terminal_id)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                TerminalAgentStatus::derive(
+                                    metadata.session_boundary,
+                                    metadata.display_title().as_ref(),
+                                )
+                            }),
                         metadata,
                         workspace,
                         worktrees,
@@ -2298,6 +2347,66 @@ impl Sidebar {
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
+        };
+
+        // Wrap re-orderable rows (threads/terminals) so they can be dragged to
+        // reposition within their project group.
+        let dragged_payload = match entry {
+            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Thread(thread) => {
+                let project_group_key = self.entry_project_group_key(&thread.workspace, cx);
+                Some(DraggedSidebarEntry::Thread {
+                    thread_id: thread.metadata.thread_id,
+                    project_group_key,
+                })
+            }
+            ListEntry::Terminal(terminal) => {
+                let project_group_key = self.entry_project_group_key(&terminal.workspace, cx);
+                Some(DraggedSidebarEntry::Terminal {
+                    terminal_id: terminal.metadata.terminal_id,
+                    project_group_key,
+                })
+            }
+        };
+
+        let same_group_payload = dragged_payload.clone();
+        let rendered = if let Some(payload) = dragged_payload {
+            let title = match entry {
+                ListEntry::Thread(thread) => thread.metadata.display_title(),
+                ListEntry::Terminal(terminal) => terminal.metadata.display_title(),
+                ListEntry::ProjectHeader { .. } => SharedString::default(),
+            };
+            div()
+                .id(format!("sidebar-row-{ix}"))
+                .on_drag(payload, move |payload, _, _window, cx| {
+                    cx.new(|_| DraggedSidebarEntryView {
+                        title: match payload {
+                            DraggedSidebarEntry::Thread { .. }
+                            | DraggedSidebarEntry::Terminal { .. } => title.clone(),
+                        },
+                    })
+                })
+                .drag_over::<DraggedSidebarEntry>({
+                    move |style, dragged: &DraggedSidebarEntry, _window, cx| {
+                        let same_group = same_group_payload
+                            .as_ref()
+                            .is_some_and(|target| target.project_group_key() == dragged.project_group_key());
+                        if same_group {
+                            style.bg(cx.theme().colors().ghost_element_hover)
+                        } else {
+                            style
+                        }
+                    }
+                })
+                .on_drop(
+                    cx.listener(move |this, dragged: &DraggedSidebarEntry, _window, cx| {
+                        this.reorder_entries(dragged, ix, cx);
+                    }),
+                )
+                .child(rendered)
+                .into_any_element()
+        } else {
+            rendered
         };
 
         if is_group_header_after_first {
@@ -5163,6 +5272,57 @@ impl Sidebar {
         );
     }
 
+    /// Re-derives a terminal's title from its live terminal view. For a closed
+    /// workspace, opens it first so the terminal is reachable; otherwise asks
+    /// the agent panel to refresh and persist the live title.
+    fn refresh_terminal_title(
+        &mut self,
+        metadata: &TerminalThreadMetadata,
+        workspace: &ThreadEntryWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let ThreadEntryWorkspace::Closed {
+            folder_paths,
+            project_group_key,
+        } = workspace
+            && self.should_load_closed_workspace_for_archive(
+                folder_paths,
+                project_group_key,
+                metadata.remote_connection.as_ref(),
+                None,
+                Some(metadata.terminal_id),
+                cx,
+            )
+        {
+            let metadata = metadata.clone();
+            self.open_workspace_for_archive(
+                folder_paths.clone(),
+                project_group_key.clone(),
+                window,
+                cx,
+                move |this, workspace, window, cx| {
+                    this.refresh_terminal_title(
+                        &metadata,
+                        &ThreadEntryWorkspace::Open(workspace),
+                        window,
+                        cx,
+                    );
+                },
+            );
+            return;
+        }
+
+        let ThreadEntryWorkspace::Open(workspace) = workspace else {
+            return;
+        };
+        if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.refresh_terminal_title(metadata.terminal_id, cx);
+            });
+        }
+    }
+
     fn close_terminal_entry(
         &mut self,
         metadata: &TerminalThreadMetadata,
@@ -5801,6 +5961,17 @@ impl Sidebar {
         metadata.interacted_at.unwrap_or(metadata.updated_at)
     }
 
+    /// Resolves the project group key that owns an entry's workspace.
+    /// Open workspaces resolve it live; closed ones carry it on the entry.
+    fn entry_project_group_key(&self, workspace: &ThreadEntryWorkspace, cx: &App) -> ProjectGroupKey {
+        match workspace {
+            ThreadEntryWorkspace::Open(workspace) => workspace.read(cx).project_group_key(cx),
+            ThreadEntryWorkspace::Closed {
+                project_group_key, ..
+            } => project_group_key.clone(),
+        }
+    }
+
     fn push_entries_by_display_time(
         entries: &mut Vec<ListEntry>,
         terminals: Vec<TerminalEntry>,
@@ -5819,11 +5990,44 @@ impl Sidebar {
             }
         }
 
+        fn user_order(entry: &ListEntry) -> Option<f64> {
+            match entry {
+                ListEntry::Thread(thread) => thread.metadata.user_order,
+                ListEntry::Terminal(terminal) => terminal.metadata.user_order,
+                ListEntry::ProjectHeader { .. } => None,
+            }
+        }
+
+        // Empty drafts always float to the very top regardless of order/recency.
+        fn is_empty_draft(entry: &ListEntry) -> bool {
+            matches!(entry, ListEntry::Thread(thread) if thread.draft == Some(DraftKind::Empty))
+        }
+
         let row_entries = terminals
             .into_iter()
             .map(ListEntry::Terminal)
             .chain(threads.into_iter().map(ListEntry::Thread))
-            .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
+            .sorted_by(|left, right| {
+                match (is_empty_draft(left), is_empty_draft(right)) {
+                    (true, false) => return std::cmp::Ordering::Less,
+                    (false, true) => return std::cmp::Ordering::Greater,
+                    (true, true) => return std::cmp::Ordering::Equal,
+                    (false, false) => {}
+                }
+                // Entries with a user-assigned order come first, sorted by that
+                // order; entries without one fall back to recency, grouped after
+                // the explicitly-ordered entries.
+                match (user_order(left), user_order(right)) {
+                    (Some(a), Some(b)) => a
+                        .partial_cmp(&b)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => {
+                        std::cmp::Reverse(display_time(left)).cmp(&std::cmp::Reverse(display_time(right)))
+                    }
+                }
+            });
 
         for entry in row_entries {
             if let ListEntry::Thread(thread) = &entry {
@@ -5834,6 +6038,149 @@ impl Sidebar {
             }
             entries.push(entry);
         }
+    }
+
+    /// Reorders a sidebar entry to a new position within its project group and
+    /// persists the resulting order to the thread/terminal metadata stores.
+    ///
+    /// Only entries sharing the dragged entry's project group are renumbered;
+    /// a drop into a different group is a no-op. Every visible row in the group
+    /// gets a consecutive explicit `user_order` matching its new display order,
+    /// so the group's arrangement is preserved across rebuilds and restarts.
+    fn reorder_entries(
+        &mut self,
+        dragged: &DraggedSidebarEntry,
+        drop_row_ix: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let project_group_key = match dragged {
+            DraggedSidebarEntry::Thread {
+                project_group_key, ..
+            }
+            | DraggedSidebarEntry::Terminal {
+                project_group_key, ..
+            } => project_group_key,
+        };
+
+        // Locate the project group's span inside the flattened entries, then
+        // gather the visible rows of that group in display order.
+        let group_header_ix = self
+            .contents
+            .project_header_indices
+            .iter()
+            .copied()
+            .take_while(|&ix| ix < drop_row_ix)
+            .last();
+        let Some(header_ix) = group_header_ix else {
+            return;
+        };
+        if !self
+            .contents
+            .entries
+            .get(header_ix)
+            .is_some_and(|entry| matches!(entry, ListEntry::ProjectHeader { key, .. } if key == project_group_key))
+        {
+            // Cross-group drop: ignore.
+            return;
+        }
+        let group_end = self
+            .contents
+            .entries
+            .iter()
+            .enumerate()
+            .skip(header_ix + 1)
+            .find(|(_, entry)| {
+                matches!(entry, ListEntry::ProjectHeader { .. })
+            })
+            .map(|(ix, _)| ix)
+            .unwrap_or(self.contents.entries.len());
+
+        let rows: Vec<(usize, ListEntry)> = self.contents.entries[header_ix + 1..group_end]
+            .iter()
+            .cloned()
+            .enumerate()
+            .collect();
+
+        // Compute the target position within the group (0-based row index).
+        let normalized_drop = drop_row_ix - header_ix - 1;
+        if normalized_drop >= rows.len() {
+            return;
+        }
+
+        // Keep only the rows that are still present (drop target must be a row).
+        let mut ordered = rows
+            .iter()
+            .filter(|(_, entry)| !matches!(entry, ListEntry::ProjectHeader { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        if ordered.is_empty() {
+            return;
+        }
+
+        // `matches_dragged` finds the dragged row by its thread/terminal
+        // identity in the group's current display order, so we can move it out
+        // and re-insert at the target position.
+        let matches_dragged = |entry: &ListEntry| match (dragged, entry) {
+            (
+                DraggedSidebarEntry::Thread { thread_id, .. },
+                ListEntry::Thread(thread),
+            ) => thread.metadata.thread_id == *thread_id,
+            (
+                DraggedSidebarEntry::Terminal { terminal_id, .. },
+                ListEntry::Terminal(terminal),
+            ) => terminal.metadata.terminal_id == *terminal_id,
+            _ => false,
+        };
+
+        let dragged_ix = ordered
+            .iter()
+            .position(|(_, entry)| matches_dragged(entry));
+
+        let Some(dragged_ix) = dragged_ix else {
+            return;
+        };
+        let dragged = ordered.remove(dragged_ix);
+        let insert_at = normalized_drop.min(ordered.len());
+        ordered.insert(insert_at, dragged);
+
+        // Renumber the group and persist to the stores.
+        let thread_ids: HashMap<ThreadId, f64> = ordered
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, entry))| match entry {
+                ListEntry::Thread(thread) => Some((thread.metadata.thread_id, index as f64)),
+                _ => None,
+            })
+            .collect();
+        let terminal_ids: HashMap<TerminalId, f64> = ordered
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, entry))| match entry {
+                ListEntry::Terminal(terminal) => Some((terminal.metadata.terminal_id, index as f64)),
+                _ => None,
+            })
+            .collect();
+
+        for (thread_id, order) in thread_ids {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                if let Some(mut metadata) = store.entry(thread_id).cloned() {
+                    metadata.user_order = Some(order);
+                    store.save(metadata, cx);
+                }
+            });
+        }
+        if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| {
+                for (terminal_id, order) in &terminal_ids {
+                    if let Some(mut metadata) = store.entry(*terminal_id).cloned() {
+                        metadata.user_order = Some(*order);
+                        store.save(metadata, cx);
+                    }
+                }
+            });
+        }
+
+        self.schedule_update_entries(false, cx);
     }
 
     /// The sort order used by the ctrl-tab switcher
@@ -6241,6 +6588,9 @@ impl Sidebar {
 
         let is_remote = thread.workspace.is_remote(cx);
 
+        // The LLM title regeneration path exists only for native agent threads.
+        let is_zed_native_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
+
         let worktrees = apply_worktree_label_mode(
             thread.worktrees.clone(),
             cx.flag_value::<AgentThreadWorktreeLabelFlag>(),
@@ -6339,6 +6689,38 @@ impl Sidebar {
                         })
                     });
 
+                let refresh_button = if is_zed_native_thread {
+                    let folder_paths = metadata.folder_paths().clone();
+                    let workspace_option = match &thread_workspace {
+                        ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
+                        ThreadEntryWorkspace::Closed { .. } => None,
+                    };
+                    Some(
+                        IconButton::new(("refresh-thread-title", ix), IconName::RotateCw)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Regenerate Thread Title"))
+                            .on_click({
+                                let session_id = session_id_for_delete.clone();
+                                cx.listener(move |this, _, _window, cx| {
+                                    if let Some(session_id) = session_id.as_ref() {
+                                        // `cx.listener` closures are `Fn` and may run
+                                        // once per click; owned values must be cloned
+                                        // per invocation, so this is not redundant.
+                                        this.regenerate_thread_title(
+                                            session_id,
+                                            thread_id_for_actions,
+                                            folder_paths.clone(),
+                                            workspace_option.clone(),
+                                            cx,
+                                        );
+                                    }
+                                })
+                            }),
+                    )
+                } else {
+                    None
+                };
+
                 let contextual_action: Option<AnyElement> = if is_running {
                     Some(
                         IconButton::new("stop-thread", IconName::Stop)
@@ -6402,6 +6784,7 @@ impl Sidebar {
                     h_flex()
                         .gap_0p5()
                         .child(rename_button)
+                        .when_some(refresh_button, |this, button| this.child(button))
                         .when_some(contextual_action, |this, action| this.child(action)),
                 )
             })
@@ -6594,6 +6977,17 @@ impl Sidebar {
             .base_bg(sidebar_bg)
             .icon(IconName::Terminal)
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
+            .status(match terminal.status {
+                TerminalAgentStatus::Running => AgentThreadStatus::Running,
+                // Waiting-for-input reuses the existing monotone warning
+                // badge (ADR 0005); Idle and Completed carry no badge.
+                TerminalAgentStatus::WaitingForUserInput => {
+                    AgentThreadStatus::WaitingForConfirmation
+                }
+                TerminalAgentStatus::Idle | TerminalAgentStatus::Completed => {
+                    AgentThreadStatus::Completed
+                }
+            })
             .is_remote(is_remote)
             .worktrees(worktrees)
             .timestamp(timestamp)
@@ -6612,23 +7006,45 @@ impl Sidebar {
             }))
             .when(is_hovered, |this| {
                 this.action_slot(
-                    IconButton::new("close-terminal", IconName::Close)
-                        .icon_size(IconSize::Small)
-                        .icon_color(Color::Muted)
-                        .tooltip({
-                            let focus_handle = focus_handle.clone();
-                            move |_window, cx| {
-                                Tooltip::for_action_in(
-                                    "Close Terminal",
-                                    &ArchiveSelectedThread,
-                                    &focus_handle,
-                                    cx,
-                                )
-                            }
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.close_terminal(&metadata, &workspace, window, cx);
-                        })),
+                    h_flex()
+                        .gap_0p5()
+                        .child(
+                            IconButton::new("refresh-terminal-title", IconName::RotateCw)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Refresh Terminal Title"))
+                                .on_click({
+                                    let metadata = metadata.clone();
+                                    let workspace = workspace.clone();
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.refresh_terminal_title(
+                                            &metadata,
+                                            &workspace,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                }),
+                        )
+                        .child(
+                            IconButton::new("close-terminal", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip({
+                                    let focus_handle = focus_handle.clone();
+                                    move |_window, cx| {
+                                        Tooltip::for_action_in(
+                                            "Close Terminal",
+                                            &ArchiveSelectedThread,
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    }
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.close_terminal(&metadata, &workspace, window, cx);
+                                })),
+                        ),
                 )
             })
             .on_click(cx.listener({

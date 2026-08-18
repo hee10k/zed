@@ -835,6 +835,11 @@ impl FetchOptions {
         }
     }
 
+    /// Whether the fetch should prune deleted remote-tracking branches.
+    pub fn should_prune(&self) -> bool {
+        true
+    }
+
     pub fn from_proto(remote_name: Option<String>) -> Self {
         match remote_name {
             Some(name) => FetchOptions::Remote(Remote { name: name.into() }),
@@ -4229,7 +4234,12 @@ impl GitRepository for RealGitRepository {
                 executor.clone(),
                 is_trusted,
             );
-            let mut command = git.build_command(&["fetch", &remote_name]);
+            let mut args = vec!["fetch"];
+            if fetch_options.should_prune() {
+                args.push("--prune");
+            }
+            args.push(&remote_name);
+            let mut command = git.build_command(&args);
             command
                 .envs(env.iter())
                 .stdout(Stdio::piped())
@@ -8629,6 +8639,55 @@ mod tests {
         assert_eq!(
             remote_urls.get("upstream").unwrap(),
             "/Users/user/My Projects/upstream.git"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_fetch_prunes_deleted_remote_tracking_branch(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (remote_directory, clone_directory) =
+            clone_remote_repository_with_main_and_feature(temp_dir.path());
+
+        // Both branches are tracked locally after the clone.
+        assert!(
+            git_command_output(&clone_directory, ["for-each-ref", "--format=%(refname)", "refs/remotes/origin"])
+                .contains("refs/remotes/origin/feature"),
+        );
+
+        // Delete the feature branch on the server.
+        git_command(&remote_directory, ["branch", "-D", "feature"]);
+
+        let repo = RealGitRepository::new(
+            &clone_directory.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let mut async_cx = cx.to_async();
+        let askpass = AskPassDelegate::new(&mut async_cx, |_prompt, _tx, _cx| {});
+
+        repo.fetch(
+            FetchOptions::All,
+            askpass,
+            Arc::new(test_commit_envs()),
+            cx.to_async(),
+        )
+        .await
+        .unwrap();
+
+        let remaining =
+            git_command_output(&clone_directory, ["for-each-ref", "--format=%(refname)", "refs/remotes/origin"]);
+        assert!(
+            !remaining.contains("refs/remotes/origin/feature"),
+            "origin/feature should be pruned after the server branch was deleted, got {remaining:?}"
+        );
+        assert!(
+            remaining.contains("refs/remotes/origin/main"),
+            "origin/main should remain after a pruned fetch"
         );
     }
 

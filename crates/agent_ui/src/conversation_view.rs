@@ -4671,6 +4671,7 @@ pub(crate) mod tests {
                         worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
                         remote_connection: None,
                         archived: false,
+                        user_order: None,
                     },
                     cx,
                 );
