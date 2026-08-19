@@ -150,4 +150,5 @@ tempfile.workspace = true
 vim.workspace = true
 tree-sitter-md.workspace = true
 unindent.workspace = true
+sysinfo.workspace = true
 terminal = { workspace = true, features = ["test-support"] }
