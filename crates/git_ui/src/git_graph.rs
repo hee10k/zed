@@ -1729,6 +1729,13 @@ impl GitGraph {
                 }
             }
             RepositoryEvent::GraphEvent(_, _) => {}
+            RepositoryEvent::StatusesChanged => {
+                // Working-tree status changed (staged/unstaged/untracked).
+                // Commit topology is unchanged, so only re-render — graph data
+                // stays valid. This keeps any uncommitted-changes subject (and
+                // the graph badges that reflect working-tree state) live.
+                cx.notify();
+            }
             _ => {}
         }
     }
