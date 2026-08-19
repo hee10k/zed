@@ -7873,6 +7873,65 @@ impl Repository {
         )
     }
 
+    /// Unified-text, three-dot diff between two commits/refs
+    /// (`git diff base...target`) — the cumulative changes the `target` branch
+    /// introduced since it diverged from `base`. Local-only; remote
+    /// repositories bail because the git graph's aggregate-diff views are a
+    /// local-graph convenience.
+    pub fn diff_commits(
+        &mut self,
+        base: String,
+        target: String,
+    ) -> oneshot::Receiver<Result<String>> {
+        self.send_job("diff_commits", None, move |git_repo, cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.diff_commits(base, target, cx).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("branch diff is only supported locally")
+                }
+            }
+        })
+    }
+
+    /// Unified-text diff of a single tracked worktree path against a HEAD oid
+    /// (`git diff <head_oid> -- <path>`). Local-only; see [`Self::diff_commits`].
+    pub fn diff_worktree_path(
+        &mut self,
+        head_oid: String,
+        path: RepoPath,
+    ) -> oneshot::Receiver<Result<String>> {
+        self.send_job("diff_worktree_path", None, move |git_repo, cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.diff_worktree_path(head_oid, path, cx).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("working-tree file diff is only supported locally")
+                }
+            }
+        })
+    }
+
+    /// Raw text of an untracked worktree file, read from disk. Local-only; see
+    /// [`Self::diff_commits`].
+    pub fn load_worktree_path(
+        &mut self,
+        path: RepoPath,
+    ) -> oneshot::Receiver<Result<String>> {
+        self.send_job("load_worktree_path", None, move |git_repo, cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.load_worktree_path(path, cx).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("working-tree file read is only supported locally")
+                }
+            }
+        })
+    }
+
     pub fn get_graph_data(
         &self,
         log_source: LogSource,

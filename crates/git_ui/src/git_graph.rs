@@ -1363,6 +1363,30 @@ struct DetailPanelCommitMessage {
     scroll_handle: ScrollHandle,
 }
 
+/// The selected branch's combined three-dot diff against HEAD
+/// (`git diff HEAD...<ref>`), shown in the right detail panel when a branch
+/// chip is left-clicked.
+pub(crate) struct BranchDiff {
+    /// Display name of the selected branch (e.g. `feature/x`).
+    pub(crate) name: SharedString,
+    /// Unified diff text loaded from `git diff HEAD...<ref>`.
+    pub(crate) text: String,
+    /// True while the diff text is still loading.
+    pub(crate) is_loading: bool,
+}
+
+/// The selected working-tree file's diff, shown in the right detail panel when
+/// a file in the expandable worktree status breakdown is clicked.
+pub(crate) struct WorktreeFileDiff {
+    pub(crate) repo_path: RepoPath,
+    /// Display label (`dir/file` or `file`) shown in the panel header.
+    pub(crate) label: SharedString,
+    /// Unified diff text, or a synthesized new-file diff for untracked paths.
+    pub(crate) text: String,
+    pub(crate) is_untracked: bool,
+    pub(crate) is_loading: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectionMode {
     Single,
@@ -1410,6 +1434,18 @@ pub struct GitGraph {
     /// below the status bar when `worktree_file_list_open`. Rebuilt from the
     /// live repository status each time the bar is toggled.
     worktree_changed_files: Vec<ChangedFileEntry>,
+
+    /// Branch selected by left-clicking a ref chip; drives the combined-diff
+    /// right-panel view. Exactly one of {commit selection, branch diff, worktree
+    /// file diff} is active at a time.
+    selected_branch_diff: Option<BranchDiff>,
+
+    /// Worktree file selected by left-clicking a row in the worktree status
+    /// breakdown; drives the per-file diff right-panel view.
+    selected_worktree_file: Option<WorktreeFileDiff>,
+
+    /// In-flight task for a branch/worktree-file diff load.
+    _diff_task: Option<Task<()>>,
 }
 
 impl GitGraph {
@@ -1420,6 +1456,9 @@ impl GitGraph {
         self.search_state.selected_index = None;
         self.search_state.state.next_state();
         self.context_menu = None;
+        self.selected_branch_diff = None;
+        self.selected_worktree_file = None;
+        self._diff_task = None;
         cx.emit(ItemEvent::Edit);
         cx.notify();
     }
@@ -1670,6 +1709,9 @@ impl GitGraph {
             ref_operation_in_progress: false,
             worktree_file_list_open: false,
             worktree_changed_files: Vec::new(),
+            selected_branch_diff: None,
+            selected_worktree_file: None,
+            _diff_task: None,
         };
 
         this.fetch_initial_graph_data(cx);
@@ -1897,16 +1939,28 @@ impl GitGraph {
         let Some(resolved_ref) = Self::resolve_ref_from_decoration(name) else {
             return chip.into_any_element();
         };
+        let ref_for_menu = resolved_ref.clone();
+        let ref_for_click = resolved_ref.clone();
         div()
             .min_w_0()
+            .id(("git-graph-ref-chip", commit_idx))
             .child(chip)
+            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                if matches!(
+                    ref_for_click.kind,
+                    RefKind::LocalBranch | RefKind::RemoteBranch
+                ) {
+                    this.select_branch_diff(ref_for_click.clone(), cx);
+                    cx.stop_propagation();
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     this.deploy_ref_context_menu(
                         event.position,
                         commit_idx,
-                        resolved_ref.clone(),
+                        ref_for_menu.clone(),
                         window,
                         cx,
                     );
@@ -2075,31 +2129,347 @@ pub fn worktree_status_detail(summary: GitSummary) -> String {
     }
 
     /// Renders the expanded per-file working-tree change list below the status
-    /// bar. Each row carries its status icon (staged / unstaged / untracked).
-    fn render_worktree_file_list(&self) -> impl IntoElement {
+    /// bar. Each row carries its status icon (staged / unstaged / untracked)
+    /// and opens that file's diff in the right detail panel on click.
+    fn render_worktree_file_list(&self, cx: &Context<Self>) -> impl IntoElement {
         if !self.worktree_file_list_open || self.worktree_changed_files.is_empty() {
             return Empty.into_any_element();
         }
         v_flex()
             .flex_none()
             .w_full()
-            .children(self.worktree_changed_files.iter().map(|entry| {
-                let path = if entry.dir_path.is_empty() {
-                    entry.file_name.clone()
+            .children(
+                self.worktree_changed_files
+                    .iter()
+                    .enumerate()
+                    .map(|(file_idx, entry)| {
+                        let entry_for_click = entry.clone();
+                        let path = if entry.dir_path.is_empty() {
+                            entry.file_name.clone()
+                        } else {
+                            SharedString::from(format!(
+                                "{}/{}",
+                                entry.dir_path, entry.file_name
+                            ))
+                        };
+                        h_flex()
+                            .gap_1()
+                            .px_2()
+                            .py_0p5()
+                            .cursor_pointer()
+                            .id(("worktree-diff-file", file_idx))
+                            .on_click(
+                                cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                    this.select_worktree_file(entry_for_click.clone(), cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(git_status_icon(entry.status))
+                            .child(Label::new(path).size(LabelSize::Small).truncate())
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Shows the combined (three-dot) diff of a branch against the current HEAD
+    /// in the right detail panel. Triggered by left-clicking a branch/remote
+    /// ref chip.
+    fn select_branch_diff(&mut self, resolved_ref: ResolvedRef, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let name = resolved_ref.display_name.clone();
+        let target = resolved_ref.ref_name.to_string();
+
+        self.selection.clear();
+        self.selected_commit_diff = None;
+        self.selected_commit_diff_stats = None;
+        self.selected_worktree_file = None;
+        self._diff_task = None;
+        self.selected_branch_diff = Some(BranchDiff {
+            name,
+            text: String::new(),
+            is_loading: true,
+        });
+
+        let diff_receiver =
+            repository.update(cx, |repo, _| repo.diff_commits("HEAD".into(), target));
+        self._diff_task = Some(cx.spawn(async move |this, cx| {
+            if let Ok(Ok(text)) = diff_receiver.await {
+                this.update(cx, |this, cx| {
+                    if let Some(branch_diff) = this.selected_branch_diff.as_mut() {
+                        branch_diff.text = text;
+                        branch_diff.is_loading = false;
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+
+        cx.emit(ItemEvent::Edit);
+        cx.notify();
+    }
+
+    /// Shows a single working-tree file's diff in the right detail panel.
+    /// Tracked paths run `git diff HEAD -- <path>` (staged + unstaged);
+    /// untracked paths load their on-disk content and synthesize a new-file
+    /// diff.
+    fn select_worktree_file(&mut self, entry: ChangedFileEntry, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let is_untracked = entry.status.is_untracked();
+        let label = if entry.dir_path.is_empty() {
+            entry.file_name.clone()
+        } else {
+            SharedString::from(format!("{}/{}", entry.dir_path, entry.file_name))
+        };
+
+        self.selection.clear();
+        self.selected_commit_diff = None;
+        self.selected_commit_diff_stats = None;
+        self.selected_branch_diff = None;
+        self._diff_task = None;
+        self.selected_worktree_file = Some(WorktreeFileDiff {
+            repo_path: entry.repo_path.clone(),
+            label,
+            text: String::new(),
+            is_untracked,
+            is_loading: true,
+        });
+
+        let diff_receiver = repository.update(cx, |repo, _| {
+            if is_untracked {
+                repo.load_worktree_path(entry.repo_path.clone())
+            } else {
+                repo.diff_worktree_path("HEAD".into(), entry.repo_path.clone())
+            }
+        });
+        self._diff_task = Some(cx.spawn(async move |this, cx| {
+            if let Ok(Ok(content)) = diff_receiver.await {
+                this.update(cx, |this, cx| {
+                    if let Some(file_diff) = this.selected_worktree_file.as_mut() {
+                        file_diff.text = if file_diff.is_untracked {
+                            Self::new_file_diff_text(&file_diff.label, content)
+                        } else {
+                            content
+                        };
+                        file_diff.is_loading = false;
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+
+        cx.emit(ItemEvent::Edit);
+        cx.notify();
+    }
+
+    /// Closes only the branch/worktree-file diff view, leaving any commit
+    /// selection-rendered state alone except for the commit selection itself
+    /// (these views exclude it by construction).
+    fn close_diff_view(&mut self, cx: &mut Context<Self>) {
+        self.selection.clear();
+        self.selected_commit_diff = None;
+        self.selected_commit_diff_stats = None;
+        self.selected_branch_diff = None;
+        self.selected_worktree_file = None;
+        self._diff_task = None;
+        cx.emit(ItemEvent::Edit);
+        cx.notify();
+    }
+
+    /// Synthesizes a unified new-file diff for an untracked path from its raw
+    /// on-disk content, so untracked files get a diff view too.
+    fn new_file_diff_text(path: &str, content: String) -> String {
+        let mut out = format!(
+            "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n"
+        );
+        let lines: Vec<&str> = content.lines().collect();
+        out.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
+        for line in lines {
+            out.push('+');
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Renders unified diff text in a scrollable pane. Each line is rendered as a
+    /// small `Label`, color-coded by diff prefix (added / removed / context),
+    /// since raw text styling APIs in this GPUI version do not offer a
+    /// pre-wrapped monospace convenience.
+    fn render_diff_text(&self, text: &str) -> AnyElement {
+        let lines: Vec<&str> = text.lines().collect();
+        v_flex()
+            .w_full()
+            .flex_1()
+            .id("git-graph-diff-text-scroll")
+            .overflow_y_scroll()
+            .p_3()
+            .gap_0p5()
+            .children(lines.iter().map(|line| {
+                let label = if line.starts_with('+') && !line.starts_with("+++") {
+                    Label::new(line.to_string())
+                        .size(LabelSize::Small)
+                        .color(Color::Success)
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    Label::new(line.to_string())
+                        .size(LabelSize::Small)
+                        .color(Color::Error)
                 } else {
-                    SharedString::from(format!(
-                        "{}/{}",
-                        entry.dir_path, entry.file_name
-                    ))
+                    Label::new(line.to_string())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
                 };
-                h_flex()
-                    .gap_1()
-                    .px_2()
-                    .py_0p5()
-                    .child(git_status_icon(entry.status))
-                    .child(Label::new(path).size(LabelSize::Small).truncate())
+                label
             }))
             .into_any_element()
+    }
+
+    fn render_diff_loading(&self) -> AnyElement {
+        v_flex()
+            .w_full()
+            .h_full()
+            .items_center()
+            .justify_center()
+            .child(Label::new("Loading…").color(Color::Muted))
+            .into_any_element()
+    }
+
+    fn render_diff_empty(&self, message: &str) -> AnyElement {
+        v_flex()
+            .w_full()
+            .h_full()
+            .items_center()
+            .justify_center()
+            .child(Label::new(message).color(Color::Muted))
+            .into_any_element()
+    }
+
+    fn render_branch_diff_panel(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(branch_diff) = self.selected_branch_diff.as_ref() else {
+            return Empty.into_any_element();
+        };
+        let title = format!("Branch {}", branch_diff.name);
+
+        v_flex()
+            .min_w(px(300.))
+            .h_full()
+            .bg(cx.theme().colors().editor_background)
+            .flex_basis(DefiniteLength::Fraction(
+                self.commit_details_split_state.read(cx).right_ratio(),
+            ))
+            .child(
+                v_flex()
+                    .relative()
+                    .w_full()
+                    .p_2()
+                    .gap_2()
+                    .child(
+                        div().absolute().top_2().right_2().child(
+                            IconButton::new("close-branch-diff", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| this.close_diff_view(cx))),
+                        ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(Label::new(title).size(LabelSize::Small)),
+                    ),
+            )
+            .child(Divider::horizontal())
+            .child(if branch_diff.is_loading {
+                self.render_diff_loading()
+            } else if branch_diff.text.is_empty() {
+                self.render_diff_empty("No changes relative to HEAD")
+            } else {
+                self.render_diff_text(&branch_diff.text)
+            })
+            .into_any_element()
+    }
+
+    fn render_worktree_file_diff_panel(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(file_diff) = self.selected_worktree_file.as_ref() else {
+            return Empty.into_any_element();
+        };
+
+        v_flex()
+            .min_w(px(300.))
+            .h_full()
+            .bg(cx.theme().colors().editor_background)
+            .flex_basis(DefiniteLength::Fraction(
+                self.commit_details_split_state.read(cx).right_ratio(),
+            ))
+            .child(
+                v_flex()
+                    .relative()
+                    .w_full()
+                    .p_2()
+                    .gap_2()
+                    .child(
+                        div().absolute().top_2().right_2().child(
+                            IconButton::new("close-worktree-file-diff", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| this.close_diff_view(cx))),
+                        ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Icon::new(IconName::File)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(Label::new(file_diff.label.clone()).size(LabelSize::Small))
+                            .when(file_diff.is_untracked, |this| {
+                                this.child(
+                                    Label::new("Untracked")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                            }),
+                    ),
+            )
+            .child(Divider::horizontal())
+            .child(if file_diff.is_loading {
+                self.render_diff_loading()
+            } else if file_diff.text.is_empty() {
+                self.render_diff_empty("No changes for this path")
+            } else {
+                self.render_diff_text(&file_diff.text)
+            })
+            .into_any_element()
+    }
+
+    /// Dispatches the right detail panel to whichever "detail" source is
+    /// active: a selected worktree file, a selected branch's combined diff, or
+    /// the selected commit's detail (the original behavior).
+    fn render_detail_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.selected_worktree_file.is_some() {
+            self.render_worktree_file_diff_panel(window, cx)
+                .into_any_element()
+        } else if self.selected_branch_diff.is_some() {
+            self.render_branch_diff_panel(window, cx)
+                .into_any_element()
+        } else {
+            self.render_commit_detail_panel(window, cx)
+                .into_any_element()
+        }
     }
 
     fn render_table_rows(
@@ -2272,6 +2642,9 @@ pub fn worktree_status_detail(summary: GitSummary) -> String {
         self.selection.clear();
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
+        self.selected_branch_diff = None;
+        self.selected_worktree_file = None;
+        self._diff_task = None;
         self.changed_files_expanded_dirs.clear();
         cx.emit(ItemEvent::Edit);
         cx.notify();
@@ -2499,6 +2872,9 @@ pub fn worktree_status_detail(summary: GitSummary) -> String {
 
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
+        self.selected_branch_diff = None;
+        self.selected_worktree_file = None;
+        self._diff_task = None;
         self.changed_files_expanded_dirs.clear();
         self.changed_files_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
@@ -4355,7 +4731,7 @@ impl Render for GitGraph {
                         .flex()
                         .flex_col()
                         .child(self.render_worktree_status_bar(cx))
-                        .child(self.render_worktree_file_list())
+                        .child(self.render_worktree_file_list(cx))
                         .child(
                             div()
                                 .on_mouse_down(
@@ -4600,10 +4976,15 @@ impl Render for GitGraph {
                         state.commit_ratio();
                     });
                 }))
-                .when(self.selection.primary.is_some(), |this| {
-                    this.child(self.render_commit_view_resize_handle(window, cx))
-                        .child(self.render_commit_detail_panel(window, cx))
-                })
+                .when(
+                    self.selection.primary.is_some()
+                        || self.selected_branch_diff.is_some()
+                        || self.selected_worktree_file.is_some(),
+                    |this| {
+                        this.child(self.render_commit_view_resize_handle(window, cx))
+                            .child(self.render_detail_panel(window, cx))
+                    },
+                )
         };
 
         div()
@@ -5879,6 +6260,138 @@ mod tests {
             git::status::StageStatus::Unstaged,
             "untracked file is unstaged"
         );
+    }
+
+    #[test]
+    fn test_new_file_diff_text_synthesizes_untracked_diff() {
+        let text = GitGraph::new_file_diff_text("notes/todo.txt", "first\nsecond\n".into());
+        assert!(text.starts_with("diff --git a/notes/todo.txt b/notes/todo.txt\n"));
+        assert!(text.contains("--- /dev/null\n"));
+        assert!(text.contains("@@ -0,0 +1,2 @@\n"));
+        assert!(text.contains("+first\n"));
+        assert!(text.contains("+second\n"));
+
+        let empty = GitGraph::new_file_diff_text("empty.txt", String::new());
+        assert!(empty.contains("@@ -0,0 +1,0 @@\n"));
+    }
+
+    #[gpui::test]
+    async fn test_select_worktree_file_shows_synthesized_untracked_diff(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "hello\nworld\n",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let entry = ChangedFileEntry::from_status_entry(&StatusEntry {
+            repo_path: RepoPath::new(&"file.txt").unwrap(),
+            status: FileStatus::Untracked,
+            diff_stat: None,
+            staged_diff_stat: None,
+            unstaged_diff_stat: None,
+        });
+        git_graph.update(cx, |graph, cx| graph.select_worktree_file(entry, cx));
+        cx.run_until_parked();
+
+        git_graph.update(cx, |graph, _| {
+            let Some(file_diff) = &graph.selected_worktree_file else {
+                panic!("no worktree file diff selected");
+            };
+            assert!(file_diff.is_untracked);
+            assert!(!file_diff.is_loading);
+            assert!(file_diff.text.contains("file.txt"));
+            assert!(file_diff.text.contains("+hello"));
+            assert!(file_diff.text.contains("+world"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_select_branch_shows_combined_diff(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let branch = ResolvedRef {
+            ref_name: "refs/heads/feature".into(),
+            display_name: "feature".into(),
+            kind: RefKind::LocalBranch,
+        };
+        git_graph.update(cx, |graph, cx| graph.select_branch_diff(branch, cx));
+        cx.run_until_parked();
+
+        git_graph.update(cx, |graph, _| {
+            let Some(branch_diff) = &graph.selected_branch_diff else {
+                panic!("no branch diff selected");
+            };
+            assert_eq!(branch_diff.name.as_ref(), "feature");
+            assert!(!branch_diff.is_loading);
+        });
     }
 
     #[test]

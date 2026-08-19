@@ -1232,6 +1232,38 @@ pub trait GitRepository: Send + Sync {
     /// Run git diff
     fn diff(&self, diff: DiffType) -> BoxFuture<'_, Result<String>>;
 
+    /// Unified-text diff between `base` and `target` using three-dot semantics
+    /// (`git diff base...target`): the cumulative changes reachable from
+    /// `target` but not `base`, i.e. everything the target branch introduced
+    /// since it diverged from `base`. Powers the git graph's "branch combined
+    /// diff" view.
+    fn diff_commits(
+        &self,
+        base: String,
+        target: String,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<String>>;
+
+    /// Unified-text diff of a single tracked working-tree path against the
+    /// given HEAD oid (`git diff <head_oid> -- <path>`), covering both staged
+    /// and unstaged changes for that path. Untracked paths yield an empty diff
+    /// (they live only on disk, not in the index), so callers fall back to
+    /// [`Self::load_worktree_path`] for those.
+    fn diff_worktree_path(
+        &self,
+        head_oid: String,
+        path: RepoPath,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<String>>;
+
+    /// Raw text of an untracked worktree file at `path`, read from disk. Used
+    /// to synthesize a new-file diff for paths git does not track.
+    fn load_worktree_path(
+        &self,
+        path: RepoPath,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<String>>;
+
     fn diff_stat(
         &self,
         diff: DiffStatType,
@@ -3800,6 +3832,70 @@ impl GitRepository for RealGitRepository {
                 Ok(crate::status::parse_numstat(&output))
             })
             .boxed()
+    }
+
+    fn diff_commits(
+        &self,
+        base: String,
+        target: String,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<String>> {
+        let git = self.git_binary();
+        let diff_arg = format!("{base}...{target}");
+        let mut command = git.build_command(&["diff"]);
+        command.arg(diff_arg);
+        cx.background_spawn(async move {
+            let output = command.output().await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "git diff failed:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        })
+        .boxed()
+    }
+
+    fn diff_worktree_path(
+        &self,
+        head_oid: String,
+        path: RepoPath,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<String>> {
+        let git = self.git_binary_in_worktree();
+        let path = path.as_unix_str().to_owned();
+        cx.background_spawn(async move {
+            let git = git?;
+            let output = git
+                .build_command(&["diff", &head_oid, "--"])
+                .arg(&path)
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "git diff failed:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        })
+        .boxed()
+    }
+
+    fn load_worktree_path(
+        &self,
+        path: RepoPath,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<String>> {
+        let working_directory = self.working_directory();
+        let rel_path = path.as_std_path().to_path_buf();
+        cx.background_spawn(async move {
+            let working_directory = working_directory.context("reading worktree file")?;
+            let abs_path = working_directory.join(rel_path);
+            smol::fs::read_to_string(abs_path)
+                .await
+                .context("reading untracked worktree file")
+        })
+        .boxed()
     }
 
     fn stage_paths(

@@ -281,6 +281,64 @@ impl GitRepository for FakeGitRepository {
         async { Ok(git::repository::CommitDiff { files: Vec::new() }) }.boxed()
     }
 
+    fn diff_commits(
+        &self,
+        _base: String,
+        _target: String,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<String>> {
+        async { Ok(String::new()) }.boxed()
+    }
+
+    fn diff_worktree_path(
+        &self,
+        _head_oid: String,
+        path: RepoPath,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<String>> {
+        let workdir_path = self.dot_git_path.parent().unwrap().to_path_buf();
+        let fs = self.fs.clone();
+        let path_str = path.as_unix_str().to_owned();
+        let rel_path = path.as_std_path().to_path_buf();
+        self.executor.spawn(async move {
+            let abs_path = workdir_path.join(rel_path);
+            let Ok(content) = fs.read_file_sync(&abs_path) else {
+                return Ok(String::new());
+            };
+            let content = String::from_utf8_lossy(&content);
+            let lines: Vec<&str> = content.lines().collect();
+            let mut out = format!(
+                "diff --git a/{path_str} b/{path_str}\n--- /dev/null\n+++ b/{path_str}\n@@ -0,0 +1,{} @@\n",
+                lines.len()
+            );
+            for line in lines {
+                out.push('+');
+                out.push_str(line);
+                out.push('\n');
+            }
+            Ok(out)
+        })
+        .boxed()
+    }
+
+    fn load_worktree_path(
+        &self,
+        path: RepoPath,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<String>> {
+        let workdir_path = self.dot_git_path.parent().unwrap().to_path_buf();
+        let fs = self.fs.clone();
+        let rel_path = path.as_std_path().to_path_buf();
+        self.executor.spawn(async move {
+            let abs_path = workdir_path.join(rel_path);
+            let content = fs
+                .read_file_sync(&abs_path)
+                .with_context(|| format!("reading untracked worktree file {:?}", abs_path))?;
+            Ok(String::from_utf8(content)?)
+        })
+        .boxed()
+    }
+
     fn set_index_text(
         &self,
         path: RepoPath,
