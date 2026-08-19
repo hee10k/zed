@@ -3026,6 +3026,17 @@ impl GitGraph {
                                     )
                                 },
                             ),
+                    )
+                    .child(
+                        IconButton::new("git-graph-refresh", IconName::RotateCw)
+                            .shape(ui::IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Refresh"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                // Reload the graph from the live repository snapshot without
+                                // issuing a fetch. The loading spinner reflects in-flight state.
+                                this.invalidate_state(cx);
+                            })),
                     ),
             )
     }
