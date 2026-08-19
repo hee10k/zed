@@ -22,7 +22,7 @@ use git::{
         CommitDiff, CommitFile, GitOperationKind, InitialGraphCommitData, LogOrder, LogSource,
         RepoPath, SearchCommitArgs,
     },
-    status::{FileStatus, StatusCode, TrackedStatus},
+    status::{FileStatus, GitSummary, StatusCode, TrackedStatus},
 };
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength,
@@ -1922,6 +1922,74 @@ impl GitGraph {
             cx,
         );
         self.set_context_menu(context_menu, position, Some(index), window, cx);
+    }
+
+    /// Builds the human-readable working-tree summary shown in the git graph's
+/// status bar, e.g. "3 staged · 2 unstaged · 1 untracked".
+pub fn worktree_status_detail(summary: GitSummary) -> String {
+    let GitSummary {
+        index,
+        worktree,
+        untracked,
+        count,
+        ..
+    } = summary;
+
+    if count == 0 {
+        return String::new();
+    }
+
+    let staged = index.added + index.modified + index.deleted;
+    let unstaged = worktree.added + worktree.modified + worktree.deleted;
+
+    let mut parts = Vec::new();
+    if staged > 0 {
+        parts.push(format!("{staged} staged"));
+    }
+    if unstaged > 0 {
+        parts.push(format!("{unstaged} unstaged"));
+    }
+    if untracked > 0 {
+        parts.push(format!("{untracked} untracked"));
+    }
+    if parts.is_empty() {
+        "uncommitted changes".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Renders a live working-tree status bar above the git graph's commit
+    /// table when the repository has uncommitted changes (staged, unstaged, or
+    /// untracked). This is rendered as a separate strip outside the commit
+    /// rows, so it never shifts commit indices or selection bookkeeping. It
+    /// refreshes on every render; a working-tree status change re-renders it
+    /// without invalidating the graph.
+    fn render_worktree_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+        let Some(repository) = self.get_repository(cx) else {
+            return div();
+        };
+        let summary = repository.read(cx).status_summary();
+
+        if summary.count == 0 {
+            return div();
+        }
+
+        let detail = Self::worktree_status_detail(summary);
+
+        h_flex()
+            .w_full()
+            .flex_none()
+            .gap_1()
+            .px_2()
+            .py_0p5()
+            .child(Icon::new(IconName::Diff).size(IconSize::Small).color(Color::Muted))
+            .child(
+                Label::new(detail)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
     }
 
     fn render_table_rows(
@@ -4176,6 +4244,7 @@ impl Render for GitGraph {
                         .size_full()
                         .flex()
                         .flex_col()
+                        .child(self.render_worktree_status_bar(cx))
                         .child(
                             div()
                                 .on_mouse_down(
@@ -5615,6 +5684,34 @@ mod tests {
         if let Err(error) = verify_all_invariants(&graph_data, &commits) {
             panic!("Graph invariant violation for linear commits:\n{}", error);
         }
+    }
+
+    #[test]
+    fn test_worktree_status_detail() {
+        use git::status::TrackedSummary;
+
+        // Clean tree → no strip label.
+        assert_eq!(GitGraph::worktree_status_detail(GitSummary::UNCHANGED), "");
+
+        let summary = GitSummary {
+            index: TrackedSummary {
+                added: 2,
+                modified: 1,
+                deleted: 0,
+            },
+            worktree: TrackedSummary {
+                added: 0,
+                modified: 3,
+                deleted: 0,
+            },
+            untracked: 1,
+            count: 6,
+            ..GitSummary::UNCHANGED
+        };
+        assert_eq!(
+            GitGraph::worktree_status_detail(summary),
+            "3 staged · 3 unstaged · 1 untracked"
+        );
     }
 
     #[test]
