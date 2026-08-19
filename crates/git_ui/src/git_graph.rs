@@ -40,7 +40,7 @@ use project::{
     ProjectPath,
     git_store::{
         CommitDataState, CommitDiff, CommitFile, GitGraphEvent, GitStore, GitStoreEvent,
-        GraphDataResponse, Repository, RepositoryEvent, RepositoryId,
+        GraphDataResponse, Repository, RepositoryEvent, RepositoryId, StatusEntry,
     },
 };
 use smallvec::{SmallVec, smallvec};
@@ -252,6 +252,33 @@ impl ChangedFileEntry {
             file_name,
             dir_path,
             repo_path: file.path.clone(),
+        }
+    }
+
+    /// Builds an entry for an uncommitted working-tree change directly from
+    /// its live status (as opposed to a committed file diff). Used by the
+    /// expandable worktree status bar; the real `FileStatus` is kept so the
+    /// staged / unstaged / untracked distinction is visible via the status
+    /// icon.
+    fn from_status_entry(entry: &StatusEntry) -> Self {
+        let file_name: SharedString = entry
+            .repo_path
+            .file_name()
+            .map(|n| n.to_string())
+            .unwrap_or_default()
+            .into();
+        let dir_path: SharedString = entry
+            .repo_path
+            .parent()
+            .map(|p| p.as_unix_str().to_string())
+            .unwrap_or_default()
+            .into();
+
+        Self {
+            status: entry.status,
+            file_name,
+            dir_path,
+            repo_path: entry.repo_path.clone(),
         }
     }
 
@@ -1374,6 +1401,15 @@ pub struct GitGraph {
     /// True while a per-ref operation (checkout / merge) is in flight. Guards
     /// against duplicate dispatch from a second click before the first settles.
     ref_operation_in_progress: bool,
+    /// Whether the worktree status bar is expanded to show the per-file
+    /// working-tree breakdown. This list lives its own non-commit state space
+    /// (outside `graph_data.commits`), so toggling it never shifts commit row
+    /// indices or selection bookkeeping.
+    worktree_file_list_open: bool,
+    /// Per-file working-tree changes (untracked / staged / unstaged), rendered
+    /// below the status bar when `worktree_file_list_open`. Rebuilt from the
+    /// live repository status each time the bar is toggled.
+    worktree_changed_files: Vec<ChangedFileEntry>,
 }
 
 impl GitGraph {
@@ -1632,6 +1668,8 @@ impl GitGraph {
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
             ref_operation_in_progress: false,
+            worktree_file_list_open: false,
+            worktree_changed_files: Vec::new(),
         };
 
         this.fetch_initial_graph_data(cx);
@@ -1965,14 +2003,14 @@ pub fn worktree_status_detail(summary: GitSummary) -> String {
     /// rows, so it never shifts commit indices or selection bookkeeping. It
     /// refreshes on every render; a working-tree status change re-renders it
     /// without invalidating the graph.
-    fn render_worktree_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_worktree_status_bar(&self, cx: &Context<Self>) -> AnyElement {
         let Some(repository) = self.get_repository(cx) else {
-            return div();
+            return div().into_any_element();
         };
         let summary = repository.read(cx).status_summary();
 
         if summary.count == 0 {
-            return div();
+            return div().into_any_element();
         }
 
         let detail = Self::worktree_status_detail(summary);
@@ -1983,6 +2021,11 @@ pub fn worktree_status_detail(summary: GitSummary) -> String {
             .gap_1()
             .px_2()
             .py_0p5()
+            .cursor_pointer()
+            .id("worktree-status-bar")
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.toggle_worktree_file_list(cx);
+            }))
             .child(Icon::new(IconName::Diff).size(IconSize::Small).color(Color::Muted))
             .child(
                 Label::new(detail)
@@ -1990,6 +2033,73 @@ pub fn worktree_status_detail(summary: GitSummary) -> String {
                     .color(Color::Muted)
                     .truncate(),
             )
+            .child(
+                Icon::new(if self.worktree_file_list_open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(IconSize::Small)
+                .color(Color::Muted),
+            )
+            .into_any_element()
+    }
+
+    /// Builds the expandable worktree change list from a status iterator,
+    /// dropping ignored paths. Kept as a standalone helper so the ignore
+    /// filter and status mapping stay unit-testable.
+    fn worktree_changed_entries(
+        status: impl Iterator<Item = StatusEntry>,
+    ) -> Vec<ChangedFileEntry> {
+        status
+            .filter(|entry| !matches!(entry.status, FileStatus::Ignored))
+            .map(|entry| ChangedFileEntry::from_status_entry(&entry))
+            .collect()
+    }
+
+    /// Toggles the expandable per-file working-tree breakdown. On expand the
+    /// list is rebuilt fresh from the live repository status; on collapse it is
+    /// dropped. Lives entirely outside the commit-table index space.
+    fn toggle_worktree_file_list(&mut self, cx: &mut Context<Self>) {
+        self.worktree_file_list_open = !self.worktree_file_list_open;
+        if self.worktree_file_list_open {
+            let status = self
+                .get_repository(cx)
+                .into_iter()
+                .flat_map(|repository| repository.read(cx).status());
+            self.worktree_changed_files = Self::worktree_changed_entries(status);
+        } else {
+            self.worktree_changed_files.clear();
+        }
+        cx.notify();
+    }
+
+    /// Renders the expanded per-file working-tree change list below the status
+    /// bar. Each row carries its status icon (staged / unstaged / untracked).
+    fn render_worktree_file_list(&self) -> impl IntoElement {
+        if !self.worktree_file_list_open || self.worktree_changed_files.is_empty() {
+            return Empty.into_any_element();
+        }
+        v_flex()
+            .flex_none()
+            .w_full()
+            .children(self.worktree_changed_files.iter().map(|entry| {
+                let path = if entry.dir_path.is_empty() {
+                    entry.file_name.clone()
+                } else {
+                    SharedString::from(format!(
+                        "{}/{}",
+                        entry.dir_path, entry.file_name
+                    ))
+                };
+                h_flex()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .child(git_status_icon(entry.status))
+                    .child(Label::new(path).size(LabelSize::Small).truncate())
+            }))
+            .into_any_element()
     }
 
     fn render_table_rows(
@@ -4245,6 +4355,7 @@ impl Render for GitGraph {
                         .flex()
                         .flex_col()
                         .child(self.render_worktree_status_bar(cx))
+                        .child(self.render_worktree_file_list())
                         .child(
                             div()
                                 .on_mouse_down(
@@ -5711,6 +5822,62 @@ mod tests {
         assert_eq!(
             GitGraph::worktree_status_detail(summary),
             "3 staged · 3 unstaged · 1 untracked"
+        );
+    }
+
+    #[test]
+    fn test_worktree_changed_entries_maps_status_and_drops_ignored() {
+        use git::repository::RepoPath;
+
+        let entry = |repo_path: &str, status: FileStatus| StatusEntry {
+            repo_path: RepoPath::new(repo_path).unwrap(),
+            status,
+            diff_stat: None,
+            staged_diff_stat: None,
+            unstaged_diff_stat: None,
+        };
+
+        let tracked = |index_status, worktree_status| {
+            FileStatus::Tracked(TrackedStatus {
+                index_status,
+                worktree_status,
+            })
+        };
+
+        let entries = vec![
+            entry(
+                "src/main.rs",
+                tracked(StatusCode::Modified, StatusCode::Unmodified),
+            ),
+            entry(
+                "README.md",
+                tracked(StatusCode::Unmodified, StatusCode::Modified),
+            ),
+            entry("notes/untracked.txt", FileStatus::Untracked),
+            entry("target/ignored.bin", FileStatus::Ignored),
+        ];
+
+        let files = GitGraph::worktree_changed_entries(entries.into_iter());
+        assert_eq!(files.len(), 3, "ignored paths must be excluded");
+        assert_eq!(files[0].file_name.as_ref(), "main.rs");
+        assert_eq!(files[0].dir_path.as_ref(), "src");
+        assert_eq!(
+            files[0].status.staging(),
+            git::status::StageStatus::Staged,
+            "index-modified tracked file is staged"
+        );
+        assert_eq!(files[1].file_name.as_ref(), "README.md");
+        assert_eq!(
+            files[1].status.staging(),
+            git::status::StageStatus::Unstaged,
+            "worktree-modified tracked file is unstaged"
+        );
+        assert_eq!(files[2].file_name.as_ref(), "untracked.txt");
+        assert_eq!(files[2].dir_path.as_ref(), "notes");
+        assert_eq!(
+            files[2].status.staging(),
+            git::status::StageStatus::Unstaged,
+            "untracked file is unstaged"
         );
     }
 
