@@ -711,6 +711,14 @@ pub mod thread {
             /// (sleeping) sessions so the user can pick which to resume or
             /// start fresh.
             ListSessions,
+            /// Lists processes Zed captured as orphans (descendants of a
+            /// closed thread/terminal/worktree that were still running at
+            /// capture time) so the user can inspect them.
+            ListOrphanProcesses,
+            /// Terminates recorded orphan processes that are still alive and
+            /// still match their capture-time start time (reusing the existing
+            /// safe orphan-reap path).
+            KillOrphanProcesses,
         ]
     );
 }

@@ -32,7 +32,9 @@ use zed_actions::{
         FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules, Toggle,
         ToggleFocus,
     },
-    thread::ListSessions,
+    thread::{
+        KillOrphanProcesses, ListOrphanProcesses, ListSessions,
+    },
 };
 
 use crate::ExpandMessageEditor;
@@ -575,6 +577,16 @@ pub fn init(cx: &mut App) {
                 .register_action(|workspace, _: &ListSessions, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| panel.list_sessions(window, cx));
+                    }
+                })
+                .register_action(|workspace, _: &ListOrphanProcesses, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| panel.list_orphan_processes(window, cx));
+                    }
+                })
+                .register_action(|workspace, _: &KillOrphanProcesses, _window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| panel.reap_pending_orphans(cx));
                     }
                 })
                 .register_action(|workspace, action: &ReviewBranchDiff, window, cx| {
@@ -3103,6 +3115,28 @@ impl AgentPanel {
             lines.push(String::from("  (none)"));
         }
 
+        self.echo_output(&lines, cx);
+        window.refresh();
+    }
+
+    /// Writes the recorded orphan processes (descendants of a closed thread,
+    /// terminal, or worktree that were still running at capture time) to the
+    /// active terminal as echo output.
+    fn list_orphan_processes(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.supports_terminal(cx) {
+            return;
+        }
+        let mut lines = vec![String::from("-- Orphan processes --")];
+        if self.pending_orphans.is_empty() {
+            lines.push(String::from("  (none captured)"));
+        } else {
+            for orphan in &self.pending_orphans {
+                lines.push(format!("  pid {}  start {}", orphan.pid, orphan.start_time));
+            }
+        }
+        lines.push(String::from(
+            "Run `thread: Kill Orphan Processes` to terminate survivors.",
+        ));
         self.echo_output(&lines, cx);
         window.refresh();
     }
