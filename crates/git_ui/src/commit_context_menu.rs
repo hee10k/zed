@@ -8,7 +8,9 @@ use crate::{
 use anyhow::anyhow;
 use futures::channel::oneshot;
 use git::Oid;
-use git::repository::{AskPassDelegate, CreateTagOptions, MergeMode, Remote, ResetMode};
+use git::repository::{
+    AskPassDelegate, CreateTagOptions, MergeMode, PushOptions, Remote, ResetMode, UpstreamTracking,
+};
 use git::stash::{
     StashIdentity, StashMutationResult, StashRenameResult, resolve_stash_identity,
 };
@@ -1069,8 +1071,9 @@ fn schedule_stash_rename(
 /// (`ResolvedRef`) and the clicked commit's SHA; every action targets that exact
 /// ref — never a fallback to the current/first branch.
 ///
-/// Local branches get Checkout, Merge into Current, Create Detached Worktree,
-/// Rename, Delete, and Copy Name. The current branch omits Checkout and Delete.
+/// Local branches get Checkout, Push, Merge into Current, Create Detached
+/// Worktree, Rename, Delete, and Copy Name. The current branch omits Checkout
+/// and Delete.
 /// Remote refs and tags get the commit-target actions (Merge into Current,
 /// Create Detached Worktree) and Copy Name; their chips are still typed to the
 /// exact ref so Copy Name never mixes local/remote same-name refs.
@@ -1236,6 +1239,22 @@ pub(crate) fn ref_chip_context_menu(
             menu = menu.entry("Merge into Current", None, {
                 let graph = graph.clone();
                 move |window, cx| schedule_ref_merge(graph.clone(), commit_sha, window, cx)
+            });
+            menu = menu.entry("Push", None, {
+                let resolved_ref = resolved_ref.clone();
+                let repository = repository.clone();
+                let graph = graph.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    schedule_local_branch_push(
+                        &resolved_ref,
+                        repository.clone(),
+                        graph.clone(),
+                        workspace.clone(),
+                        window,
+                        cx,
+                    );
+                }
             });
             menu = menu.entry("Create Detached Worktree", None, {
                 let repository = repository.clone();
@@ -1610,6 +1629,112 @@ fn emit_toast(
             workspace.toggle_status_toast(status_toast, app_cx);
         });
     }
+}
+
+/// Pushes the clicked local branch to a chosen remote, reusing the existing
+/// push path (`Repository::push`). A branch that has no tracked upstream is
+/// pushed with `--set-upstream` so an upstream is recorded for it. Errors are
+/// surfaced through the standard error prompt, and success is reported via a
+/// toast. The ref-operation guard is negotiated (and always released) just like
+/// the other ref-chip operations.
+fn schedule_local_branch_push(
+    resolved_ref: &ResolvedRef,
+    repository: Option<WeakEntity<Repository>>,
+    graph: Option<WeakEntity<GitGraph>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let branch_name = resolved_ref.display_name.as_ref().to_string();
+    let Some(repository_entity) = repository.and_then(|r| r.upgrade()) else {
+        emit_error_async(
+            &workspace,
+            &mut window.to_async(cx),
+            "push branch",
+            anyhow!("The repository is no longer available"),
+        );
+        return;
+    };
+    let Some(graph_weak) = begin_graph_ref_operation(&graph, cx) else {
+        return;
+    };
+    // Resolve the clicked branch's tracked upstream from the live snapshot so a
+    // branch that already tracks a remote target is pushed plainly, while a
+    // branch with no (or a gone) upstream is pushed with `--set-upstream` to
+    // establish one. Mirrors the git panel's non-force push options.
+    let tracked_upstream = repository_entity
+        .read(cx)
+        .branch_list
+        .iter()
+        .find(|branch| branch.name() == branch_name)
+        .and_then(|branch| branch.upstream.as_ref())
+        .filter(|upstream| matches!(upstream.tracking, UpstreamTracking::Tracked(_)))
+        .and_then(|upstream| upstream.branch_name().map(ToOwned::to_owned));
+    let options = if tracked_upstream.is_some() {
+        None
+    } else {
+        Some(PushOptions::SetUpstream)
+    };
+    let remote_branch = tracked_upstream.unwrap_or_else(|| branch_name.clone());
+    let window_handle = window.window_handle();
+    let askpass = askpass_delegate(&workspace, window_handle, cx, "git push");
+    window
+        .spawn(cx, async move |cx| {
+            let result = async {
+                let remote = match select_remote_explicit(
+                    &repository_entity,
+                    workspace.clone(),
+                    window_handle,
+                    cx,
+                    "Pick which remote to push the branch to",
+                )
+                .await?
+                {
+                    Some(remote) => remote,
+                    None => {
+                        emit_toast(
+                            &workspace,
+                            cx,
+                            format!("No configured remote to push branch {branch_name} to."),
+                        );
+                        return Ok(());
+                    }
+                };
+                let output = repository_entity
+                    .update(cx, |repository, cx| {
+                        repository.push(
+                            branch_name.clone().into(),
+                            remote_branch.clone().into(),
+                            remote.name.clone(),
+                            options,
+                            askpass,
+                            cx,
+                        )
+                    })
+                    .await
+                    .map_err(|e| anyhow!("push cancelled: {e}"))?;
+                let output = output?;
+                emit_toast(
+                    &workspace,
+                    cx,
+                    format!(
+                        "Pushed branch {branch_name} to {}\n{}",
+                        remote.name,
+                        output.stderr.trim()
+                    ),
+                );
+                Ok(())
+            }
+            .await;
+            graph_weak.update(cx, |graph, _| graph.end_ref_operation()).ok();
+            result
+        })
+        .detach_and_prompt_err(
+            "Git graph branch push failed",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
 }
 
 /// Checkout of a clicked remote-tracking branch (`refs/remotes/<remote>/<b>`),
