@@ -40,8 +40,8 @@ use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_agent_resume::{
-    get_agent_resume_argv, is_invalid_session_record, is_stale_sleeping_record,
-    select_sessions_to_resume, session_claim_key, SleepingSessionRecord,
+    expand_resume_command, get_agent_resume_argv, is_invalid_session_record,
+    is_stale_sleeping_record, select_sessions_to_resume, session_claim_key, SleepingSessionRecord,
 };
 use crate::terminal_thread_metadata_store::{
     AgentSessionBoundary, TerminalAgentProfile, TerminalAgentStatus, TerminalThreadMetadata,
@@ -2317,14 +2317,12 @@ impl AgentPanel {
     /// locator logic stays in one place.
     fn omp_launch_init_command(launch: &OmpTerminalLaunch) -> String {
         if launch.resume {
-            get_agent_resume_argv(
-                TerminalAgentProfile::Omp,
-                &launch.resume_command,
-                Some(launch.resume_path.as_path()),
-                None,
-            )
-            .unwrap_or_default()
-            .join(" ")
+            // Do not auto-execute the resume command: typing it at a not-yet
+            // interactive shell garbles the terminal on restore. Print it as a
+            // shell comment instead so the user can copy it and decide whether
+            // to resume or start fresh.
+            let locator = launch.resume_path.to_string_lossy();
+            format!("# {}", expand_resume_command(&launch.resume_command, &locator).join(" "))
         } else {
             format!(
                 "{} --session-dir {}",
