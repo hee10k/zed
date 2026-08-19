@@ -116,29 +116,34 @@ mod tests {
             .expect("failed to spawn shell");
 
         let root = Pid::from_u32(shell.id());
-        let captured = capture_descendants(root);
-        assert!(
-            !captured.is_empty(),
-            "the forked sleep children should be captured as descendants"
-        );
 
-        // Reap only the forked children, keeping the shell process itself
-        // (which is not one of our captured leaf children — it is the root).
+        // `sh` forks its children asynchronously after spawn, so a single
+        // immediate snapshot can race the forks and observe no descendants.
+        // Poll until both `sleep` children (background + foreground) are
+        // visible before capturing, so the tree we test against is stable and
+        // fully reaped afterward (no stray foreground child left behind).
+        let captured = std::iter::repeat_with(|| capture_descendants(root))
+            .take(100)
+            .find(|captured| captured.len() == 2)
+            .expect("both forked sleep children should be captured as descendants");
+
+        // Reap only the forked children. The root shell is never in the
+        // captured set (it is the root, not a descendant), so reaping cannot
+        // touch it.
         let reaped = reap_orphans(&captured);
         assert!(reaped >= 1, "at least one descendant should be reaped");
-
-        // The shell itself survives reaping (it was never a captured orphan).
-        let status = shell.try_wait();
-        assert!(
-            !matches!(status, Ok(Some(_))),
-            "the capturing shell must not be reaped"
-        );
 
         // A second reap on the same set is a no-op: the children are gone.
         let reaped_again = reap_orphans(&captured);
         assert_eq!(reaped_again, 0);
-        shell.kill().expect("failed to kill test shell");
-        shell.wait().expect("failed to wait for test shell");
+
+        // The shell may have exited on its own once we reaped its foreground
+        // child. Reap it only if it is still running; either way it was never
+        // reaped as an orphan (its pid was not among the captured children).
+        if shell.try_wait().expect("failed to check test shell").is_none() {
+            shell.kill().expect("failed to kill test shell");
+            shell.wait().expect("failed to wait for test shell");
+        }
     }
 
     #[test]
