@@ -192,18 +192,18 @@ mod tests {
         // Default template expands each token, substituting the placeholder.
         assert_eq!(
             expand_resume_command("omp --resume {resume_path}", "/tmp/omp-zed/session"),
-            vec!["omp".into(), "--resume".into(), "/tmp/omp-zed/session".into()]
+            vec!["omp".to_string(), "--resume".to_string(), "/tmp/omp-zed/session".to_string()]
         );
         // Extra tokens/args survive, and a missing placeholder leaves tokens
         // unchanged.
         assert_eq!(
             expand_resume_command("myomp start {resume_path} --force", "/s"),
-            vec!["myomp".into(), "start".into(), "/s".into(), "--force".into()]
+            vec!["myomp".to_string(), "start".to_string(), "/s".to_string(), "--force".to_string()]
         );
         // Expansion handles the placeholder embedded within a token.
         assert_eq!(
             expand_resume_command("omp--{resume_path}", "/s"),
-            vec!["omp--/s".into()]
+            vec!["omp--/s".to_string()]
         );
     }
 

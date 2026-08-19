@@ -81,10 +81,10 @@ use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
-    Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncApp, AsyncWindowContext,
-    ClipboardItem, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
-    PlatformDisplay, PromptLevel, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
-    pulsating_between,
+    Action, Anchor, Animation, AnimationExt, AnyElement, AnyWindowHandle, App, AsyncApp,
+    AsyncWindowContext, ClipboardItem, Entity, EventEmitter, ExternalPaths, FocusHandle,
+    Focusable, KeyContext, Pixels, PlatformDisplay, PromptLevel, Subscription, Task, TaskExt,
+    WeakEntity, WindowHandle, prelude::*, pulsating_between,
 };
 use language::LanguageRegistry;
 use language_model::{
@@ -1247,6 +1247,11 @@ pub struct AgentPanel {
     workspace: WeakEntity<Workspace>,
     /// Workspace id is used as a database key
     workspace_id: Option<WorkspaceId>,
+    /// The window this panel was created in, used to drive gated revival (and
+    /// other window-bound work) from event subscriptions that have no window in
+    /// scope (e.g. a restored workspace applying its worktree paths after the
+    /// panel has loaded).
+    panel_window: Option<AnyWindowHandle>,
     user_store: Entity<UserStore>,
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
@@ -1610,7 +1615,7 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -1661,6 +1666,24 @@ impl AgentPanel {
                     this.ensure_native_agent_connection(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
+                    // A restored workspace applies its worktree paths after the
+                    // panel has already loaded (restore_project_groups), so the
+                    // load-time revival scan may have run against a partial path
+                    // set. Re-run the idempotent gated OMP-session revival now
+                    // that the worktree set is settled; claim-key fencing keeps
+                    // already-resumed sessions from doubling up.
+                    let panel_window = this.panel_window;
+                    if let Some(panel_window) = panel_window {
+                        let this = cx.entity().downgrade();
+                        panel_window
+                            .update(cx, move |_, _, cx| {
+                                this.update_in(cx, |panel, window, cx| {
+                                    panel.auto_resume_sleeping_sessions(window, cx);
+                                })
+                                .log_err();
+                            })
+                            .log_err();
+                    }
                     cx.notify();
                 }
                 project::Event::WorktreeRemoved(_) => {
@@ -1709,6 +1732,7 @@ impl AgentPanel {
 
         let panel = Self {
             workspace_id,
+            panel_window: Some(window.window_handle()),
             base_view,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
             workspace,
@@ -9101,7 +9125,7 @@ mod tests {
         assert_eq!(
             input_log,
             vec![format!(
-                "omp --resume {}\r",
+                "# omp --resume {}\r",
                 expected_resume_path.to_string_lossy()
             )
             .into_bytes()],
@@ -9393,7 +9417,7 @@ mod tests {
         let input_log = resumed.update(&mut cx, |terminal, _| terminal.take_input_log());
         assert_eq!(
             input_log,
-            vec![format!("omp --resume {}\r", resume_path.to_string_lossy()).into_bytes()]
+            vec![format!("# omp --resume {}\r", resume_path.to_string_lossy()).into_bytes()]
         );
 
         // The older duplicate is cleared (not resumed), while the resumed
@@ -9516,7 +9540,7 @@ mod tests {
         assert_eq!(
             input_log,
             vec![format!(
-                "omp --resume {}\r",
+                "# omp --resume {}\r",
                 expected_resume_path.to_string_lossy()
             )
             .into_bytes()],
