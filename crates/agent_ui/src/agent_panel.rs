@@ -2835,6 +2835,58 @@ impl AgentPanel {
         .detach();
     }
 
+    /// Captures the live descendant set of every live OMP agent terminal
+    /// across `panels`, for deciding whether an app quit should prompt about
+    /// running child processes. Returns empty when none of the panels hold a
+    /// live agent terminal with live children (quit may proceed silently).
+    pub async fn capture_live_agent_children(
+        panels: &[Entity<AgentPanel>],
+        cx: &mut AsyncApp,
+    ) -> Vec<CapturedOrphan> {
+        let pids: Vec<_> = {
+            let mut pids = Vec::new();
+            for panel in panels {
+                let panel_pids: Vec<_> = panel
+                    .downgrade()
+                    .read_with(cx, |this, cx| {
+                        this.terminals
+                            .iter()
+                            .filter(|(_, terminal)| {
+                                terminal.agent_profile.is_some()
+                                    && terminal.session_boundary
+                                        == Some(AgentSessionBoundary::Live)
+                            })
+                            .filter_map(|(_, terminal)| {
+                                terminal.view.read(cx).terminal().read(cx).pid()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                pids.extend(panel_pids);
+            }
+            pids
+        };
+        if pids.is_empty() {
+            return Vec::new();
+        }
+        cx.background_spawn(async move {
+            let mut all = Vec::new();
+            for pid in pids {
+                all.extend(terminal::orphan_cleanup::capture_descendants(pid));
+            }
+            all
+        })
+        .await
+    }
+
+    /// Kills captured orphan processes that still exist and still match their
+    /// captured start time (identity re-verified so a recycled PID is never
+    /// touched). Returns the number actually killed. Call when the user opts
+    /// to kill and quit.
+    pub fn kill_children(captured: &[CapturedOrphan]) -> usize {
+        terminal::orphan_cleanup::reap_orphans(captured)
+    }
+
     fn emit_terminal_thread_started(
         &self,
         terminal_id: TerminalId,
@@ -9775,6 +9827,51 @@ mod tests {
         assert!(
             !panel.read_with(&cx, |panel, _| panel.terminals.contains_key(&terminal_id)),
             "choosing close-and-kill must close the terminal"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_quit_child_capture_is_empty_without_live_agent_children(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::init_global(cx);
+        });
+
+        // A plain shell and a display-only OMP terminal: neither has a real
+        // shell pid, so the quit-time child capture must be empty (no prompt
+        // to show, quit proceeds silently).
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.insert_test_terminal("Plain Shell", true, window, cx);
+        });
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_omp_terminal("OMP Agent", true, window, cx)
+            })
+            .expect("OMP test terminal should be inserted");
+        cx.run_until_parked();
+
+        let mut async_app = cx.update(|_, cx| cx.to_async());
+        let captured = AgentPanel::capture_live_agent_children(
+            &[panel.clone()],
+            &mut async_app,
+        )
+        .await;
+        assert!(
+            captured.is_empty(),
+            "no live agent terminal children should be captured at quit"
+        );
+
+        // Reaping a fabricated (non-running) orphan is a no-op, never a panic.
+        let fake = [CapturedOrphan {
+            pid: sysinfo::Pid::from_u32(4242),
+            start_time: 0,
+        }];
+        assert_eq!(
+            AgentPanel::kill_children(&fake),
+            0,
+            "killing a fabricated pid must be a no-op"
         );
     }
 
