@@ -51,12 +51,15 @@ pub fn session_claim_key(
     )
 }
 
-/// Builds the argv that resumes a sleeping agent session. For OMP the
-/// Zed-controlled resume path is preferred; the provider session id is the
-/// fallback. Returns `None` when neither locator is available or the session
-/// id fails validation.
+/// Builds the argv that resumes a sleeping agent session from the configured
+/// `resume_command` template. The `{resume_path}` placeholder is replaced with
+/// the session's locator; each whitespace-separated token becomes one argv
+/// element. For OMP the Zed-controlled resume path is preferred; the provider
+/// session id is the fallback. Returns `None` when no locator is available or
+/// the session id fails validation.
 pub fn get_agent_resume_argv(
     profile: TerminalAgentProfile,
+    resume_command: &str,
     resume_path: Option<&Path>,
     session_id: Option<&str>,
 ) -> Option<Vec<String>> {
@@ -65,9 +68,21 @@ pub fn get_agent_resume_argv(
             let locator = resume_path
                 .map(|path| path.to_string_lossy().into_owned())
                 .or_else(|| session_id.and_then(normalize_session_id).map(str::to_owned))?;
-            Some(vec!["omp".into(), "--resume".into(), locator])
+            Some(expand_resume_command(resume_command, &locator))
         }
     }
+}
+
+/// Splits a resume-command template on whitespace, substituting `{resume_path}`
+/// with the given locator in each token. A token may be more than a bare
+/// placeholder (e.g. `omp --resume {resume_path} --force` stays as-is except
+/// for the placeholder). Returns an argv vector; the caller passes the default
+/// OMP template when no per-harness override is configured.
+pub fn expand_resume_command(template: &str, locator: &str) -> Vec<String> {
+    template
+        .split_whitespace()
+        .map(|token| token.replace("{resume_path}", locator))
+        .collect()
 }
 
 /// A sleeping-session record reduced to the fields the fencing and staleness
@@ -140,6 +155,7 @@ mod tests {
     fn test_get_agent_resume_argv_prefers_resume_path() {
         let argv = get_agent_resume_argv(
             TerminalAgentProfile::Omp,
+            "omp --resume {resume_path}",
             Some(Path::new("/tmp/omp-zed/session")),
             Some("session_123"),
         );
@@ -153,6 +169,7 @@ mod tests {
     fn test_get_agent_resume_argv_falls_back_to_session_id() {
         let argv = get_agent_resume_argv(
             TerminalAgentProfile::Omp,
+            "omp --resume {resume_path}",
             None,
             Some("session_123"),
         );
@@ -164,7 +181,30 @@ mod tests {
 
     #[test]
     fn test_get_agent_resume_argv_returns_none_without_a_locator() {
-        assert_eq!(get_agent_resume_argv(TerminalAgentProfile::Omp, None, None), None);
+        assert_eq!(
+            get_agent_resume_argv(TerminalAgentProfile::Omp, "omp --resume {resume_path}", None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_expand_resume_command_substitutes_resume_path() {
+        // Default template expands each token, substituting the placeholder.
+        assert_eq!(
+            expand_resume_command("omp --resume {resume_path}", "/tmp/omp-zed/session"),
+            vec!["omp".into(), "--resume".into(), "/tmp/omp-zed/session".into()]
+        );
+        // Extra tokens/args survive, and a missing placeholder leaves tokens
+        // unchanged.
+        assert_eq!(
+            expand_resume_command("myomp start {resume_path} --force", "/s"),
+            vec!["myomp".into(), "start".into(), "/s".into(), "--force".into()]
+        );
+        // Expansion handles the placeholder embedded within a token.
+        assert_eq!(
+            expand_resume_command("omp--{resume_path}", "/s"),
+            vec!["omp--/s".into()]
+        );
     }
 
     #[test]

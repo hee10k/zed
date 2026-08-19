@@ -1036,8 +1036,11 @@ pub(crate) struct AgentThread {
 struct OmpTerminalLaunch {
     program: String,
     resume_path: PathBuf,
-    /// When true, launch the harness with `--resume <path>` instead of
-    /// `--session-dir <path>` (auto-resume of a sleeping session).
+    /// Shell-token template used to build the resume command. `{resume_path}`
+    /// is substituted with the session's resume locator.
+    resume_command: String,
+    /// When true, launch the harness with the resume command (auto-resume of a
+    /// sleeping session) instead of `--session-dir <path>`.
     resume: bool,
 }
 
@@ -2152,6 +2155,7 @@ impl AgentPanel {
         let working_directory = self.terminal_working_directory(workspace, cx);
         let terminal_id = TerminalId::new();
         let program = AgentSettings::get_global(cx).terminal_agent.program.clone();
+        let resume_command = AgentSettings::get_global(cx).terminal_agent.resume_command.clone();
         let resume_path = Self::omp_resume_path_for_terminal(&terminal_id);
         self.spawn_terminal(
             terminal_id,
@@ -2159,7 +2163,7 @@ impl AgentPanel {
             None,
             None,
             None,
-            Some(OmpTerminalLaunch { program, resume_path, resume: false }),
+            Some(OmpTerminalLaunch { program, resume_path, resume_command, resume: false }),
             None,
             true,
             true,
@@ -2315,6 +2319,7 @@ impl AgentPanel {
         if launch.resume {
             get_agent_resume_argv(
                 TerminalAgentProfile::Omp,
+                &launch.resume_command,
                 Some(launch.resume_path.as_path()),
                 None,
             )
@@ -3255,10 +3260,13 @@ impl AgentPanel {
 
         // A resume needs a usable resume locator (the Zed-controlled resume
         // path for OMP). If none is available, the session cannot be resumed.
+        let resume_command = AgentSettings::get_global(cx).terminal_agent.resume_command.clone();
         let resume_argv_available = metadata
             .resume_path
             .as_ref()
-            .and_then(|path| get_agent_resume_argv(TerminalAgentProfile::Omp, Some(path), None))
+            .and_then(|path| {
+                get_agent_resume_argv(TerminalAgentProfile::Omp, &resume_command, Some(path), None)
+            })
             .is_some();
 
         let agent_launch = if resume_argv_available {
@@ -3269,6 +3277,7 @@ impl AgentPanel {
                     .resume_path
                     .clone()
                     .expect("resume argv availability implies a resume path"),
+                resume_command,
                 resume: true,
             })
         } else {
@@ -7782,6 +7791,7 @@ impl AgentPanel {
         let terminal_id = TerminalId::new();
         let resume_path = Self::omp_resume_path_for_terminal(&terminal_id);
         let program = AgentSettings::get_global(cx).terminal_agent.program.clone();
+        let resume_command = AgentSettings::get_global(cx).terminal_agent.resume_command.clone();
         self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::OmpTerminal, cx);
         self.insert_display_only_terminal(
             terminal_id,
@@ -7789,7 +7799,7 @@ impl AgentPanel {
             Some(SharedString::from(title.into())),
             None,
             None,
-            Some(OmpTerminalLaunch { program, resume_path, resume: false }),
+            Some(OmpTerminalLaunch { program, resume_path, resume_command, resume: false }),
             None,
             focus,
             focus,

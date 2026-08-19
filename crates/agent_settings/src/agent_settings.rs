@@ -251,14 +251,22 @@ pub struct AgentSettings {
 pub struct TerminalAgentSettings {
     /// The harness program to launch for a dedicated agent terminal.
     pub program: String,
+    /// Shell-token template used to build the command that resumes a sleeping
+    /// agent session. `{resume_path}` is substituted with the resume locator.
+    pub resume_command: String,
     /// Session policy for dedicated agent terminals.
     pub policy: settings::TerminalAgentPolicy,
 }
+
+/// Default template: `omp --resume {resume_path}`. The `{resume_path}`
+/// placeholder is replaced with the session's resume locator at launch time.
+pub const DEFAULT_TERMINAL_RESUME_COMMAND: &str = "omp --resume {resume_path}";
 
 impl Default for TerminalAgentSettings {
     fn default() -> Self {
         Self {
             program: "omp".to_string(),
+            resume_command: DEFAULT_TERMINAL_RESUME_COMMAND.to_string(),
             policy: settings::TerminalAgentPolicy::Local,
         }
     }
@@ -845,6 +853,10 @@ impl Settings for AgentSettings {
                         .program
                         .filter(|program| !program.trim().is_empty())
                         .unwrap_or_else(|| "omp".to_string()),
+                    resume_command: terminal_agent
+                        .resume_command
+                        .filter(|command| !command.trim().is_empty())
+                        .unwrap_or_else(|| DEFAULT_TERMINAL_RESUME_COMMAND.to_string()),
                     policy: terminal_agent.policy.unwrap_or_default(),
                 }
             },
@@ -1149,20 +1161,22 @@ mod tests {
         project::DisableAiSettings::register(cx);
         AgentSettings::register(cx);
 
-        // No explicit settings: single OMP profile, program "omp", local policy.
+        // No explicit settings: single OMP profile, program "omp", default
+        // resume template, local policy.
         assert_eq!(
             AgentSettings::get_global(cx).terminal_agent,
             TerminalAgentSettings {
                 program: "omp".to_string(),
+                resume_command: DEFAULT_TERMINAL_RESUME_COMMAND.to_string(),
                 policy: settings::TerminalAgentPolicy::Local,
             }
         );
 
-        // Custom program and policy parse through the settings block.
+        // Custom program, resume template, and policy parse through the block.
         SettingsStore::update_global(cx, |store, cx| {
             store
                 .set_user_settings(
-                    r#"{ "agent": { "terminal_agent": { "program": "my-omp", "policy": "local" } } }"#,
+                    r#"{ "agent": { "terminal_agent": { "program": "my-omp", "resume_command": "my-omp start {resume_path}", "policy": "local" } } }"#,
                     cx,
                 )
                 .unwrap();
@@ -1172,15 +1186,19 @@ mod tests {
             "my-omp"
         );
         assert_eq!(
+            AgentSettings::get_global(cx).terminal_agent.resume_command,
+            "my-omp start {resume_path}"
+        );
+        assert_eq!(
             AgentSettings::get_global(cx).terminal_agent.policy,
             settings::TerminalAgentPolicy::Local
         );
 
-        // An empty program falls back to the default "omp".
+        // An empty program and empty resume template fall back to defaults.
         SettingsStore::update_global(cx, |store, cx| {
             store
                 .set_user_settings(
-                    r#"{ "agent": { "terminal_agent": { "program": "   " } } }"#,
+                    r#"{ "agent": { "terminal_agent": { "program": "   ", "resume_command": "   " } } }"#,
                     cx,
                 )
                 .unwrap();
@@ -1188,6 +1206,10 @@ mod tests {
         assert_eq!(
             AgentSettings::get_global(cx).terminal_agent.program,
             "omp"
+        );
+        assert_eq!(
+            AgentSettings::get_global(cx).terminal_agent.resume_command,
+            DEFAULT_TERMINAL_RESUME_COMMAND
         );
     }
 
