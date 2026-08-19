@@ -700,6 +700,21 @@ pub mod assistant {
     }
 }
 
+pub mod thread {
+    use gpui::actions;
+
+    actions!(
+        thread,
+        [
+            /// Lists the current worktree's terminal-agent sessions. Open
+            /// (live/queued) sessions are shown separately from Closed
+            /// (sleeping) sessions so the user can pick which to resume or
+            /// start fresh.
+            ListSessions,
+        ]
+    );
+}
+
 /// Opens the recent projects interface.
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
 #[action(namespace = projects)]

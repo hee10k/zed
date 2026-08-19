@@ -32,6 +32,7 @@ use zed_actions::{
         FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules, Toggle,
         ToggleFocus,
     },
+    thread::ListSessions,
 };
 
 use crate::ExpandMessageEditor;
@@ -569,6 +570,11 @@ pub fn init(cx: &mut App) {
                 .register_action(|workspace, _: &CleanUpOrphans, _window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| panel.reap_pending_orphans(cx));
+                    }
+                })
+                .register_action(|workspace, _: &ListSessions, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| panel.list_sessions(window, cx));
                     }
                 })
                 .register_action(|workspace, action: &ReviewBranchDiff, window, cx| {
@@ -3002,6 +3008,100 @@ impl AgentPanel {
         store.update(cx, |store, cx| {
             store.save(metadata, cx);
         });
+    }
+
+    /// Writes `lines` as plain text into the active terminal's output (the
+    /// echo surface used for session listings). No-ops when no terminal is
+    /// active. This injects display text into the terminal emulator without
+    /// going through the PTY, so the shell remains interactive.
+    fn echo_output(&self, lines: &[String], cx: &mut Context<Self>) {
+        let Some(terminal_id) = self.active_terminal_id() else {
+            return;
+        };
+        let Some(view) = self.terminals.get(&terminal_id).map(|t| t.view.clone()) else {
+            return;
+        };
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        let terminal = view.read(cx).terminal().clone();
+        terminal.update(cx, |terminal, cx| terminal.write_output(text.as_bytes(), cx));
+    }
+
+    /// Lists the current worktree's terminal-agent sessions as Open (live or
+    /// queued in this panel) versus Closed (sleeping records persisted in the
+    /// metadata store: OMP profile with a sleeping boundary). The list is
+    /// written to the active terminal as echo output.
+    fn list_sessions(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.supports_terminal(cx) {
+            return;
+        }
+        let project = self.project.read(cx);
+        let worktree_paths = project.worktree_paths(cx);
+        let remote_connection = project.remote_connection_options(cx);
+        let store = TerminalThreadMetadataStore::try_global(cx);
+
+        let mut lines = vec![String::from("-- Terminal agent sessions --")];
+
+        lines.push(String::from("Open (live/queued):"));
+        let mut open_ids: Vec<TerminalId> = self.terminals.keys().copied().collect();
+        open_ids.sort();
+        for terminal_id in open_ids {
+            let state = self
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| terminal.session_boundary)
+                .map(|boundary| format!("{boundary:?}"))
+                .unwrap_or_else(|| "Live".to_string());
+            lines.push(format!("  {terminal_id}  {state}"));
+        }
+        if lines.len() == 2 {
+            lines.push(String::from("  (none)"));
+        }
+
+        lines.push(String::from("Closed (sleeping):"));
+        let mut any_closed = false;
+        if let Some(store) = store {
+            let mut closed: Vec<(TerminalId, String)> = store
+                .read(cx)
+                .entries_for_main_worktree_path(
+                    worktree_paths.main_worktree_path_list(),
+                    remote_connection.as_ref(),
+                )
+                .filter(|metadata| {
+                    metadata.agent_profile == Some(TerminalAgentProfile::Omp)
+                        && metadata.session_boundary == Some(AgentSessionBoundary::Sleeping)
+                })
+                .map(|metadata| {
+                    (
+                        metadata.terminal_id,
+                        metadata
+                            .resume_path
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect();
+            closed.sort();
+            for (terminal_id, resume_path) in closed {
+                any_closed = true;
+                let locator = if resume_path.is_empty() {
+                    "<no locator>".to_string()
+                } else {
+                    resume_path
+                };
+                lines.push(format!("  {terminal_id}  omp --resume {locator}"));
+            }
+        }
+        if !any_closed {
+            lines.push(String::from("  (none)"));
+        }
+
+        self.echo_output(&lines, cx);
+        window.refresh();
     }
 
     /// Auto-resumes sleeping OMP agent sessions for the current worktree on
