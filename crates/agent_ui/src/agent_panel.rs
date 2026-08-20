@@ -83,7 +83,7 @@ use futures::FutureExt as _;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, AnyWindowHandle, App, AsyncApp,
     AsyncWindowContext, ClipboardItem, Entity, EventEmitter, ExternalPaths, FocusHandle,
-    Focusable, KeyContext, Pixels, PlatformDisplay, PromptLevel, Subscription, Task, TaskExt,
+    Focusable, KeyContext, Pixels, PlatformDisplay, Subscription, Task, TaskExt,
     WeakEntity, WindowHandle, prelude::*, pulsating_between,
 };
 use language::LanguageRegistry;
@@ -120,9 +120,6 @@ const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Interval between background orphan-reaping passes. Kept slow because each
-/// pass walks the full system process table.
-const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// Shown when a sleeping OMP session cannot be resumed because no usable resume
 /// locator is available. A plain shell is left instead; no fresh agent session
 /// is silently launched.
@@ -1720,16 +1717,6 @@ impl AgentPanel {
         })
         .detach();
 
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(ORPHAN_SWEEP_INTERVAL).await;
-                if this.update(cx, |this, cx| this.reap_pending_orphans(cx)).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-
         let panel = Self {
             workspace_id,
             panel_window: Some(window.window_handle()),
@@ -2621,7 +2608,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.request_close_terminal_with_orphan_guard(terminal_id, true, window, cx);
+        self.close_terminal_internal(terminal_id, true, window, cx);
     }
 
     pub fn close_terminal_without_activating_draft(
@@ -2630,100 +2617,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.request_close_terminal_with_orphan_guard(terminal_id, false, window, cx);
-    }
-
-    /// Guards a terminal close: if the terminal's shell/agent process still has
-    /// live descendants, ask the user whether to kill them and close, or cancel
-    /// the close. A terminal with no live process (already exited) or no
-    /// descendants closes immediately with no prompt.
-    fn request_close_terminal_with_orphan_guard(
-        &mut self,
-        terminal_id: TerminalId,
-        activate_draft_after_close: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(pid) = self
-            .terminals
-            .get(&terminal_id)
-            .and_then(|terminal| terminal.view.read(cx).terminal().read(cx).pid())
-        else {
-            // No live shell process to outlive the terminal: close immediately.
-            self.close_terminal_internal(terminal_id, activate_draft_after_close, window, cx);
-            return;
-        };
-
-        cx.spawn_in(window, async move |this, cx| {
-            let captured = cx
-                .background_spawn(async move {
-                    terminal::orphan_cleanup::capture_descendants(pid)
-                })
-                .await;
-            this.update_in(cx, |this, window, cx| {
-                if captured.is_empty() {
-                    this.close_terminal_internal(
-                        terminal_id,
-                        activate_draft_after_close,
-                        window,
-                        cx,
-                    );
-                } else {
-                    this.confirm_close_with_orphans(
-                        captured,
-                        terminal_id,
-                        activate_draft_after_close,
-                        window,
-                        cx,
-                    );
-                }
-            })
-            .log_err();
-        })
-        .detach();
-    }
-
-    /// Shows a "kill children and close?" confirmation for a terminal that is
-    /// about to be closed with live descendants. On "Close & Kill", the
-    /// captured orphans are staged for reaping (start-time verified) and the
-    /// terminal closes; on "Cancel", the close is aborted and the captured set
-    /// is discarded so the process stays the terminal's own.
-    fn confirm_close_with_orphans(
-        &mut self,
-        captured: Vec<CapturedOrphan>,
-        terminal_id: TerminalId,
-        activate_draft_after_close: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let prompt = window.prompt(
-            PromptLevel::Warning,
-            &format!(
-                "This thread has {} running descendant process(es). Close the thread and kill them?",
-                captured.len()
-            ),
-            None,
-            &["Close & Kill", "Cancel"],
-            cx,
-        );
-        let this = cx.weak_entity();
-        window.spawn(cx, async move |cx| {
-            let kill = matches!(cx.background_spawn(async move { prompt.await }).await, Ok(0));
-            this.update_in(cx, |this, window, cx| {
-                if !kill {
-                    return;
-                }
-                this.pending_orphans.extend(captured);
-                this.close_terminal_internal(
-                    terminal_id,
-                    activate_draft_after_close,
-                    window,
-                    cx,
-                );
-            })
-            .log_err();
-        })
-        .detach();
+        self.close_terminal_internal(terminal_id, false, window, cx);
     }
 
     fn close_terminal_internal(
@@ -3291,7 +3185,7 @@ impl AgentPanel {
     /// Writes the recorded orphan processes (descendants of a closed thread,
     /// terminal, or worktree that were still running at capture time) to the
     /// active terminal as echo output.
-    fn list_orphan_processes(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn list_orphan_processes(&self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.supports_terminal(cx) {
             return;
         }
@@ -3304,10 +3198,18 @@ impl AgentPanel {
             }
         }
         lines.push(String::from(
-            "Run `thread: Kill Orphan Processes` to terminate survivors.",
+            "Run `thread: Kill Orphaned Processes` to terminate survivors.",
         ));
         self.echo_output(&lines, cx);
         window.refresh();
+    }
+
+    /// Number of still-tracked orphan processes (descendants of closed
+    /// threads/terminals that were running at capture time). Used to surface an
+    /// explicit orphan-cleanup affordance (e.g. a thread context-menu item);
+    /// orphans are only reaped when the user opts in, never silently.
+    pub fn pending_orphan_count(&self) -> usize {
+        self.pending_orphans.len()
     }
 
     /// Auto-resumes sleeping OMP agent sessions for the current worktree on
@@ -9778,9 +9680,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_close_terminal_with_live_children_prompts_before_killing(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_close_terminal_closes_without_orphan_prompt(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         cx.update(|_, cx| {
             TerminalThreadMetadataStore::init_global(cx);
@@ -9793,40 +9693,16 @@ mod tests {
             .expect("OMP test terminal should be inserted");
         cx.run_until_parked();
 
-        let fake_orphan = CapturedOrphan {
-            pid: sysinfo::Pid::from_u32(4242),
-            start_time: 0,
-        };
-
-        // Closing a terminal with live descendants shows a prompt instead of
-        // closing it outright.
+        // Closing a thread closes it directly — orphan handling is an explicit
+        // thread context-menu action, not a blocking close-time prompt, so a
+        // close must never stall (or be cancelled) behind a confirmation.
         panel.update_in(&mut cx, |panel, window, cx| {
-            panel.confirm_close_with_orphans(vec![fake_orphan], terminal_id, true, window, cx);
+            panel.close_terminal(terminal_id, window, cx);
         });
-        cx.run_until_parked();
-        assert!(
-            panel.read_with(&cx, |panel, _| panel.terminals.contains_key(&terminal_id)),
-            "terminal must remain open while the close prompt is pending"
-        );
-
-        // Cancelling keeps the terminal open.
-        cx.simulate_prompt_answer("Cancel");
-        cx.run_until_parked();
-        assert!(
-            panel.read_with(&cx, |panel, _| panel.terminals.contains_key(&terminal_id)),
-            "cancelling the close prompt must keep the terminal open"
-        );
-
-        // Re-confirm and choose to kill; the terminal closes.
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.confirm_close_with_orphans(vec![fake_orphan], terminal_id, true, window, cx);
-        });
-        cx.run_until_parked();
-        cx.simulate_prompt_answer("Close & Kill");
         cx.run_until_parked();
         assert!(
             !panel.read_with(&cx, |panel, _| panel.terminals.contains_key(&terminal_id)),
-            "choosing close-and-kill must close the terminal"
+            "closing a terminal must remove it without prompting about orphans"
         );
     }
 
