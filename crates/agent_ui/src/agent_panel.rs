@@ -39,8 +39,8 @@ use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
-    AgentSessionBoundary, TerminalAgentProfile, TerminalAgentStatus, TerminalThreadMetadata,
-    TerminalThreadMetadataStore, compose_terminal_thread_title, terminal_title_without_prefix,
+    TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore,
+    compose_terminal_thread_title, terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
@@ -49,7 +49,7 @@ use crate::{
 };
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow,
-    LoadThreadFromClipboard, NewOmpAgentTerminal, NewTerminalThread, NewThread,
+    LoadThreadFromClipboard, NewTerminalThread, NewThread,
     OpenActiveThreadAsMarkdown, OpenAgentDiff, ResetFastModeWarnings, ResetTrialEndUpsell,
     ResetTrialUpsell, ShowAllSidebarThreadMetadata, ShowThreadMetadata, ToggleNewThreadMenu,
     ToggleOptionsMenu,
@@ -90,7 +90,7 @@ use settings::TerminalDockPosition;
 use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
-use terminal::{Event as TerminalEvent, orphan_cleanup::CapturedOrphan, terminal_settings::TerminalSettings};
+use terminal::{Event as TerminalEvent, terminal_settings::TerminalSettings};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
@@ -99,7 +99,6 @@ use ui::{
     PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
 };
 use util::ResultExt as _;
-use util::paths::home_dir;
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
     ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
@@ -348,13 +347,20 @@ enum AgentPanelEntryKind {
     #[default]
     Thread,
     Terminal,
-    OmpTerminal,
+}
+
+fn deserialize_entry_kind<'de, D>(deserializer: D) -> Result<AgentPanelEntryKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct SerializedAgentPanel {
     selected_agent: Option<Agent>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_entry_kind")]
     last_created_entry_kind: AgentPanelEntryKind,
     #[serde(default)]
     last_active_thread: Option<SerializedActiveThread>,
@@ -397,14 +403,6 @@ pub fn init(cx: &mut App) {
                                 window,
                                 cx,
                             )
-                        });
-                        workspace.focus_panel::<AgentPanel>(window, cx);
-                    }
-                })
-                .register_action(|workspace, _: &NewOmpAgentTerminal, window, cx| {
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        panel.update(cx, |panel, cx| {
-                            panel.new_omp_agent_terminal(Some(workspace), window, cx)
                         });
                         workspace.focus_panel::<AgentPanel>(window, cx);
                     }
@@ -1005,14 +1003,6 @@ pub(crate) struct AgentThread {
     conversation_view: Entity<ConversationView>,
 }
 
-/// Launch parameters for a dedicated OMP agent terminal. The panel assigns the
-/// session path so the session is identified deterministically without parsing
-/// TUI output; the harness is launched with `program --session-dir <path>`.
-#[derive(Clone)]
-struct OmpTerminalLaunch {
-    program: String,
-    resume_path: PathBuf,
-}
 
 
 struct AgentTerminal {
@@ -1030,14 +1020,8 @@ struct AgentTerminal {
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
-    /// Terminal-agent profile if this is a dedicated agent session.
-    agent_profile: Option<TerminalAgentProfile>,
-    /// Opaque Zed-assigned session path for the agent session.
-    resume_path: Option<PathBuf>,
-    /// Session-boundary state of a dedicated agent session.
-    session_boundary: Option<AgentSessionBoundary>,
-}
 
+}
 impl AgentTerminal {
     fn terminal_title_for_view(view: &TerminalView, cx: &App) -> SharedString {
         let terminal = view.terminal().read(cx);
@@ -1496,18 +1480,14 @@ impl AgentPanel {
                     }
 
                     if let Some(metadata) = terminal_to_restore {
-                        // Sleeping dedicated-agent records remain persisted for
-                        // their sidebar status, but are not relaunched.
-                        if metadata.session_boundary != Some(AgentSessionBoundary::Sleeping) {
-                            panel.restore_terminal_for_panel_load(
-                                metadata,
-                                false,
-                                AgentThreadSource::AgentPanel,
-                                Some(workspace),
-                                window,
-                                cx,
-                            );
-                        }
+                        panel.restore_terminal_for_panel_load(
+                            metadata,
+                            false,
+                            AgentThreadSource::AgentPanel,
+                            Some(workspace),
+                            window,
+                            cx,
+                        );
                     } else if let Some((info, thread_id)) = thread_to_restore {
                         let agent = panel.selected_agent.clone();
                         panel.load_agent_thread(
@@ -1610,7 +1590,6 @@ impl AgentPanel {
 
         cx.on_release(|this, cx| {
             this.dismiss_all_terminal_notifications(cx);
-            this.sleep_all_live_agent_terminals(cx);
         })
         .detach();
 
@@ -1822,9 +1801,6 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         match self.last_created_entry_kind {
-            AgentPanelEntryKind::OmpTerminal => {
-                self.new_omp_agent_terminal(workspace, window, cx);
-            }
             _ if self.should_create_terminal_for_new_entry(cx) => {
                 self.new_terminal(workspace, AgentThreadSource::AgentPanel, window, cx);
             }
@@ -2042,7 +2018,6 @@ impl AgentPanel {
             None,
             None,
             None,
-            None,
             true,
             true,
             true,
@@ -2052,52 +2027,6 @@ impl AgentPanel {
         );
     }
 
-    /// Creates a dedicated OMP agent terminal, distinct from a plain terminal
-    /// thread that reuses `terminal_init_command`. Zed assigns the terminal a
-    /// session path (`~/.omp/zed/<terminal-id>/`) and launches the harness with
-    /// `omp --session-dir <path>`, recording the session as `live`.
-    /// A plain shell that happens to run `omp` is never promoted to a dedicated
-    /// agent session: only this dedicated entry carries session metadata.
-    pub fn new_omp_agent_terminal(
-        &mut self,
-        workspace: Option<&Workspace>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.supports_terminal(cx) {
-            return;
-        }
-        self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::OmpTerminal, cx);
-        let working_directory = self.terminal_working_directory(workspace, cx);
-        let terminal_id = TerminalId::new();
-        let program = AgentSettings::get_global(cx).terminal_agent.program.clone();
-        let resume_path = Self::omp_resume_path_for_terminal(&terminal_id);
-        self.spawn_terminal(
-            terminal_id,
-            working_directory,
-            None,
-            None,
-            None,
-            Some(OmpTerminalLaunch { program, resume_path }),
-            true,
-            true,
-            false,
-            AgentThreadSource::AgentPanel,
-            window,
-            cx,
-        );
-    }
-
-    /// The Zed-controlled session path for a dedicated agent terminal: an opaque
-    /// per-terminal directory under `~/.omp/zed/<terminal-id>/`. It is the
-    /// persisted locator for the session; the harness is launched with
-    /// `--session-dir <path>`.
-    fn omp_resume_path_for_terminal(terminal_id: &TerminalId) -> PathBuf {
-        home_dir()
-            .join(".omp")
-            .join("zed")
-            .join(terminal_id.to_key_string())
-    }
 
     fn terminal_working_directory(
         &self,
@@ -2147,7 +2076,6 @@ impl AgentPanel {
         custom_title: Option<SharedString>,
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
-        agent_launch: Option<OmpTerminalLaunch>,
         select: bool,
         focus: bool,
         run_init_command: bool,
@@ -2156,11 +2084,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         let terminal_working_directory = working_directory.clone();
-        let init_command = if let Some(launch) = &agent_launch {
-            Some(Self::omp_launch_init_command(launch))
-        } else {
-            Self::terminal_init_command(run_init_command, cx)
-        };
+        let init_command = Self::terminal_init_command(run_init_command, cx);
         let terminal_task = self.project.update(cx, |project, cx| {
             project.create_terminal_shell(working_directory, cx)
         });
@@ -2201,7 +2125,6 @@ impl AgentPanel {
                     custom_title,
                     initial_title,
                     created_at,
-                    agent_launch,
                     select,
                     focus,
                     source,
@@ -2222,15 +2145,6 @@ impl AgentPanel {
             .filter(|command| !command.trim().is_empty())
     }
 
-    /// Builds the shell command that launches an OMP agent terminal with
-    /// `--session-dir <path>`.
-    fn omp_launch_init_command(launch: &OmpTerminalLaunch) -> String {
-        format!(
-            "{} --session-dir {}",
-            launch.program,
-            launch.resume_path.to_string_lossy()
-        )
-    }
 
     fn write_terminal_init_command(
         terminal: &Entity<terminal::Terminal>,
@@ -2296,7 +2210,6 @@ impl AgentPanel {
         custom_title: Option<SharedString>,
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
-        agent_launch: Option<OmpTerminalLaunch>,
         select: bool,
         focus: bool,
         source: AgentThreadSource,
@@ -2334,32 +2247,20 @@ impl AgentPanel {
                     this.schedule_terminal_status_inference(terminal_id, cx);
                 }
                 TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
-                TerminalEvent::ProcessExited => {
-                    // The OMP process ended on its own: the session becomes
-                    // sleeping so its terminal status remains visible.
-                    this.transition_terminal_to_sleeping(terminal_id, cx);
-                }
                 TerminalEvent::CloseTerminal => {
                     this.request_close_terminal_from_terminal_event(terminal_id, cx);
                 }
                 TerminalEvent::BlinkChanged(_)
                 | TerminalEvent::SelectionsChanged
                 | TerminalEvent::NewNavigationTarget(_)
-                | TerminalEvent::Open(_) => {}
+                | TerminalEvent::Open(_)
+                | TerminalEvent::ProcessExited => {}
             },
         );
 
         let last_known_terminal_title = initial_title
             .map(|title| title.to_string())
             .unwrap_or_default();
-        let (agent_profile, resume_path, session_boundary) = match &agent_launch {
-            Some(_) => (
-                Some(TerminalAgentProfile::Omp),
-                agent_launch.as_ref().map(|launch| launch.resume_path.clone()),
-                Some(AgentSessionBoundary::Live),
-            ),
-            None => (None, None, None),
-        };
         let mut terminal = AgentTerminal {
             view: terminal_view,
             title_editor: None,
@@ -2375,9 +2276,6 @@ impl AgentPanel {
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
             _subscriptions: vec![view_subscription, terminal_subscription],
-            agent_profile,
-            resume_path,
-            session_boundary,
         };
         if self.pending_terminal_spawn == Some(terminal_id) {
             self.pending_terminal_spawn = None;
@@ -2448,27 +2346,13 @@ impl AgentPanel {
             self.pending_terminal_spawn = None;
         }
         self.dismiss_terminal_notifications(terminal_id, cx);
-        // Capture dedicated agent metadata before removing the terminal so an
-        // explicit close can clear its persisted session record.
-        let metadata = self.terminal_metadata(terminal_id, cx);
         if self.terminals.remove(&terminal_id).is_none() {
             return;
         }
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
-            if metadata.as_ref().is_some_and(|metadata| metadata.agent_profile.is_some()) {
-                // Explicitly closing a dedicated agent terminal clears its
-                // persisted session record.
-                if let Some(mut metadata) = metadata {
-                    metadata.session_boundary = Some(AgentSessionBoundary::Cleared);
-                    store.update(cx, |store, cx| {
-                        store.save(metadata, cx);
-                    });
-                }
-            } else {
-                store.update(cx, |store, cx| {
-                    store.delete(terminal_id, cx);
-                });
-            }
+            store.update(cx, |store, cx| {
+                store.delete(terminal_id, cx);
+            });
         }
         if was_active {
             self.base_view = BaseView::Uninitialized;
@@ -2493,57 +2377,6 @@ impl AgentPanel {
     }
 
 
-    /// Captures the live descendant set of every live OMP agent terminal
-    /// across `panels`, for deciding whether an app quit should prompt about
-    /// running child processes. Returns empty when none of the panels hold a
-    /// live agent terminal with live children (quit may proceed silently).
-    pub async fn capture_live_agent_children(
-        panels: &[Entity<AgentPanel>],
-        cx: &mut AsyncApp,
-    ) -> Vec<CapturedOrphan> {
-        let pids: Vec<_> = {
-            let mut pids = Vec::new();
-            for panel in panels {
-                let panel_pids: Vec<_> = panel
-                    .downgrade()
-                    .read_with(cx, |this, cx| {
-                        this.terminals
-                            .iter()
-                            .filter(|(_, terminal)| {
-                                terminal.agent_profile.is_some()
-                                    && terminal.session_boundary
-                                        == Some(AgentSessionBoundary::Live)
-                            })
-                            .filter_map(|(_, terminal)| {
-                                terminal.view.read(cx).terminal().read(cx).pid()
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                pids.extend(panel_pids);
-            }
-            pids
-        };
-        if pids.is_empty() {
-            return Vec::new();
-        }
-        cx.background_spawn(async move {
-            let mut all = Vec::new();
-            for pid in pids {
-                all.extend(terminal::orphan_cleanup::capture_descendants(pid));
-            }
-            all
-        })
-        .await
-    }
-
-    /// Kills captured orphan processes that still exist and still match their
-    /// captured start time (identity re-verified so a recycled PID is never
-    /// touched). Returns the number actually killed. Call when the user opts
-    /// to kill and quit.
-    pub fn kill_children(captured: &[CapturedOrphan]) -> usize {
-        terminal::orphan_cleanup::reap_orphans(captured)
-    }
 
     fn emit_terminal_thread_started(
         &self,
@@ -2565,13 +2398,7 @@ impl AgentPanel {
         if let Some(terminal) = self.terminals.get_mut(&terminal_id)
             && terminal.refresh_metadata(cx)
         {
-            // A deterministic transition away from Idle (spinner started →
-            // Running; session ended → Completed) invalidates any cached
-            // model inference for wait-vs-idle.
-            let deterministic = TerminalAgentStatus::derive(
-                terminal.session_boundary,
-                terminal.title(cx).as_ref(),
-            );
+            let deterministic = TerminalAgentStatus::derive(terminal.title(cx).as_ref());
             if !matches!(deterministic, TerminalAgentStatus::Idle) {
                 self.clear_terminal_inferred_status(terminal_id);
             }
@@ -2647,13 +2474,10 @@ impl AgentPanel {
             return;
         };
         let title = view.read(cx).terminal().read(cx).title(false);
-        let session_boundary = self
-            .terminal_metadata(terminal_id, cx)
-            .and_then(|m| m.session_boundary);
-        // Deterministic Running (busy title prefix, e.g. a spinner) or
-        // Completed (ended session) needs no inference.
+        // Deterministic Running (busy title prefix, e.g. a spinner) needs no
+        // inference.
         if !matches!(
-            TerminalAgentStatus::derive(session_boundary, &title),
+            TerminalAgentStatus::derive(&title),
             TerminalAgentStatus::Idle
         ) {
             return;
@@ -2756,71 +2580,12 @@ impl AgentPanel {
             worktree_paths: project.worktree_paths(cx),
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
-            agent_profile: terminal.agent_profile,
-            resume_path: terminal.resume_path.clone(),
-            session_boundary: terminal.session_boundary,
             user_order: stored_user_order,
         })
     }
 
 
-    /// Transitions a live OMP agent terminal to `sleeping` and persists the
-    /// change. No-op for non-agent terminals, or when the session is not
-    /// currently live (already sleeping/cleared).
-    fn transition_terminal_to_sleeping(
-        &mut self,
-        terminal_id: TerminalId,
-        cx: &mut Context<Self>,
-    ) {
-        let should_transition = self.terminals.get(&terminal_id).is_some_and(|terminal| {
-            terminal.agent_profile.is_some()
-                && terminal.session_boundary == Some(AgentSessionBoundary::Live)
-        });
-        if !should_transition {
-            return;
-        }
-        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-            terminal.session_boundary = Some(AgentSessionBoundary::Sleeping);
-        }
-        // The session has ended (deterministic Completed); drop any inferred
-        // waiting state so the badge reflects the boundary.
-        self.clear_terminal_inferred_status(terminal_id);
-        self.persist_terminal_metadata(terminal_id, cx);
-        cx.notify();
-    }
 
-    /// On panel/worktree close (app quit), every live OMP agent terminal becomes
-    /// a sleeping session so its session record survives the restart. Runs with
-    /// an `App` context because it is invoked from `on_release` during teardown.
-    fn sleep_all_live_agent_terminals(&mut self, cx: &mut App) {
-        let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
-            return;
-        };
-        let terminal_ids: Vec<TerminalId> = self
-            .terminals
-            .iter()
-            .filter(|(_, terminal)| {
-                terminal.agent_profile.is_some()
-                    && terminal.session_boundary == Some(AgentSessionBoundary::Live)
-            })
-            .map(|(terminal_id, _)| *terminal_id)
-            .collect();
-        for terminal_id in terminal_ids {
-            if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
-                terminal.session_boundary = Some(AgentSessionBoundary::Sleeping);
-            }
-            // Update the persisted record directly so the sleeping boundary
-            // survives the restart without needing project context during
-            // teardown.
-            if let Some(metadata) = store.read(cx).entry(terminal_id).cloned() {
-                let mut metadata = metadata;
-                metadata.session_boundary = Some(AgentSessionBoundary::Sleeping);
-                store.update(cx, |store, cx| {
-                    store.save(metadata, cx);
-                });
-            }
-        }
-    }
 
 
 
@@ -2851,7 +2616,6 @@ impl AgentPanel {
             metadata.custom_title.clone(),
             initial_title,
             Some(metadata.created_at),
-            None,
             true,
             focus,
             true,
@@ -3768,10 +3532,7 @@ impl AgentPanel {
         self.terminals
             .iter()
             .map(|(id, terminal)| {
-                let status = TerminalAgentStatus::derive(
-                    terminal.session_boundary,
-                    terminal.title(cx).as_ref(),
-                )
+                let status = TerminalAgentStatus::derive(terminal.title(cx).as_ref())
                 .with_inferred_waiting(self.inferred_terminal_waiting.get(id) == Some(&true));
                 AgentPanelTerminalInfo {
                     id: *id,
@@ -5564,7 +5325,6 @@ impl AgentPanel {
             None,
             None,
             None,
-            None,
             true,
             false,
             true,
@@ -5586,7 +5346,6 @@ impl AgentPanel {
         if let Err(error) = self.insert_display_only_terminal(
             terminal_id,
             working_directory,
-            None,
             None,
             None,
             None,
@@ -6316,32 +6075,6 @@ impl AgentPanel {
                                         }
                                     }),
                             )
-                            .item(
-                                ContextMenuEntry::new("OMP Agent Terminal")
-                                    .action(Box::new(NewOmpAgentTerminal))
-                                    .icon(IconName::ZedAgent)
-                                    .icon_color(Color::Muted)
-                                    .handler({
-                                        let workspace = workspace.clone();
-                                        move |window, cx| {
-                                            if let Some(workspace) = workspace.upgrade() {
-                                                workspace.update(cx, |workspace, cx| {
-                                                    if let Some(panel) =
-                                                        workspace.panel::<AgentPanel>(cx)
-                                                    {
-                                                        panel.update(cx, |panel, cx| {
-                                                            panel.new_omp_agent_terminal(
-                                                                Some(workspace),
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }
-                                                });
-                                            }
-                                        }
-                                    }),
-                            )
                         })
                         .map(|mut menu| {
                             let agent_server_store = agent_server_store.read(cx);
@@ -6918,10 +6651,6 @@ impl Render for AgentPanel {
                 cx.stop_propagation();
                 this.new_terminal(None, AgentThreadSource::AgentPanel, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &NewOmpAgentTerminal, window, cx| {
-                cx.stop_propagation();
-                this.new_omp_agent_terminal(None, window, cx);
-            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_configuration(window, cx);
             }))
@@ -7149,7 +6878,6 @@ impl AgentPanel {
             Some(SharedString::from(title.into())),
             None,
             None,
-            None,
             focus,
             focus,
             true,
@@ -7160,38 +6888,6 @@ impl AgentPanel {
         Ok(terminal_id)
     }
 
-    /// Test-only: creates a dedicated OMP agent terminal via the display-only
-    /// path (no real shell), so tests can assert the assigned resume path, the
-    /// `omp --session-dir <path>` launch command, and the persisted `live`
-    /// session metadata deterministically on any platform.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn insert_test_omp_terminal(
-        &mut self,
-        title: impl Into<String>,
-        focus: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<TerminalId> {
-        let terminal_id = TerminalId::new();
-        let resume_path = Self::omp_resume_path_for_terminal(&terminal_id);
-        let program = AgentSettings::get_global(cx).terminal_agent.program.clone();
-        self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::OmpTerminal, cx);
-        self.insert_display_only_terminal(
-            terminal_id,
-            None,
-            Some(SharedString::from(title.into())),
-            None,
-            None,
-            Some(OmpTerminalLaunch { program, resume_path }),
-            focus,
-            focus,
-            false,
-            AgentThreadSource::AgentPanel,
-            window,
-            cx,
-        )?;
-        Ok(terminal_id)
-    }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn restore_test_terminal(
@@ -7220,7 +6916,6 @@ impl AgentPanel {
             metadata.custom_title.clone(),
             initial_title,
             Some(metadata.created_at),
-            None,
             true,
             focus,
             true,
@@ -7238,7 +6933,6 @@ impl AgentPanel {
         custom_title: Option<SharedString>,
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
-        agent_launch: Option<OmpTerminalLaunch>,
         select: bool,
         focus: bool,
         run_init_command: bool,
@@ -7246,11 +6940,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        let init_command = if let Some(launch) = &agent_launch {
-            Some(Self::omp_launch_init_command(launch))
-        } else {
-            Self::terminal_init_command(run_init_command, cx)
-        };
+        let init_command = Self::terminal_init_command(run_init_command, cx);
         let settings = TerminalSettings::get_global(cx).clone();
         let path_style = self.project.read(cx).path_style(cx);
         let builder = terminal::TerminalBuilder::new_display_only(
@@ -7282,7 +6972,6 @@ impl AgentPanel {
             custom_title,
             initial_title,
             created_at,
-            agent_launch,
             select,
             focus,
             source,
@@ -8037,9 +7726,6 @@ mod tests {
             worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
             remote_connection: None,
             working_directory: None,
-            agent_profile: None,
-            resume_path: None,
-            session_boundary: None,
             user_order: None,
         };
         assert_eq!(metadata.working_directory, None);
@@ -8125,9 +7811,6 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
-            agent_profile: None,
-            resume_path: None,
-            session_boundary: None,
             user_order: None,
         };
         let terminal_id = metadata.terminal_id;
@@ -8185,305 +7868,11 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    async fn test_new_omp_agent_terminal_assigns_resume_path_and_persists_live_session(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| {
-            TerminalThreadMetadataStore::init_global(cx);
-        });
-
-        let terminal_id = panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_omp_terminal("OMP Agent", true, window, cx)
-            })
-            .expect("OMP test terminal should be inserted");
-        cx.run_until_parked();
-
-        let expected_resume_path = util::paths::home_dir()
-            .join(".omp")
-            .join("zed")
-            .join(terminal_id.to_key_string());
-
-        // The dedicated OMP entry is a distinct agent session: it carries an
-        // OMP profile, a Zed-assigned session path, and a `live` boundary.
-        let metadata = cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store
-                .read(cx)
-                .entry(terminal_id)
-                .expect("OMP terminal should be persisted in the metadata store")
-                .clone()
-        });
-        assert_eq!(metadata.agent_profile, Some(TerminalAgentProfile::Omp));
-        assert_eq!(
-            metadata.resume_path.as_deref(),
-            Some(expected_resume_path.as_path())
-        );
-        assert_eq!(metadata.session_boundary, Some(AgentSessionBoundary::Live));
-
-        // The entry kind is remembered so the next explicit new entry re-creates
-        // an OMP agent terminal rather than a plain shell. Workspace activation
-        // does not auto-spawn one: only the dedicated entry does.
-        panel.read_with(&cx, |panel, cx| {
-            assert_eq!(
-                panel.last_created_entry_kind,
-                AgentPanelEntryKind::OmpTerminal
-            );
-            assert!(
-                !panel.should_create_terminal_for_new_entry(cx),
-                "reactivating the panel must not auto-create a shell when the last entry was an OMP agent terminal"
-            );
-        });
-
-        // The launch command must be `omp --session-dir <resume_path>`.
-        let terminal = panel.read_with(&cx, |panel, cx| {
-            panel
-                .terminals
-                .get(&terminal_id)
-                .expect("OMP terminal should exist in the panel")
-                .view
-                .read(cx)
-                .terminal()
-                .clone()
-        });
-        let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
-        assert_eq!(
-            input_log,
-            vec![format!(
-                "omp --session-dir {}\r",
-                expected_resume_path.to_string_lossy()
-            )
-            .into_bytes()]
-        );
-    }
-
-    #[gpui::test]
-    async fn test_explicit_close_clears_sleeping_record_and_never_resurrects(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| {
-            TerminalThreadMetadataStore::init_global(cx);
-        });
-
-        let workspace = cx.update(|window, cx| {
-            window
-                .root::<MultiWorkspace>()
-                .flatten()
-                .expect("test window should have a MultiWorkspace root")
-                .read(cx)
-                .workspace()
-                .clone()
-        });
-        workspace.update(&mut cx, |workspace, _cx| {
-            workspace.set_random_database_id();
-        });
-
-        // Create a dedicated OMP agent terminal (persisted as `live`).
-        let terminal_id = panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_omp_terminal("OMP Agent", true, window, cx)
-            })
-            .expect("OMP test terminal should be inserted");
-        cx.run_until_parked();
-
-        let live = cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store
-                .read(cx)
-                .entry(terminal_id)
-                .expect("OMP terminal should be persisted")
-                .clone()
-        });
-        assert_eq!(
-            live.session_boundary,
-            Some(AgentSessionBoundary::Live),
-            "OMP terminal should start live"
-        );
-
-        // Explicitly closing the terminal clears its sleeping record.
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.close_terminal(terminal_id, window, cx);
-        });
-        cx.run_until_parked();
-
-        let boundary = cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store.read(cx).entry(terminal_id).map(|m| m.session_boundary)
-        });
-        assert_eq!(
-            boundary,
-            Some(Some(AgentSessionBoundary::Cleared)),
-            "explicitly closing a terminal should clear its sleeping record"
-        );
-
-        // A cleared record must never come back on a later activation.
-        let async_cx = cx.update(|window, cx| window.to_async(cx));
-        let loaded = AgentPanel::load(workspace.downgrade(), async_cx)
-            .await
-            .expect("panel load should succeed");
-        cx.run_until_parked();
-
-        loaded.read_with(&cx, |panel, _cx| {
-            assert!(
-                panel
-                    .terminals
-                    .values()
-                    .all(|terminal| terminal.agent_profile.is_none()),
-                "a cleared record must never resurrect on a later activation"
-            );
-        });
-    }
 
 
-    #[gpui::test]
-    async fn test_quit_child_capture_is_empty_without_live_agent_children(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| {
-            TerminalThreadMetadataStore::init_global(cx);
-        });
 
-        // A plain shell and a display-only OMP terminal: neither has a real
-        // shell pid, so the quit-time child capture must be empty (no prompt
-        // to show, quit proceeds silently).
-        panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_terminal("Plain Shell", true, window, cx)
-            })
-            .expect("plain test terminal should be inserted");
-        panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_omp_terminal("OMP Agent", true, window, cx)
-            })
-            .expect("OMP test terminal should be inserted");
-        cx.run_until_parked();
 
-        let mut async_app = cx.update(|_, cx| cx.to_async());
-        let captured = AgentPanel::capture_live_agent_children(
-            &[panel.clone()],
-            &mut async_app,
-        )
-        .await;
-        assert!(
-            captured.is_empty(),
-            "no live agent terminal children should be captured at quit"
-        );
 
-    }
-
-    #[gpui::test]
-    async fn test_plain_terminal_is_not_promoted_to_agent_session(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| {
-            TerminalThreadMetadataStore::init_global(cx);
-        });
-
-        let terminal_id = panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_terminal("Plain Shell", true, window, cx)
-            })
-            .expect("plain test terminal should be inserted");
-        cx.run_until_parked();
-
-        let metadata = cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store
-                .read(cx)
-                .entry(terminal_id)
-                .expect("plain terminal should be persisted in the metadata store")
-                .clone()
-        });
-        // A plain shell that later happens to run `omp` carries no agent
-        // metadata, so it remains a plain terminal.
-        assert_eq!(metadata.agent_profile, None);
-        assert_eq!(metadata.resume_path, None);
-        assert_eq!(metadata.session_boundary, None);
-    }
-
-    /// Exercises the real `new_omp_agent_terminal` → `spawn_terminal` path with
-    /// a genuine shell PTY to confirm the public entry assigns a resume path,
-    /// launches `omp --session-dir <path>`, and persists a `live` session.
-    #[cfg(unix)]
-    #[gpui::test]
-    async fn test_new_omp_agent_terminal_launches_session_in_real_shell(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.executor().allow_parking();
-        cx.update(|_, cx| {
-            TerminalThreadMetadataStore::init_global(cx);
-        });
-
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.new_omp_agent_terminal(None, window, cx);
-        });
-
-        // The shell spawns on a background thread; poll until the store
-        // persists the OMP terminal as a live session.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let (terminal_id, resume_path) = loop {
-            cx.run_until_parked();
-            let entry = cx.update(|_, cx| {
-                TerminalThreadMetadataStore::try_global(cx).and_then(|store| {
-                    store
-                        .read(cx)
-                        .entries()
-                        .find(|metadata| {
-                            metadata.agent_profile == Some(TerminalAgentProfile::Omp)
-                        })
-                        .cloned()
-                })
-            });
-            if let Some(entry) = entry {
-                let resume_path = entry
-                    .resume_path
-                    .expect("OMP terminal should have a Zed-assigned resume path");
-                assert_eq!(
-                    entry.session_boundary,
-                    Some(AgentSessionBoundary::Live),
-                    "OMP terminal should be persisted in the live session-boundary state"
-                );
-                break (entry.terminal_id, resume_path);
-            }
-            if Instant::now() >= deadline {
-                panic!("OMP agent terminal was never persisted as a live session");
-            }
-            cx.executor().timer(Duration::from_millis(50)).await;
-        };
-
-        let terminal = panel.read_with(&cx, |panel, cx| {
-            panel
-                .terminals
-                .get(&terminal_id)
-                .expect("OMP terminal should exist in the panel")
-                .view
-                .read(cx)
-                .terminal()
-                .clone()
-        });
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let input_log = loop {
-            cx.run_until_parked();
-            let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
-            if !input_log.is_empty() {
-                break input_log;
-            }
-            if Instant::now() >= deadline {
-                panic!("OMP launch command was never written to the terminal, got {input_log:?}");
-            }
-            cx.executor().timer(Duration::from_millis(50)).await;
-        };
-        assert_eq!(
-            input_log,
-            vec![format!("omp --session-dir {}\r", resume_path.to_string_lossy()).into_bytes()]
-        );
-    }
 
     /// Exercises the real `spawn_terminal` path with a genuine shell PTY (not the
     /// display-only test terminal, where `write_to_pty` is a no-op) to verify the
@@ -8512,7 +7901,6 @@ mod tests {
                 terminal_id,
                 // No working directory: the FakeFs project path doesn't exist on
                 // the real filesystem the shell process runs against.
-                None,
                 None,
                 None,
                 None,
@@ -8603,9 +7991,6 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
-            agent_profile: None,
-            resume_path: None,
-            session_boundary: None,
             user_order: None,
         };
         panel
@@ -10023,7 +9408,6 @@ mod tests {
                     Some("Terminal".into()),
                     None,
                     None,
-                    None,
                     true,
                     true,
                     false,
@@ -10572,9 +9956,6 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
-            agent_profile: None,
-            resume_path: None,
-            session_boundary: None,
             user_order: None,
         };
 
@@ -10627,9 +10008,6 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
-            agent_profile: None,
-            resume_path: None,
-            session_boundary: None,
             user_order: None,
         };
 

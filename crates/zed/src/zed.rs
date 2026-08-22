@@ -1807,60 +1807,6 @@ fn quit(_: &Quit, cx: &mut App) {
             }
         }
 
-        // Ask before quitting when any live OMP agent terminal has running
-        // child processes: killing them is destructive, and letting them run
-        // silently orphans processes the agent thread no longer owns after the
-        // session is slept for restart.
-        let panels: Vec<_> = cx
-            .update(|cx| {
-                let mut panels = Vec::new();
-                for window in &workspace_windows {
-                    let Ok(multi_workspace) = window.read(cx) else {
-                        continue;
-                    };
-                    for workspace in multi_workspace.workspaces() {
-                        if let Some(panel) = workspace.read(cx).panel::<agent_ui::AgentPanel>(cx)
-                        {
-                            panels.push(panel);
-                        }
-                    }
-                }
-                panels
-            });
-        if !panels.is_empty() {
-            let captured = agent_ui::AgentPanel::capture_live_agent_children(&panels, cx).await;
-            if !captured.is_empty() {
-                let kill = match workspace_windows.first().and_then(|window| {
-                    window
-                        .update(cx, |_, window, cx| {
-                            window.prompt(
-                                PromptLevel::Warning,
-                                &format!(
-                                    "{} running child process(es) from agent threads will keep running after Zed quits. Kill them?",
-                                    captured.len()
-                                ),
-                                None,
-                                &["Kill & Quit", "Cancel"],
-                                cx,
-                            )
-                        })
-                        .log_err()
-                }) {
-                    Some(answer) => {
-                        matches!(cx.background_spawn(async move { answer.await }).await, Ok(0))
-                    }
-                    None => false,
-                };
-                if kill {
-                    agent_ui::AgentPanel::kill_children(&captured);
-                } else {
-                    // The user chose to keep the processes; abort the quit so
-                    // they are not silently orphaned.
-                    return Ok(());
-                }
-            }
-        }
-
         // If the user cancels any save prompt, then keep the app open.
         for window in &workspace_windows {
             let window = *window;

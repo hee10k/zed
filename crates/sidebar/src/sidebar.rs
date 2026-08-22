@@ -1586,10 +1586,7 @@ impl Sidebar {
                             .get(&metadata.terminal_id)
                             .copied()
                             .unwrap_or_else(|| {
-                                TerminalAgentStatus::derive(
-                                    metadata.session_boundary,
-                                    metadata.display_title().as_ref(),
-                                )
+                                TerminalAgentStatus::derive(metadata.display_title().as_ref())
                             }),
                         metadata,
                         workspace,

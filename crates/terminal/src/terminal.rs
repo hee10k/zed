@@ -1,7 +1,6 @@
 mod mappings;
 
 mod alacritty;
-pub mod orphan_cleanup;
 mod pty_info;
 pub mod terminal_settings;
 

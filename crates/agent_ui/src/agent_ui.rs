@@ -326,10 +326,6 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
-        /// Starts a new dedicated OMP agent terminal, distinct from a plain
-        /// terminal thread. Assigns a Zed-controlled resume path and launches
-        /// the agent with `--session-dir <path>`.
-        NewOmpAgentTerminal,
     ]
 );
 
@@ -1018,7 +1014,6 @@ mod tests {
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
-            terminal_agent: Default::default(),
         };
 
         cx.update(|cx| {

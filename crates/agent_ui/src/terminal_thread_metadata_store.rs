@@ -44,29 +44,6 @@ impl TestTerminalMetadataDbName {
     }
 }
 
-/// Profile of a dedicated terminal-agent session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TerminalAgentProfile {
-    Omp,
-}
-
-impl TerminalAgentProfile {
-    /// Stable short label used in fencing claim keys and telemetry.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Omp => "omp",
-        }
-    }
-}
-
-/// Lifecycle boundary of a dedicated agent session: live while the agent
-/// process runs, sleeping once it has ended, and cleared when explicitly closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum AgentSessionBoundary {
-    Live,
-    Sleeping,
-    Cleared,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalThreadMetadata {
@@ -77,11 +54,6 @@ pub struct TerminalThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub working_directory: Option<PathBuf>,
-    pub agent_profile: Option<TerminalAgentProfile>,
-    /// Opaque Zed-assigned resume path for the agent session.
-    pub resume_path: Option<PathBuf>,
-    /// Session-boundary state of a dedicated agent session.
-    pub session_boundary: Option<AgentSessionBoundary>,
     /// User-assigned sidebar position (fractional midpoint) within its project
     /// group. `None` means fall back to recency sorting.
     pub user_order: Option<f64>,
@@ -138,22 +110,13 @@ pub enum TerminalAgentStatus {
 }
 
 impl TerminalAgentStatus {
-    /// Derives the status from the persisted session-boundary state and the
-    /// live terminal title. A live session whose title carries a busy prefix
-    /// (e.g. a braille spinner) is Running; an ended session is Completed;
-    /// otherwise Idle.
-    pub fn derive(session_boundary: Option<AgentSessionBoundary>, title: &str) -> Self {
-        match session_boundary {
-            Some(AgentSessionBoundary::Sleeping) | Some(AgentSessionBoundary::Cleared) => {
-                Self::Completed
-            }
-            _ => {
-                if terminal_title_prefix(title).is_some() {
-                    Self::Running
-                } else {
-                    Self::Idle
-                }
-            }
+    /// Derives the status from the live terminal title. A title carrying a
+    /// busy prefix (e.g. a braille spinner) is Running; otherwise Idle.
+    pub fn derive(title: &str) -> Self {
+        if terminal_title_prefix(title).is_some() {
+            Self::Running
+        } else {
+            Self::Idle
         }
     }
 
@@ -548,8 +511,7 @@ impl TerminalThreadMetadataDb {
         self.select::<TerminalThreadMetadata>(
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-            main_worktree_paths_order, remote_connection, agent_profile, resume_path, \
-            session_boundary, user_order \
+            main_worktree_paths_order, remote_connection, user_order \
             FROM sidebar_terminal_threads \
             ORDER BY created_at DESC",
         )?()
@@ -583,27 +545,11 @@ impl TerminalThreadMetadataDb {
             .map(serde_json::to_string)
             .transpose()
             .context("serialize terminal thread remote connection")?;
-        let agent_profile = row
-            .agent_profile
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .context("serialize terminal agent profile")?;
-        let resume_path = row
-            .resume_path
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned());
-        let session_boundary = row
-            .session_boundary
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .context("serialize terminal session boundary")?;
         let user_order = row.user_order;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, agent_profile, resume_path, session_boundary, user_order) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, user_order) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -614,9 +560,6 @@ impl TerminalThreadMetadataDb {
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
-                           agent_profile = excluded.agent_profile, \
-                           resume_path = excluded.resume_path, \
-                           session_boundary = excluded.session_boundary, \
                            user_order = excluded.user_order";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
@@ -629,9 +572,6 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
-            i = stmt.bind(&agent_profile, i)?;
-            i = stmt.bind(&resume_path, i)?;
-            i = stmt.bind(&session_boundary, i)?;
             stmt.bind(&user_order, i)?;
             stmt.exec()
         })
@@ -668,9 +608,6 @@ impl Column for TerminalThreadMetadata {
             Column::column(statement, next)?;
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
-        let (agent_profile_json, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (resume_path_str, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (session_boundary_json, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (user_order, next): (Option<f64>, i32) = Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
@@ -696,16 +633,6 @@ impl Column for TerminalThreadMetadata {
             .map(serde_json::from_str::<RemoteConnectionOptions>)
             .transpose()
             .context("deserialize terminal thread remote connection")?;
-        let agent_profile = agent_profile_json
-            .as_deref()
-            .map(serde_json::from_str::<TerminalAgentProfile>)
-            .transpose()
-            .context("deserialize terminal agent profile")?;
-        let session_boundary = session_boundary_json
-            .as_deref()
-            .map(serde_json::from_str::<AgentSessionBoundary>)
-            .transpose()
-            .context("deserialize terminal session boundary")?;
 
         let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
             .unwrap_or_else(|_| WorktreePaths::default());
@@ -721,9 +648,6 @@ impl Column for TerminalThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 working_directory: working_directory.map(PathBuf::from),
-                agent_profile,
-                resume_path: resume_path_str.map(PathBuf::from),
-                session_boundary,
                 user_order,
             },
             next,
@@ -754,9 +678,6 @@ mod tests {
             worktree_paths,
             remote_connection: None,
             working_directory: None,
-            agent_profile: None,
-            resume_path: None,
-            session_boundary: None,
             user_order: None,
         }
     }
@@ -786,32 +707,23 @@ mod tests {
 
     #[test]
     fn test_terminal_agent_status_derivation() {
-        // Live session with a busy (spinner) prefix is Running.
+        // A title with a busy (spinner) prefix is Running.
         assert_eq!(
-            TerminalAgentStatus::derive(None, "⠋ Thinking"),
+            TerminalAgentStatus::derive("⠋ Thinking"),
             TerminalAgentStatus::Running
         );
         assert_eq!(
-            TerminalAgentStatus::derive(Some(AgentSessionBoundary::Live), "⠙ Planning"),
+            TerminalAgentStatus::derive("⠙ Planning"),
             TerminalAgentStatus::Running
         );
-        // Live session with a stable title is Idle.
+        // A stable title is Idle.
         assert_eq!(
-            TerminalAgentStatus::derive(Some(AgentSessionBoundary::Live), "Dev Server"),
+            TerminalAgentStatus::derive("Dev Server"),
             TerminalAgentStatus::Idle
         );
         assert_eq!(
-            TerminalAgentStatus::derive(None, "Shell"),
+            TerminalAgentStatus::derive("Shell"),
             TerminalAgentStatus::Idle
-        );
-        // Ended sessions are Completed regardless of title.
-        assert_eq!(
-            TerminalAgentStatus::derive(Some(AgentSessionBoundary::Sleeping), "⠋ Thinking"),
-            TerminalAgentStatus::Completed
-        );
-        assert_eq!(
-            TerminalAgentStatus::derive(Some(AgentSessionBoundary::Cleared), "Dev Server"),
-            TerminalAgentStatus::Completed
         );
     }
 
@@ -904,42 +816,6 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    async fn test_agent_session_fields_round_trip_through_db(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let db = cx.update(|cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store.read(cx).db.clone()
-        });
-
-        let mut metadata = metadata("OMP Agent", WorktreePaths::default());
-        metadata.agent_profile = Some(TerminalAgentProfile::Omp);
-        metadata.resume_path = Some(PathBuf::from("/tmp/omp-zed/terminal-session"));
-        metadata.session_boundary = Some(AgentSessionBoundary::Sleeping);
-        let terminal_id = metadata.terminal_id;
-
-        db.save(metadata).await.unwrap();
-
-        let rows = db.list().unwrap();
-        let row = rows
-            .into_iter()
-            .find(|row| row.terminal_id == terminal_id)
-            .expect("saved terminal should be listed");
-        assert_eq!(row.agent_profile, Some(TerminalAgentProfile::Omp));
-        assert_eq!(
-            row.resume_path.as_deref(),
-            Some(Path::new("/tmp/omp-zed/terminal-session"))
-        );
-        assert_eq!(row.session_boundary, Some(AgentSessionBoundary::Sleeping));
-
-        db.delete(terminal_id).await.unwrap();
-        let rows = db.list().unwrap();
-        assert!(
-            !rows.into_iter().any(|row| row.terminal_id == terminal_id),
-            "deleted terminal should no longer be listed"
-        );
-    }
 
     #[gpui::test]
     async fn test_user_order_round_trips_through_db(cx: &mut TestAppContext) {
