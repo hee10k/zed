@@ -700,28 +700,6 @@ pub mod assistant {
     }
 }
 
-pub mod thread {
-    use gpui::actions;
-
-    actions!(
-        thread,
-        [
-            /// Lists the current worktree's terminal-agent sessions. Open
-            /// (live/queued) sessions are shown separately from Closed
-            /// (sleeping) sessions so the user can pick which to resume or
-            /// start fresh.
-            ListSessions,
-            /// Lists processes Zed captured as orphans (descendants of a
-            /// closed thread/terminal/worktree that were still running at
-            /// capture time) so the user can inspect them.
-            ListOrphanProcesses,
-            /// Terminates recorded orphan processes that are still alive and
-            /// still match their capture-time start time (reusing the existing
-            /// safe orphan-reap path).
-            KillOrphanProcesses,
-        ]
-    );
-}
 
 /// Opens the recent projects interface.
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]

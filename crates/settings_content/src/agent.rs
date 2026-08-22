@@ -386,13 +386,6 @@ pub struct TerminalAgentSettingsContent {
     ///
     /// Default: "omp"
     pub program: Option<String>,
-    /// Shell-token template used to build the command that resumes a sleeping
-    /// agent session. The `{resume_path}` placeholder is replaced with the
-    /// session's resume locator. Used both to auto-resume a sleeping session
-    /// and (per ticket 08) to render the manual resume hint as a comment.
-    ///
-    /// Default: `"omp --resume {resume_path}"`
-    pub resume_command: Option<String>,
     /// Session policy for dedicated agent terminals.
     ///
     /// Default: local

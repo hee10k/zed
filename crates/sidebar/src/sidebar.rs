@@ -6942,12 +6942,6 @@ impl Sidebar {
             .into_any_element()
     }
 
-    // Each context-menu handler below is an independent `'static` closure that
-    // must own its own copy of the row's workspace to reach the agent panel;
-    // clippy's `redundant_clone` singleton heuristic flags the last such capture
-    // as "redundant" even though moving the shared handle into either closure
-    // would break the other.
-    #[allow(clippy::redundant_clone)]
     fn render_terminal(
         &self,
         ix: usize,
@@ -6965,12 +6959,6 @@ impl Sidebar {
             .blend(color.panel_background.opacity(0.25));
         let metadata = terminal.metadata.clone();
         let workspace = terminal.workspace.clone();
-        // Captured before `workspace` is moved into the hover/action closures so
-        // the context menu can still reach the row's agent panel for orphan ops.
-        let terminal_workspace_open = match &workspace {
-            ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
-            ThreadEntryWorkspace::Closed { .. } => None,
-        };
         let focus_handle = self.focus_handle.clone();
         let worktrees = apply_worktree_label_mode(
             terminal.worktrees.clone(),
@@ -7073,65 +7061,7 @@ impl Sidebar {
                 }
             }));
 
-        let context_menu_id = SharedString::from(format!("terminal-context-menu-{}", ix));
-
-        right_click_menu(context_menu_id)
-            .trigger(move |_, _, _| thread_item)
-            .menu(move |_window, cx| {
-                let terminal_workspace_open = match &terminal_workspace_open {
-                    Some(workspace) => Some(workspace.downgrade()),
-                    None => None,
-                };
-                ContextMenu::build(_window, cx, move |mut menu, _window, cx| {
-                    let orphan_count = terminal_workspace_open
-                        .as_ref()
-                        .and_then(|workspace| workspace.upgrade())
-                        .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
-                        .map(|panel| panel.read(cx).pending_orphan_count())
-                        .unwrap_or(0);
-                    if orphan_count > 0 {
-                        menu = menu.entry(
-                            format!("Kill Orphaned Processes ({orphan_count})"),
-                            None,
-                            {
-                                let terminal_workspace_open = terminal_workspace_open.clone();
-                                move |_window, cx| {
-                                    let Some(panel) = terminal_workspace_open
-                                        .as_ref()
-                                        .and_then(|workspace| workspace.upgrade())
-                                        .and_then(|workspace| {
-                                            workspace.read(cx).panel::<AgentPanel>(cx)
-                                        })
-                                    else {
-                                        return;
-                                    };
-                                    panel.update(cx, |panel, cx| {
-                                        panel.reap_pending_orphans(cx);
-                                    });
-                                }
-                            },
-                        );
-                    }
-                    menu.entry("List Orphaned Processes", None, {
-                        let terminal_workspace_open = terminal_workspace_open.clone();
-                        move |window, cx| {
-                            let Some(panel) = terminal_workspace_open
-                                .as_ref()
-                                .and_then(|workspace| workspace.upgrade())
-                                .and_then(|workspace| {
-                                    workspace.read(cx).panel::<AgentPanel>(cx)
-                                })
-                            else {
-                                return;
-                            };
-                            panel.update(cx, |panel, cx| {
-                                panel.list_orphan_processes(window, cx);
-                            });
-                        }
-                    })
-                })
-            })
-            .into_any_element()
+        thread_item.into_any_element()
     }
 
     fn render_filter_input(&self, cx: &mut Context<Self>) -> impl IntoElement {

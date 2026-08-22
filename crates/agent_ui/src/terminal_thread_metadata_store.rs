@@ -44,7 +44,7 @@ impl TestTerminalMetadataDbName {
     }
 }
 
-/// Profile of a terminal-agent whose session can be revived.
+/// Profile of a dedicated terminal-agent session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TerminalAgentProfile {
     Omp,
@@ -59,9 +59,8 @@ impl TerminalAgentProfile {
     }
 }
 
-/// Lifecycle boundary of a revivable agent session: live while the agent
-/// process runs, sleeping once it has ended but remains resumable, cleared
-/// when it is no longer resumable.
+/// Lifecycle boundary of a dedicated agent session: live while the agent
+/// process runs, sleeping once it has ended, and cleared when explicitly closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentSessionBoundary {
     Live,
@@ -78,15 +77,11 @@ pub struct TerminalThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub working_directory: Option<PathBuf>,
-    /// Terminal-agent profile if this terminal is a revivable agent session.
     pub agent_profile: Option<TerminalAgentProfile>,
     /// Opaque Zed-assigned resume path for the agent session.
     pub resume_path: Option<PathBuf>,
-    /// Session-boundary state of a revivable agent session.
+    /// Session-boundary state of a dedicated agent session.
     pub session_boundary: Option<AgentSessionBoundary>,
-    /// When true, a sleeping session was slept manually and must only resume
-    /// when its tab is opened (restore-on-tab-open), never on activation.
-    pub restore_on_tab_open: bool,
     /// User-assigned sidebar position (fractional midpoint) within its project
     /// group. `None` means fall back to recency sorting.
     pub user_order: Option<f64>,
@@ -554,7 +549,7 @@ impl TerminalThreadMetadataDb {
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
             main_worktree_paths_order, remote_connection, agent_profile, resume_path, \
-            session_boundary, restore_on_tab_open, user_order \
+            session_boundary, user_order \
             FROM sidebar_terminal_threads \
             ORDER BY created_at DESC",
         )?()
@@ -604,12 +599,11 @@ impl TerminalThreadMetadataDb {
             .map(serde_json::to_string)
             .transpose()
             .context("serialize terminal session boundary")?;
-        let restore_on_tab_open = row.restore_on_tab_open;
         let user_order = row.user_order;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, agent_profile, resume_path, session_boundary, restore_on_tab_open, user_order) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, agent_profile, resume_path, session_boundary, user_order) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -623,7 +617,6 @@ impl TerminalThreadMetadataDb {
                            agent_profile = excluded.agent_profile, \
                            resume_path = excluded.resume_path, \
                            session_boundary = excluded.session_boundary, \
-                           restore_on_tab_open = excluded.restore_on_tab_open, \
                            user_order = excluded.user_order";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
@@ -639,7 +632,6 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&agent_profile, i)?;
             i = stmt.bind(&resume_path, i)?;
             i = stmt.bind(&session_boundary, i)?;
-            i = stmt.bind(&restore_on_tab_open, i)?;
             stmt.bind(&user_order, i)?;
             stmt.exec()
         })
@@ -679,7 +671,6 @@ impl Column for TerminalThreadMetadata {
         let (agent_profile_json, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (resume_path_str, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (session_boundary_json, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (restore_on_tab_open, next): (bool, i32) = Column::column(statement, next)?;
         let (user_order, next): (Option<f64>, i32) = Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
@@ -733,7 +724,6 @@ impl Column for TerminalThreadMetadata {
                 agent_profile,
                 resume_path: resume_path_str.map(PathBuf::from),
                 session_boundary,
-                restore_on_tab_open,
                 user_order,
             },
             next,
@@ -767,7 +757,6 @@ mod tests {
             agent_profile: None,
             resume_path: None,
             session_boundary: None,
-            restore_on_tab_open: false,
             user_order: None,
         }
     }
@@ -916,7 +905,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_revival_fields_round_trip_through_db(cx: &mut TestAppContext) {
+    async fn test_agent_session_fields_round_trip_through_db(cx: &mut TestAppContext) {
         init_test(cx);
 
         let db = cx.update(|cx| {
@@ -928,7 +917,6 @@ mod tests {
         metadata.agent_profile = Some(TerminalAgentProfile::Omp);
         metadata.resume_path = Some(PathBuf::from("/tmp/omp-zed/terminal-session"));
         metadata.session_boundary = Some(AgentSessionBoundary::Sleeping);
-        metadata.restore_on_tab_open = true;
         let terminal_id = metadata.terminal_id;
 
         db.save(metadata).await.unwrap();
@@ -944,10 +932,6 @@ mod tests {
             Some(Path::new("/tmp/omp-zed/terminal-session"))
         );
         assert_eq!(row.session_boundary, Some(AgentSessionBoundary::Sleeping));
-        assert!(
-            row.restore_on_tab_open,
-            "restore-on-tab-open flag should survive a store round trip"
-        );
 
         db.delete(terminal_id).await.unwrap();
         let rows = db.list().unwrap();

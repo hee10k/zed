@@ -1279,8 +1279,8 @@
     "terminal_init_command": "",
     // Settings for the dedicated OMP agent terminal entry in the agent panel.
     // A dedicated agent terminal is distinct from a plain Terminal Thread shell:
-    // creating one assigns a Zed-controlled resume path and launches the program
-    // with "--session-dir <path>", so the session can be revived later.
+    // creating one assigns a Zed-controlled session path and launches the program
+    // with "--session-dir <path>".
     //
     // Default:
     // {

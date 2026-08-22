@@ -1995,7 +1995,6 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         agent_profile: None,
         resume_path: None,
         session_boundary: None,
-        restore_on_tab_open: false,
         user_order: None,
     };
 
@@ -3231,7 +3230,6 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         agent_profile: None,
         resume_path: None,
         session_boundary: None,
-        restore_on_tab_open: false,
         user_order: None,
     };
     cx.update(|_, cx| {
@@ -3343,7 +3341,6 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         agent_profile: None,
         resume_path: None,
         session_boundary: None,
-        restore_on_tab_open: false,
         user_order: None,
     };
     cx.update(|_, cx| {
@@ -3496,7 +3493,6 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         agent_profile: None,
         resume_path: None,
         session_boundary: None,
-        restore_on_tab_open: false,
         user_order: None,
     };
     cx.update(|_, cx| {

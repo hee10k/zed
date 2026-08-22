@@ -27,7 +27,6 @@ mod profile_selector;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;
-pub mod terminal_agent_resume;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 mod thread_import;
@@ -232,8 +231,6 @@ actions!(
         RemoveSelectedThread,
         /// Renames the currently selected thread.
         RenameSelectedThread,
-        /// Terminates any orphaned descendant processes of closed agent terminals.
-        CleanUpOrphans,
         /// Starts a chat conversation with follow-up enabled.
         ChatWithFollow,
         /// Cycles to the next inline assist suggestion.

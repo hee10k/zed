@@ -32,19 +32,12 @@ use zed_actions::{
         FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules, Toggle,
         ToggleFocus,
     },
-    thread::{
-        KillOrphanProcesses, ListOrphanProcesses, ListSessions,
-    },
 };
 
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
-use crate::terminal_agent_resume::{
-    expand_resume_command, get_agent_resume_argv, is_invalid_session_record,
-    is_stale_sleeping_record, select_sessions_to_resume, session_claim_key, SleepingSessionRecord,
-};
 use crate::terminal_thread_metadata_store::{
     AgentSessionBoundary, TerminalAgentProfile, TerminalAgentStatus, TerminalThreadMetadata,
     TerminalThreadMetadataStore, compose_terminal_thread_title, terminal_title_without_prefix,
@@ -55,7 +48,7 @@ use crate::{
     NewNativeAgentThreadFromSummary,
 };
 use crate::{
-    AgentDiffPane, CleanUpOrphans, ConversationView, CopyThreadToClipboard, Follow,
+    AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow,
     LoadThreadFromClipboard, NewOmpAgentTerminal, NewTerminalThread, NewThread,
     OpenActiveThreadAsMarkdown, OpenAgentDiff, ResetFastModeWarnings, ResetTrialEndUpsell,
     ResetTrialUpsell, ShowAllSidebarThreadMetadata, ShowThreadMetadata, ToggleNewThreadMenu,
@@ -81,7 +74,7 @@ use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
-    Action, Anchor, Animation, AnimationExt, AnyElement, AnyWindowHandle, App, AsyncApp,
+    Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncApp,
     AsyncWindowContext, ClipboardItem, Entity, EventEmitter, ExternalPaths, FocusHandle,
     Focusable, KeyContext, Pixels, PlatformDisplay, Subscription, Task, TaskExt,
     WeakEntity, WindowHandle, prelude::*, pulsating_between,
@@ -120,12 +113,6 @@ const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Shown when a sleeping OMP session cannot be resumed because no usable resume
-/// locator is available. A plain shell is left instead; no fresh agent session
-/// is silently launched.
-const UNABLE_TO_RESUME_SESSION_MESSAGE: &str =
-    "Could not resume the OMP agent session (no resume locator available). \
-     A plain shell was started instead; no new agent session was launched.";
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "agent", // Unfortunately, both Cursor cli + grok
     "agy",
@@ -564,26 +551,6 @@ pub fn init(cx: &mut App) {
                                 cx,
                             );
                         });
-                    }
-                })
-                .register_action(|workspace, _: &CleanUpOrphans, _window, cx| {
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        panel.update(cx, |panel, cx| panel.reap_pending_orphans(cx));
-                    }
-                })
-                .register_action(|workspace, _: &ListSessions, window, cx| {
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        panel.update(cx, |panel, cx| panel.list_sessions(window, cx));
-                    }
-                })
-                .register_action(|workspace, _: &ListOrphanProcesses, window, cx| {
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        panel.update(cx, |panel, cx| panel.list_orphan_processes(window, cx));
-                    }
-                })
-                .register_action(|workspace, _: &KillOrphanProcesses, _window, cx| {
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        panel.update(cx, |panel, cx| panel.reap_pending_orphans(cx));
                     }
                 })
                 .register_action(|workspace, action: &ReviewBranchDiff, window, cx| {
@@ -1039,28 +1006,14 @@ pub(crate) struct AgentThread {
 }
 
 /// Launch parameters for a dedicated OMP agent terminal. The panel assigns the
-/// resume path so the session is identified deterministically without parsing
-/// TUI output; the harness is launched with `program --session-dir <resume_path>`.
+/// session path so the session is identified deterministically without parsing
+/// TUI output; the harness is launched with `program --session-dir <path>`.
 #[derive(Clone)]
 struct OmpTerminalLaunch {
     program: String,
     resume_path: PathBuf,
-    /// Shell-token template used to build the resume command. `{resume_path}`
-    /// is substituted with the session's resume locator.
-    resume_command: String,
-    /// When true, launch the harness with the resume command (auto-resume of a
-    /// sleeping session) instead of `--session-dir <path>`.
-    resume: bool,
 }
 
-/// UI outcome written onto a terminal launched by `resume_sleeping_session`.
-/// A successful resume shows a restored-session banner (new process, same
-/// session); a failed resume shows an explicit error on top of a usable plain
-/// shell. `None` for ordinary terminal launches.
-enum TerminalResumeOutcome {
-    Restored,
-    Failed { message: SharedString },
-}
 
 struct AgentTerminal {
     view: Entity<TerminalView>,
@@ -1077,23 +1030,12 @@ struct AgentTerminal {
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
-    /// Terminal-agent profile if this terminal is a revivable agent session.
+    /// Terminal-agent profile if this is a dedicated agent session.
     agent_profile: Option<TerminalAgentProfile>,
-    /// Opaque Zed-assigned resume path for the agent session.
+    /// Opaque Zed-assigned session path for the agent session.
     resume_path: Option<PathBuf>,
-    /// Session-boundary state of a revivable agent session.
+    /// Session-boundary state of a dedicated agent session.
     session_boundary: Option<AgentSessionBoundary>,
-    /// When true, this sleeping session was slept manually and resumes only
-    /// when its tab is opened (restore-on-tab-open), never on activation.
-    restore_on_tab_open: bool,
-    /// When true, show a "session restored (new process, same session)" banner
-    /// above the terminal so the user knows the conversation continued but the
-    /// process is new.
-    restored_banner: bool,
-    /// When set, the terminal shows this explicit resume-failure error above
-    /// the view and behaves as a plain usable shell (never a silently
-    /// relaunched fresh agent session).
-    resume_error: Option<SharedString>,
 }
 
 impl AgentTerminal {
@@ -1244,11 +1186,6 @@ pub struct AgentPanel {
     workspace: WeakEntity<Workspace>,
     /// Workspace id is used as a database key
     workspace_id: Option<WorkspaceId>,
-    /// The window this panel was created in, used to drive gated revival (and
-    /// other window-bound work) from event subscriptions that have no window in
-    /// scope (e.g. a restored workspace applying its worktree paths after the
-    /// panel has loaded).
-    panel_window: Option<AnyWindowHandle>,
     user_store: Entity<UserStore>,
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
@@ -1263,9 +1200,6 @@ pub struct AgentPanel {
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
-    /// Descendant processes captured when a terminal closed, awaiting a sweep
-    /// to reap those still alive (verified against their capture-time start).
-    pending_orphans: Vec<CapturedOrphan>,
     /// Debounced model-inference results distinguishing `Idle` from
     /// `WaitingForUserInput` per terminal (ADR 0005). Cleared whenever a
     /// deterministic transition (Running / Completed) or explicit close
@@ -1507,9 +1441,8 @@ impl AgentPanel {
             };
 
             // Ensure the terminal metadata store is loaded before the panel is
-            // constructed so auto-resume sees any sleeping OMP sessions for the
-            // worktree. `reload_task` is a shared future, so this is a no-op if
-            // the terminal-restore path already awaited it.
+            // constructed. `reload_task` is a shared future, so this is a no-op
+            // if the terminal-restore path already awaited it.
             if let Ok(Some((_store, reload_task))) = cx.update(|_window, cx| {
                 TerminalThreadMetadataStore::try_global(cx).map(|store| {
                     let reload_task = store.read(cx).reload_task();
@@ -1563,14 +1496,9 @@ impl AgentPanel {
                     }
 
                     if let Some(metadata) = terminal_to_restore {
-                        if metadata.agent_profile == Some(TerminalAgentProfile::Omp)
-                            && metadata.session_boundary == Some(AgentSessionBoundary::Sleeping)
-                        {
-                            // A sleeping OMP session is auto-resumed below via
-                            // claim-key fencing; do not restore it as a plain
-                            // shell (which would spawn a second, un-resumed
-                            // terminal).
-                        } else {
+                        // Sleeping dedicated-agent records remain persisted for
+                        // their sidebar status, but are not relaunched.
+                        if metadata.session_boundary != Some(AgentSessionBoundary::Sleeping) {
                             panel.restore_terminal_for_panel_load(
                                 metadata,
                                 false,
@@ -1593,9 +1521,6 @@ impl AgentPanel {
                             cx,
                         );
                     }
-                    // On worktree/panel activation, auto-resume sleeping OMP
-                    // sessions exactly once (fenced by claim key).
-                    panel.auto_resume_sleeping_sessions(window, cx);
                     if let Some(new_draft_thread_id) = serialized_panel
                         .as_ref()
                         .and_then(|p| p.new_draft_thread_id)
@@ -1604,7 +1529,6 @@ impl AgentPanel {
                     }
                     cx.notify();
                 });
-
                 panel
             })?;
 
@@ -1612,7 +1536,7 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -1663,39 +1587,12 @@ impl AgentPanel {
                     this.ensure_native_agent_connection(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
-                    // A restored workspace applies its worktree paths after the
-                    // panel has already loaded (restore_project_groups), so the
-                    // load-time revival scan may have run against a partial path
-                    // set. Re-run the idempotent gated OMP-session revival now
-                    // that the worktree set is settled; claim-key fencing keeps
-                    // already-resumed sessions from doubling up.
-                    let panel_window = this.panel_window;
-                    if let Some(panel_window) = panel_window {
-                        let this = cx.entity().downgrade();
-                        panel_window
-                            .update(cx, move |_, _, cx| {
-                                this.update_in(cx, |panel, window, cx| {
-                                    panel.auto_resume_sleeping_sessions(window, cx);
-                                })
-                                .log_err();
-                            })
-                            .log_err();
-                    }
                     cx.notify();
                 }
                 project::Event::WorktreeRemoved(_) => {
                     this.ensure_native_agent_connection(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
-                    // A closed worktree orphans the agent subprocesses still
-                    // running under it. Capture every active terminal's
-                    // descendants (never the shell root itself) so the sweep
-                    // can reap survivors. Safe: descendants are re-verified
-                    // by start time before killing.
-                    let terminal_ids = this.terminals.keys().copied().collect::<Vec<_>>();
-                    for terminal_id in terminal_ids {
-                        this.capture_terminal_orphans(terminal_id, cx);
-                    }
                     cx.notify();
                 }
                 _ => {}
@@ -1719,7 +1616,6 @@ impl AgentPanel {
 
         let panel = Self {
             workspace_id,
-            panel_window: Some(window.window_handle()),
             base_view,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
             workspace,
@@ -1734,7 +1630,6 @@ impl AgentPanel {
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
-            pending_orphans: Vec::new(),
             inferred_terminal_waiting: HashMap::default(),
             _terminal_inference_tasks: HashMap::default(),
             new_thread_menu_handle: PopoverMenuHandle::default(),
@@ -2148,7 +2043,6 @@ impl AgentPanel {
             None,
             None,
             None,
-            None,
             true,
             true,
             true,
@@ -2160,11 +2054,10 @@ impl AgentPanel {
 
     /// Creates a dedicated OMP agent terminal, distinct from a plain terminal
     /// thread that reuses `terminal_init_command`. Zed assigns the terminal a
-    /// resume path (`~/.omp/zed/<terminal-id>/`) and launches the harness with
-    /// `omp --session-dir <path>`, recording the session as `live` so Tickets
-    /// 04-06 can later revive it. A plain shell that happens to run `omp` is
-    /// never promoted to a revivable session: only this dedicated entry carries
-    /// revival metadata.
+    /// session path (`~/.omp/zed/<terminal-id>/`) and launches the harness with
+    /// `omp --session-dir <path>`, recording the session as `live`.
+    /// A plain shell that happens to run `omp` is never promoted to a dedicated
+    /// agent session: only this dedicated entry carries session metadata.
     pub fn new_omp_agent_terminal(
         &mut self,
         workspace: Option<&Workspace>,
@@ -2178,7 +2071,6 @@ impl AgentPanel {
         let working_directory = self.terminal_working_directory(workspace, cx);
         let terminal_id = TerminalId::new();
         let program = AgentSettings::get_global(cx).terminal_agent.program.clone();
-        let resume_command = AgentSettings::get_global(cx).terminal_agent.resume_command.clone();
         let resume_path = Self::omp_resume_path_for_terminal(&terminal_id);
         self.spawn_terminal(
             terminal_id,
@@ -2186,8 +2078,7 @@ impl AgentPanel {
             None,
             None,
             None,
-            Some(OmpTerminalLaunch { program, resume_path, resume_command, resume: false }),
-            None,
+            Some(OmpTerminalLaunch { program, resume_path }),
             true,
             true,
             false,
@@ -2197,10 +2088,10 @@ impl AgentPanel {
         );
     }
 
-    /// The Zed-controlled resume path for a dedicated agent terminal: an opaque
+    /// The Zed-controlled session path for a dedicated agent terminal: an opaque
     /// per-terminal directory under `~/.omp/zed/<terminal-id>/`. It is the
     /// persisted locator for the session; the harness is launched with
-    /// `--session-dir <path>` and later resumed with `--resume <path>`.
+    /// `--session-dir <path>`.
     fn omp_resume_path_for_terminal(terminal_id: &TerminalId) -> PathBuf {
         home_dir()
             .join(".omp")
@@ -2257,7 +2148,6 @@ impl AgentPanel {
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
         agent_launch: Option<OmpTerminalLaunch>,
-        resume_outcome: Option<TerminalResumeOutcome>,
         select: bool,
         focus: bool,
         run_init_command: bool,
@@ -2312,7 +2202,6 @@ impl AgentPanel {
                     initial_title,
                     created_at,
                     agent_launch,
-                    resume_outcome,
                     select,
                     focus,
                     source,
@@ -2333,26 +2222,14 @@ impl AgentPanel {
             .filter(|command| !command.trim().is_empty())
     }
 
-    /// Builds the shell command that launches an OMP agent terminal: the
-    /// harness is started with `--session-dir <path>` at creation and resumed
-    /// with `--resume <path>` when a sleeping session is revived. The resume
-    /// argv comes from the pure `get_agent_resume_argv` helper so the resume
-    /// locator logic stays in one place.
+    /// Builds the shell command that launches an OMP agent terminal with
+    /// `--session-dir <path>`.
     fn omp_launch_init_command(launch: &OmpTerminalLaunch) -> String {
-        if launch.resume {
-            // Do not auto-execute the resume command: typing it at a not-yet
-            // interactive shell garbles the terminal on restore. Print it as a
-            // shell comment instead so the user can copy it and decide whether
-            // to resume or start fresh.
-            let locator = launch.resume_path.to_string_lossy();
-            format!("# {}", expand_resume_command(&launch.resume_command, &locator).join(" "))
-        } else {
-            format!(
-                "{} --session-dir {}",
-                launch.program,
-                launch.resume_path.to_string_lossy()
-            )
-        }
+        format!(
+            "{} --session-dir {}",
+            launch.program,
+            launch.resume_path.to_string_lossy()
+        )
     }
 
     fn write_terminal_init_command(
@@ -2420,7 +2297,6 @@ impl AgentPanel {
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
         agent_launch: Option<OmpTerminalLaunch>,
-        resume_outcome: Option<TerminalResumeOutcome>,
         select: bool,
         focus: bool,
         source: AgentThreadSource,
@@ -2459,20 +2335,12 @@ impl AgentPanel {
                 }
                 TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
                 TerminalEvent::ProcessExited => {
-                    // The OMP process ended on its own: the session becomes a
-                    // sleeping session that auto-resumes on the next worktree
-                    // activation (not restore-on-tab-open).
-                    this.transition_terminal_to_sleeping(terminal_id, false, cx);
+                    // The OMP process ended on its own: the session becomes
+                    // sleeping so its terminal status remains visible.
+                    this.transition_terminal_to_sleeping(terminal_id, cx);
                 }
                 TerminalEvent::CloseTerminal => {
-                    if this.has_revivable_agent_session(terminal_id) {
-                        // Manually closing an OMP agent session sleeps it in
-                        // restore-on-tab-open mode: it resumes only when its
-                        // tab is opened, never on panel/worktree activation.
-                        this.transition_terminal_to_sleeping(terminal_id, true, cx);
-                    } else {
-                        this.request_close_terminal_from_terminal_event(terminal_id, cx);
-                    }
+                    this.request_close_terminal_from_terminal_event(terminal_id, cx);
                 }
                 TerminalEvent::BlinkChanged(_)
                 | TerminalEvent::SelectionsChanged
@@ -2492,11 +2360,6 @@ impl AgentPanel {
             ),
             None => (None, None, None),
         };
-        let (restored_banner, resume_error) = match resume_outcome {
-            Some(TerminalResumeOutcome::Restored) => (true, None),
-            Some(TerminalResumeOutcome::Failed { message }) => (false, Some(message)),
-            None => (false, None),
-        };
         let mut terminal = AgentTerminal {
             view: terminal_view,
             title_editor: None,
@@ -2515,9 +2378,6 @@ impl AgentPanel {
             agent_profile,
             resume_path,
             session_boundary,
-            restore_on_tab_open: false,
-            restored_banner,
-            resume_error,
         };
         if self.pending_terminal_spawn == Some(terminal_id) {
             self.pending_terminal_spawn = None;
@@ -2541,16 +2401,6 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Opening (activating) the tab of a manually slept session resumes it:
-        // restore-on-tab-open sessions relaunch only when their tab is opened,
-        // never on panel/worktree activation.
-        if self.terminals.get(&terminal_id).is_some_and(|terminal| {
-            terminal.session_boundary == Some(AgentSessionBoundary::Sleeping)
-                && terminal.restore_on_tab_open
-        }) {
-            self.resume_restore_on_tab_open_session(terminal_id, window, cx);
-            return;
-        }
         let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
             return;
         };
@@ -2566,41 +2416,6 @@ impl AgentPanel {
         }
     }
 
-    /// Resumes a manually slept (restore-on-tab-open) sleeping session when its
-    /// tab is opened. The record is only resumed if it is sleeping and was
-    /// slept manually; otherwise this is a no-op. If the session is already
-    /// live in the panel, it is simply activated. This is the production hook
-    /// behind "resume only when its tab opens".
-    pub fn resume_restore_on_tab_open_session(
-        &mut self,
-        terminal_id: TerminalId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let metadata = self.terminal_metadata(terminal_id, cx).or_else(|| {
-            TerminalThreadMetadataStore::try_global(cx)
-                .and_then(|store| store.read(cx).entry(terminal_id).cloned())
-        });
-        let Some(metadata) = metadata else {
-            return;
-        };
-        if metadata.session_boundary != Some(AgentSessionBoundary::Sleeping)
-            || !metadata.restore_on_tab_open
-        {
-            // Not a manually slept restore-on-tab-open session; nothing to do.
-            return;
-        }
-        // If the session is already live in the panel, just show it.
-        if self
-            .terminals
-            .get(&terminal_id)
-            .is_some_and(|terminal| terminal.session_boundary == Some(AgentSessionBoundary::Live))
-        {
-            self.set_base_view(BaseView::Terminal { terminal_id }, true, window, cx);
-            return;
-        }
-        self.resume_sleeping_session(terminal_id, &metadata, window, cx);
-    }
 
     pub fn close_terminal(
         &mut self,
@@ -2633,22 +2448,16 @@ impl AgentPanel {
             self.pending_terminal_spawn = None;
         }
         self.dismiss_terminal_notifications(terminal_id, cx);
-        // Capture revival metadata before removing the terminal so an explicit
-        // close can clear the session's sleeping record.
+        // Capture dedicated agent metadata before removing the terminal so an
+        // explicit close can clear its persisted session record.
         let metadata = self.terminal_metadata(terminal_id, cx);
-        // Capture the terminal's live descendant tree before it is dropped;
-        // once the terminal handle is gone its process is no longer reachable.
-        self.capture_terminal_orphans(terminal_id, cx);
-        // The terminal is closing: no badge, no pending inference.
-        self.clear_terminal_inferred_status(terminal_id);
         if self.terminals.remove(&terminal_id).is_none() {
             return;
         }
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
             if metadata.as_ref().is_some_and(|metadata| metadata.agent_profile.is_some()) {
-                // Explicitly closing a revivable agent terminal clears its
-                // sleeping/revival record so it can never resurrect on a later
-                // activation.
+                // Explicitly closing a dedicated agent terminal clears its
+                // persisted session record.
                 if let Some(mut metadata) = metadata {
                     metadata.session_boundary = Some(AgentSessionBoundary::Cleared);
                     store.update(cx, |store, cx| {
@@ -2683,51 +2492,6 @@ impl AgentPanel {
         }
     }
 
-    /// Captures the live descendant tree of a terminal's shell/agent process,
-    /// recording each descendant's PID plus its start time. Called while the
-    /// terminal is still in `self.terminals` so `Terminal::pid()` is reachable.
-    fn capture_terminal_orphans(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
-        let Some(AgentTerminal { view, .. }) = self.terminals.get(&terminal_id) else {
-            return;
-        };
-        let Some(pid) = view.read(cx).terminal().read(cx).pid() else {
-            return;
-        };
-        // The descendant walk takes a full process-table snapshot; run it off
-        // the UI thread. The pid was read while the terminal was still alive,
-        // and reaping re-verifies identity by start time anyway.
-        cx.spawn(async move |this, cx| {
-            let captured = cx.background_spawn(async move {
-                terminal::orphan_cleanup::capture_descendants(pid)
-            });
-            let captured = captured.await;
-            this.update(cx, |this, _cx| {
-                if !captured.is_empty() {
-                    this.pending_orphans.extend(captured);
-                }
-            })
-            .log_err();
-        })
-        .detach();
-    }
-
-    /// Reaps pending orphans that are still alive *and* still match their
-    /// capture-time start time, then discards the captured set (any process
-    /// not reaped is either already gone or its PID was recycled — either way
-    /// it must not be retried as-is). Runs on a background executor.
-    pub fn reap_pending_orphans(&mut self, cx: &mut Context<Self>) {
-        if self.pending_orphans.is_empty() {
-            return;
-        }
-        let captured = std::mem::take(&mut self.pending_orphans);
-        cx.background_spawn(async move {
-            let reaped = terminal::orphan_cleanup::reap_orphans(&captured);
-            if reaped > 0 {
-                log::debug!("reaped {reaped} orphaned terminal descendant processes");
-            }
-        })
-        .detach();
-    }
 
     /// Captures the live descendant set of every live OMP agent terminal
     /// across `panels`, for deciding whether an app quit should prompt about
@@ -2995,29 +2759,17 @@ impl AgentPanel {
             agent_profile: terminal.agent_profile,
             resume_path: terminal.resume_path.clone(),
             session_boundary: terminal.session_boundary,
-            restore_on_tab_open: terminal.restore_on_tab_open,
             user_order: stored_user_order,
         })
     }
 
-    /// Whether the terminal is a revivable agent session (carries an agent
-    /// profile). Used to keep such a terminal alive as a sleeping session when
-    /// its process ends rather than closing it.
-    fn has_revivable_agent_session(&self, terminal_id: TerminalId) -> bool {
-        self.terminals
-            .get(&terminal_id)
-            .is_some_and(|terminal| terminal.agent_profile.is_some())
-    }
 
     /// Transitions a live OMP agent terminal to `sleeping` and persists the
-    /// change. `restore_on_tab_open` marks a manually slept session that must
-    /// resume only when its tab is opened (never on activation). No-op for
-    /// non-agent terminals, or when the session is not currently live
-    /// (already sleeping/cleared).
+    /// change. No-op for non-agent terminals, or when the session is not
+    /// currently live (already sleeping/cleared).
     fn transition_terminal_to_sleeping(
         &mut self,
         terminal_id: TerminalId,
-        restore_on_tab_open: bool,
         cx: &mut Context<Self>,
     ) {
         let should_transition = self.terminals.get(&terminal_id).is_some_and(|terminal| {
@@ -3029,7 +2781,6 @@ impl AgentPanel {
         }
         if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
             terminal.session_boundary = Some(AgentSessionBoundary::Sleeping);
-            terminal.restore_on_tab_open = restore_on_tab_open;
         }
         // The session has ended (deterministic Completed); drop any inferred
         // waiting state so the badge reflects the boundary.
@@ -3039,7 +2790,7 @@ impl AgentPanel {
     }
 
     /// On panel/worktree close (app quit), every live OMP agent terminal becomes
-    /// a sleeping session so its resume locator survives the restart. Runs with
+    /// a sleeping session so its session record survives the restart. Runs with
     /// an `App` context because it is invoked from `on_release` during teardown.
     fn sleep_all_live_agent_terminals(&mut self, cx: &mut App) {
         let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
@@ -3057,9 +2808,6 @@ impl AgentPanel {
         for terminal_id in terminal_ids {
             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                 terminal.session_boundary = Some(AgentSessionBoundary::Sleeping);
-                // An app-quit sleep is not a manual sleep: the session
-                // auto-resumes on the next activation (auto-resume mode).
-                terminal.restore_on_tab_open = false;
             }
             // Update the persisted record directly so the sleeping boundary
             // survives the restart without needing project context during
@@ -3067,7 +2815,6 @@ impl AgentPanel {
             if let Some(metadata) = store.read(cx).entry(terminal_id).cloned() {
                 let mut metadata = metadata;
                 metadata.session_boundary = Some(AgentSessionBoundary::Sleeping);
-                metadata.restore_on_tab_open = false;
                 store.update(cx, |store, cx| {
                     store.save(metadata, cx);
                 });
@@ -3075,366 +2822,7 @@ impl AgentPanel {
         }
     }
 
-    /// Marks a persisted session record `cleared` (no longer resumable) so it
-    /// is never auto-resumed again.
-    fn clear_persisted_session(&self, metadata: &TerminalThreadMetadata, cx: &mut Context<Self>) {
-        let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
-            return;
-        };
-        let mut metadata = metadata.clone();
-        metadata.session_boundary = Some(AgentSessionBoundary::Cleared);
-        store.update(cx, |store, cx| {
-            store.save(metadata, cx);
-        });
-    }
 
-    /// Writes `lines` as plain text into the active terminal's output (the
-    /// echo surface used for session listings). No-ops when no terminal is
-    /// active. This injects display text into the terminal emulator without
-    /// going through the PTY, so the shell remains interactive.
-    fn echo_output(&self, lines: &[String], cx: &mut Context<Self>) {
-        let Some(terminal_id) = self.active_terminal_id() else {
-            return;
-        };
-        let Some(view) = self.terminals.get(&terminal_id).map(|t| t.view.clone()) else {
-            return;
-        };
-        let mut text = String::new();
-        for line in lines {
-            text.push_str(line);
-            text.push('\n');
-        }
-        let terminal = view.read(cx).terminal().clone();
-        terminal.update(cx, |terminal, cx| terminal.write_output(text.as_bytes(), cx));
-    }
-
-    /// Lists the current worktree's terminal-agent sessions as Open (live or
-    /// queued in this panel) versus Closed (sleeping records persisted in the
-    /// metadata store: OMP profile with a sleeping boundary). The list is
-    /// written to the active terminal as echo output.
-    fn list_sessions(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.supports_terminal(cx) {
-            return;
-        }
-        let project = self.project.read(cx);
-        let worktree_paths = project.worktree_paths(cx);
-        let remote_connection = project.remote_connection_options(cx);
-        let store = TerminalThreadMetadataStore::try_global(cx);
-
-        let mut lines = vec![String::from("-- Terminal agent sessions --")];
-
-        lines.push(String::from("Open (live/queued):"));
-        let mut open_ids: Vec<TerminalId> = self.terminals.keys().copied().collect();
-        open_ids.sort();
-        for terminal_id in open_ids {
-            let state = self
-                .terminals
-                .get(&terminal_id)
-                .and_then(|terminal| terminal.session_boundary)
-                .map(|boundary| format!("{boundary:?}"))
-                .unwrap_or_else(|| "Live".to_string());
-            lines.push(format!("  {terminal_id}  {state}"));
-        }
-        if lines.len() == 2 {
-            lines.push(String::from("  (none)"));
-        }
-
-        lines.push(String::from("Closed (sleeping):"));
-        let mut any_closed = false;
-        if let Some(store) = store {
-            let mut closed: Vec<(TerminalId, String)> = store
-                .read(cx)
-                .entries_for_main_worktree_path(
-                    worktree_paths.main_worktree_path_list(),
-                    remote_connection.as_ref(),
-                )
-                .filter(|metadata| {
-                    metadata.agent_profile == Some(TerminalAgentProfile::Omp)
-                        && metadata.session_boundary == Some(AgentSessionBoundary::Sleeping)
-                })
-                .map(|metadata| {
-                    (
-                        metadata.terminal_id,
-                        metadata
-                            .resume_path
-                            .as_ref()
-                            .map(|path| path.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                    )
-                })
-                .collect();
-            closed.sort();
-            for (terminal_id, resume_path) in closed {
-                any_closed = true;
-                let locator = if resume_path.is_empty() {
-                    "<no locator>".to_string()
-                } else {
-                    resume_path
-                };
-                lines.push(format!("  {terminal_id}  omp --resume {locator}"));
-            }
-        }
-        if !any_closed {
-            lines.push(String::from("  (none)"));
-        }
-
-        self.echo_output(&lines, cx);
-        window.refresh();
-    }
-
-    /// Writes the recorded orphan processes (descendants of a closed thread,
-    /// terminal, or worktree that were still running at capture time) to the
-    /// active terminal as echo output.
-    pub fn list_orphan_processes(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.supports_terminal(cx) {
-            return;
-        }
-        let mut lines = vec![String::from("-- Orphan processes --")];
-        if self.pending_orphans.is_empty() {
-            lines.push(String::from("  (none captured)"));
-        } else {
-            for orphan in &self.pending_orphans {
-                lines.push(format!("  pid {}  start {}", orphan.pid, orphan.start_time));
-            }
-        }
-        lines.push(String::from(
-            "Run `thread: Kill Orphaned Processes` to terminate survivors.",
-        ));
-        self.echo_output(&lines, cx);
-        window.refresh();
-    }
-
-    /// Number of still-tracked orphan processes (descendants of closed
-    /// threads/terminals that were running at capture time). Used to surface an
-    /// explicit orphan-cleanup affordance (e.g. a thread context-menu item);
-    /// orphans are only reaped when the user opts in, never silently.
-    pub fn pending_orphan_count(&self) -> usize {
-        self.pending_orphans.len()
-    }
-
-    /// Auto-resumes sleeping OMP agent sessions for the current worktree on
-    /// panel/worktree activation. Sleeping records are run through
-    /// `select_sessions_to_resume`, which fences by claim key (newest wins,
-    /// invalid/duplicate/older records skipped), so a given session is resumed
-    /// exactly once. Each selected record is relaunched into a new shell with
-    /// `omp --resume <path>`; non-selected (duplicate/older/invalid) sleeping
-    /// records are cleared. Stale sleeping records (dormant past the staleness
-    /// window) are cleared rather than resumed, and manually slept sessions
-    /// (`restore_on_tab_open`) are preserved for a tab-open resume but never
-    /// auto-resumed on activation. Live or queued sessions are never resumed.
-    fn auto_resume_sleeping_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.supports_terminal(cx) {
-            return;
-        }
-        let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
-            return;
-        };
-        let worktree_paths = self.project.read(cx).worktree_paths(cx);
-        let remote_connection = self.project.read(cx).remote_connection_options(cx);
-        let worktree_id = self
-            .workspace_id
-            .map(i64::from)
-            .map(|id| id.to_string())
-            .unwrap_or_default();
-        let profile = TerminalAgentProfile::Omp;
-        let now = Utc::now();
-
-        // Collect sleeping OMP records scoped to this worktree.
-        let mut candidates: Vec<(TerminalId, TerminalThreadMetadata, SleepingSessionRecord)> =
-            Vec::new();
-        for metadata in store.read(cx).entries_for_main_worktree_path(
-            worktree_paths.main_worktree_path_list(),
-            remote_connection.as_ref(),
-        ) {
-            if metadata.agent_profile != Some(profile)
-                || metadata.session_boundary != Some(AgentSessionBoundary::Sleeping)
-            {
-                continue;
-            }
-            let Some(resume_path) = metadata.resume_path.as_ref() else {
-                continue;
-            };
-            // Skip sessions already live or queued in this panel.
-            if self.terminals.contains_key(&metadata.terminal_id) {
-                continue;
-            }
-            let claim_key = session_claim_key(&worktree_id, profile, resume_path);
-            // A sleeping record is invalid (cleared, not resumed) when it is
-            // structurally invalid per the session-record rule or has been
-            // dormant past the staleness window.
-            let invalid = is_invalid_session_record(
-                true,
-                true,
-                metadata.created_at,
-                metadata.created_at,
-            ) || is_stale_sleeping_record(metadata.created_at, now);
-            candidates.push((
-                metadata.terminal_id,
-                metadata.clone(),
-                SleepingSessionRecord {
-                    claim_key,
-                    invalid,
-                    updated_at: metadata.created_at,
-                },
-            ));
-        }
-        if candidates.is_empty() {
-            return;
-        }
-
-        // Freshly slept manual sessions (restore-on-tab-open) are excluded from
-        // the selection pool: they must never auto-resume on activation, but
-        // they are preserved (not cleared) so they can resume when their tab
-        // opens. Stale manual-sleep records remain `invalid` and are cleared.
-        let selection_pool: Vec<(usize, SleepingSessionRecord)> = candidates
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, metadata, record))| {
-                !record.invalid && !metadata.restore_on_tab_open
-            })
-            .map(|(index, (_, _, record))| (index, record.clone()))
-            .collect();
-        let pool_records: Vec<SleepingSessionRecord> = selection_pool
-            .iter()
-            .map(|(_, record)| record.clone())
-            .collect();
-        let selected = select_sessions_to_resume(&pool_records);
-        // `select_sessions_to_resume` returns references into `pool_records`;
-        // map them back to candidate indices by reference identity so that,
-        // when several sleep records share a claim key, only the single
-        // selected (newest) record is resumed and the rest are cleared. The
-        // pointer points into `pool_records`, so resolve it there first, then
-        // translate the pool position to the candidate index stored alongside.
-        let selected_indices: HashSet<usize> = selected
-            .iter()
-            .map(|record| {
-                let record = *record;
-                let ptr = record as *const SleepingSessionRecord as usize;
-                let pool_index = pool_records
-                    .iter()
-                    .position(|candidate| {
-                        candidate as *const SleepingSessionRecord as usize == ptr
-                    })
-                    .expect("selected record must reference a pool record");
-                selection_pool[pool_index].0
-            })
-            .collect();
-
-        for (index, (_, metadata, record)) in candidates.iter().enumerate() {
-            let is_selected = selected_indices.contains(&index);
-            // Preserve fresh manual-sleep (restore-on-tab-open) records so they
-            // can resume when their tab opens; clear everything else that was
-            // not selected (stale/invalid, or duplicate/older auto-resume
-            // records) so it can never resurrect.
-            let preserve_manual_sleep = !record.invalid && metadata.restore_on_tab_open;
-            if !is_selected && !preserve_manual_sleep {
-                self.clear_persisted_session(metadata, cx);
-            }
-        }
-
-        // Resume each selected sleeping session exactly once.
-        for (index, (terminal_id, metadata, _)) in candidates.iter().enumerate() {
-            if selected_indices.contains(&index) {
-                self.resume_sleeping_session(*terminal_id, metadata, window, cx);
-            }
-        }
-    }
-
-    /// Launches a sleeping OMP session into a new shell with `omp --resume
-    /// <path>`, reusing the session's terminal id and resume path so the store
-    /// record transitions back to `live`. A successful resume shows a
-    /// "session restored (new process, same session)" banner. When no usable
-    /// resume locator is available, the session cannot be resumed: instead of
-    /// silently starting a fresh agent, a plain usable shell is left with an
-    /// explicit error (and the sleeping record is cleared so it is never
-    /// retried). In tests the display-only path is used (no real shell),
-    /// mirroring `restore_terminal_for_panel_load`.
-    fn resume_sleeping_session(
-        &mut self,
-        terminal_id: TerminalId,
-        metadata: &TerminalThreadMetadata,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let working_directory = metadata.working_directory.clone();
-        let initial_title = Self::terminal_restore_initial_title(metadata);
-        let custom_title = metadata.custom_title.clone();
-        let created_at = Some(metadata.created_at);
-
-        // A resume needs a usable resume locator (the Zed-controlled resume
-        // path for OMP). If none is available, the session cannot be resumed.
-        let resume_command = AgentSettings::get_global(cx).terminal_agent.resume_command.clone();
-        let resume_argv_available = metadata
-            .resume_path
-            .as_ref()
-            .and_then(|path| {
-                get_agent_resume_argv(TerminalAgentProfile::Omp, &resume_command, Some(path), None)
-            })
-            .is_some();
-
-        let agent_launch = if resume_argv_available {
-            let program = AgentSettings::get_global(cx).terminal_agent.program.clone();
-            Some(OmpTerminalLaunch {
-                program,
-                resume_path: metadata
-                    .resume_path
-                    .clone()
-                    .expect("resume argv availability implies a resume path"),
-                resume_command,
-                resume: true,
-            })
-        } else {
-            None
-        };
-        let resume_outcome = if resume_argv_available {
-            Some(TerminalResumeOutcome::Restored)
-        } else {
-            Some(TerminalResumeOutcome::Failed {
-                message: UNABLE_TO_RESUME_SESSION_MESSAGE.into(),
-            })
-        };
-        // Never run the global terminal init command on a failed resume: it
-        // could silently launch a fresh agent session.
-        let run_init_command = agent_launch.is_some();
-
-        #[cfg(test)]
-        {
-            self.insert_display_only_terminal(
-                terminal_id,
-                working_directory,
-                custom_title,
-                initial_title,
-                created_at,
-                agent_launch.clone(),
-                resume_outcome,
-                true,
-                false,
-                run_init_command,
-                AgentThreadSource::AgentPanel,
-                window,
-                cx,
-            )
-            .log_err();
-        }
-        #[cfg(not(test))]
-        {
-            self.spawn_terminal(
-                terminal_id,
-                working_directory,
-                custom_title,
-                initial_title,
-                created_at,
-                agent_launch,
-                resume_outcome,
-                true,
-                false,
-                run_init_command,
-                AgentThreadSource::AgentPanel,
-                window,
-                cx,
-            );
-        }
-    }
 
     pub fn restore_terminal(
         &mut self,
@@ -3463,7 +2851,6 @@ impl AgentPanel {
             metadata.custom_title.clone(),
             initial_title,
             Some(metadata.created_at),
-            None,
             None,
             true,
             focus,
@@ -6178,7 +5565,6 @@ impl AgentPanel {
             None,
             None,
             None,
-            None,
             true,
             false,
             true,
@@ -6200,7 +5586,6 @@ impl AgentPanel {
         if let Err(error) = self.insert_display_only_terminal(
             terminal_id,
             working_directory,
-            None,
             None,
             None,
             None,
@@ -7506,107 +6891,8 @@ impl AgentPanel {
         key_context
     }
 
-    /// Renders the banner shown above a terminal that was produced by
-    /// `resume_sleeping_session`: an informational "session restored (new
-    /// process, same session)" banner on a successful resume, or an explicit
-    /// error banner on a failed resume (which leaves a plain usable shell).
-    /// Returns `None` for ordinary terminal launches.
-    fn render_terminal_resume_notice(
-        &self,
-        terminal: Option<&AgentTerminal>,
-        cx: &App,
-    ) -> Option<AnyElement> {
-        let terminal = terminal?;
-        if terminal.restored_banner {
-            return Some(
-                v_flex()
-                    .w_full()
-                    .p_2()
-                    .gap_1()
-                    .border_b_1()
-                    .border_color(cx.theme().status().info_border)
-                    .bg(cx.theme().status().info_background.opacity(0.15))
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap_1p5()
-                            .items_start()
-                            .child(
-                                Icon::new(IconName::ZedAgent)
-                                    .size(IconSize::Small)
-                                    .color(Color::Info),
-                            )
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .gap_0p5()
-                                    .child(
-                                        Label::new(
-                                            "Session restored (new process, same session)",
-                                        )
-                                        .size(LabelSize::Small)
-                                        .color(Color::Info),
-                                    )
-                                    .child(
-                                        Label::new(
-                                            "The conversation continued, but this is a new \
-                                             process.",
-                                        )
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                    ),
-                            ),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if let Some(error) = &terminal.resume_error {
-            return Some(
-                v_flex()
-                    .w_full()
-                    .p_2()
-                    .gap_1()
-                    .border_b_1()
-                    .border_color(cx.theme().status().error_border)
-                    .bg(cx.theme().status().error_background.opacity(0.15))
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap_1p5()
-                            .items_start()
-                            .child(
-                                Icon::new(IconName::Warning)
-                                    .size(IconSize::Small)
-                                    .color(Color::Error),
-                            )
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .gap_0p5()
-                                    .child(
-                                        Label::new(error.clone())
-                                            .size(LabelSize::Small)
-                                            .color(Color::Error),
-                                    )
-                                    .child(
-                                        Label::new(
-                                            "This is a plain shell. No new agent session was \
-                                             started.",
-                                        )
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                    ),
-                            ),
-                    )
-                    .into_any_element(),
-            );
-        }
-        None
-    }
-}
 
+}
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // WARNING: Changes to this element hierarchy can have
@@ -7694,10 +6980,6 @@ impl Render for AgentPanel {
                                 )
                             })
                         })
-                        .when_some(
-                            self.render_terminal_resume_notice(active_terminal, cx),
-                            |this, notice| this.child(notice),
-                        )
                         .child(terminal_view.clone());
 
                     parent
@@ -7868,7 +7150,6 @@ impl AgentPanel {
             None,
             None,
             None,
-            None,
             focus,
             focus,
             true,
@@ -7894,7 +7175,6 @@ impl AgentPanel {
         let terminal_id = TerminalId::new();
         let resume_path = Self::omp_resume_path_for_terminal(&terminal_id);
         let program = AgentSettings::get_global(cx).terminal_agent.program.clone();
-        let resume_command = AgentSettings::get_global(cx).terminal_agent.resume_command.clone();
         self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::OmpTerminal, cx);
         self.insert_display_only_terminal(
             terminal_id,
@@ -7902,8 +7182,7 @@ impl AgentPanel {
             Some(SharedString::from(title.into())),
             None,
             None,
-            Some(OmpTerminalLaunch { program, resume_path, resume_command, resume: false }),
-            None,
+            Some(OmpTerminalLaunch { program, resume_path }),
             focus,
             focus,
             false,
@@ -7942,7 +7221,6 @@ impl AgentPanel {
             initial_title,
             Some(metadata.created_at),
             None,
-            None,
             true,
             focus,
             true,
@@ -7961,7 +7239,6 @@ impl AgentPanel {
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
         agent_launch: Option<OmpTerminalLaunch>,
-        resume_outcome: Option<TerminalResumeOutcome>,
         select: bool,
         focus: bool,
         run_init_command: bool,
@@ -8006,7 +7283,6 @@ impl AgentPanel {
             initial_title,
             created_at,
             agent_launch,
-            resume_outcome,
             select,
             focus,
             source,
@@ -8764,7 +8040,6 @@ mod tests {
             agent_profile: None,
             resume_path: None,
             session_boundary: None,
-            restore_on_tab_open: false,
             user_order: None,
         };
         assert_eq!(metadata.working_directory, None);
@@ -8853,7 +8128,6 @@ mod tests {
             agent_profile: None,
             resume_path: None,
             session_boundary: None,
-            restore_on_tab_open: false,
             user_order: None,
         };
         let terminal_id = metadata.terminal_id;
@@ -8932,9 +8206,8 @@ mod tests {
             .join("zed")
             .join(terminal_id.to_key_string());
 
-        // The dedicated OMP entry is a distinct, revivable agent session: it
-        // carries an OMP profile, a Zed-assigned resume path, and a `live`
-        // session boundary.
+        // The dedicated OMP entry is a distinct agent session: it carries an
+        // OMP profile, a Zed-assigned session path, and a `live` boundary.
         let metadata = cx.update(|_, cx| {
             let store = TerminalThreadMetadataStore::global(cx);
             store
@@ -8950,9 +8223,9 @@ mod tests {
         );
         assert_eq!(metadata.session_boundary, Some(AgentSessionBoundary::Live));
 
-        // The entry kind is remembered so the next explicit new entry re-creates an
-// OMP agent terminal rather than a plain shell. Workspace activation does not
-// auto-spawn one: only the dedicated entry does.
+        // The entry kind is remembered so the next explicit new entry re-creates
+        // an OMP agent terminal rather than a plain shell. Workspace activation
+        // does not auto-spawn one: only the dedicated entry does.
         panel.read_with(&cx, |panel, cx| {
             assert_eq!(
                 panel.last_created_entry_kind,
@@ -8987,616 +8260,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_auto_resume_sleeping_omp_session_exactly_once_on_load(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| {
-            TerminalThreadMetadataStore::init_global(cx);
-        });
-
-        let workspace = cx.update(|window, cx| {
-            window
-                .root::<MultiWorkspace>()
-                .flatten()
-                .expect("test window should have a MultiWorkspace root")
-                .read(cx)
-                .workspace()
-                .clone()
-        });
-        workspace.update(&mut cx, |workspace, _cx| {
-            workspace.set_random_database_id();
-        });
-
-        // Create a dedicated OMP agent terminal (persisted as `live`).
-        let terminal_id = panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_omp_terminal("OMP Agent", true, window, cx)
-            })
-            .expect("OMP test terminal should be inserted");
-        cx.run_until_parked();
-
-        let expected_resume_path = util::paths::home_dir()
-            .join(".omp")
-            .join("zed")
-            .join(terminal_id.to_key_string());
-
-        let metadata_before = cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store
-                .read(cx)
-                .entry(terminal_id)
-                .expect("OMP terminal should be persisted")
-                .clone()
-        });
-        assert_eq!(
-            metadata_before.session_boundary,
-            Some(AgentSessionBoundary::Live),
-            "OMP terminal should start live"
-        );
-
-        // Simulate the OMP process exiting: the panel's TerminalEvent handler
-        // transitions the live session to `sleeping` and persists it.
-        panel.update(&mut cx, |panel, cx| {
-            panel.emit_test_terminal_process_exited(terminal_id, cx);
-        });
-        cx.run_until_parked();
-
-        let metadata_sleeping = cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store
-                .read(cx)
-                .entry(terminal_id)
-                .expect("OMP terminal should still be persisted")
-                .clone()
-        });
-        assert_eq!(
-            metadata_sleeping.session_boundary,
-            Some(AgentSessionBoundary::Sleeping),
-            "process exit should mark the OMP terminal sleeping"
-        );
-
-        // Reopen the worktree: a fresh panel load auto-resumes the sleeping
-        // session. The resumed terminal reuses the same terminal id and resume
-        // path, so the store record flips back to `live`.
-        let async_cx = cx.update(|window, cx| window.to_async(cx));
-        let loaded = AgentPanel::load(workspace.downgrade(), async_cx)
-            .await
-            .expect("panel load should succeed");
-        cx.run_until_parked();
-
-        let resumed = loaded.read_with(&cx, |panel, cx| {
-            panel
-                .terminals
-                .get(&terminal_id)
-                .expect("auto-resume should relaunch the sleeping session")
-                .view
-                .read(cx)
-                .terminal()
-                .clone()
-        });
-        let input_log = resumed.update(&mut cx, |terminal, _| terminal.take_input_log());
-        assert_eq!(
-            input_log,
-            vec![format!(
-                "# omp --resume {}\r",
-                expected_resume_path.to_string_lossy()
-            )
-            .into_bytes()],
-            "auto-resume should relaunch exactly once with `omp --resume <path>`"
-        );
-
-        let metadata_after = cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store
-                .read(cx)
-                .entry(terminal_id)
-                .expect("resumed terminal should be persisted")
-                .clone()
-        });
-        assert_eq!(
-            metadata_after.session_boundary,
-            Some(AgentSessionBoundary::Live),
-            "a resumed session should return to the live boundary"
-        );
-
-        // A second load must not resume the now-live session again.
-        let async_cx = cx.update(|window, cx| window.to_async(cx));
-        let loaded_again = AgentPanel::load(workspace.downgrade(), async_cx)
-            .await
-            .expect("second panel load should succeed");
-        cx.run_until_parked();
-
-        // A second load must not resume the now-live session again: the
-        // already-live session is never auto-resumed, so no new OMP resume
-        // terminal is created (the last-active terminal may be restored as a
-        // plain shell — pre-existing `restore_terminal` behavior — but never
-        // relaunched with `omp --resume`).
-        loaded_again.read_with(&cx, |panel, _cx| {
-            assert!(
-                panel
-                    .terminals
-                    .values()
-                    .all(|terminal| terminal.agent_profile.is_none()),
-                "an already-live session must not be auto-resumed again (no second OMP resume terminal)"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_auto_resume_shows_restored_session_banner(cx: &mut TestAppContext) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| {
-            TerminalThreadMetadataStore::init_global(cx);
-        });
-
-        let workspace = cx.update(|window, cx| {
-            window
-                .root::<MultiWorkspace>()
-                .flatten()
-                .expect("test window should have a MultiWorkspace root")
-                .read(cx)
-                .workspace()
-                .clone()
-        });
-        workspace.update(&mut cx, |workspace, _cx| {
-            workspace.set_random_database_id();
-        });
-
-        // Create a dedicated OMP agent terminal (persisted as `live`).
-        let terminal_id = panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_omp_terminal("OMP Agent", true, window, cx)
-            })
-            .expect("OMP test terminal should be inserted");
-        cx.run_until_parked();
-
-        // Simulate the OMP process exiting so the session becomes `sleeping`.
-        panel.update(&mut cx, |panel, cx| {
-            panel.emit_test_terminal_process_exited(terminal_id, cx);
-        });
-        cx.run_until_parked();
-
-        // Reopen the worktree: a fresh panel load auto-resumes the sleeping
-        // session and tags the relaunched terminal with the restored-session
-        // banner so the user knows the conversation continued but the process
-        // is new.
-        let async_cx = cx.update(|window, cx| window.to_async(cx));
-        let loaded = AgentPanel::load(workspace.downgrade(), async_cx)
-            .await
-            .expect("panel load should succeed");
-        cx.run_until_parked();
-
-        loaded.read_with(&cx, |panel, cx| {
-            let terminal = panel
-                .terminals
-                .get(&terminal_id)
-                .expect("auto-resume should relaunch the sleeping session");
-            assert!(
-                terminal.restored_banner,
-                "a resumed session should show the restored-session banner"
-            );
-            assert_eq!(
-                terminal.resume_error, None,
-                "a successful resume must not show a failure error"
-            );
-            // The banner is rendered above the terminal view, so the active
-            // terminal's notice is non-empty.
-            let notice = panel.render_terminal_resume_notice(Some(terminal), cx);
-            assert!(
-                notice.is_some(),
-                "a resumed session must render the restored-session banner"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_resume_failure_leaves_usable_shell_with_explicit_error(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| {
-            TerminalThreadMetadataStore::init_global(cx);
-        });
-
-        // A sleeping OMP record with no resume locator cannot be resumed.
-        let terminal_id = TerminalId::new();
-        let worktree_paths = panel.read_with(&cx, |panel, cx| {
-            panel.project.read(cx).worktree_paths(cx)
-        });
-        let remote_connection = panel.read_with(&cx, |panel, cx| {
-            panel.project.read(cx).remote_connection_options(cx)
-        });
-        let metadata = TerminalThreadMetadata {
-            terminal_id,
-            title: "OMP Agent".into(),
-            custom_title: None,
-            created_at: Utc::now(),
-            worktree_paths,
-            remote_connection,
-            working_directory: None,
-            agent_profile: Some(TerminalAgentProfile::Omp),
-            // No resume locator: the session cannot be resumed, so the panel
-            // must leave a usable shell with an explicit error instead of
-            // silently starting a fresh agent.
-            resume_path: None,
-            session_boundary: Some(AgentSessionBoundary::Sleeping),
-            restore_on_tab_open: false,
-            user_order: None,
-        };
-
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.resume_sleeping_session(terminal_id, &metadata, window, cx);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, cx| {
-            let terminal = panel
-                .terminals
-                .get(&terminal_id)
-                .expect("a failed resume should still leave a terminal");
-            assert_eq!(
-                terminal.agent_profile, None,
-                "a failed resume must not launch a fresh agent session"
-            );
-            let error = terminal
-                .resume_error
-                .as_ref()
-                .expect("a failed resume must show an explicit error");
-            assert!(
-                error.contains("no resume locator"),
-                "the failure error should mention the missing resume locator, got {error:?}"
-            );
-            assert!(
-                !terminal.restored_banner,
-                "a failed resume must not show the restored-session banner"
-            );
-            let notice = panel.render_terminal_resume_notice(Some(terminal), cx);
-            assert!(
-                notice.is_some(),
-                "a failed resume must render an explicit error banner"
-            );
-        });
-
-        // The failed-resume shell must never have been told to run `omp
-        // --resume` (or any init command), so no fresh agent session is
-        // launched.
-        let terminal = panel.read_with(&cx, |panel, cx| {
-            panel
-                .terminals
-                .get(&terminal_id)
-                .expect("failed-resume terminal should exist")
-                .view
-                .read(cx)
-                .terminal()
-                .clone()
-        });
-        let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
-        assert!(
-            input_log.is_empty(),
-            "a failed resume must not write an agent launch command, got {input_log:?}"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_auto_resume_clears_duplicate_sleeping_records_per_claim_key(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| {
-            TerminalThreadMetadataStore::init_global(cx);
-        });
-
-        let workspace = cx.update(|window, cx| {
-            window
-                .root::<MultiWorkspace>()
-                .flatten()
-                .expect("test window should have a MultiWorkspace root")
-                .read(cx)
-                .workspace()
-                .clone()
-        });
-        workspace.update(&mut cx, |workspace, _cx| {
-            workspace.set_random_database_id();
-        });
-
-        // Two sleeping OMP records that share the same claim key (same worktree
-        // id, profile, and resume path) but belong to different terminal ids —
-        // simulating duplicate/older evidence for the same logical session.
-        // The store maps by terminal id, so both rows coexist.
-        let resume_path = PathBuf::from("/tmp/omp-zed/duplicate-session");
-        let (older_id, newer_id) = (TerminalId::new(), TerminalId::new());
-        let now = Utc::now();
-        let worktree_paths = panel.read_with(&cx, |panel, cx| {
-            panel.project.read(cx).worktree_paths(cx)
-        });
-        let remote_connection = panel.read_with(&cx, |panel, cx| {
-            panel.project.read(cx).remote_connection_options(cx)
-        });
-
-        let build_record = |terminal_id: TerminalId, created_at: DateTime<Utc>| {
-            TerminalThreadMetadata {
-                terminal_id,
-                title: "OMP Agent".into(),
-                custom_title: None,
-                created_at,
-                worktree_paths: worktree_paths.clone(),
-                remote_connection: remote_connection.clone(),
-                working_directory: None,
-                agent_profile: Some(TerminalAgentProfile::Omp),
-                resume_path: Some(resume_path.clone()),
-                session_boundary: Some(AgentSessionBoundary::Sleeping),
-                restore_on_tab_open: false,
-                user_order: None,
-            }
-        };
-        let older = build_record(older_id, now - chrono::Duration::minutes(5));
-        let newer = build_record(newer_id, now);
-
-        cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store.update(cx, |store, cx| {
-                store.save(older, cx);
-                store.save(newer, cx);
-            });
-        });
-        cx.run_until_parked();
-
-        // Loading the worktree auto-resumes exactly one of the two duplicate
-        // records (the newest), clears the older one, and never double-resumes.
-        let async_cx = cx.update(|window, cx| window.to_async(cx));
-        let loaded = AgentPanel::load(workspace.downgrade(), async_cx)
-            .await
-            .expect("panel load should succeed");
-        cx.run_until_parked();
-
-        let resumed = loaded.read_with(&cx, |panel, cx| {
-            let resume_terminals: Vec<_> = panel
-                .terminals
-                .iter()
-                .filter(|(_, terminal)| terminal.agent_profile.is_some())
-                .collect();
-            assert_eq!(
-                resume_terminals.len(),
-                1,
-                "duplicate claim keys must produce exactly one resume"
-            );
-            assert_eq!(
-                resume_terminals[0].0,
-                &newer_id,
-                "the newest record per claim key should win"
-            );
-            resume_terminals[0].1.view.read(cx).terminal().clone()
-        });
-        let input_log = resumed.update(&mut cx, |terminal, _| terminal.take_input_log());
-        assert_eq!(
-            input_log,
-            vec![format!("# omp --resume {}\r", resume_path.to_string_lossy()).into_bytes()]
-        );
-
-        // The older duplicate is cleared (not resumed), while the resumed
-        // session is live.
-        let (older_boundary, newer_boundary) = cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            (
-                store.read(cx).entry(older_id).map(|m| m.session_boundary),
-                store.read(cx).entry(newer_id).map(|m| m.session_boundary),
-            )
-        });
-        assert_eq!(
-            older_boundary,
-            Some(Some(AgentSessionBoundary::Cleared)),
-            "the older duplicate record should be cleared, not double-resumed"
-        );
-        assert_eq!(
-            newer_boundary,
-            Some(Some(AgentSessionBoundary::Live)),
-            "the resumed newest record should be live"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_manually_slept_session_resumes_only_on_tab_open(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| {
-            TerminalThreadMetadataStore::init_global(cx);
-        });
-
-        let workspace = cx.update(|window, cx| {
-            window
-                .root::<MultiWorkspace>()
-                .flatten()
-                .expect("test window should have a MultiWorkspace root")
-                .read(cx)
-                .workspace()
-                .clone()
-        });
-        workspace.update(&mut cx, |workspace, _cx| {
-            workspace.set_random_database_id();
-        });
-
-        // Create a dedicated OMP agent terminal (persisted live).
-        let terminal_id = panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_omp_terminal("OMP Agent", true, window, cx)
-            })
-            .expect("OMP test terminal should be inserted");
-        cx.run_until_parked();
-
-        let expected_resume_path = util::paths::home_dir()
-            .join(".omp")
-            .join("zed")
-            .join(terminal_id.to_key_string());
-
-        // Manual sleep: the user closes the terminal (CloseTerminal event),
-        // which transitions the live session to sleeping in restore-on-tab-open
-        // mode.
-        panel.update(&mut cx, |panel, cx| {
-            panel.emit_test_terminal_close(terminal_id, cx);
-        });
-        cx.run_until_parked();
-
-        let metadata_sleeping = cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store
-                .read(cx)
-                .entry(terminal_id)
-                .expect("OMP terminal should still be persisted")
-                .clone()
-        });
-        assert_eq!(
-            metadata_sleeping.session_boundary,
-            Some(AgentSessionBoundary::Sleeping),
-            "manual close should mark the OMP terminal sleeping"
-        );
-        assert!(
-            metadata_sleeping.restore_on_tab_open,
-            "a manually slept session must be marked restore-on-tab-open"
-        );
-
-        // Reopen the worktree: a manually slept session must NOT auto-resume on
-        // activation.
-        let async_cx = cx.update(|window, cx| window.to_async(cx));
-        let loaded = AgentPanel::load(workspace.downgrade(), async_cx)
-            .await
-            .expect("panel load should succeed");
-        cx.run_until_parked();
-
-        loaded.read_with(&cx, |panel, _cx| {
-            assert!(
-                panel
-                    .terminals
-                    .values()
-                    .all(|terminal| terminal.agent_profile.is_none()),
-                "a manually slept session must not auto-resume on activation"
-            );
-        });
-
-        // Opening its tab resumes it (restore-on-tab-open).
-        loaded.update_in(&mut cx, |panel, window, cx| {
-            panel.resume_restore_on_tab_open_session(terminal_id, window, cx);
-        });
-        cx.run_until_parked();
-
-        let resumed = loaded.read_with(&cx, |panel, cx| {
-            panel
-                .terminals
-                .get(&terminal_id)
-                .expect("tab-open resume should relaunch the sleeping session")
-                .view
-                .read(cx)
-                .terminal()
-                .clone()
-        });
-        let input_log = resumed.update(&mut cx, |terminal, _| terminal.take_input_log());
-        assert_eq!(
-            input_log,
-            vec![format!(
-                "# omp --resume {}\r",
-                expected_resume_path.to_string_lossy()
-            )
-            .into_bytes()],
-            "opening its tab should resume the manually slept session with `omp --resume <path>`"
-        );
-
-        let metadata_after = cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store
-                .read(cx)
-                .entry(terminal_id)
-                .expect("resumed terminal should be persisted")
-                .clone()
-        });
-        assert_eq!(
-            metadata_after.session_boundary,
-            Some(AgentSessionBoundary::Live),
-            "a tab-open resumed session should return to the live boundary"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_stale_sleeping_record_is_cleared_not_resumed(cx: &mut TestAppContext) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| {
-            TerminalThreadMetadataStore::init_global(cx);
-        });
-
-        let workspace = cx.update(|window, cx| {
-            window
-                .root::<MultiWorkspace>()
-                .flatten()
-                .expect("test window should have a MultiWorkspace root")
-                .read(cx)
-                .workspace()
-                .clone()
-        });
-        workspace.update(&mut cx, |workspace, _cx| {
-            workspace.set_random_database_id();
-        });
-
-        // A sleeping OMP record captured more than the 18-minute staleness
-        // window ago is stale and must be cleared, not resumed.
-        let resume_path = PathBuf::from("/tmp/omp-zed/stale-session");
-        let terminal_id = TerminalId::new();
-        let now = Utc::now();
-        let worktree_paths = panel.read_with(&cx, |panel, cx| {
-            panel.project.read(cx).worktree_paths(cx)
-        });
-        let remote_connection = panel.read_with(&cx, |panel, cx| {
-            panel.project.read(cx).remote_connection_options(cx)
-        });
-        let stale = TerminalThreadMetadata {
-            terminal_id,
-            title: "OMP Agent".into(),
-            custom_title: None,
-            created_at: now - chrono::Duration::minutes(20),
-            worktree_paths: worktree_paths.clone(),
-            remote_connection: remote_connection.clone(),
-            working_directory: None,
-            agent_profile: Some(TerminalAgentProfile::Omp),
-            resume_path: Some(resume_path.clone()),
-            session_boundary: Some(AgentSessionBoundary::Sleeping),
-            restore_on_tab_open: false,
-            user_order: None,
-        };
-        cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store.update(cx, |store, cx| {
-                store.save(stale, cx);
-            });
-        });
-        cx.run_until_parked();
-
-        // Loading the worktree must not resume the stale record: it is cleared.
-        let async_cx = cx.update(|window, cx| window.to_async(cx));
-        let loaded = AgentPanel::load(workspace.downgrade(), async_cx)
-            .await
-            .expect("panel load should succeed");
-        cx.run_until_parked();
-
-        loaded.read_with(&cx, |panel, _cx| {
-            assert!(
-                panel
-                    .terminals
-                    .values()
-                    .all(|terminal| terminal.agent_profile.is_none()),
-                "a stale sleeping record must not be resumed"
-            );
-        });
-        let boundary = cx.update(|_, cx| {
-            let store = TerminalThreadMetadataStore::global(cx);
-            store.read(cx).entry(terminal_id).map(|m| m.session_boundary)
-        });
-        assert_eq!(
-            boundary,
-            Some(Some(AgentSessionBoundary::Cleared)),
-            "a stale sleeping record should be cleared, not resumed"
-        );
-    }
-
-    #[gpui::test]
     async fn test_explicit_close_clears_sleeping_record_and_never_resurrects(
         cx: &mut TestAppContext,
     ) {
@@ -9618,7 +8281,7 @@ mod tests {
             workspace.set_random_database_id();
         });
 
-        // Create a dedicated OMP agent terminal and manually sleep it.
+        // Create a dedicated OMP agent terminal (persisted as `live`).
         let terminal_id = panel
             .update_in(&mut cx, |panel, window, cx| {
                 panel.insert_test_omp_terminal("OMP Agent", true, window, cx)
@@ -9626,12 +8289,7 @@ mod tests {
             .expect("OMP test terminal should be inserted");
         cx.run_until_parked();
 
-        panel.update(&mut cx, |panel, cx| {
-            panel.emit_test_terminal_close(terminal_id, cx);
-        });
-        cx.run_until_parked();
-
-        let sleeping = cx.update(|_, cx| {
+        let live = cx.update(|_, cx| {
             let store = TerminalThreadMetadataStore::global(cx);
             store
                 .read(cx)
@@ -9640,9 +8298,9 @@ mod tests {
                 .clone()
         });
         assert_eq!(
-            sleeping.session_boundary,
-            Some(AgentSessionBoundary::Sleeping),
-            "manual close should mark the OMP terminal sleeping"
+            live.session_boundary,
+            Some(AgentSessionBoundary::Live),
+            "OMP terminal should start live"
         );
 
         // Explicitly closing the terminal clears its sleeping record.
@@ -9679,32 +8337,6 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    async fn test_close_terminal_closes_without_orphan_prompt(cx: &mut TestAppContext) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        cx.update(|_, cx| {
-            TerminalThreadMetadataStore::init_global(cx);
-        });
-
-        let terminal_id = panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_omp_terminal("OMP Agent", true, window, cx)
-            })
-            .expect("OMP test terminal should be inserted");
-        cx.run_until_parked();
-
-        // Closing a thread closes it directly — orphan handling is an explicit
-        // thread context-menu action, not a blocking close-time prompt, so a
-        // close must never stall (or be cancelled) behind a confirmation.
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.close_terminal(terminal_id, window, cx);
-        });
-        cx.run_until_parked();
-        assert!(
-            !panel.read_with(&cx, |panel, _| panel.terminals.contains_key(&terminal_id)),
-            "closing a terminal must remove it without prompting about orphans"
-        );
-    }
 
     #[gpui::test]
     async fn test_quit_child_capture_is_empty_without_live_agent_children(
@@ -9718,9 +8350,11 @@ mod tests {
         // A plain shell and a display-only OMP terminal: neither has a real
         // shell pid, so the quit-time child capture must be empty (no prompt
         // to show, quit proceeds silently).
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.insert_test_terminal("Plain Shell", true, window, cx);
-        });
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Plain Shell", true, window, cx)
+            })
+            .expect("plain test terminal should be inserted");
         panel
             .update_in(&mut cx, |panel, window, cx| {
                 panel.insert_test_omp_terminal("OMP Agent", true, window, cx)
@@ -9739,20 +8373,10 @@ mod tests {
             "no live agent terminal children should be captured at quit"
         );
 
-        // Reaping a fabricated (non-running) orphan is a no-op, never a panic.
-        let fake = [CapturedOrphan {
-            pid: sysinfo::Pid::from_u32(4242),
-            start_time: 0,
-        }];
-        assert_eq!(
-            AgentPanel::kill_children(&fake),
-            0,
-            "killing a fabricated pid must be a no-op"
-        );
     }
 
     #[gpui::test]
-    async fn test_plain_terminal_is_not_promoted_to_revivable_agent_session(
+    async fn test_plain_terminal_is_not_promoted_to_agent_session(
         cx: &mut TestAppContext,
     ) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -9775,8 +8399,8 @@ mod tests {
                 .expect("plain terminal should be persisted in the metadata store")
                 .clone()
         });
-        // A plain shell that later happens to run `omp` carries no revival
-        // metadata, so it is never treated as a revivable agent session.
+        // A plain shell that later happens to run `omp` carries no agent
+        // metadata, so it remains a plain terminal.
         assert_eq!(metadata.agent_profile, None);
         assert_eq!(metadata.resume_path, None);
         assert_eq!(metadata.session_boundary, None);
@@ -9893,7 +8517,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
                 true,
                 true,
                 true,
@@ -9983,7 +8606,6 @@ mod tests {
             agent_profile: None,
             resume_path: None,
             session_boundary: None,
-            restore_on_tab_open: false,
             user_order: None,
         };
         panel
@@ -11402,7 +10024,6 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
                     true,
                     true,
                     false,
@@ -11954,7 +10575,6 @@ mod tests {
             agent_profile: None,
             resume_path: None,
             session_boundary: None,
-            restore_on_tab_open: false,
             user_order: None,
         };
 
@@ -12010,7 +10630,6 @@ mod tests {
             agent_profile: None,
             resume_path: None,
             session_boundary: None,
-            restore_on_tab_open: false,
             user_order: None,
         };
 
