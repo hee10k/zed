@@ -482,6 +482,14 @@ struct TerminalThreadMetadataDb(ThreadSafeConnection);
 
 impl Domain for TerminalThreadMetadataDb {
     const NAME: &str = stringify!(TerminalThreadMetadataDb);
+    // Indices 1-4 previously held fork-only session-tracking columns
+    // (agent_profile, resume_path, session_boundary, restore_on_tab_open)
+    // that were removed. Existing databases recorded those migrations; the
+    // override accepts the shifted comparison so startup does not bail, and
+    // the leftover columns stay as harmless no-ops (SELECT lists are explicit).
+    fn should_allow_migration_change(_index: usize, _old: &str, _new: &str) -> bool {
+        (1..=4).contains(&_index)
+    }
 
     const MIGRATIONS: &[&str] = &[sql!(
         CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
@@ -497,10 +505,6 @@ impl Domain for TerminalThreadMetadataDb {
             remote_connection TEXT
         ) STRICT;
     ),
-    sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN agent_profile TEXT),
-    sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN resume_path TEXT),
-sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN session_boundary TEXT),
-    sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN restore_on_tab_open INTEGER NOT NULL DEFAULT 0),
     sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN user_order REAL)];
 }
 
