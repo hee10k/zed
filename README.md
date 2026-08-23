@@ -26,16 +26,16 @@ Windows build:
   `hee10k/zed`. If the source commit already has a release, the workflow skips the
   build and does not bump the release version.
 
-The auto-update check in `crates/auto_update` selects the release repository by
+The auto-update check in `crates/auto_update` selects the update source by
 platform:
 
 - Windows receives releases from this fork (`hee10k/zed`), or from the repository
   supplied through `ZED_FORK_REPO` at build time. This includes the Windows remote
   server archive.
-- macOS and Linux use upstream `zed-industries/zed` releases for automatic updates.
+- macOS and Linux use upstream Zed's release service for automatic updates.
 
-- Release assets are named `zed-{os}-{arch}.{ext}`. The current fork release contains
-  `zed-windows-x86_64.exe` and the Windows remote server archive.
+Windows release assets are named `zed-{os}-{arch}.{ext}`. The current fork release
+contains `zed-windows-x86_64.exe` and the Windows remote server archive.
 - The fork builds on the `stable` release channel (`crates/zed/RELEASE_CHANNEL`), so
   `zed update` polls for updates and installs them in place on Windows.
 - macOS binaries are not produced by this workflow. Build macOS locally with
