@@ -110,11 +110,27 @@ actions!(
 );
 
 /// The GitHub repository that publishes releases for this fork, in `owner/repo`
-/// form. Override at build time with `ZED_FORK_REPO`.
+/// form. Override at build time with `ZED_FORK_REPO` on Windows builds.
 const DEFAULT_FORK_REPOSITORY: &str = "hee10k/zed";
+const UPSTREAM_REPOSITORY: &str = "zed-industries/zed";
 
-fn fork_repository() -> &'static str {
-    option_env!("ZED_FORK_REPO").unwrap_or(DEFAULT_FORK_REPOSITORY)
+fn release_repository_for_target<'a>(target_os: &str, fork_override: Option<&'a str>) -> &'a str {
+    if target_os == "windows" {
+        fork_override.unwrap_or(DEFAULT_FORK_REPOSITORY)
+    } else {
+        UPSTREAM_REPOSITORY
+    }
+}
+
+fn release_repository() -> &'static str {
+    release_repository_for_target(
+        if cfg!(target_os = "windows") {
+            "windows"
+        } else {
+            "non-windows"
+        },
+        option_env!("ZED_FORK_REPO"),
+    )
 }
 
 #[derive(Deserialize)]
@@ -351,10 +367,10 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
     let release_channel = ReleaseChannel::try_global(cx)?;
     let url = match release_channel {
         ReleaseChannel::Stable | ReleaseChannel::Preview => {
-            format!("https://github.com/{}/releases", fork_repository())
+            format!("https://github.com/{}/releases", release_repository())
         }
         ReleaseChannel::Nightly | ReleaseChannel::Dev => {
-            format!("https://github.com/{}/commits/main/", fork_repository())
+            format!("https://github.com/{}/commits/main/", release_repository())
         }
     };
     Some(url)
@@ -691,12 +707,12 @@ impl AutoUpdater {
         let url = if version == "latest" {
             format!(
                 "https://api.github.com/repos/{}/releases/latest",
-                fork_repository()
+                release_repository()
             )
         } else {
             format!(
                 "https://api.github.com/repos/{}/releases/tags/{version}",
-                fork_repository()
+                release_repository()
             )
         };
 
@@ -1375,6 +1391,23 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn test_release_repository_uses_explicit_fork_for_windows() {
+        assert_eq!(
+            release_repository_for_target("windows", Some("example/zed")),
+            "example/zed"
+        );
+    }
+
+    #[test]
+    fn test_release_repository_uses_upstream_for_macos_and_linux_even_with_fork_override() {
+        for target_os in ["macos", "linux"] {
+            assert_eq!(
+                release_repository_for_target(target_os, Some("example/zed")),
+                "zed-industries/zed"
+            );
+        }
+    }
 
     pub(super) struct InstallOverride(pub Rc<dyn Fn(&Path, &AsyncApp) -> Result<Option<PathBuf>>>);
     impl Global for InstallOverride {}
@@ -1412,17 +1445,19 @@ mod tests {
             let release_available = Arc::clone(&release_available);
             let dmg_rx = Arc::new(parking_lot::Mutex::new(Some(dmg_rx)));
             let asset_name = format!("zed-{OS}-{ARCH}");
+            let release_path = format!("/repos/{}/releases/latest", release_repository());
             let fake_client_http = FakeHttpClient::create(move |req| {
                 let release_available = release_available.load(atomic::Ordering::Relaxed);
                 let dmg_rx = dmg_rx.clone();
                 let asset_name = asset_name.clone();
+                let release_path = release_path.clone();
                 async move {
                 let release_json = |version: &str, url: &str| {
                     format!(
                         r#"{{"tag_name":"{version}","assets":[{{"name":"{asset_name}.dmg","browser_download_url":"{url}"}}]}}"#
                     )
                 };
-                if req.uri().path() == "/repos/hee10k/zed/releases/latest" {
+                if req.uri().path() == release_path {
                     if release_available {
                         return Ok(Response::builder().status(200).body(
                             release_json("0.100.1", "https://test.example/new-download").into()

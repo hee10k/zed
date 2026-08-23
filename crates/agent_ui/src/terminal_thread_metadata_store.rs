@@ -174,7 +174,7 @@ pub fn terminal_title_prefix(title: &str) -> Option<&str> {
 }
 
 pub struct TerminalThreadMetadataStore {
-    db: TerminalThreadMetadataDb,
+    db: TerminalThreadMetadataDbV2,
     terminals: HashMap<TerminalId, TerminalThreadMetadata>,
     terminals_by_paths: HashMap<PathList, HashSet<TerminalId>>,
     terminals_by_main_paths: HashMap<PathList, HashSet<TerminalId>>,
@@ -205,7 +205,7 @@ impl TerminalThreadMetadataStore {
             return;
         }
 
-        let db = TerminalThreadMetadataDb::global(cx);
+        let db = TerminalThreadMetadataDbV2::global(cx);
         let terminal_store = cx.new(|cx| Self::new(db, cx));
         cx.set_global(GlobalTerminalThreadMetadataStore(terminal_store));
     }
@@ -213,8 +213,8 @@ impl TerminalThreadMetadataStore {
     #[cfg(any(test, feature = "test-support"))]
     pub fn init_global(cx: &mut App) {
         let db_name = TestTerminalMetadataDbName::global(cx);
-        let db = gpui::block_on(db::open_test_db::<TerminalThreadMetadataDb>(&db_name));
-        let terminal_store = cx.new(|cx| Self::new(TerminalThreadMetadataDb(db), cx));
+        let db = gpui::block_on(db::open_test_db::<TerminalThreadMetadataDbV2>(&db_name));
+        let terminal_store = cx.new(|cx| Self::new(TerminalThreadMetadataDbV2(db), cx));
         cx.set_global(GlobalTerminalThreadMetadataStore(terminal_store));
     }
 
@@ -398,7 +398,7 @@ impl TerminalThreadMetadataStore {
         cx.notify();
     }
 
-    fn new(db: TerminalThreadMetadataDb, cx: &mut Context<Self>) -> Self {
+    fn new(db: TerminalThreadMetadataDbV2, cx: &mut Context<Self>) -> Self {
         let (tx, rx) = async_channel::unbounded();
         let _db_operations_task = cx.background_spawn({
             let db = db.clone();
@@ -478,21 +478,13 @@ impl TerminalThreadMetadataStore {
     }
 }
 
-struct TerminalThreadMetadataDb(ThreadSafeConnection);
+struct TerminalThreadMetadataDbV2(ThreadSafeConnection);
 
-impl Domain for TerminalThreadMetadataDb {
-    const NAME: &str = stringify!(TerminalThreadMetadataDb);
-    // Indices 1-4 previously held fork-only session-tracking columns
-    // (agent_profile, resume_path, session_boundary, restore_on_tab_open)
-    // that were removed. Existing databases recorded those migrations; the
-    // override accepts the shifted comparison so startup does not bail, and
-    // the leftover columns stay as harmless no-ops (SELECT lists are explicit).
-    fn should_allow_migration_change(_index: usize, _old: &str, _new: &str) -> bool {
-        (1..=4).contains(&_index)
-    }
+impl Domain for TerminalThreadMetadataDbV2 {
+    const NAME: &str = stringify!(TerminalThreadMetadataDbV2);
 
     const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
+        CREATE TABLE IF NOT EXISTS sidebar_terminal_threads_v2(
             terminal_id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             custom_title TEXT,
@@ -502,21 +494,21 @@ impl Domain for TerminalThreadMetadataDb {
             folder_paths_order TEXT,
             main_worktree_paths TEXT,
             main_worktree_paths_order TEXT,
-            remote_connection TEXT
+            remote_connection TEXT,
+            user_order REAL
         ) STRICT;
-    ),
-    sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN user_order REAL)];
+    )];
 }
 
-db::static_connection!(TerminalThreadMetadataDb, []);
+db::static_connection!(TerminalThreadMetadataDbV2, []);
 
-impl TerminalThreadMetadataDb {
+impl TerminalThreadMetadataDbV2 {
     pub fn list(&self) -> anyhow::Result<Vec<TerminalThreadMetadata>> {
         self.select::<TerminalThreadMetadata>(
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
             main_worktree_paths_order, remote_connection, user_order \
-            FROM sidebar_terminal_threads \
+            FROM sidebar_terminal_threads_v2 \
             ORDER BY created_at DESC",
         )?()
     }
@@ -552,7 +544,7 @@ impl TerminalThreadMetadataDb {
         let user_order = row.user_order;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, user_order) \
+            let sql = "INSERT INTO sidebar_terminal_threads_v2(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, user_order) \
                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
@@ -587,7 +579,7 @@ impl TerminalThreadMetadataDb {
         self.write(move |conn| {
             let mut stmt = Statement::prepare(
                 conn,
-                "DELETE FROM sidebar_terminal_threads WHERE terminal_id = ?",
+                "DELETE FROM sidebar_terminal_threads_v2 WHERE terminal_id = ?",
             )?;
             stmt.bind(&terminal_id, 1)?;
             stmt.exec()
@@ -873,5 +865,168 @@ mod tests {
             .expect("second terminal should be listed after re-save");
         assert_eq!(second_row.user_order, Some(3.0));
         assert_eq!(second_row.title.as_ref(), "Second");
+    }
+    #[gpui::test]
+    async fn test_v2_ignores_legacy_terminal_metadata(cx: &mut TestAppContext) {
+        let test_name = std::thread::current()
+            .name()
+            .unwrap_or("unknown_test")
+            .to_string();
+        let db_name = format!("TERMINAL_THREAD_METADATA_DB_{test_name}");
+        let legacy_db = db::open_test_db::<()>(&db_name).await;
+        let legacy_terminal_id = TerminalId::new();
+        let legacy_terminal_id_key = legacy_terminal_id.to_key_string();
+
+        let legacy_schema = sql!(
+            CREATE TABLE sidebar_terminal_threads(
+                terminal_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                custom_title TEXT,
+                created_at TEXT NOT NULL,
+                working_directory TEXT,
+                folder_paths TEXT,
+                folder_paths_order TEXT,
+                main_worktree_paths TEXT,
+                main_worktree_paths_order TEXT,
+                remote_connection TEXT,
+                agent_profile TEXT,
+                resume_path TEXT,
+                session_boundary TEXT,
+                restore_on_tab_open INTEGER,
+                user_order REAL
+            ) STRICT;
+        );
+        let legacy_migrations = [
+            sql!(
+                CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
+                    terminal_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    custom_title TEXT,
+                    created_at TEXT NOT NULL,
+                    working_directory TEXT,
+                    folder_paths TEXT,
+                    folder_paths_order TEXT,
+                    main_worktree_paths TEXT,
+                    main_worktree_paths_order TEXT,
+                    remote_connection TEXT
+                ) STRICT;
+            ),
+            sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN agent_profile TEXT),
+            sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN resume_path TEXT),
+            sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN session_boundary TEXT),
+            sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN restore_on_tab_open INTEGER),
+            sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN user_order REAL),
+        ];
+        legacy_db
+            .write(move |conn| {
+                conn.exec(legacy_schema)?()?;
+                conn.exec(
+                    "CREATE TABLE migrations(domain TEXT, step INTEGER, migration TEXT)",
+                )?()?;
+
+                let mut stmt = Statement::prepare(
+                    conn,
+                    "INSERT INTO sidebar_terminal_threads(\
+                        terminal_id, title, created_at, agent_profile, resume_path, \
+                        session_boundary, restore_on_tab_open, user_order\
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?;
+                let mut index = stmt.bind(&legacy_terminal_id_key, 1)?;
+                index = stmt.bind(&"Legacy terminal", index)?;
+                index = stmt.bind(&"2026-08-24T00:00:00Z", index)?;
+                index = stmt.bind(&"omp", index)?;
+                index = stmt.bind(&"/tmp/omp-resume", index)?;
+                index = stmt.bind(&"sleeping", index)?;
+                index = stmt.bind(&1_i64, index)?;
+                stmt.bind(&4.0_f64, index)?;
+                stmt.exec()?;
+
+                for (step, migration) in legacy_migrations.iter().enumerate() {
+                    let mut stmt = Statement::prepare(
+                        conn,
+                        "INSERT INTO migrations(domain, step, migration) VALUES (?1, ?2, ?3)",
+                    )?;
+                    let mut index = stmt.bind(&"TerminalThreadMetadataDb", 1)?;
+                    index = stmt.bind(&step, index)?;
+                    stmt.bind(migration, index)?;
+                    stmt.exec()?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .unwrap();
+
+        let legacy_schema_before = legacy_db
+            .select_row::<String>(
+                "SELECT sql FROM sqlite_schema \
+                 WHERE type = 'table' AND name = 'sidebar_terminal_threads'",
+            )
+            .unwrap()()
+            .unwrap()
+            .expect("legacy table schema");
+        let legacy_contents_before = legacy_db
+            .select_row::<(
+                String,
+                String,
+                String,
+                String,
+                i64,
+                f64,
+            )>(
+                "SELECT terminal_id, title, agent_profile, resume_path, \
+                 restore_on_tab_open, user_order FROM sidebar_terminal_threads",
+            )
+            .unwrap()()
+            .unwrap()
+            .expect("legacy row");
+
+        init_test(cx);
+
+        let db = cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            store.read(cx).db.clone()
+        });
+        let mut v2_metadata = metadata("V2 terminal", WorktreePaths::default());
+        v2_metadata.user_order = Some(2.5);
+        let v2_terminal_id = v2_metadata.terminal_id;
+        db.save(v2_metadata).await.unwrap();
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| store.reload(cx));
+        });
+        cx.run_until_parked();
+
+        let rows = db.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].terminal_id, v2_terminal_id);
+        assert_eq!(rows[0].user_order, Some(2.5));
+        assert_eq!(rows[0].title.as_ref(), "V2 terminal");
+
+        let legacy_schema_after = legacy_db
+            .select_row::<String>(
+                "SELECT sql FROM sqlite_schema \
+                 WHERE type = 'table' AND name = 'sidebar_terminal_threads'",
+            )
+            .unwrap()()
+            .unwrap()
+            .expect("legacy table schema after V2 initialization");
+        let legacy_contents_after = legacy_db
+            .select_row::<(
+                String,
+                String,
+                String,
+                String,
+                i64,
+                f64,
+            )>(
+                "SELECT terminal_id, title, agent_profile, resume_path, \
+                 restore_on_tab_open, user_order FROM sidebar_terminal_threads",
+            )
+            .unwrap()()
+            .unwrap()
+            .expect("legacy row after V2 initialization");
+        assert_eq!(legacy_schema_after, legacy_schema_before);
+        assert_eq!(legacy_contents_after, legacy_contents_before);
     }
 }
