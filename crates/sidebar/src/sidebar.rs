@@ -1913,9 +1913,26 @@ impl Sidebar {
                 }
 
                 threads.sort_by(|a, b| {
-                    let a_time = Self::thread_display_time(&a.metadata);
-                    let b_time = Self::thread_display_time(&b.metadata);
-                    b_time.cmp(&a_time)
+                    let group_order = match (&a.metadata.group_id, &b.metadata.group_id) {
+                        (Some(a), Some(b)) => a.to_key_string().cmp(&b.to_key_string()),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    };
+                    if group_order != std::cmp::Ordering::Equal {
+                        return group_order;
+                    }
+
+                    let a_is_root = a.metadata.parent_thread_id.is_none();
+                    let b_is_root = b.metadata.parent_thread_id.is_none();
+                    match b_is_root.cmp(&a_is_root) {
+                        std::cmp::Ordering::Equal => {
+                            let a_time = Self::thread_display_time(&a.metadata);
+                            let b_time = Self::thread_display_time(&b.metadata);
+                            b_time.cmp(&a_time)
+                        }
+                        order => order,
+                    }
                 });
             } else {
                 for info in live_infos {
