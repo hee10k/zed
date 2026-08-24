@@ -2570,13 +2570,6 @@ impl AgentPanel {
             &AgentSettings::get_global(cx).terminal_resume_commands,
         )
         .and_then(|command| resume_comment(&command))
-        .and_then(|comment| {
-            anyhow::ensure!(
-                comment.starts_with("# omp --resume "),
-                "resume comment must begin with '# omp --resume '"
-            );
-            Ok(comment)
-        })
         {
             Ok(comment) => comment,
             Err(error) => return Task::ready(Err(error)),
@@ -2713,13 +2706,15 @@ impl AgentPanel {
             &terminal_entity,
             window,
             move |this, _terminal, event: &TerminalEvent, window, cx| match event {
-                TerminalEvent::TitleChanged
-                | TerminalEvent::Wakeup
-                | TerminalEvent::BreadcrumbsChanged => {
+                TerminalEvent::TitleChanged | TerminalEvent::BreadcrumbsChanged => {
                     this.refresh_terminal_metadata(terminal_id, cx);
                     this.report_terminal_program(terminal_id, source, cx);
-                    // Debounced Idle-vs-waiting inference; cleared by
-                    // deterministic transitions elsewhere.
+                    this.schedule_terminal_status_inference(terminal_id, cx);
+                }
+                TerminalEvent::Wakeup => {
+                    this.record_terminal_activity(terminal_id, ActivityStatus::Running, cx);
+                    this.refresh_terminal_metadata(terminal_id, cx);
+                    this.report_terminal_program(terminal_id, source, cx);
                     this.schedule_terminal_status_inference(terminal_id, cx);
                 }
                 TerminalEvent::Bell => {

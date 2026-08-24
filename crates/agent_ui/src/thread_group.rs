@@ -48,6 +48,7 @@ impl Bind for ThreadGroupId {
 impl Column for ThreadGroupId {
     fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
         let (uuid, next) = Column::column(statement, start_index)?;
+
         Ok((ThreadGroupId(uuid), next))
     }
 }
@@ -59,6 +60,19 @@ use ui::{Context, SharedString};
 use crate::thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore};
 
 use crate::worktree_lifecycle::WorktreeLifecycleKey;
+/// Derives a stable group identity from the canonical worktree path lists.
+pub fn group_id_for_worktree_paths(paths: &WorktreePaths) -> Option<ThreadGroupId> {
+    if paths.folder_path_list().is_empty() {
+        return None;
+    }
+    let main = paths.main_worktree_path_list().serialize();
+    let folder = paths.folder_path_list().serialize();
+    let key = format!("{}|{}|{}|{}", main.paths, main.order, folder.paths, folder.order);
+    Some(ThreadGroupId::from_uuid(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        key.as_bytes(),
+    )))
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadGroupTransfer {
     Move,
@@ -242,7 +256,13 @@ pub fn execute_move_or_clone(
     });
 
     let target_root = match target_root_id.and_then(|id| store.entry(id).cloned()) {
-        Some(root) if root.group_id == Some(target_group_id) => root,
+        Some(root)
+            if root.group_id == Some(target_group_id)
+                && root.parent_thread_id.is_none()
+                && (root.root_thread_id.is_none() || root.root_thread_id == Some(root.thread_id)) =>
+        {
+            root
+        }
         _ => {
             return match operation {
                 MoveOrCloneThread::Move => MoveOrCloneResult::MoveFailed {
@@ -332,7 +352,7 @@ pub fn execute_move_or_clone(
             MoveOrCloneResult::Cloned {
                 new_thread_id,
                 new_group_id: target_group_id,
-                parent_thread_id: source_thread_id,
+                parent_thread_id: target_root.thread_id,
             }
         }
     }
@@ -346,6 +366,17 @@ pub fn execute_move_or_clone_payload(
     store: &mut ThreadMetadataStore,
     cx: &mut Context<ThreadMetadataStore>,
 ) -> MoveOrCloneResult {
+    if !payload.confirmed {
+        return match payload.operation {
+            MoveOrCloneThread::Move => MoveOrCloneResult::MoveFailed {
+                reason: "thread-group transfer requires explicit confirmation".to_string(),
+                rebase_result: None,
+            },
+            MoveOrCloneThread::Clone => MoveOrCloneResult::CloneFailed {
+                reason: "thread-group transfer requires explicit confirmation".to_string(),
+            },
+        };
+    }
     let source_root_worktree = store
         .entry(payload.source_thread_id)
         .and_then(|t| t.worktree_paths.folder_path_list().paths().first().cloned());
@@ -766,7 +797,7 @@ mod tests {
                 };
 
                 assert_eq!(new_group_id, target_group);
-                assert_eq!(parent_thread_id, source_id);
+                assert_eq!(parent_thread_id, target_root_id);
 
                 let cloned = store.entry(new_thread_id).expect("cloned thread should exist in store");
                 assert_eq!(cloned.group_id, Some(target_group));

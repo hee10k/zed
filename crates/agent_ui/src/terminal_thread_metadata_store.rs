@@ -787,7 +787,7 @@ impl Column for TerminalThreadMetadata {
         let (session_boundary, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (last_activity_at_str, next): (Option<String>, i32) =
             Column::column(statement, next)?;
-        let (activity_status_str, next): (Option<String>, i32) =
+        let (_activity_status_str, next): (Option<String>, i32) =
             Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
@@ -830,14 +830,7 @@ impl Column for TerminalThreadMetadata {
             .map(DateTime::parse_from_rfc3339)
             .transpose()?
             .map(|dt| dt.with_timezone(&Utc));
-        let activity_status = ActivityStatus::from_db_str(
-            activity_status_str.as_deref().unwrap_or("idle"),
-        );
-        let activity_status = if activity_status == ActivityStatus::Running {
-            ActivityStatus::Idle
-        } else {
-            activity_status
-        };
+        let activity_status = ActivityStatus::Idle;
         let restore_on_workspace_open = restore_on_workspace_open.unwrap_or(true);
 
         Ok((

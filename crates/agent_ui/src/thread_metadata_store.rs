@@ -28,7 +28,10 @@ use ui::{App, Context, SharedString, ThreadItemWorktreeInfo, WorktreeKind};
 use util::ResultExt as _;
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
 
-use crate::{DEFAULT_THREAD_TITLE, thread_group::ThreadGroupId};
+use crate::{
+    DEFAULT_THREAD_TITLE,
+    thread_group::{ThreadGroupId, group_id_for_worktree_paths},
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ThreadId(uuid::Uuid);
@@ -996,8 +999,21 @@ impl ThreadMetadataStore {
     }
 
     pub fn unarchive(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
-        self.update_archived(thread_id, false, cx);
-        // Dropping the Sender triggers cancellation in the background task.
+        let mut thread_ids = vec![thread_id];
+        let mut index = 0;
+        while index < thread_ids.len() {
+            let parent_id = thread_ids[index];
+            thread_ids.extend(
+                self.threads
+                    .values()
+                    .filter(|thread| thread.parent_thread_id == Some(parent_id))
+                    .map(|thread| thread.thread_id),
+            );
+            index += 1;
+        }
+        for id in thread_ids {
+            self.update_archived(id, false, cx);
+        }
         self.in_flight_archives.remove(&thread_id);
     }
 
@@ -1559,7 +1575,9 @@ impl ThreadMetadataStore {
             crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         }
 
-        let group_id = existing_thread.and_then(|t| t.group_id);
+        let group_id = existing_thread
+            .and_then(|thread| thread.group_id)
+            .or_else(|| group_id_for_worktree_paths(&worktree_paths));
         let parent_thread_id = existing_thread.and_then(|t| t.parent_thread_id);
         let worktree_id = existing_thread.and_then(|t| t.worktree_id.clone());
         let root_thread_id = existing_thread.and_then(|t| t.root_thread_id);
@@ -1581,9 +1599,7 @@ impl ThreadMetadataStore {
             parent_thread_id,
             worktree_id,
             root_thread_id,
-            last_activity_at: existing_thread
-                .and_then(|thread| thread.last_activity_at)
-                .or(Some(updated_at)),
+            last_activity_at: Some(updated_at),
             activity_status: existing_thread
                 .map(|thread| thread.activity_status)
                 .unwrap_or_default(),
@@ -2066,6 +2082,7 @@ impl Column for ThreadMetadata {
 
         let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
             .unwrap_or_else(|_| WorktreePaths::default());
+        let group_id = group_id.or_else(|| group_id_for_worktree_paths(&worktree_paths));
 
         let thread_id = ThreadId(thread_id_uuid);
 

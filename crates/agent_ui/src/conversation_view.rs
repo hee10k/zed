@@ -88,7 +88,7 @@ use crate::entry_view_state::{EntryViewEvent, ViewEvent};
 use crate::message_editor::{InputAttempt, MessageEditor, MessageEditorEvent};
 use crate::profile_selector::{ProfileProvider, ProfileSelector};
 
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore};
+use crate::thread_metadata_store::{ActivityStatus, ThreadId, ThreadMetadataStore};
 use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
@@ -1578,6 +1578,50 @@ impl ConversationView {
             return;
         };
         let is_subagent = thread.read(cx).parent_session_id().is_some();
+        if !is_subagent {
+            let activity_status = match event {
+                AcpThreadEvent::StatusChanged => Some(if matches!(
+                    thread.read(cx).status(),
+                    ThreadStatus::Generating
+                ) {
+                    ActivityStatus::Running
+                } else {
+                    ActivityStatus::Idle
+                }),
+                AcpThreadEvent::NewEntry
+                | AcpThreadEvent::EntryUpdated(_)
+                | AcpThreadEvent::EntriesRemoved(_) => Some(if matches!(
+                    thread.read(cx).status(),
+                    ThreadStatus::Generating
+                ) {
+                    ActivityStatus::Running
+                } else {
+                    ActivityStatus::Completed
+                }),
+                AcpThreadEvent::ToolAuthorizationRequested(_)
+                | AcpThreadEvent::ElicitationRequested(_) => {
+                    Some(ActivityStatus::WaitingForUser)
+                }
+                AcpThreadEvent::Stopped(_) | AcpThreadEvent::Refusal => {
+                    Some(ActivityStatus::Completed)
+                }
+                AcpThreadEvent::Error => Some(ActivityStatus::Error),
+                _ => None,
+            };
+            if let Some(activity_status) = activity_status
+                && let Some(store) = ThreadMetadataStore::try_global(cx)
+            {
+                store.update(cx, |store, cx| {
+                    store.record_activity(
+                        self.thread_id,
+                        activity_status,
+                        chrono::Utc::now(),
+                        cx,
+                    );
+                });
+            }
+        }
+
         if !is_subagent && affects_thread_metadata(event) {
             cx.emit(RootThreadUpdated);
         }

@@ -1746,11 +1746,20 @@ impl Sidebar {
                         // pass below downgrades them to `Empty` if no draft
                         // label can be derived.
                         let draft = row.is_draft().then_some(DraftKind::WithContent);
+                        let status = match row.activity_status {
+                            ActivityStatus::Running => AgentThreadStatus::Running,
+                            ActivityStatus::WaitingForUser => {
+                                AgentThreadStatus::WaitingForConfirmation
+                            }
+                            ActivityStatus::Completed => AgentThreadStatus::Completed,
+                            ActivityStatus::Error => AgentThreadStatus::Error,
+                            ActivityStatus::Idle => AgentThreadStatus::Completed,
+                        };
                         Arc::new(ThreadEntry {
                             metadata: row,
                             icon,
                             icon_from_external_svg,
-                            status: AgentThreadStatus::default(),
+                            status,
                             workspace,
                             is_live: false,
                             is_background: false,
@@ -4996,11 +5005,17 @@ impl Sidebar {
         archive_workspaces: &[Entity<Workspace>],
         cx: &App,
     ) -> bool {
+        let except_group_id = except_thread_id
+            .and_then(|thread_id| thread_store.entry(thread_id))
+            .and_then(|thread| thread.group_id);
         thread_store.path_is_referenced_by_unarchived_threads_matching(
             except_thread_id,
             path,
             remote_connection,
-            |thread| Self::thread_blocks_worktree_archive(thread, archive_workspaces, cx),
+            |thread| {
+                thread.group_id != except_group_id
+                    && Self::thread_blocks_worktree_archive(thread, archive_workspaces, cx)
+            },
         )
     }
 
@@ -6269,6 +6284,13 @@ impl Sidebar {
         let Some(header_ix) = group_header_ix else {
             return;
         };
+        if matches!(self.contents.entries.get(drop_row_ix), Some(ListEntry::Thread(_))) {
+            self.pending_group_transfer = None;
+            self.begin_group_transfer(dragged, drop_row_ix, cx);
+            if self.pending_group_transfer.is_some() {
+                return;
+            }
+        }
         if !self
             .contents
             .entries
@@ -6277,13 +6299,6 @@ impl Sidebar {
         {
             // Cross-group drop: ignore.
             return;
-        }
-        if matches!(self.contents.entries.get(drop_row_ix), Some(ListEntry::Thread(_))) {
-            self.pending_group_transfer = None;
-            self.begin_group_transfer(dragged, drop_row_ix, cx);
-            if self.pending_group_transfer.is_some() {
-                return;
-            }
         }
         let group_end = self
             .contents
@@ -6341,8 +6356,20 @@ impl Sidebar {
         let Some(dragged_ix) = dragged_ix else {
             return;
         };
+        let is_self_drop = match position {
+            DropPosition::Before => normalized_drop == dragged_ix,
+            DropPosition::After => normalized_drop == dragged_ix.saturating_add(1),
+        };
+        if is_self_drop {
+            return;
+        }
         let dragged = ordered.remove(dragged_ix);
-        let insert_at = normalized_drop.min(ordered.len());
+        let insert_at = if dragged_ix < normalized_drop {
+            normalized_drop.saturating_sub(1)
+        } else {
+            normalized_drop
+        }
+        .min(ordered.len());
         ordered.insert(insert_at, dragged);
 
         // Renumber the group and persist to the stores.
