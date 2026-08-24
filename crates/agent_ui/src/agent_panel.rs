@@ -18,6 +18,7 @@ use agent_settings::UserAgentsMd;
 use collections::HashSet;
 use db::kvp::{Dismissable, KeyValueStore};
 use itertools::Itertools;
+use remote::remote_connection_identity;
 use project::{AgentId, ProjectItem};
 use serde::{Deserialize, Serialize};
 
@@ -1556,7 +1557,12 @@ impl AgentPanel {
         let worktrees = self.project.read_with(cx, |project, cx| {
             let remote_identity = project
                 .remote_connection_options(cx)
-                .map(|options| format!("{options:?}"))
+                .map(|options| {
+                    format!(
+                        "remote-v1:{}",
+                        remote_connection_identity(&options).persistence_key()
+                    )
+                })
                 .unwrap_or_else(|| "local".to_string());
             project
                 .worktrees(cx)
@@ -1576,7 +1582,14 @@ impl AgentPanel {
                 .collect::<Vec<_>>()
         });
         let coordinator = self.worktree_lifecycle.clone();
+        let previous_task = self._worktree_lifecycle_task.take();
         self._worktree_lifecycle_task = Some(cx.background_spawn(async move {
+            // Keep every lifecycle read-modify-write in event order. In
+            // particular, a reconcile queued after a removal must not race
+            // the Closing transition and resurrect the record.
+            if let Some(previous_task) = previous_task {
+                previous_task.await;
+            }
             if mark_closing {
                 if let Err(error) = coordinator.mark_workspace_closing(workspace_id).await {
                     log::error!("marking worktree lifecycle records closing: {error:#}");
@@ -1588,7 +1601,6 @@ impl AgentPanel {
             {
                 log::error!("reconciling worktree lifecycle records: {error:#}");
             }
-
         }));
     }
 
@@ -1670,6 +1682,22 @@ impl AgentPanel {
 
         cx.on_release(|this, cx| {
             this.dismiss_all_terminal_notifications(cx);
+            if let Some(workspace_id) = this.workspace_id {
+                let coordinator = this.worktree_lifecycle.clone();
+                let previous_task = this._worktree_lifecycle_task.take();
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Some(previous_task) = previous_task {
+                            previous_task.await;
+                        }
+                        if let Err(error) = coordinator.mark_workspace_closing(workspace_id).await {
+                            log::error!(
+                                "flushing worktree lifecycle records during AgentPanel release: {error:#}"
+                            );
+                        }
+                    })
+                    .detach();
+            }
         })
         .detach();
 

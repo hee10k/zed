@@ -114,11 +114,16 @@ impl WorktreeLifecycleRecord {
         let old_state = self.state.clone();
         self.workspace_id = Some(workspace_id);
         self.last_seen_workspace_id = Some(workspace_id);
-        self.state = if path_exists {
-            WorktreeLifecycleState::Active
-        } else {
-            WorktreeLifecycleState::Unavailable
-        };
+        if !matches!(
+            &self.state,
+            WorktreeLifecycleState::Closing | WorktreeLifecycleState::Removed
+        ) {
+            self.state = if path_exists {
+                WorktreeLifecycleState::Active
+            } else {
+                WorktreeLifecycleState::Unavailable
+            };
+        }
         old_state != self.state
     }
 }
@@ -184,8 +189,16 @@ impl WorktreeLifecycleStore {
             .load(&path)
             .await
             .with_context(|| format!("loading worktree lifecycle file {}", path.display()))?;
-        let record = serde_json::from_str(&contents)
-            .with_context(|| format!("decoding worktree lifecycle file {}", path.display()))?;
+        let record = match serde_json::from_str::<WorktreeLifecycleRecord>(&contents) {
+            Ok(record) => record,
+            Err(error) => {
+                log::error!(
+                    "skipping malformed worktree lifecycle file {}: {error:#}",
+                    path.display()
+                );
+                return Ok(None);
+            }
+        };
         Ok(Some(record))
     }
 
@@ -264,9 +277,15 @@ impl WorktreeLifecycleStore {
             let contents = self.fs.load(&path).await.with_context(|| {
                 format!("loading worktree lifecycle file {}", path.display())
             })?;
-            records.push(serde_json::from_str(&contents).with_context(|| {
-                format!("decoding worktree lifecycle file {}", path.display())
-            })?);
+            match serde_json::from_str::<WorktreeLifecycleRecord>(&contents) {
+                Ok(record) => records.push(record),
+                Err(error) => {
+                    log::error!(
+                        "skipping malformed worktree lifecycle file {}: {error:#}",
+                        path.display()
+                    );
+                }
+            }
         }
         Ok(records)
     }
@@ -346,7 +365,10 @@ impl WorktreeLifecycleCoordinator {
         for mut record in self.store.list().await? {
             if record.workspace_id == Some(workspace_id)
                 && !seen_keys.contains(&record.key)
-                && record.state != WorktreeLifecycleState::Removed
+                && !matches!(
+                    &record.state,
+                    WorktreeLifecycleState::Closing | WorktreeLifecycleState::Removed
+                )
             {
                 record.state = WorktreeLifecycleState::Unavailable;
                 self.store.save(&record).await?;
@@ -372,12 +394,13 @@ impl WorktreeLifecycleCoordinator {
         for record in &mut records {
             if record.workspace_id == Some(workspace_id)
                 && record.state != WorktreeLifecycleState::Removed
+                && record.state != WorktreeLifecycleState::Closing
             {
                 record.state = WorktreeLifecycleState::Closing;
-                self.store.save(record).await?;
                 changed.push(record.clone());
             }
         }
+        self.flush(&changed).await?;
         Ok(changed)
     }
 
@@ -508,5 +531,144 @@ mod tests {
         assert!(fs.is_file(&store.path_for(&key)).await);
         store.remove(&key).await.expect("remove lifecycle record");
         assert!(!fs.is_file(&store.path_for(&key)).await);
+    }
+
+    #[gpui::test]
+    async fn lifecycle_coordinator_preserves_explicit_terminal_states(cx: &mut TestAppContext) {
+        let temp = TempDir::new().expect("create temporary lifecycle root");
+        let fs = Arc::new(RealFs::new(None, cx.executor()));
+        let store = WorktreeLifecycleStore::with_root(fs.clone(), temp.path());
+        let coordinator = WorktreeLifecycleCoordinator::new(store.clone());
+        let workspace_id = WorkspaceId::from_i64(8);
+        let repository_path = temp.path().join("repository");
+        let worktree_path = temp.path().join("worktree");
+        fs.create_dir(&worktree_path)
+            .await
+            .expect("create worktree path");
+        let worktree = WorktreeLifecycleWorktree::new(
+            repository_path.clone(),
+            worktree_path.clone(),
+            "local",
+        );
+        let key = WorktreeLifecycleKey::new(repository_path, worktree_path, "local");
+
+        let mut closing = WorktreeLifecycleRecord::new(key.clone(), workspace_id);
+        closing.state = WorktreeLifecycleState::Closing;
+        store.save(&closing).await.expect("save closing record");
+        let reconciled = coordinator
+            .reconcile_workspace(workspace_id, std::slice::from_ref(&worktree))
+            .await
+            .expect("reconcile closing record");
+        assert_eq!(reconciled[0].state, WorktreeLifecycleState::Closing);
+        coordinator
+            .reconcile_workspace(workspace_id, &[])
+            .await
+            .expect("reconcile unseen closing record");
+        assert_eq!(
+            store
+                .load(&key)
+                .await
+                .expect("load unseen closing record")
+                .expect("closing record should remain persisted")
+                .state,
+            WorktreeLifecycleState::Closing
+        );
+
+        let mut removed = closing;
+        removed.state = WorktreeLifecycleState::Removed;
+        store.save(&removed).await.expect("save removed record");
+        let reconciled = coordinator
+            .reconcile_workspace(workspace_id, std::slice::from_ref(&worktree))
+            .await
+            .expect("reconcile removed record");
+        assert_eq!(reconciled[0].state, WorktreeLifecycleState::Removed);
+    }
+
+    #[gpui::test]
+    async fn lifecycle_coordinator_marks_unavailable_and_not_seen_records(
+        cx: &mut TestAppContext,
+    ) {
+        let temp = TempDir::new().expect("create temporary lifecycle root");
+        let fs = Arc::new(RealFs::new(None, cx.executor()));
+        let store = WorktreeLifecycleStore::with_root(fs, temp.path());
+        let coordinator = WorktreeLifecycleCoordinator::new(store.clone());
+        let workspace_id = WorkspaceId::from_i64(9);
+        let repository_path = temp.path().join("repository");
+        let worktree_path = temp.path().join("missing-worktree");
+        let worktree = WorktreeLifecycleWorktree::new(
+            repository_path.clone(),
+            worktree_path.clone(),
+            "local",
+        );
+        let key = WorktreeLifecycleKey::new(repository_path, worktree_path, "local");
+        store
+            .save(&WorktreeLifecycleRecord::new(key.clone(), workspace_id))
+            .await
+            .expect("save active record");
+
+        let reconciled = coordinator
+            .reconcile_workspace(workspace_id, std::slice::from_ref(&worktree))
+            .await
+            .expect("reconcile unavailable record");
+        assert_eq!(reconciled[0].state, WorktreeLifecycleState::Unavailable);
+
+        coordinator
+            .reconcile_workspace(workspace_id, &[])
+            .await
+            .expect("reconcile not-seen record");
+        let persisted = store
+            .load(&key)
+            .await
+            .expect("load unavailable record")
+            .expect("unavailable record should remain persisted");
+        assert_eq!(persisted.state, WorktreeLifecycleState::Unavailable);
+    }
+
+    #[gpui::test]
+    async fn lifecycle_coordinator_recovers_from_corrupt_file(cx: &mut TestAppContext) {
+        let temp = TempDir::new().expect("create temporary lifecycle root");
+        let fs = Arc::new(RealFs::new(None, cx.executor()));
+        let store = WorktreeLifecycleStore::with_root(fs.clone(), temp.path());
+        let coordinator = WorktreeLifecycleCoordinator::new(store.clone());
+        let workspace_id = WorkspaceId::from_i64(10);
+        let repository_path = temp.path().join("repository");
+        let worktree_path = temp.path().join("missing-worktree");
+        let worktree = WorktreeLifecycleWorktree::new(
+            repository_path.clone(),
+            worktree_path.clone(),
+            "local",
+        );
+        let key = WorktreeLifecycleKey::new(repository_path, worktree_path, "local");
+        let path = store.path_for(&key);
+        fs.create_dir(path.parent().expect("lifecycle file parent"))
+            .await
+            .expect("create lifecycle file parent");
+        fs.atomic_write(path, "{not valid json".to_string())
+            .await
+            .expect("write corrupt lifecycle file");
+
+        assert_eq!(store.load(&key).await.expect("load corrupt record"), None);
+        assert!(
+            store
+                .list()
+                .await
+                .expect("list corrupt records")
+                .is_empty()
+        );
+
+        let reconciled = coordinator
+            .reconcile_workspace(workspace_id, std::slice::from_ref(&worktree))
+            .await
+            .expect("reconcile around corrupt record");
+        assert_eq!(reconciled[0].state, WorktreeLifecycleState::Unavailable);
+        assert_eq!(
+            store
+                .load(&key)
+                .await
+                .expect("load recovered record")
+                .expect("reconciliation should replace corrupt record")
+                .state,
+            WorktreeLifecycleState::Unavailable
+        );
     }
 }
