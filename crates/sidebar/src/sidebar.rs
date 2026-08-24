@@ -526,7 +526,7 @@ mod drag_position_tests {
         assert_eq!(insertion_index(3, DropPosition::After, 3), None);
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct PendingGroupTransfer {
     source_thread_id: ThreadId,
     target_thread_id: ThreadId,
@@ -535,6 +535,7 @@ struct PendingGroupTransfer {
     target_worktree_id: Option<SharedString>,
     source_is_dirty: bool,
     source_has_active_session: bool,
+    source_workspace: ThreadEntryWorkspace,
 }
 
 
@@ -6239,6 +6240,14 @@ impl Sidebar {
             })
             .unwrap_or(false);
         let source_has_active_session = source.activity_status.is_live();
+        let Some(source_workspace) = self.contents.entries.iter().find_map(|entry| match entry {
+            ListEntry::Thread(thread) if thread.metadata.thread_id == *thread_id => {
+                Some(thread.workspace.clone())
+            }
+            _ => None,
+        }) else {
+            return;
+        };
 
         self.pending_group_transfer = Some(PendingGroupTransfer {
             source_thread_id: *thread_id,
@@ -6251,6 +6260,7 @@ impl Sidebar {
             target_worktree_id: target.metadata.worktree_id.clone(),
             source_is_dirty,
             source_has_active_session,
+            source_workspace,
         });
         cx.notify();
     }
@@ -6273,8 +6283,9 @@ impl Sidebar {
             source_has_active_session: pending.source_has_active_session,
             confirmed: true,
         };
-        let Some(workspace) = self.active_workspace(cx) else {
-            return;
+        let workspace = match pending.source_workspace.clone() {
+            ThreadEntryWorkspace::Open(workspace) => workspace,
+            ThreadEntryWorkspace::Closed { .. } => return,
         };
         let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
             return;
