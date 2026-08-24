@@ -82,7 +82,7 @@ pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
 pub use crate::thread_group::{
     MoveOrClonePayload, MoveOrCloneResult, MoveOrCloneThread, RebaseResult, ThreadGroupId,
-    ThreadGroupTransfer, ThreadGroupTransferPreview, execute_move_or_clone,
+    ThreadGroupTransfer, ThreadGroupTransferPreview,
     execute_move_or_clone_payload, unsupported_rebase_executor, validate_transfer,
 };
 pub use crate::thread_metadata_store::ThreadId;

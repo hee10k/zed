@@ -67,7 +67,17 @@ pub fn group_id_for_worktree_paths(paths: &WorktreePaths) -> Option<ThreadGroupI
     }
     let main = paths.main_worktree_path_list().serialize();
     let folder = paths.folder_path_list().serialize();
-    let key = format!("{}|{}|{}|{}", main.paths, main.order, folder.paths, folder.order);
+    let key = format!(
+        "{}:{}{}:{}{}:{}{}:{}",
+        main.paths.len(),
+        main.paths,
+        main.order.len(),
+        main.order,
+        folder.paths.len(),
+        folder.paths,
+        folder.order.len(),
+        folder.order,
+    );
     Some(ThreadGroupId::from_uuid(uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
         key.as_bytes(),
@@ -185,12 +195,12 @@ pub fn unsupported_rebase_executor() -> RebaseResult {
     }
 }
 
-pub fn execute_move_or_clone(
+fn execute_move_or_clone(
     operation: MoveOrCloneThread,
     source_thread_id: ThreadId,
     target_group_id: ThreadGroupId,
     target_root_thread_id: Option<ThreadId>,
-    target_worktree_id: Option<SharedString>,
+    _target_worktree_id: Option<SharedString>,
     source_root_worktree: Option<PathBuf>,
     target_root_worktree: Option<PathBuf>,
     source_is_dirty: bool,
@@ -276,10 +286,16 @@ pub fn execute_move_or_clone(
         }
     };
 
-    // Reject dirty Move before calling rebase_executor.
-    if operation == MoveOrCloneThread::Move && source_is_dirty {
+    // Reject unsafe Move sources before calling the rebase executor.
+    if operation == MoveOrCloneThread::Move
+        && (source_is_dirty || source_has_active_session)
+    {
         return MoveOrCloneResult::MoveFailed {
-            reason: "cannot move dirty thread; uncommitted changes present".to_string(),
+            reason: if source_is_dirty {
+                "cannot move dirty thread; uncommitted changes present".to_string()
+            } else {
+                "cannot move thread with an active session".to_string()
+            },
             rebase_result: None,
         };
     }
@@ -296,18 +312,21 @@ pub fn execute_move_or_clone(
                 }
             }
 
-            let mut updated_metadata = source_thread.clone();
-            updated_metadata.group_id = Some(target_group_id);
-            updated_metadata.parent_thread_id = Some(target_root.thread_id);
-            updated_metadata.root_thread_id = target_root
+            let target_root_thread_id = target_root
                 .root_thread_id
-                .or(Some(target_root.thread_id));
-            updated_metadata.worktree_id = target_root
-                .worktree_id
-                .clone()
-                .or(target_worktree_id);
-            updated_metadata.worktree_paths = target_root.worktree_paths.clone();
-            store.save(updated_metadata, cx);
+                .unwrap_or(target_root.thread_id);
+            let source_threads: Vec<_> = store
+                .entries_for_group(source_group_id)
+                .cloned()
+                .collect();
+            for mut metadata in source_threads {
+                if metadata.thread_id == source_thread_id {
+                    metadata.parent_thread_id = Some(target_root.thread_id);
+                }
+                metadata.group_id = Some(target_group_id);
+                metadata.root_thread_id = Some(target_root_thread_id);
+                store.save(metadata, cx);
+            }
 
             MoveOrCloneResult::Moved {
                 thread_id: source_thread_id,

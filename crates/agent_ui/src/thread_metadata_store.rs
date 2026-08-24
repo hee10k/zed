@@ -953,6 +953,22 @@ impl ThreadMetadataStore {
         let Some(mut thread) = self.threads.get(&thread_id).cloned() else {
             return;
         };
+        thread.last_activity_at = Some(at);
+        thread.activity_status = status;
+        self.save_internal(thread);
+        cx.notify();
+    }
+
+    pub fn record_status_activity(
+        &mut self,
+        thread_id: ThreadId,
+        status: ActivityStatus,
+        at: DateTime<Utc>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut thread) = self.threads.get(&thread_id).cloned() else {
+            return;
+        };
         let timestamp_changed = thread
             .last_activity_at
             .map(|previous| at.signed_duration_since(previous).num_milliseconds() >= 500)
@@ -962,7 +978,7 @@ impl ThreadMetadataStore {
         }
         thread.last_activity_at = Some(at);
         thread.activity_status = status;
-        self.save_internal(thread);
+        self.save_internal(thread.clone());
         cx.notify();
     }
     pub fn flush_pending(&self, cx: &App) -> Task<()> {

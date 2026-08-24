@@ -351,6 +351,16 @@ enum DraftKind {
     WithContent,
     Empty,
 }
+fn activity_status_mark(status: ActivityStatus) -> &'static str {
+    match status {
+        ActivityStatus::Idle => "I",
+        ActivityStatus::Running => "R",
+        ActivityStatus::WaitingForUser => "W",
+        ActivityStatus::Completed => "D",
+        ActivityStatus::Error => "!",
+    }
+}
+
 
 #[derive(Clone)]
 struct ThreadEntry {
@@ -7007,6 +7017,7 @@ impl Sidebar {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
             })
             .status(thread.status)
+            .activity_mark(activity_status_mark(thread.metadata.activity_status))
             .is_remote(is_remote)
             .when_some(icon_svg, |this, svg| {
                 this.custom_icon_from_external_svg(svg)
@@ -7388,6 +7399,7 @@ impl Sidebar {
             .icon(IconName::Terminal)
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
             .status(thread_status)
+            .activity_mark(activity_status_mark(terminal.metadata.activity_status))
             .is_remote(is_remote)
             .worktrees(worktrees)
             .timestamp(timestamp)
