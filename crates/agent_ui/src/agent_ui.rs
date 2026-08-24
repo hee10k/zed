@@ -38,6 +38,7 @@ mod thread_group;
 pub mod threads_archive_view;
 mod ui;
 mod unicode_confusables;
+pub mod worktree_lifecycle;
 
 use std::rc::Rc;
 use std::sync::Arc;

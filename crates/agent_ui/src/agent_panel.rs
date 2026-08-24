@@ -47,6 +47,9 @@ use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
 };
+use crate::worktree_lifecycle::{
+    WorktreeLifecycleCoordinator, WorktreeLifecycleStore, WorktreeLifecycleWorktree,
+};
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow,
     LoadThreadFromClipboard, NewTerminalThread, NewThread,
@@ -1186,6 +1189,8 @@ pub struct AgentPanel {
     connection_store: Entity<AgentConnectionStore>,
     context_server_registry: Entity<ContextServerRegistry>,
     focus_handle: FocusHandle,
+    worktree_lifecycle: WorktreeLifecycleCoordinator,
+    _worktree_lifecycle_task: Option<Task<()>>,
     base_view: BaseView,
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
@@ -1540,8 +1545,57 @@ impl AgentPanel {
         })
     }
 
+    fn reconcile_worktree_lifecycle(
+        &mut self,
+        cx: &mut Context<Self>,
+        mark_closing: bool,
+    ) {
+        let Some(workspace_id) = self.workspace_id else {
+            return;
+        };
+        let worktrees = self.project.read_with(cx, |project, cx| {
+            let remote_identity = project
+                .remote_connection_options(cx)
+                .map(|options| format!("{options:?}"))
+                .unwrap_or_else(|| "local".to_string());
+            project
+                .worktrees(cx)
+                .map(|worktree| {
+                    let worktree = worktree.read(cx);
+                    let worktree_path = worktree.abs_path().to_path_buf();
+                    let repository_path = worktree
+                        .root_repo_common_dir()
+                        .map(|path| path.to_path_buf())
+                        .unwrap_or_else(|| worktree_path.clone());
+                    WorktreeLifecycleWorktree::new(
+                        repository_path,
+                        worktree_path,
+                        remote_identity.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        let coordinator = self.worktree_lifecycle.clone();
+        self._worktree_lifecycle_task = Some(cx.background_spawn(async move {
+            if mark_closing {
+                if let Err(error) = coordinator.mark_workspace_closing(workspace_id).await {
+                    log::error!("marking worktree lifecycle records closing: {error:#}");
+                }
+            }
+            if let Err(error) = coordinator
+                .reconcile_workspace(workspace_id, &worktrees)
+                .await
+            {
+                log::error!("reconciling worktree lifecycle records: {error:#}");
+            }
+
+        }));
+    }
+
     pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
+        let worktree_lifecycle =
+            WorktreeLifecycleCoordinator::new(WorktreeLifecycleStore::new(fs.clone()));
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
         let language_registry = project.read(cx).languages().clone();
@@ -1588,12 +1642,14 @@ impl AgentPanel {
                 project::Event::WorktreeAdded(_)
                 | project::Event::WorktreeOrderChanged
                 | project::Event::WorktreePathsChanged { .. } => {
+                    this.reconcile_worktree_lifecycle(cx, false);
                     this.ensure_native_agent_connection(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
                     cx.notify();
                 }
                 project::Event::WorktreeRemoved(_) => {
+                    this.reconcile_worktree_lifecycle(cx, true);
                     this.ensure_native_agent_connection(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
@@ -1617,7 +1673,7 @@ impl AgentPanel {
         })
         .detach();
 
-        let panel = Self {
+        let mut panel = Self {
             workspace_id,
             base_view,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
@@ -1628,6 +1684,8 @@ impl AgentPanel {
             language_registry,
             connection_store,
             focus_handle: cx.focus_handle(),
+            worktree_lifecycle,
+            _worktree_lifecycle_task: None,
             context_server_registry,
             draft_thread: None,
             retained_threads: HashMap::default(),
@@ -1656,6 +1714,7 @@ impl AgentPanel {
             is_active: false,
         };
 
+        panel.reconcile_worktree_lifecycle(cx, false);
         panel.ensure_native_agent_connection(cx);
         panel
     }
