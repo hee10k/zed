@@ -1219,6 +1219,22 @@ pub struct AgentPanel {
     is_active: bool,
 }
 
+fn omp_creation_command(shell_kind: task::ShellKind, locator: &str) -> Option<String> {
+    shell_kind
+        .try_quote(locator)
+        .map(|locator| format!("omp --session-dir {locator}"))
+}
+
+fn ensure_local_omp_project(is_local: bool) -> Result<()> {
+    if is_local {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "OMP agent terminals require a local project; remote projects cannot access Zed's local session directory"
+        ))
+    }
+}
+
 impl AgentPanel {
     fn serialize(&mut self, cx: &mut App) {
         let Some(workspace_id) = self.workspace_id else {
@@ -2040,6 +2056,12 @@ impl AgentPanel {
         if !self.supports_terminal(cx) {
             return;
         }
+        if let Err(error) = ensure_local_omp_project(self.project.read(cx).is_local()) {
+            self.workspace
+                .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                .log_err();
+            return;
+        }
 
         self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Terminal, cx);
         let terminal_id = TerminalId::new();
@@ -2153,9 +2175,10 @@ impl AgentPanel {
     ) {
         let terminal_working_directory = working_directory.clone();
         let init_command = session
-            .as_ref()
-            .map(|(_, locator)| format!("omp --session-dir {locator}"))
-            .or_else(|| Self::terminal_init_command(run_init_command, cx));
+            .is_none()
+            .then(|| Self::terminal_init_command(run_init_command, cx))
+            .flatten();
+        let session_locator = session.as_ref().map(|(_, locator)| locator.clone());
         let terminal_task = self.project.update(cx, |project, cx| {
             project.create_terminal_shell(working_directory, cx)
         });
@@ -2211,6 +2234,17 @@ impl AgentPanel {
                         );
                     }
                 }
+                let init_command = if let Some(locator) = session_locator {
+                    let shell_kind = terminal_for_init_command.read(cx).shell_kind();
+                    omp_creation_command(shell_kind, locator.as_ref()).or_else(|| {
+                        log::error!(
+                            "failed to quote OMP session locator for terminal {terminal_id}"
+                        );
+                        None
+                    })
+                } else {
+                    init_command
+                };
                 Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
             })?;
             anyhow::Ok(())
@@ -2226,6 +2260,7 @@ impl AgentPanel {
             .flatten()
             .filter(|command| !command.trim().is_empty())
     }
+
 
 
     fn write_terminal_init_command(
@@ -7877,6 +7912,25 @@ mod tests {
         assert!(!metadata.restore_on_workspace_open);
         assert_eq!(metadata.session_boundary, SessionBoundary::Live);
     }
+    #[test]
+    fn omp_creation_command_quotes_whitespace_paths() {
+        let locator = "/Users/example/Library/Application Support/Zed/agent_sessions/omp/terminal";
+        assert_eq!(
+            omp_creation_command(task::ShellKind::Posix, locator).as_deref(),
+            Some("omp --session-dir '/Users/example/Library/Application Support/Zed/agent_sessions/omp/terminal'")
+        );
+    }
+
+    #[test]
+    fn omp_terminal_requires_local_project() {
+        let error = ensure_local_omp_project(false).expect_err("remote projects must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("OMP agent terminals require a local project")
+        );
+    }
+
     #[gpui::test]
     async fn new_omp_terminal(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_visible_panel(cx).await;
@@ -7884,7 +7938,14 @@ mod tests {
         cx.update(|_, cx| {
             TerminalThreadMetadataStore::init_global(cx);
             let mut settings = TerminalSettings::get_global(cx).clone();
-            settings.shell = task::Shell::Program("/bin/sh".to_string());
+            settings.shell = task::Shell::WithArguments {
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "while IFS= read -r line; do printf '%s\\n' \"$line\"; done".to_string(),
+                ],
+                title_override: None,
+            };
             TerminalSettings::override_global(settings, cx);
         });
         cx.run_until_parked();
@@ -7917,10 +7978,6 @@ mod tests {
 
         assert_eq!(input_log.len(), 1, "OMP creation should send only one command");
         let command = String::from_utf8(input_log.concat()).expect("command should be UTF-8");
-        let locator_from_command = command
-            .strip_prefix("omp --session-dir ")
-            .and_then(|command| command.strip_suffix('\r'))
-            .expect("initial command should use the OMP session-dir contract");
 
         let metadata = cx
             .update(|_, cx| {
@@ -7930,21 +7987,34 @@ mod tests {
                     .cloned()
             })
             .expect("OMP terminal metadata should be persisted");
+        let locator = metadata
+            .resume_locator
+            .as_deref()
+            .expect("OMP metadata should have a locator");
+        assert_eq!(
+            command,
+            format!(
+                "omp --session-dir {}\r",
+                task::ShellKind::Posix
+                    .try_quote(locator)
+                    .expect("POSIX should quote the OMP locator")
+            )
+        );
         let expected_root = paths::data_dir().join("agent_sessions").join("omp");
         assert_eq!(metadata.harness.as_deref(), Some("omp"));
-        assert_eq!(metadata.resume_locator.as_deref(), Some(locator_from_command));
-        assert!(Path::new(locator_from_command).starts_with(&expected_root));
+        assert!(Path::new(locator).starts_with(&expected_root));
         assert_eq!(metadata.session_boundary, SessionBoundary::Live);
         assert!(metadata.restore_on_workspace_open);
         assert_eq!(
             panel.read_with(&cx, |panel, cx| {
                 panel.resume_locator_for_terminal(terminal_id, cx)
             }),
-            Some(locator_from_command.into())
+            Some(locator.into())
         );
         assert_eq!(panel.read_with(&cx, |panel, cx| panel.terminals(cx).len()), 1);
         drop(terminal);
     }
+
 
     #[gpui::test]
     async fn terminal_session_boundary(cx: &mut TestAppContext) {
