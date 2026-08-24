@@ -567,11 +567,7 @@ impl Domain for TerminalThreadMetadataDbV2 {
                 main_worktree_paths TEXT,
                 main_worktree_paths_order TEXT,
                 remote_connection TEXT,
-                user_order REAL,
-                harness TEXT,
-                resume_locator TEXT,
-                restore_on_workspace_open INTEGER NOT NULL DEFAULT 1,
-                session_boundary TEXT NOT NULL DEFAULT "sleeping"
+                user_order REAL
             ) STRICT;
         ),
         sql!(ALTER TABLE sidebar_terminal_threads_v2 ADD COLUMN harness TEXT),

@@ -39,7 +39,7 @@ use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
-    SessionBoundary, TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore,
+    TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore,
     compose_terminal_thread_title, terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
@@ -2569,9 +2569,8 @@ impl AgentPanel {
     ) -> Option<TerminalThreadMetadata> {
         let terminal = self.terminals.get(&terminal_id)?;
         let project = self.project.read(cx);
-        let stored_user_order = TerminalThreadMetadataStore::try_global(cx)
-            .and_then(|store| store.read(cx).entry(terminal_id).cloned())
-            .and_then(|metadata| metadata.user_order);
+        let stored_metadata = TerminalThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry(terminal_id).cloned());
         Some(TerminalThreadMetadata {
             terminal_id,
             title: terminal.terminal_title(cx),
@@ -2580,11 +2579,23 @@ impl AgentPanel {
             worktree_paths: project.worktree_paths(cx),
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
-            user_order: stored_user_order,
-            harness: None,
-            resume_locator: None,
-            restore_on_workspace_open: true,
-            session_boundary: SessionBoundary::Sleeping,
+            user_order: stored_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.user_order),
+            harness: stored_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.harness.clone()),
+            resume_locator: stored_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.resume_locator.clone()),
+            restore_on_workspace_open: stored_metadata
+                .as_ref()
+                .map(|metadata| metadata.restore_on_workspace_open)
+                .unwrap_or(true),
+            session_boundary: stored_metadata
+                .as_ref()
+                .map(|metadata| metadata.session_boundary)
+                .unwrap_or_default(),
         })
     }
 
@@ -7037,6 +7048,7 @@ impl AgentPanel {
 mod tests {
     use super::*;
     use crate::NewWorktreeBranchTarget;
+    use crate::terminal_thread_metadata_store::SessionBoundary;
     use crate::conversation_view::tests::{StubAgentServer, init_test};
     use crate::test_support::{
         active_session_id, active_thread_id, open_thread_with_connection,
@@ -7672,6 +7684,49 @@ mod tests {
                 "active terminal metadata should be restored into the loaded panel"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_metadata_preserves_cached_session_recovery_fields(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Recoverable terminal", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+
+        let mut cached_metadata = panel
+            .read_with(&cx, |panel, cx| {
+                panel
+                    .terminal_metadata(terminal_id, cx)
+                    .expect("terminal metadata should exist")
+            });
+        cached_metadata.harness = Some("omp".into());
+        cached_metadata.resume_locator = Some("/tmp/omp-session-1".into());
+        cached_metadata.restore_on_workspace_open = false;
+        cached_metadata.session_boundary = SessionBoundary::Live;
+
+        cx.update(|_window, cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(cached_metadata, cx);
+            });
+        });
+
+        let metadata = panel
+            .read_with(&cx, |panel, cx| {
+                panel
+                    .terminal_metadata(terminal_id, cx)
+                    .expect("terminal metadata should exist")
+            });
+        assert_eq!(metadata.harness.as_deref(), Some("omp"));
+        assert_eq!(
+            metadata.resume_locator.as_deref(),
+            Some("/tmp/omp-session-1")
+        );
+        assert!(!metadata.restore_on_workspace_open);
+        assert_eq!(metadata.session_boundary, SessionBoundary::Live);
     }
 
     #[gpui::test]
