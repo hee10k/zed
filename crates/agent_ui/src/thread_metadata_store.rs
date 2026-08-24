@@ -69,7 +69,14 @@ const THREAD_ID_MIGRATION_KEY: &str = "thread-metadata-thread-id-backfill";
 pub(crate) fn list_thread_metadata_from_connection(
     connection: &db::sqlez::connection::Connection,
 ) -> anyhow::Result<Vec<ThreadMetadata>> {
-    connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY)?()
+    let mut query = match connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY) {
+        Ok(query) => query,
+        Err(error) if error.to_string().contains("no such column") => {
+            connection.select::<ThreadMetadata>(ThreadMetadataDb::LEGACY_LIST_QUERY)?
+        }
+        Err(error) => return Err(error),
+    };
+    query()
 }
 
 /// Run the `ThreadMetadataDb` migrations on a raw connection.
@@ -1634,6 +1641,12 @@ impl ThreadMetadataDb {
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
         main_worktree_paths_order, remote_connection, title_override, user_order, \
         group_id, parent_thread_id, worktree_id, root_thread_id \
+        FROM sidebar_threads \
+        ORDER BY updated_at DESC";
+    const LEGACY_LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
+        created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
+        main_worktree_paths_order, remote_connection, title_override, user_order, \
+        NULL AS group_id, NULL AS parent_thread_id, NULL AS worktree_id, NULL AS root_thread_id \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 

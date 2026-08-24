@@ -142,6 +142,23 @@ pub fn validate_transfer(
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoveOrClonePayload {
+    pub operation: MoveOrCloneThread,
+    pub source_thread_id: ThreadId,
+    pub target_group_id: ThreadGroupId,
+    pub target_root_thread_id: ThreadId,
+    pub source_is_dirty: bool,
+    pub source_has_active_session: bool,
+    pub confirmed: bool,
+}
+
+pub fn unsupported_rebase_executor() -> RebaseResult {
+    RebaseResult::Error {
+        details: "Git rebase API is unsupported in this environment".to_string(),
+    }
+}
+
 pub fn execute_move_or_clone(
     operation: MoveOrCloneThread,
     source_thread_id: ThreadId,
@@ -153,6 +170,7 @@ pub fn execute_move_or_clone(
     source_is_dirty: bool,
     source_has_active_session: bool,
     rebase_executor: impl FnOnce() -> RebaseResult,
+    worktree_factory: impl FnOnce() -> Result<(WorktreePaths, SharedString), String>,
     store: &mut ThreadMetadataStore,
     cx: &mut Context<ThreadMetadataStore>,
 ) -> MoveOrCloneResult {
@@ -198,6 +216,42 @@ pub fn execute_move_or_clone(
         }
     };
 
+    // Target root invariant: target root thread must exist in store and belong to target_group_id.
+    let target_root_id = target_root_thread_id.or_else(|| {
+        store
+            .entries()
+            .find(|entry| {
+                entry.group_id == Some(target_group_id)
+                    && (entry.parent_thread_id.is_none()
+                        || entry.root_thread_id.is_none()
+                        || entry.root_thread_id == Some(entry.thread_id))
+            })
+            .map(|entry| entry.thread_id)
+    });
+
+    let target_root = match target_root_id.and_then(|id| store.entry(id).cloned()) {
+        Some(root) if root.group_id == Some(target_group_id) => root,
+        _ => {
+            return match operation {
+                MoveOrCloneThread::Move => MoveOrCloneResult::MoveFailed {
+                    reason: "target root thread missing or does not belong to target group".to_string(),
+                    rebase_result: None,
+                },
+                MoveOrCloneThread::Clone => MoveOrCloneResult::CloneFailed {
+                    reason: "target root thread missing or does not belong to target group".to_string(),
+                },
+            };
+        }
+    };
+
+    // Reject dirty Move before calling rebase_executor.
+    if operation == MoveOrCloneThread::Move && source_is_dirty {
+        return MoveOrCloneResult::MoveFailed {
+            reason: "cannot move dirty thread; uncommitted changes present".to_string(),
+            rebase_result: None,
+        };
+    }
+
     match operation {
         MoveOrCloneThread::Move => {
             if preview.requires_rebase_confirmation {
@@ -212,8 +266,15 @@ pub fn execute_move_or_clone(
 
             let mut updated_metadata = source_thread.clone();
             updated_metadata.group_id = Some(target_group_id);
-            updated_metadata.worktree_id = target_worktree_id;
-            updated_metadata.root_thread_id = target_root_thread_id.or(Some(source_thread_id));
+            updated_metadata.parent_thread_id = Some(target_root.thread_id);
+            updated_metadata.root_thread_id = target_root
+                .root_thread_id
+                .or(Some(target_root.thread_id));
+            updated_metadata.worktree_id = target_root
+                .worktree_id
+                .clone()
+                .or(target_worktree_id);
+            updated_metadata.worktree_paths = target_root.worktree_paths.clone();
             store.save(updated_metadata, cx);
 
             MoveOrCloneResult::Moved {
@@ -222,6 +283,18 @@ pub fn execute_move_or_clone(
             }
         }
         MoveOrCloneThread::Clone => {
+            let (cloned_paths, cloned_worktree_id) = match worktree_factory() {
+                Ok((paths, wt_id)) if !paths.folder_path_list().is_empty() => (paths, wt_id),
+                Ok(_) => {
+                    return MoveOrCloneResult::CloneFailed {
+                        reason: "derived-worktree creation returned empty worktree paths".to_string(),
+                    };
+                }
+                Err(err) => {
+                    return MoveOrCloneResult::CloneFailed { reason: err };
+                }
+            };
+
             let new_thread_id = ThreadId::new();
             let cloned_metadata = ThreadMetadata {
                 thread_id: new_thread_id,
@@ -232,14 +305,16 @@ pub fn execute_move_or_clone(
                 updated_at: Utc::now(),
                 created_at: Some(Utc::now()),
                 interacted_at: None,
-                worktree_paths: WorktreePaths::default(),
+                worktree_paths: cloned_paths,
                 remote_connection: source_thread.remote_connection.clone(),
                 archived: false,
                 user_order: None,
                 group_id: Some(target_group_id),
-                parent_thread_id: Some(source_thread_id),
-                worktree_id: target_worktree_id,
-                root_thread_id: target_root_thread_id.or(Some(source_thread_id)),
+                parent_thread_id: Some(target_root.thread_id),
+                worktree_id: Some(cloned_worktree_id),
+                root_thread_id: target_root
+                    .root_thread_id
+                    .or(Some(target_root.thread_id)),
             };
 
             store.save(cloned_metadata, cx);
@@ -251,6 +326,38 @@ pub fn execute_move_or_clone(
             }
         }
     }
+}
+
+pub fn execute_move_or_clone_payload(
+    payload: MoveOrClonePayload,
+    target_worktree_id: Option<SharedString>,
+    rebase_executor: impl FnOnce() -> RebaseResult,
+    worktree_factory: impl FnOnce() -> Result<(WorktreePaths, SharedString), String>,
+    store: &mut ThreadMetadataStore,
+    cx: &mut Context<ThreadMetadataStore>,
+) -> MoveOrCloneResult {
+    let source_root_worktree = store
+        .entry(payload.source_thread_id)
+        .and_then(|t| t.worktree_paths.folder_path_list().paths().first().cloned());
+    let target_root_worktree = store
+        .entry(payload.target_root_thread_id)
+        .and_then(|t| t.worktree_paths.folder_path_list().paths().first().cloned());
+
+    execute_move_or_clone(
+        payload.operation,
+        payload.source_thread_id,
+        payload.target_group_id,
+        Some(payload.target_root_thread_id),
+        target_worktree_id,
+        source_root_worktree,
+        target_root_worktree,
+        payload.source_is_dirty,
+        payload.source_has_active_session,
+        rebase_executor,
+        worktree_factory,
+        store,
+        cx,
+    )
 }
 
 #[cfg(test)]
@@ -395,43 +502,66 @@ mod tests {
         let source_group = group(1);
         let target_group = group(2);
         let source_id = crate::thread_metadata_store::ThreadId::new();
+        let target_root_id = crate::thread_metadata_store::ThreadId::new();
 
-        let metadata = crate::thread_metadata_store::ThreadMetadata {
+        let source_metadata = crate::thread_metadata_store::ThreadMetadata {
             thread_id: source_id,
             session_id: Some(agent_client_protocol::schema::v1::SessionId::new("sess-1")),
             agent_id: agent::ZED_AGENT_ID.clone(),
-            title: Some("Thread Title".into()),
+            title: Some("Source Title".into()),
             title_override: None,
             updated_at: chrono::Utc::now(),
             created_at: Some(chrono::Utc::now()),
             interacted_at: None,
-            worktree_paths: project::WorktreePaths::default(),
+            worktree_paths: project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[source_root.clone()])),
             remote_connection: None,
             archived: false,
             user_order: None,
             group_id: Some(source_group),
             parent_thread_id: None,
-            worktree_id: None,
-            root_thread_id: None,
+            worktree_id: Some("source-wt-id".into()),
+            root_thread_id: Some(source_id),
+        };
+
+        let target_root_metadata = crate::thread_metadata_store::ThreadMetadata {
+            thread_id: target_root_id,
+            session_id: Some(agent_client_protocol::schema::v1::SessionId::new("sess-target-root")),
+            agent_id: agent::ZED_AGENT_ID.clone(),
+            title: Some("Target Root Title".into()),
+            title_override: None,
+            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            interacted_at: None,
+            worktree_paths: project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[target_root.clone()])),
+            remote_connection: None,
+            archived: false,
+            user_order: None,
+            group_id: Some(target_group),
+            parent_thread_id: None,
+            worktree_id: Some("target-wt-id".into()),
+            root_thread_id: Some(target_root_id),
         };
 
         cx.update(|cx| {
             ThreadMetadataStore::init_global(cx);
             let store = ThreadMetadataStore::global(cx);
             store.update(cx, |store, cx| {
-                store.save(metadata.clone(), cx);
+                store.save(source_metadata.clone(), cx);
+                store.save(target_root_metadata.clone(), cx);
 
+                // Case 1: Rebase failure
                 let res = execute_move_or_clone(
                     MoveOrCloneThread::Move,
                     source_id,
                     target_group,
-                    None,
+                    Some(target_root_id),
                     None,
                     Some(source_root.clone()),
                     Some(target_root.clone()),
                     false,
                     false,
                     || RebaseResult::Conflict { details: "conflict".to_string() },
+                    || Ok((project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[target_root.clone()])), "target-wt-id".into())),
                     store,
                     cx,
                 );
@@ -446,23 +576,55 @@ mod tests {
 
                 let retrieved = store.entry(source_id).unwrap();
                 assert_eq!(retrieved.group_id, Some(source_group));
+
+                // Case 2: Reject dirty Move BEFORE calling rebase
+                let mut rebase_called = false;
+                let res_dirty = execute_move_or_clone(
+                    MoveOrCloneThread::Move,
+                    source_id,
+                    target_group,
+                    Some(target_root_id),
+                    None,
+                    Some(source_root.clone()),
+                    Some(target_root.clone()),
+                    true, // dirty Move!
+                    false,
+                    || {
+                        rebase_called = true;
+                        RebaseResult::Success
+                    },
+                    || Ok((project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[target_root.clone()])), "target-wt-id".into())),
+                    store,
+                    cx,
+                );
+
+                assert!(!rebase_called, "dirty Move MUST be rejected before rebase_executor is called!");
+                assert_eq!(
+                    res_dirty,
+                    MoveOrCloneResult::MoveFailed {
+                        reason: "cannot move dirty thread; uncommitted changes present".to_string(),
+                        rebase_result: None,
+                    }
+                );
             });
         });
 
         cx.update(|cx| {
             let store = ThreadMetadataStore::global(cx);
             store.update(cx, |store, cx| {
+                // Case 3: Successful Move updates group_id, parent_thread_id, root_thread_id, worktree_id, worktree_paths
                 let res = execute_move_or_clone(
                     MoveOrCloneThread::Move,
                     source_id,
                     target_group,
-                    None,
+                    Some(target_root_id),
                     None,
                     Some(source_root.clone()),
                     Some(target_root.clone()),
                     false,
                     false,
                     || RebaseResult::Success,
+                    || Ok((project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[target_root.clone()])), "target-wt-id".into())),
                     store,
                     cx,
                 );
@@ -477,6 +639,10 @@ mod tests {
 
                 let retrieved = store.entry(source_id).unwrap();
                 assert_eq!(retrieved.group_id, Some(target_group));
+                assert_eq!(retrieved.parent_thread_id, Some(target_root_id));
+                assert_eq!(retrieved.root_thread_id, Some(target_root_id));
+                assert_eq!(retrieved.worktree_id.as_deref(), Some("target-wt-id"));
+                assert_eq!(retrieved.worktree_paths, target_root_metadata.worktree_paths);
             });
         });
     }
@@ -487,8 +653,9 @@ mod tests {
         let source_group = group(1);
         let target_group = group(2);
         let source_id = crate::thread_metadata_store::ThreadId::new();
+        let target_root_id = crate::thread_metadata_store::ThreadId::new();
 
-        let metadata = crate::thread_metadata_store::ThreadMetadata {
+        let source_metadata = crate::thread_metadata_store::ThreadMetadata {
             thread_id: source_id,
             session_id: Some(agent_client_protocol::schema::v1::SessionId::new("sess-source")),
             agent_id: agent::ZED_AGENT_ID.clone(),
@@ -497,33 +664,81 @@ mod tests {
             updated_at: chrono::Utc::now(),
             created_at: Some(chrono::Utc::now()),
             interacted_at: None,
-            worktree_paths: project::WorktreePaths::default(),
+            worktree_paths: project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[source_root.clone()])),
             remote_connection: None,
             archived: false,
             user_order: None,
             group_id: Some(source_group),
             parent_thread_id: None,
-            worktree_id: None,
-            root_thread_id: None,
+            worktree_id: Some("source-wt-id".into()),
+            root_thread_id: Some(source_id),
+        };
+
+        let target_root_metadata = crate::thread_metadata_store::ThreadMetadata {
+            thread_id: target_root_id,
+            session_id: Some(agent_client_protocol::schema::v1::SessionId::new("sess-target-root")),
+            agent_id: agent::ZED_AGENT_ID.clone(),
+            title: Some("Target Root Title".into()),
+            title_override: None,
+            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            interacted_at: None,
+            worktree_paths: project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[target_root.clone()])),
+            remote_connection: None,
+            archived: false,
+            user_order: None,
+            group_id: Some(target_group),
+            parent_thread_id: None,
+            worktree_id: Some("target-wt-id".into()),
+            root_thread_id: Some(target_root_id),
         };
 
         cx.update(|cx| {
             ThreadMetadataStore::init_global(cx);
             let store = ThreadMetadataStore::global(cx);
             store.update(cx, |store, cx| {
-                store.save(metadata, cx);
+                store.save(source_metadata, cx);
+                store.save(target_root_metadata, cx);
 
+                // Case 1: Worktree creation failure returns CloneFailed without mutating metadata
+                let store_entries_before = store.entries().count();
+                let res_fail = execute_move_or_clone(
+                    MoveOrCloneThread::Clone,
+                    source_id,
+                    target_group,
+                    Some(target_root_id),
+                    None,
+                    Some(source_root.clone()),
+                    Some(target_root.clone()),
+                    false,
+                    false,
+                    || RebaseResult::Success,
+                    || Err("failed to spawn derived worktree".to_string()),
+                    store,
+                    cx,
+                );
+
+                assert_eq!(
+                    res_fail,
+                    MoveOrCloneResult::CloneFailed {
+                        reason: "failed to spawn derived worktree".to_string(),
+                    }
+                );
+                assert_eq!(store.entries().count(), store_entries_before, "Clone failure MUST NOT insert metadata into store");
+
+                // Case 2: Successful Clone
                 let res = execute_move_or_clone(
                     MoveOrCloneThread::Clone,
                     source_id,
                     target_group,
-                    None,
+                    Some(target_root_id),
                     None,
                     Some(source_root),
-                    Some(target_root),
+                    Some(target_root.clone()),
                     false,
                     false,
                     || RebaseResult::Success,
+                    || Ok((project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[target_root.clone()])), "cloned-wt-id".into())),
                     store,
                     cx,
                 );
@@ -537,7 +752,9 @@ mod tests {
 
                 let cloned = store.entry(new_thread_id).expect("cloned thread should exist in store");
                 assert_eq!(cloned.group_id, Some(target_group));
-                assert_eq!(cloned.parent_thread_id, Some(source_id));
+                assert_eq!(cloned.parent_thread_id, Some(target_root_id));
+                assert_eq!(cloned.root_thread_id, Some(target_root_id));
+                assert_eq!(cloned.worktree_id.as_deref(), Some("cloned-wt-id"));
                 assert_eq!(cloned.session_id, None, "clone MUST NOT copy transcript / session_id");
                 assert_eq!(cloned.title, Some("Source Title".into()));
             });
