@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
-        ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
+        AddSelectionToThread, ConflictContent, LogoutAgent, NewOmpTerminal, OpenSettings,
+        ReauthenticateAgent, ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
         ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
     },
     assistant::{
@@ -39,7 +39,7 @@ use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
-    TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore,
+    SessionBoundary, TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore,
     compose_terminal_thread_title, terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
@@ -403,6 +403,14 @@ pub fn init(cx: &mut App) {
                                 window,
                                 cx,
                             )
+                        });
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
+                })
+                .register_action(|workspace, _: &NewOmpTerminal, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.new_omp_terminal(window, cx);
                         });
                         workspace.focus_panel::<AgentPanel>(window, cx);
                     }
@@ -2026,7 +2034,36 @@ impl AgentPanel {
             cx,
         );
     }
+    /// Starts a dedicated OMP terminal and assigns its session locator before
+    /// sending the creation command to the interactive shell.
+    pub fn new_omp_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.supports_terminal(cx) {
+            return;
+        }
 
+        self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Terminal, cx);
+        let terminal_id = TerminalId::new();
+        let locator = paths::data_dir()
+            .join("agent_sessions")
+            .join("omp")
+            .join(terminal_id.to_key_string());
+        let locator = SharedString::from(locator.to_string_lossy().into_owned());
+        let working_directory = self.terminal_working_directory(None, cx);
+        self.spawn_terminal_with_session(
+            terminal_id,
+            working_directory,
+            None,
+            None,
+            None,
+            true,
+            true,
+            false,
+            Some(("omp".into(), locator)),
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+    }
 
     fn terminal_working_directory(
         &self,
@@ -2083,8 +2120,42 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.spawn_terminal_with_session(
+            terminal_id,
+            working_directory,
+            custom_title,
+            initial_title,
+            created_at,
+            select,
+            focus,
+            run_init_command,
+            None,
+            source,
+            window,
+            cx,
+        );
+    }
+
+    fn spawn_terminal_with_session(
+        &mut self,
+        terminal_id: TerminalId,
+        working_directory: Option<PathBuf>,
+        custom_title: Option<SharedString>,
+        initial_title: Option<SharedString>,
+        created_at: Option<DateTime<Utc>>,
+        select: bool,
+        focus: bool,
+        run_init_command: bool,
+        session: Option<(SharedString, SharedString)>,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let terminal_working_directory = working_directory.clone();
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = session
+            .as_ref()
+            .map(|(_, locator)| format!("omp --session-dir {locator}"))
+            .or_else(|| Self::terminal_init_command(run_init_command, cx));
         let terminal_task = self.project.update(cx, |project, cx| {
             project.create_terminal_shell(working_directory, cx)
         });
@@ -2131,12 +2202,23 @@ impl AgentPanel {
                     window,
                     cx,
                 );
+                if let Some((harness, locator)) = session {
+                    if let Err(error) =
+                        this.register_terminal_agent_session(terminal_id, harness, locator, cx)
+                    {
+                        log::error!(
+                            "failed to register OMP terminal session {terminal_id}: {error:#}"
+                        );
+                    }
+                }
                 Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
             })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
     }
+
+
 
     fn terminal_init_command(run_init_command: bool, cx: &App) -> Option<String> {
         run_init_command
@@ -2253,8 +2335,10 @@ impl AgentPanel {
                 TerminalEvent::BlinkChanged(_)
                 | TerminalEvent::SelectionsChanged
                 | TerminalEvent::NewNavigationTarget(_)
-                | TerminalEvent::Open(_)
-                | TerminalEvent::ProcessExited => {}
+                | TerminalEvent::Open(_) => {}
+                TerminalEvent::ProcessExited => {
+                    this.mark_omp_session_sleeping(terminal_id, cx);
+                }
             },
         );
 
@@ -2350,8 +2434,17 @@ impl AgentPanel {
             return;
         }
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+            let is_omp = store
+                .read(cx)
+                .entry(terminal_id)
+                .and_then(|metadata| metadata.harness.as_deref())
+                == Some("omp");
             store.update(cx, |store, cx| {
-                store.delete(terminal_id, cx);
+                if is_omp {
+                    store.mark_session_boundary(terminal_id, SessionBoundary::Cleared, cx);
+                } else {
+                    store.delete(terminal_id, cx);
+                }
             });
         }
         if was_active {
@@ -2597,6 +2690,58 @@ impl AgentPanel {
                 .map(|metadata| metadata.session_boundary)
                 .unwrap_or_default(),
         })
+    }
+    pub fn register_terminal_agent_session(
+        &mut self,
+        terminal_id: TerminalId,
+        harness: SharedString,
+        locator: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let mut metadata = self
+            .terminal_metadata(terminal_id, cx)
+            .ok_or_else(|| anyhow!("terminal {terminal_id} is not live"))?;
+        metadata.harness = Some(harness);
+        metadata.resume_locator = Some(locator);
+        metadata.restore_on_workspace_open = true;
+        metadata.session_boundary = SessionBoundary::Live;
+
+        let store = TerminalThreadMetadataStore::try_global(cx)
+            .ok_or_else(|| anyhow!("terminal metadata store is not initialized"))?;
+        store.update(cx, |store, cx| {
+            store.save(metadata, cx);
+        });
+        Ok(())
+    }
+
+    pub fn resume_locator_for_terminal(
+        &self,
+        terminal_id: TerminalId,
+        cx: &App,
+    ) -> Option<SharedString> {
+        TerminalThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry(terminal_id).cloned())
+            .and_then(|metadata| metadata.resume_locator)
+    }
+
+    fn mark_omp_session_sleeping(
+        &mut self,
+        terminal_id: TerminalId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
+            return;
+        };
+        let is_omp = store
+            .read(cx)
+            .entry(terminal_id)
+            .and_then(|metadata| metadata.harness.as_deref())
+            == Some("omp");
+        if is_omp {
+            store.update(cx, |store, cx| {
+                store.mark_session_boundary(terminal_id, SessionBoundary::Sleeping, cx);
+            });
+        }
     }
 
 
@@ -6666,6 +6811,10 @@ impl Render for AgentPanel {
                 cx.stop_propagation();
                 this.new_terminal(None, AgentThreadSource::AgentPanel, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &NewOmpTerminal, window, cx| {
+                cx.stop_propagation();
+                this.new_omp_terminal(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_configuration(window, cx);
             }))
@@ -7728,6 +7877,133 @@ mod tests {
         assert!(!metadata.restore_on_workspace_open);
         assert_eq!(metadata.session_boundary, SessionBoundary::Live);
     }
+    #[gpui::test]
+    async fn new_omp_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        cx.executor().allow_parking();
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::init_global(cx);
+            let mut settings = TerminalSettings::get_global(cx).clone();
+            settings.shell = task::Shell::Program("/bin/sh".to_string());
+            TerminalSettings::override_global(settings, cx);
+        });
+        cx.run_until_parked();
+
+
+        cx.dispatch_action(NewOmpTerminal);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (terminal_id, terminal, input_log) = loop {
+            cx.run_until_parked();
+            let active_terminal = panel.read_with(&cx, |panel, cx| {
+                panel.active_terminal_id().and_then(|terminal_id| {
+                    panel
+                        .terminals
+                        .get(&terminal_id)
+                        .map(|terminal| (terminal_id, terminal.view.read(cx).terminal().clone()))
+                })
+            });
+            if let Some((terminal_id, terminal)) = active_terminal {
+                let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
+                if !input_log.is_empty() {
+                    break (terminal_id, terminal, input_log);
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("OMP terminal creation command was not sent before timeout");
+            }
+            cx.executor().timer(Duration::from_millis(50)).await;
+        };
+
+        assert_eq!(input_log.len(), 1, "OMP creation should send only one command");
+        let command = String::from_utf8(input_log.concat()).expect("command should be UTF-8");
+        let locator_from_command = command
+            .strip_prefix("omp --session-dir ")
+            .and_then(|command| command.strip_suffix('\r'))
+            .expect("initial command should use the OMP session-dir contract");
+
+        let metadata = cx
+            .update(|_, cx| {
+                TerminalThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(terminal_id)
+                    .cloned()
+            })
+            .expect("OMP terminal metadata should be persisted");
+        let expected_root = paths::data_dir().join("agent_sessions").join("omp");
+        assert_eq!(metadata.harness.as_deref(), Some("omp"));
+        assert_eq!(metadata.resume_locator.as_deref(), Some(locator_from_command));
+        assert!(Path::new(locator_from_command).starts_with(&expected_root));
+        assert_eq!(metadata.session_boundary, SessionBoundary::Live);
+        assert!(metadata.restore_on_workspace_open);
+        assert_eq!(
+            panel.read_with(&cx, |panel, cx| {
+                panel.resume_locator_for_terminal(terminal_id, cx)
+            }),
+            Some(locator_from_command.into())
+        );
+        assert_eq!(panel.read_with(&cx, |panel, cx| panel.terminals(cx).len()), 1);
+        drop(terminal);
+    }
+
+    #[gpui::test]
+    async fn terminal_session_boundary(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::init_global(cx);
+        });
+        let omp_terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("OMP terminal", true, window, cx)
+            })
+            .expect("OMP terminal should be inserted");
+        let plain_terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Plain terminal", false, window, cx)
+            })
+            .expect("plain terminal should be inserted");
+
+        let locator = SharedString::from("/tmp/omp-session-boundary");
+        panel.update(&mut cx, |panel, cx| {
+            panel
+                .register_terminal_agent_session(
+                    omp_terminal_id,
+                    SharedString::from("omp"),
+                    locator.clone(),
+                    cx,
+                )
+                .expect("OMP session should register");
+            panel.emit_test_terminal_process_exited(omp_terminal_id, cx);
+            panel.emit_test_terminal_process_exited(plain_terminal_id, cx);
+        });
+
+        let (omp_metadata, plain_metadata) = cx.update(|_, cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            (
+                store.entry(omp_terminal_id).cloned(),
+                store.entry(plain_terminal_id).cloned(),
+            )
+        });
+        let omp_metadata = omp_metadata.expect("OMP metadata should remain after exit");
+        let plain_metadata = plain_metadata.expect("plain metadata should remain after exit");
+        assert_eq!(omp_metadata.session_boundary, SessionBoundary::Sleeping);
+        assert_eq!(omp_metadata.harness.as_deref(), Some("omp"));
+        assert_eq!(omp_metadata.resume_locator, Some(locator));
+        assert_eq!(plain_metadata.harness, None);
+        assert_eq!(plain_metadata.resume_locator, None);
+        assert_eq!(plain_metadata.session_boundary, SessionBoundary::Sleeping);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal_without_activating_draft(omp_terminal_id, window, cx);
+        });
+        cx.update(|_, cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert!(store.entry(omp_terminal_id).is_none());
+            assert!(store.entry(plain_terminal_id).is_some());
+        });
+    }
+
 
     #[gpui::test]
     async fn test_terminal_restore_working_directory_does_not_read_leased_workspace(
