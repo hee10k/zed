@@ -13,8 +13,8 @@ use agent_ui::thread_metadata_store::{
     worktree_info_from_thread_paths,
 };
 use agent_ui::thread_group::{
-    MoveOrClonePayload, MoveOrCloneResult, MoveOrCloneThread, ThreadGroupId,
-    unsupported_rebase_executor,
+    MoveOrClonePayload, MoveOrCloneResult, MoveOrCloneThread, RebaseResult, ThreadGroupId,
+    stable_worktree_id,
 };
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
@@ -2440,9 +2440,10 @@ impl Sidebar {
                         .child(
                             Button::new(("group-transfer-move", ix), "Move")
                                 .style(ButtonStyle::Outlined)
-                                .on_click(cx.listener(|this, _, _window, cx| {
+                                .on_click(cx.listener(|this, _, window, cx| {
                                     this.apply_pending_group_transfer(
                                         MoveOrCloneThread::Move,
+                                        window,
                                         cx,
                                     );
                                 })),
@@ -2450,9 +2451,10 @@ impl Sidebar {
                         .child(
                             Button::new(("group-transfer-clone", ix), "Clone")
                                 .style(ButtonStyle::Outlined)
-                                .on_click(cx.listener(|this, _, _window, cx| {
+                                .on_click(cx.listener(|this, _, window, cx| {
                                     this.apply_pending_group_transfer(
                                         MoveOrCloneThread::Clone,
+                                        window,
                                         cx,
                                     );
                                 })),
@@ -6211,6 +6213,7 @@ impl Sidebar {
     fn apply_pending_group_transfer(
         &mut self,
         operation: MoveOrCloneThread,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(pending) = self.pending_group_transfer.take() else {
@@ -6231,23 +6234,157 @@ impl Sidebar {
         let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
             return;
         };
-        let result = panel.update(cx, |panel, cx| {
-            panel.execute_thread_group_transfer(
-                payload,
-                pending.target_worktree_id,
-                unsupported_rebase_executor,
-                || Err("derived worktree creation requires the worktree manager".to_string()),
+
+        if operation == MoveOrCloneThread::Move {
+            let target_path = ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(pending.target_root_thread_id)
+                .and_then(|metadata| metadata.folder_paths().paths().first().cloned());
+            let project = workspace.read(cx).project().clone();
+            let repository = target_path.as_ref().and_then(|target_path| {
+                project.read_with(cx, |project, cx| {
+                    project.repositories(cx).values().find_map(|repository| {
+                        let snapshot = repository.read(cx).snapshot();
+                        if snapshot.work_directory_abs_path.as_ref() == target_path {
+                            snapshot
+                                .branch
+                                .as_ref()
+                                .map(|branch| (repository.clone(), branch.name().to_string()))
+                        } else {
+                            snapshot
+                                .linked_worktrees()
+                                .iter()
+                                .find(|worktree| worktree.path == *target_path)
+                                .and_then(|worktree| {
+                                    worktree
+                                        .branch_name()
+                                        .map(|branch| (repository.clone(), branch.to_string()))
+                                })
+                        }
+                    })
+                })
+            });
+            let Some((repository, upstream)) = repository else {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_error(
+                        anyhow::anyhow!("could not resolve the target group's Git branch"),
+                        cx,
+                    );
+                });
+                return;
+            };
+            let rebase_task = repository.update(cx, |repository, cx| {
+                repository.rebase(upstream, cx)
+            });
+            let workspace_for_task = workspace.clone();
+            cx.spawn(async move |this, cx| {
+                let rebase_result = match rebase_task.await {
+                    Ok(Ok(())) => RebaseResult::Success,
+                    Ok(Err(error)) => RebaseResult::Error {
+                        details: error.to_string(),
+                    },
+                    Err(error) => RebaseResult::Error {
+                        details: error.to_string(),
+                    },
+                };
+                let result = panel.update(cx, |panel, cx| {
+                    panel.execute_thread_group_transfer(
+                        payload,
+                        pending.target_worktree_id,
+                        || rebase_result.clone(),
+                        || Err("derived worktree creation is only used by Clone".to_string()),
+                        cx,
+                    )
+                });
+                if let MoveOrCloneResult::MoveFailed {
+                    reason,
+                    rebase_result,
+                } = result
+                {
+                    let details = rebase_result
+                        .map(|result| format!("{result:?}"))
+                        .unwrap_or_default();
+                    workspace_for_task.update(cx, |workspace, cx| {
+                        workspace.show_error(
+                            anyhow::anyhow!("{reason} {details}"),
+                            cx,
+                        );
+                    });
+                }
+                this.update(cx, |this, cx| {
+                    this.schedule_update_entries(false, cx);
+                })
+                .ok();
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+            return;
+        }
+
+        let action = zed_actions::CreateWorktree {
+            worktree_name: Some(format!("clone-{}", pending.source_thread_id.to_key_string())),
+            branch_target: zed_actions::NewWorktreeBranchTarget::CurrentBranch,
+        };
+        let mut async_window_cx = window.to_async(cx);
+        let create_task = match workspace.update_in(&mut async_window_cx, |workspace, window, cx| {
+            git_ui_core::worktree_service::create_worktree_workspace(
+                workspace,
+                &action,
+                window,
+                None,
+                workspace::OpenMode::Add,
                 cx,
             )
-        });
-        if let MoveOrCloneResult::MoveFailed { reason, .. }
-        | MoveOrCloneResult::CloneFailed { reason } = result
-        {
-            workspace.update(cx, |workspace, cx| {
-                workspace.show_error(anyhow::anyhow!(reason), cx);
+        }) {
+            Ok(task) => task,
+            Err(error) => {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_error(error, cx);
+                });
+                return;
+            }
+        };
+        let workspace_for_task = workspace.clone();
+        cx.spawn(async move |this, cx| {
+            let created = create_task.await?;
+            let paths = created
+                .workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace.project().read(cx).worktree_paths(cx)
+                });
+            let Some(folder_path) = paths.folder_path_list().paths().first().cloned() else {
+                anyhow::bail!("cloned worktree has no folder path");
+            };
+            let main_path = paths
+                .main_worktree_path_list()
+                .paths()
+                .first()
+                .cloned()
+                .unwrap_or_else(|| folder_path.clone());
+            let worktree_id = stable_worktree_id(&main_path, &folder_path, "local");
+            let clone_paths = paths.clone();
+            let clone_id = worktree_id.clone();
+            let result = panel.update(cx, |panel, cx| {
+                panel.execute_thread_group_transfer(
+                    payload,
+                    Some(worktree_id),
+                    || RebaseResult::Success,
+                    move || Ok((clone_paths, clone_id)),
+                    cx,
+                )
             });
-        }
-        self.schedule_update_entries(false, cx);
+            if let MoveOrCloneResult::CloneFailed { reason } = result {
+                workspace_for_task.update(cx, |workspace, cx| {
+                    workspace.show_error(anyhow::anyhow!(reason), cx);
+                });
+            }
+            this.update(cx, |this, cx| {
+                this.schedule_update_entries(false, cx);
+            })
+            .ok();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
     /// Reorders a sidebar entry to a new position within its project group and
     /// persists the resulting order to the thread/terminal metadata stores.

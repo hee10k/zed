@@ -1860,11 +1860,26 @@ impl AgentPanel {
 
         cx.on_release(|this, cx| {
             this.dismiss_all_terminal_notifications(cx);
-            if let Some(workspace_id) = this.workspace_id {
-                let coordinator = this.worktree_lifecycle.clone();
-                let previous_task = this._worktree_lifecycle_task.take();
-                cx.background_executor()
-                    .spawn(async move {
+            let thread_flush = ThreadMetadataStore::try_global(cx)
+                .map(|store| store.read(cx).flush_pending(cx));
+            let terminal_flush = TerminalThreadMetadataStore::try_global(cx)
+                .map(|store| store.read(cx).flush_pending(cx));
+            let lifecycle_flush = this.workspace_id.map(|workspace_id| {
+                (
+                    this.worktree_lifecycle.clone(),
+                    this._worktree_lifecycle_task.take(),
+                    workspace_id,
+                )
+            });
+            cx.background_executor()
+                .spawn(async move {
+                    if let Some(task) = thread_flush {
+                        task.await;
+                    }
+                    if let Some(task) = terminal_flush {
+                        task.await;
+                    }
+                    if let Some((coordinator, previous_task, workspace_id)) = lifecycle_flush {
                         if let Some(previous_task) = previous_task {
                             previous_task.await;
                         }
@@ -1873,9 +1888,9 @@ impl AgentPanel {
                                 "flushing worktree lifecycle records during AgentPanel release: {error:#}"
                             );
                         }
-                    })
-                    .detach();
-            }
+                    }
+                })
+                .detach();
         })
         .detach();
 

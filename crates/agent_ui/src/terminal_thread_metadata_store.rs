@@ -219,17 +219,31 @@ pub struct TerminalThreadMetadataStore {
     _db_operations_task: Task<()>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 enum DbOperation {
     Upsert(TerminalThreadMetadata),
     Delete(TerminalId),
+    Flush(async_channel::Sender<()>),
 }
 
+impl PartialEq for DbOperation {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Upsert(left), Self::Upsert(right)) => left == right,
+            (Self::Delete(left), Self::Delete(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for DbOperation {}
+
 impl DbOperation {
-    fn id(&self) -> TerminalId {
+    fn id(&self) -> Option<TerminalId> {
         match self {
-            DbOperation::Upsert(metadata) => metadata.terminal_id,
-            DbOperation::Delete(terminal_id) => *terminal_id,
+            DbOperation::Upsert(metadata) => Some(metadata.terminal_id),
+            DbOperation::Delete(terminal_id) => Some(*terminal_id),
+            DbOperation::Flush(_) => None,
         }
     }
 }
@@ -359,6 +373,16 @@ impl TerminalThreadMetadataStore {
         self.save_internal(terminal);
         cx.notify();
     }
+    pub fn flush_pending(&self, cx: &App) -> Task<()> {
+        let (done_tx, done_rx) = async_channel::bounded(1);
+        self.pending_terminal_ops_tx
+            .try_send(DbOperation::Flush(done_tx))
+            .log_err();
+        cx.background_spawn(async move {
+            done_rx.recv().await.log_err();
+        })
+    }
+
 
 
     pub fn update_session_metadata(
@@ -552,6 +576,9 @@ impl TerminalThreadMetadataStore {
                             DbOperation::Delete(terminal_id) => {
                                 db.delete(terminal_id).await.log_err();
                             }
+                            DbOperation::Flush(done) => {
+                                done.send(()).await.log_err();
+                            }
                         }
                     }
                 }
@@ -572,14 +599,16 @@ impl TerminalThreadMetadataStore {
     }
 
     fn dedup_db_operations(operations: Vec<DbOperation>) -> Vec<DbOperation> {
-        let mut ops = HashMap::default();
+        let mut seen = HashSet::default();
+        let mut deduped = Vec::new();
         for operation in operations.into_iter().rev() {
-            if ops.contains_key(&operation.id()) {
+            if let Some(id) = operation.id() && !seen.insert(id) {
                 continue;
             }
-            ops.insert(operation.id(), operation);
+            deduped.push(operation);
         }
-        ops.into_values().collect()
+        deduped.reverse();
+        deduped
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
