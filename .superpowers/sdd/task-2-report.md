@@ -114,3 +114,33 @@ Source changes are complete for all six lifecycle reviewer findings. The follow-
 - Malformed JSON is the only load/list failure converted to a skipped record; permission, read, directory, and write failures still surface to the coordinator and are logged by AgentPanel.
 - The task chain covers all AgentPanel lifecycle event and release callers. Direct coordinator API callers remain responsible for not invoking concurrent mutations outside that production seam.
 - No sidebar/group UI, activity/status UI, drag guide, OMP restore behavior, workspace ownership, or SQLite history behavior was added.
+
+## Final lifecycle reviewer fixes
+
+### Status
+
+DONE; final commit SHA is reported by `git log -1` and the task handoff.
+
+### Changes
+
+1. **WorktreeRemoved is worktree-scoped but non-destructive.** `AgentPanel` captures each observed `WorktreeId` with its resolved lifecycle key before project events run. The generic `ProjectEvent::WorktreeRemoved(WorktreeId)` path now only marks that one record `Closing`; it does not delete the lifecycle file or clear terminal links. This preserves Closing records across detach/reconcile/restart.
+2. **Confirmed deletion has the production caller.** `thread_worktree_archive::remove_root` invokes lifecycle cleanup only after the confirmed `git worktree remove` succeeds. It uses the cached resolved key when available, marks that record `Closing`, clears only the target terminal folder association, and then invokes `remove_worktree` → `confirm_deletion` to remove the lifecycle directory. Failed destructive removal rolls back before this cleanup is reached.
+3. **Workspace reassignment persists.** Reconciliation treats changes to `workspace_id` or `last_seen_workspace_id` as record changes even when state remains `Active` or `Unavailable`, and saves those records.
+4. **State-file identity is validated.** `load` requires both the embedded key and its stable name to match the requested key and parent directory. `list` applies the parent-directory/stable-name check and skips mismatches as corrupt.
+5. **SQLite cleanup is narrow and remote-scoped.** `TerminalThreadMetadataStore::remove_worktree_path` removes only the deleted folder association for the matching local/remote connection; a same-path terminal on another host is untouched. It preserves the terminal row, OMP harness, resume locator, session boundary, and transcript/thread history. `ThreadMetadataStore` archived-thread rows and archived-worktree history are untouched.
+6. **Focused coverage added.** Lifecycle tests cover single-worktree removal in a multi-worktree workspace, workspace-ID reassignment persistence, key/file mismatch, and preserving a remote record without consulting local filesystem state. Terminal metadata coverage verifies path-link removal preserves terminal metadata and OMP resume state while respecting remote scope.
+
+### Verification
+
+- `CARGO_BUILD_JOBS=1 cargo check -p agent_ui --lib` — PASS after confirmed-deletion, key-cache, and remote-aware reconciliation wiring. Only existing `thread_group.rs` dead-code warnings and the existing `block` future-incompatibility warning were emitted.
+- `cargo metadata --no-deps --format-version 1` — PASS.
+- `git diff --check` on the lifecycle source files — PASS before the amended commit.
+- `CARGO_BUILD_JOBS=1 cargo test -p agent_ui --lib worktree_lifecycle::tests:: -- --nocapture` — started but canceled at the parent agent's request while compiling the test-support graph to avoid exhausting the volume. No test executable ran and no test pass is claimed. Disk availability had fallen to approximately 12 GiB (98% used); the earlier report records the same graph exhausting the volume with `os error 28`.
+
+### Self-review and concerns
+
+- Lifecycle mutations remain serialized through `_worktree_lifecycle_task`; release shutdown still uses the workspace-wide close only for normal panel shutdown, while generic worktree detachment only closes the matching record.
+- Resolved lifecycle keys are cached during normal reconciliation and carried into the confirmed archive plan, so cleanup does not re-canonicalize a deleted path. Remote records bypass local canonicalization and local `is_dir` checks; without a remote-aware filesystem they preserve their existing state.
+- If a removal event arrives without a captured descriptor, the seam logs a warning and leaves the lifecycle record for reconciliation rather than guessing a key.
+- Terminal cleanup intentionally removes only `folder_paths` associations for the matching remote identity. It does not delete terminal metadata, resume locators, working directories, archived thread rows, or durable transcripts.
+- The two design/spec files shown as untracked by `git status` are pre-existing task artifacts and are not included in the amended commit.

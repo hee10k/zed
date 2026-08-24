@@ -409,6 +409,42 @@ impl TerminalThreadMetadataStore {
 
         cx.notify();
     }
+    /// Removes one worktree folder association from terminals on the target
+    /// remote connection while preserving each terminal row, session boundary,
+    /// and resume locator.
+    pub fn remove_worktree_path(
+        &mut self,
+        worktree_path: &Path,
+        remote_connection: Option<&RemoteConnectionOptions>,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal_ids: Vec<_> = self
+            .terminals
+            .values()
+            .filter(|terminal| {
+                same_remote_connection_identity(
+                    terminal.remote_connection.as_ref(),
+                    remote_connection,
+                ) && terminal
+                    .folder_paths()
+                    .paths()
+                    .iter()
+                    .any(|folder_path| folder_path.as_path() == worktree_path)
+            })
+            .map(|terminal| terminal.terminal_id)
+            .collect();
+
+        for terminal_id in terminal_ids.iter().copied() {
+            if let Some(mut terminal) = self.terminals.get(&terminal_id).cloned() {
+                terminal.worktree_paths.remove_folder_path(worktree_path);
+                self.save_internal(terminal);
+            }
+        }
+
+        if !terminal_ids.is_empty() {
+            cx.notify();
+        }
+    }
 
     fn save_internal(&mut self, metadata: TerminalThreadMetadata) {
         if let Some(existing) = self.terminals.get(&metadata.terminal_id) {
@@ -928,6 +964,49 @@ mod tests {
                     .paths(),
                 old_main_paths.paths()
             );
+        });
+    }
+    #[gpui::test]
+    async fn test_remove_worktree_path_preserves_metadata_and_remote_scope(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let folder_path = Path::new("/repo-feature");
+        let mut local_metadata = metadata(
+            "OMP session",
+            WorktreePaths::from_folder_paths(&PathList::new(&[folder_path])),
+        );
+        local_metadata.harness = Some("omp".into());
+        local_metadata.resume_locator = Some("/tmp/session".into());
+        let local_id = local_metadata.terminal_id;
+        let mut remote_metadata = metadata(
+            "Remote session",
+            WorktreePaths::from_folder_paths(&PathList::new(&[folder_path])),
+        );
+        remote_metadata.remote_connection =
+            Some(RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 1 }));
+        let remote_id = remote_metadata.terminal_id;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(local_metadata, cx);
+                store.save(remote_metadata, cx);
+            });
+        });
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.remove_worktree_path(folder_path, None, cx);
+            });
+        });
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let local = store.read(cx).entry(local_id).expect("local row remains");
+            assert!(local.worktree_paths.is_empty());
+            assert_eq!(local.harness.as_deref(), Some("omp"));
+            assert_eq!(local.resume_locator.as_deref(), Some("/tmp/session"));
+            let remote = store.read(cx).entry(remote_id).expect("remote row remains");
+            assert!(!remote.worktree_paths.is_empty());
         });
     }
 

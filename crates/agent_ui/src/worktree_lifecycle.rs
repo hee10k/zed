@@ -110,21 +110,24 @@ impl WorktreeLifecycleRecord {
         }
     }
 
-    fn reconcile(&mut self, workspace_id: WorkspaceId, path_exists: bool) -> bool {
+    fn reconcile(&mut self, workspace_id: WorkspaceId, path_exists: Option<bool>) -> bool {
         let old_state = self.state.clone();
+        let workspace_changed = self.workspace_id != Some(workspace_id)
+            || self.last_seen_workspace_id != Some(workspace_id);
         self.workspace_id = Some(workspace_id);
         self.last_seen_workspace_id = Some(workspace_id);
         if !matches!(
             &self.state,
             WorktreeLifecycleState::Closing | WorktreeLifecycleState::Removed
-        ) {
+        ) && let Some(path_exists) = path_exists
+        {
             self.state = if path_exists {
                 WorktreeLifecycleState::Active
             } else {
                 WorktreeLifecycleState::Unavailable
             };
         }
-        old_state != self.state
+        workspace_changed || old_state != self.state
     }
 }
 
@@ -179,7 +182,10 @@ impl WorktreeLifecycleStore {
         self.root.join(key.stable_name()).join(LIFECYCLE_FILE_NAME)
     }
 
-    pub async fn load(&self, key: &WorktreeLifecycleKey) -> Result<Option<WorktreeLifecycleRecord>> {
+    pub async fn load(
+        &self,
+        key: &WorktreeLifecycleKey,
+    ) -> Result<Option<WorktreeLifecycleRecord>> {
         let path = self.path_for(key);
         if !self.fs.is_file(&path).await {
             return Ok(None);
@@ -199,6 +205,17 @@ impl WorktreeLifecycleStore {
                 return Ok(None);
             }
         };
+        let matches_directory = path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|directory| directory.to_string_lossy() == record.key.stable_name());
+        if record.key != *key || !matches_directory {
+            log::error!(
+                "skipping worktree lifecycle file with mismatched key {}",
+                path.display()
+            );
+            return Ok(None);
+        }
         Ok(Some(record))
     }
 
@@ -278,7 +295,22 @@ impl WorktreeLifecycleStore {
                 format!("loading worktree lifecycle file {}", path.display())
             })?;
             match serde_json::from_str::<WorktreeLifecycleRecord>(&contents) {
-                Ok(record) => records.push(record),
+                Ok(record) => {
+                    let matches_directory = path
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|directory| {
+                            directory.to_string_lossy() == record.key.stable_name()
+                        });
+                    if matches_directory {
+                        records.push(record);
+                    } else {
+                        log::error!(
+                            "skipping worktree lifecycle file with mismatched key {}",
+                            path.display()
+                        );
+                    }
+                }
                 Err(error) => {
                     log::error!(
                         "skipping malformed worktree lifecycle file {}: {error:#}",
@@ -346,15 +378,19 @@ impl WorktreeLifecycleCoordinator {
         for worktree in worktrees {
             let key = self.key_for(worktree).await?;
             seen_keys.insert(key.clone());
-            let path_exists = self.store.fs.is_dir(&key.worktree_path).await;
+            let path_exists = if worktree.remote_identity == "local" {
+                Some(self.store.fs.is_dir(&key.worktree_path).await)
+            } else {
+                None
+            };
             let existing = self.store.load(&key).await?;
             let was_missing = existing.is_none();
             let mut record = match existing {
                 Some(record) => record,
                 None => WorktreeLifecycleRecord::new(key.clone(), workspace_id),
             };
-            let state_changed = record.reconcile(workspace_id, path_exists);
-            if was_missing || state_changed {
+            let record_changed = record.reconcile(workspace_id, path_exists);
+            if was_missing || record_changed {
                 self.store.save(&record).await?;
             }
             reconciled.push(record);
@@ -447,10 +483,24 @@ impl WorktreeLifecycleCoordinator {
         Ok(())
     }
 
-    async fn key_for(&self, worktree: &WorktreeLifecycleWorktree) -> Result<WorktreeLifecycleKey> {
+    pub async fn key_for(
+        &self,
+        worktree: &WorktreeLifecycleWorktree,
+    ) -> Result<WorktreeLifecycleKey> {
+        let (repository_path, worktree_path) = if worktree.remote_identity == "local" {
+            (
+                canonical_path(&*self.store.fs, &worktree.repository_path).await?,
+                canonical_path(&*self.store.fs, &worktree.worktree_path).await?,
+            )
+        } else {
+            (
+                worktree.repository_path.clone(),
+                worktree.worktree_path.clone(),
+            )
+        };
         Ok(WorktreeLifecycleKey::new(
-            canonical_path(&*self.store.fs, &worktree.repository_path).await?,
-            canonical_path(&*self.store.fs, &worktree.worktree_path).await?,
+            repository_path,
+            worktree_path,
             worktree.remote_identity.clone(),
         ))
     }
@@ -670,5 +720,159 @@ mod tests {
                 .state,
             WorktreeLifecycleState::Unavailable
         );
+    }
+    #[gpui::test]
+    async fn lifecycle_coordinator_removes_only_requested_worktree(cx: &mut TestAppContext) {
+        let temp = TempDir::new().expect("create temporary lifecycle root");
+        let fs = Arc::new(RealFs::new(None, cx.executor()));
+        let store = WorktreeLifecycleStore::with_root(fs.clone(), temp.path());
+        let coordinator = WorktreeLifecycleCoordinator::new(store.clone());
+        let workspace_id = WorkspaceId::from_i64(11);
+        let repository_path = temp.path().join("repository");
+        let first_path = temp.path().join("worktree-first");
+        let second_path = temp.path().join("worktree-second");
+        fs.create_dir(&first_path)
+            .await
+            .expect("create first worktree path");
+        fs.create_dir(&second_path)
+            .await
+            .expect("create second worktree path");
+        let first = WorktreeLifecycleWorktree::new(
+            repository_path.clone(),
+            first_path.clone(),
+            "local",
+        );
+        let second = WorktreeLifecycleWorktree::new(
+            repository_path.clone(),
+            second_path.clone(),
+            "local",
+        );
+        coordinator
+            .reconcile_workspace(workspace_id, &[first, second])
+            .await
+            .expect("reconcile multi-worktree workspace");
+
+        let first_key = WorktreeLifecycleKey::new(repository_path.clone(), first_path, "local");
+        let second_key = WorktreeLifecycleKey::new(repository_path, second_path, "local");
+        coordinator
+            .remove_worktree(&first_key)
+            .await
+            .expect("remove one worktree lifecycle record");
+        assert!(
+            store
+                .load(&first_key)
+                .await
+                .expect("load removed record")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .load(&second_key)
+                .await
+                .expect("load retained record")
+                .expect("second worktree should remain")
+                .state,
+            WorktreeLifecycleState::Active
+        );
+    }
+
+    #[gpui::test]
+    async fn lifecycle_reconcile_persists_workspace_id_reassignment(cx: &mut TestAppContext) {
+        let temp = TempDir::new().expect("create temporary lifecycle root");
+        let fs = Arc::new(RealFs::new(None, cx.executor()));
+        let store = WorktreeLifecycleStore::with_root(fs, temp.path());
+        let coordinator = WorktreeLifecycleCoordinator::new(store.clone());
+        let first_workspace = WorkspaceId::from_i64(12);
+        let second_workspace = WorkspaceId::from_i64(13);
+        let repository_path = temp.path().join("repository");
+        let worktree_path = temp.path().join("worktree");
+        let worktree = WorktreeLifecycleWorktree::new(
+            repository_path.clone(),
+            worktree_path.clone(),
+            "local",
+        );
+        coordinator
+            .reconcile_workspace(first_workspace, std::slice::from_ref(&worktree))
+            .await
+            .expect("reconcile first workspace");
+        coordinator
+            .reconcile_workspace(second_workspace, std::slice::from_ref(&worktree))
+            .await
+            .expect("reconcile reassigned workspace");
+
+        let key = WorktreeLifecycleKey::new(repository_path, worktree_path, "local");
+        let persisted = store
+            .load(&key)
+            .await
+            .expect("load reassigned record")
+            .expect("record should persist");
+        assert_eq!(persisted.workspace_id, Some(second_workspace));
+        assert_eq!(persisted.last_seen_workspace_id, Some(second_workspace));
+    }
+
+    #[gpui::test]
+    async fn lifecycle_store_skips_key_file_mismatch(cx: &mut TestAppContext) {
+        let temp = TempDir::new().expect("create temporary lifecycle root");
+        let fs = Arc::new(RealFs::new(None, cx.executor()));
+        let store = WorktreeLifecycleStore::with_root(fs.clone(), temp.path());
+        let expected_key = key(Path::new("/repo/.git"), Path::new("/repo"));
+        let embedded_key = key(Path::new("/other/.git"), Path::new("/other"));
+        let path = store.path_for(&expected_key);
+        fs.create_dir(path.parent().expect("lifecycle file parent"))
+            .await
+            .expect("create lifecycle file parent");
+        fs.atomic_write(
+            path,
+            serde_json::to_string(&record(embedded_key)).expect("encode mismatched record"),
+        )
+        .await
+        .expect("write mismatched record");
+
+        assert!(
+            store
+                .load(&expected_key)
+                .await
+                .expect("load mismatched record")
+                .is_none()
+        );
+        assert!(
+            store
+                .list()
+                .await
+                .expect("list mismatched record")
+                .is_empty()
+        );
+    }
+    #[gpui::test]
+    async fn lifecycle_reconcile_preserves_remote_state_without_local_fs(
+        cx: &mut TestAppContext,
+    ) {
+        let temp = TempDir::new().expect("create temporary lifecycle root");
+        let fs = Arc::new(RealFs::new(None, cx.executor()));
+        let store = WorktreeLifecycleStore::with_root(fs, temp.path());
+        let coordinator = WorktreeLifecycleCoordinator::new(store.clone());
+        let workspace_id = WorkspaceId::from_i64(14);
+        let repository_path = PathBuf::from("/remote/repository/.git");
+        let worktree_path = PathBuf::from("/remote/worktree");
+        let key = WorktreeLifecycleKey::new(
+            repository_path.clone(),
+            worktree_path.clone(),
+            "remote-v1:ssh-host",
+        );
+        let mut existing = WorktreeLifecycleRecord::new(key, WorkspaceId::from_i64(13));
+        existing.state = WorktreeLifecycleState::Unavailable;
+        store.save(&existing).await.expect("save remote record");
+
+        let worktree = WorktreeLifecycleWorktree::new(
+            repository_path,
+            worktree_path,
+            "remote-v1:ssh-host",
+        );
+        let reconciled = coordinator
+            .reconcile_workspace(workspace_id, std::slice::from_ref(&worktree))
+            .await
+            .expect("reconcile remote worktree");
+        assert_eq!(reconciled[0].state, WorktreeLifecycleState::Unavailable);
+        assert_eq!(reconciled[0].workspace_id, Some(workspace_id));
     }
 }

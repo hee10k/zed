@@ -19,7 +19,7 @@ use collections::HashSet;
 use db::kvp::{Dismissable, KeyValueStore};
 use itertools::Itertools;
 use remote::remote_connection_identity;
-use project::{AgentId, ProjectItem};
+use project::{AgentId, ProjectItem, WorktreeId};
 use serde::{Deserialize, Serialize};
 
 use zed_actions::{
@@ -49,7 +49,8 @@ use crate::{
     NewNativeAgentThreadFromSummary,
 };
 use crate::worktree_lifecycle::{
-    WorktreeLifecycleCoordinator, WorktreeLifecycleStore, WorktreeLifecycleWorktree,
+    WorktreeLifecycleCoordinator, WorktreeLifecycleKey, WorktreeLifecycleStore,
+    WorktreeLifecycleWorktree,
 };
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow,
@@ -1192,6 +1193,8 @@ pub struct AgentPanel {
     focus_handle: FocusHandle,
     worktree_lifecycle: WorktreeLifecycleCoordinator,
     _worktree_lifecycle_task: Option<Task<()>>,
+    worktree_lifecycle_worktrees: HashMap<WorktreeId, WorktreeLifecycleWorktree>,
+    worktree_lifecycle_keys: HashMap<WorktreeId, WorktreeLifecycleKey>,
     base_view: BaseView,
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
@@ -1546,15 +1549,11 @@ impl AgentPanel {
         })
     }
 
-    fn reconcile_worktree_lifecycle(
-        &mut self,
-        cx: &mut Context<Self>,
-        mark_closing: bool,
-    ) {
+    fn reconcile_worktree_lifecycle(&mut self, cx: &mut Context<Self>) {
         let Some(workspace_id) = self.workspace_id else {
             return;
         };
-        let worktrees = self.project.read_with(cx, |project, cx| {
+        let (worktrees, observed_worktrees) = self.project.read_with(cx, |project, cx| {
             let remote_identity = project
                 .remote_connection_options(cx)
                 .map(|options| {
@@ -1564,7 +1563,8 @@ impl AgentPanel {
                     )
                 })
                 .unwrap_or_else(|| "local".to_string());
-            project
+            let mut observed_worktrees = Vec::new();
+            let worktrees = project
                 .worktrees(cx)
                 .map(|worktree| {
                     let worktree = worktree.read(cx);
@@ -1573,35 +1573,92 @@ impl AgentPanel {
                         .root_repo_common_dir()
                         .map(|path| path.to_path_buf())
                         .unwrap_or_else(|| worktree_path.clone());
-                    WorktreeLifecycleWorktree::new(
+                    let lifecycle_worktree = WorktreeLifecycleWorktree::new(
                         repository_path,
                         worktree_path,
                         remote_identity.clone(),
-                    )
+                    );
+                    observed_worktrees.push((worktree.id(), lifecycle_worktree.clone()));
+                    lifecycle_worktree
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (worktrees, observed_worktrees)
         });
+        let observed_ids: HashSet<_> = observed_worktrees
+            .iter()
+            .map(|(worktree_id, _)| *worktree_id)
+            .collect();
+        self.worktree_lifecycle_worktrees
+            .retain(|worktree_id, _| observed_ids.contains(worktree_id));
+        self.worktree_lifecycle_keys
+            .retain(|worktree_id, _| observed_ids.contains(worktree_id));
+        self.worktree_lifecycle_worktrees
+            .extend(observed_worktrees.clone());
+
         let coordinator = self.worktree_lifecycle.clone();
         let previous_task = self._worktree_lifecycle_task.take();
-        self._worktree_lifecycle_task = Some(cx.background_spawn(async move {
+        let observed_worktrees_for_keys = observed_worktrees;
+        self._worktree_lifecycle_task = Some(cx.spawn(async move |this, cx| {
             // Keep every lifecycle read-modify-write in event order. In
             // particular, a reconcile queued after a removal must not race
             // the Closing transition and resurrect the record.
             if let Some(previous_task) = previous_task {
                 previous_task.await;
             }
-            if mark_closing {
-                if let Err(error) = coordinator.mark_workspace_closing(workspace_id).await {
-                    log::error!("marking worktree lifecycle records closing: {error:#}");
-                }
-            }
-            if let Err(error) = coordinator
+            let Ok(records) = coordinator
                 .reconcile_workspace(workspace_id, &worktrees)
                 .await
-            {
-                log::error!("reconciling worktree lifecycle records: {error:#}");
+            else {
+                log::error!("reconciling worktree lifecycle records failed");
+                return;
+            };
+            this.update(cx, |panel, _cx| {
+                panel.worktree_lifecycle_keys.extend(
+                    observed_worktrees_for_keys
+                        .into_iter()
+                        .zip(records)
+                        .map(|((worktree_id, _), record)| (worktree_id, record.key)),
+                );
+            })
+            .ok();
+        }));
+    }
+
+    fn remove_worktree_lifecycle(&mut self, worktree_id: WorktreeId, cx: &mut Context<Self>) {
+        let cached_key = self.worktree_lifecycle_keys.remove(&worktree_id);
+        let Some(worktree) = self.worktree_lifecycle_worktrees.remove(&worktree_id) else {
+            log::warn!(
+                "worktree lifecycle removal had no captured worktree for {worktree_id:?}"
+            );
+            return;
+        };
+
+        let coordinator = self.worktree_lifecycle.clone();
+        let previous_task = self._worktree_lifecycle_task.take();
+        self._worktree_lifecycle_task = Some(cx.background_spawn(async move {
+            if let Some(previous_task) = previous_task {
+                previous_task.await;
+            }
+            let key = match cached_key {
+                Some(key) => key,
+                None => match coordinator.key_for(&worktree).await {
+                    Ok(key) => key,
+                    Err(error) => {
+                        log::error!("resolving removed worktree lifecycle key: {error:#}");
+                        return;
+                    }
+                },
+            };
+            if let Err(error) = coordinator.mark_worktree_closing(&key).await {
+                log::error!("marking removed worktree lifecycle record closing: {error:#}");
             }
         }));
+    }
+    pub(crate) fn lifecycle_key_for_worktree(
+        &self,
+        worktree_id: WorktreeId,
+    ) -> Option<WorktreeLifecycleKey> {
+        self.worktree_lifecycle_keys.get(&worktree_id).cloned()
     }
 
     pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -1654,14 +1711,14 @@ impl AgentPanel {
                 project::Event::WorktreeAdded(_)
                 | project::Event::WorktreeOrderChanged
                 | project::Event::WorktreePathsChanged { .. } => {
-                    this.reconcile_worktree_lifecycle(cx, false);
+                    this.reconcile_worktree_lifecycle(cx);
                     this.ensure_native_agent_connection(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
                     cx.notify();
                 }
-                project::Event::WorktreeRemoved(_) => {
-                    this.reconcile_worktree_lifecycle(cx, true);
+                project::Event::WorktreeRemoved(worktree_id) => {
+                    this.remove_worktree_lifecycle(*worktree_id, cx);
                     this.ensure_native_agent_connection(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
@@ -1714,6 +1771,8 @@ impl AgentPanel {
             focus_handle: cx.focus_handle(),
             worktree_lifecycle,
             _worktree_lifecycle_task: None,
+            worktree_lifecycle_worktrees: HashMap::default(),
+            worktree_lifecycle_keys: HashMap::default(),
             context_server_registry,
             draft_thread: None,
             retained_threads: HashMap::default(),
@@ -1741,8 +1800,7 @@ impl AgentPanel {
             last_context_source: None,
             is_active: false,
         };
-
-        panel.reconcile_worktree_lifecycle(cx, false);
+        panel.reconcile_worktree_lifecycle(cx);
         panel.ensure_native_agent_connection(cx);
         panel
     }
