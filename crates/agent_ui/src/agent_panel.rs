@@ -48,6 +48,9 @@ use crate::terminal_thread_metadata_store::{
 use crate::thread_metadata_store::{
     ActivityStatus, ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent,
 };
+use crate::thread_group::{
+    MoveOrClonePayload, MoveOrCloneResult, RebaseResult, execute_move_or_clone_payload,
+};
 use crate::terminal_resume::{build_resume_command, resume_comment};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
@@ -2286,6 +2289,29 @@ impl AgentPanel {
             cx.notify();
         }
     }
+    /// Executes a confirmed thread-group transfer at the panel boundary.
+    /// Callers own the confirmation and provide the Git/worktree operation;
+    /// metadata is changed only after those operations report success.
+    pub fn execute_thread_group_transfer(
+        &mut self,
+        payload: MoveOrClonePayload,
+        target_worktree_id: Option<SharedString>,
+        rebase_executor: impl FnOnce() -> RebaseResult,
+        worktree_factory: impl FnOnce() -> Result<(project::WorktreePaths, SharedString), String>,
+        cx: &mut Context<Self>,
+    ) -> MoveOrCloneResult {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            execute_move_or_clone_payload(
+                payload,
+                target_worktree_id,
+                rebase_executor,
+                worktree_factory,
+                store,
+                cx,
+            )
+        })
+    }
+
 
     pub fn new_terminal(
         &mut self,
