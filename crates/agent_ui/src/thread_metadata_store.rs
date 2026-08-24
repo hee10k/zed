@@ -28,7 +28,7 @@ use ui::{App, Context, SharedString, ThreadItemWorktreeInfo, WorktreeKind};
 use util::ResultExt as _;
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
 
-use crate::DEFAULT_THREAD_TITLE;
+use crate::{DEFAULT_THREAD_TITLE, thread_group::ThreadGroupId};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ThreadId(uuid::Uuid);
@@ -56,6 +56,8 @@ impl Column for ThreadId {
         Ok((ThreadId(uuid), next))
     }
 }
+
+impl db::sqlez::bindable::StaticColumnCount for ThreadId {}
 
 const THREAD_REMOTE_CONNECTION_MIGRATION_KEY: &str = "thread-metadata-remote-connection-backfill";
 const THREAD_ID_MIGRATION_KEY: &str = "thread-metadata-thread-id-backfill";
@@ -143,6 +145,10 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                         remote_connection: None,
                         archived: true,
                         user_order: None,
+                        group_id: None,
+                        parent_thread_id: None,
+                        worktree_id: None,
+                        root_thread_id: None,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -327,6 +333,19 @@ pub struct ThreadMetadata {
     /// User-assigned sidebar position (fractional midpoint) within its project
     /// group. `None` means fall back to recency sorting.
     pub user_order: Option<f64>,
+    pub group_id: Option<ThreadGroupId>,
+    pub parent_thread_id: Option<ThreadId>,
+    pub worktree_id: Option<SharedString>,
+    pub root_thread_id: Option<ThreadId>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadGroupMetadata {
+    pub group_id: ThreadGroupId,
+    pub root_thread_id: Option<ThreadId>,
+    pub root_worktree_id: Option<SharedString>,
+    pub root_thread: Option<ThreadMetadata>,
+    pub child_threads: Vec<ThreadMetadata>,
 }
 
 impl ThreadMetadata {
@@ -507,6 +526,7 @@ pub struct ThreadMetadataStore {
     threads_by_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
+    threads_by_group: HashMap<ThreadGroupId, HashSet<ThreadId>>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
@@ -676,6 +696,7 @@ impl ThreadMetadataStore {
                     this.threads_by_paths.clear();
                     this.threads_by_main_paths.clear();
                     this.threads_by_session.clear();
+                    this.threads_by_group.clear();
 
                     for row in rows {
                         this.cache_thread_metadata(row);
@@ -744,6 +765,13 @@ impl ThreadMetadataStore {
 
     fn save_internal(&mut self, metadata: ThreadMetadata) {
         if let Some(thread) = self.threads.get(&metadata.thread_id) {
+            if thread.group_id != metadata.group_id {
+                if let Some(old_group_id) = thread.group_id {
+                    if let Some(thread_ids) = self.threads_by_group.get_mut(&old_group_id) {
+                        thread_ids.remove(&metadata.thread_id);
+                    }
+                }
+            }
             if thread.folder_paths() != metadata.folder_paths() {
                 if let Some(thread_ids) = self.threads_by_paths.get_mut(thread.folder_paths()) {
                     thread_ids.remove(&metadata.thread_id);
@@ -773,6 +801,13 @@ impl ThreadMetadataStore {
         if let Some(session_id) = metadata.session_id.as_ref() {
             self.threads_by_session
                 .insert(session_id.clone(), metadata.thread_id);
+        }
+
+        if let Some(group_id) = metadata.group_id {
+            self.threads_by_group
+                .entry(group_id)
+                .or_default()
+                .insert(metadata.thread_id);
         }
 
         self.threads.insert(metadata.thread_id, metadata.clone());
@@ -1143,6 +1178,11 @@ impl ThreadMetadataStore {
 
     pub fn delete(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
         if let Some(thread) = self.threads.get(&thread_id) {
+            if let Some(group_id) = thread.group_id {
+                if let Some(thread_ids) = self.threads_by_group.get_mut(&group_id) {
+                    thread_ids.remove(&thread_id);
+                }
+            }
             if let Some(sid) = &thread.session_id {
                 self.threads_by_session.remove(sid);
             }
@@ -1164,6 +1204,94 @@ impl ThreadMetadataStore {
             .log_err();
         crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         cx.notify();
+    }
+
+    /// Deletes a thread and all of its descendant threads in the group hierarchy.
+    pub fn delete_thread_and_descendants(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let descendants: Vec<ThreadId> = self
+            .threads
+            .values()
+            .filter(|t| t.parent_thread_id == Some(thread_id) || t.root_thread_id == Some(thread_id))
+            .map(|t| t.thread_id)
+            .collect();
+        for id in descendants {
+            if id != thread_id {
+                self.delete_thread_and_descendants(id, cx);
+            }
+        }
+        self.delete(thread_id, cx);
+    }
+
+    /// Returns group metadata including root thread and child threads.
+    pub fn group_metadata(&self, group_id: ThreadGroupId) -> Option<ThreadGroupMetadata> {
+        let group_threads: Vec<&ThreadMetadata> = self
+            .threads
+            .values()
+            .filter(|t| t.group_id == Some(group_id))
+            .collect();
+
+        if group_threads.is_empty() {
+            return None;
+        }
+
+        let root_thread = group_threads
+            .iter()
+            .find(|t| t.root_thread_id == Some(t.thread_id) || (t.parent_thread_id.is_none() && t.root_thread_id.is_none()))
+            .or_else(|| group_threads.iter().find(|t| t.parent_thread_id.is_none()))
+            .copied()
+            .cloned();
+
+        let root_thread_id = root_thread.as_ref().map(|t| t.thread_id);
+        let root_worktree_id = root_thread.as_ref().and_then(|t| t.worktree_id.clone());
+
+        let child_threads: Vec<ThreadMetadata> = group_threads
+            .into_iter()
+            .filter(|t| Some(t.thread_id) != root_thread_id)
+            .cloned()
+            .collect();
+
+        Some(ThreadGroupMetadata {
+            group_id,
+            root_thread_id,
+            root_worktree_id,
+            root_thread,
+            child_threads,
+        })
+    }
+
+    /// Returns the root thread for a group if one exists.
+    pub fn root_thread_for_group(&self, group_id: ThreadGroupId) -> Option<&ThreadMetadata> {
+        let threads: Vec<&ThreadMetadata> = self
+            .threads
+            .values()
+            .filter(|t| t.group_id == Some(group_id))
+            .collect();
+        threads
+            .iter()
+            .find(|t| t.root_thread_id == Some(t.thread_id) || (t.parent_thread_id.is_none() && t.root_thread_id.is_none()))
+            .or_else(|| threads.iter().find(|t| t.parent_thread_id.is_none()))
+            .copied()
+    }
+
+    /// Returns all child threads for a group.
+    pub fn child_threads_for_group(&self, group_id: ThreadGroupId) -> Vec<&ThreadMetadata> {
+        let root_id = self.root_thread_for_group(group_id).map(|t| t.thread_id);
+        self.threads
+            .values()
+            .filter(|t| t.group_id == Some(group_id) && Some(t.thread_id) != root_id)
+            .collect()
+    }
+
+    /// Returns all threads belonging to a group.
+    pub fn entries_for_group<'a>(
+        &'a self,
+        group_id: ThreadGroupId,
+    ) -> impl Iterator<Item = &'a ThreadMetadata> + 'a {
+        self.threads_by_group
+            .get(&group_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.threads.get(id))
     }
 
     pub fn unarchived_draft_ids_matching(
@@ -1245,6 +1373,7 @@ impl ThreadMetadataStore {
             threads_by_paths: HashMap::default(),
             threads_by_main_paths: HashMap::default(),
             threads_by_session: HashMap::default(),
+            threads_by_group: HashMap::default(),
             reload_task: None,
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
@@ -1344,6 +1473,11 @@ impl ThreadMetadataStore {
             crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         }
 
+        let group_id = existing_thread.and_then(|t| t.group_id);
+        let parent_thread_id = existing_thread.and_then(|t| t.parent_thread_id);
+        let worktree_id = existing_thread.and_then(|t| t.worktree_id.clone());
+        let root_thread_id = existing_thread.and_then(|t| t.root_thread_id);
+
         let metadata = ThreadMetadata {
             thread_id,
             session_id,
@@ -1357,6 +1491,10 @@ impl ThreadMetadataStore {
             remote_connection,
             archived,
             user_order,
+            group_id,
+            parent_thread_id,
+            worktree_id,
+            root_thread_id,
         };
 
         self.save(metadata, cx);
@@ -1472,6 +1610,12 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN user_order REAL;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN group_id BLOB;
+            ALTER TABLE sidebar_threads ADD COLUMN parent_thread_id BLOB;
+            ALTER TABLE sidebar_threads ADD COLUMN worktree_id TEXT;
+            ALTER TABLE sidebar_threads ADD COLUMN root_thread_id BLOB;
+        ),
     ];
 }
 
@@ -1488,7 +1632,8 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override, user_order \
+        main_worktree_paths_order, remote_connection, title_override, user_order, \
+        group_id, parent_thread_id, worktree_id, root_thread_id \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1542,10 +1687,14 @@ impl ThreadMetadataDb {
         let thread_id = row.thread_id;
         let archived = row.archived;
         let user_order = row.user_order;
+        let group_id = row.group_id;
+        let parent_thread_id = row.parent_thread_id;
+        let worktree_id = row.worktree_id.as_ref().map(|id| id.to_string());
+        let root_thread_id = row.root_thread_id;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, user_order) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, user_order, group_id, parent_thread_id, worktree_id, root_thread_id) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1560,7 +1709,11 @@ impl ThreadMetadataDb {
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
                            title_override = excluded.title_override, \
-                           user_order = excluded.user_order";
+                           user_order = excluded.user_order, \
+                           group_id = excluded.group_id, \
+                           parent_thread_id = excluded.parent_thread_id, \
+                           worktree_id = excluded.worktree_id, \
+                           root_thread_id = excluded.root_thread_id";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1576,7 +1729,11 @@ impl ThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
             i = stmt.bind(&title_override, i)?;
-            stmt.bind(&user_order, i)?;
+            i = stmt.bind(&user_order, i)?;
+            i = stmt.bind(&group_id, i)?;
+            i = stmt.bind(&parent_thread_id, i)?;
+            i = stmt.bind(&worktree_id, i)?;
+            stmt.bind(&root_thread_id, i)?;
             stmt.exec()
         })
         .await
@@ -1735,6 +1892,10 @@ impl Column for ThreadMetadata {
             Column::column(statement, next)?;
         let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (user_order, next): (Option<f64>, i32) = Column::column(statement, next)?;
+        let (group_id, next): (Option<ThreadGroupId>, i32) = Column::column(statement, next)?;
+        let (parent_thread_id, next): (Option<ThreadId>, i32) = Column::column(statement, next)?;
+        let (worktree_id, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (root_thread_id, next): (Option<ThreadId>, i32) = Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -1802,6 +1963,10 @@ impl Column for ThreadMetadata {
                 remote_connection,
                 archived,
                 user_order,
+                group_id,
+                parent_thread_id,
+                worktree_id: worktree_id.map(SharedString::from),
+                root_thread_id,
             },
             next,
         ))
@@ -1893,6 +2058,10 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
             remote_connection: None,
             user_order: None,
+            group_id: None,
+            parent_thread_id: None,
+            worktree_id: None,
+            root_thread_id: None,
         }
     }
 
@@ -2188,6 +2357,10 @@ mod tests {
             remote_connection: None,
             archived: false,
             user_order: None,
+            group_id: None,
+            parent_thread_id: None,
+            worktree_id: None,
+            root_thread_id: None,
         };
 
         cx.update(|cx| {
@@ -2274,6 +2447,10 @@ mod tests {
             remote_connection: None,
             archived: false,
             user_order: None,
+            group_id: None,
+            parent_thread_id: None,
+            worktree_id: None,
+            root_thread_id: None,
         };
 
         cx.update(|cx| {
@@ -2401,6 +2578,10 @@ mod tests {
             remote_connection: None,
             archived: false,
             user_order: None,
+            group_id: None,
+            parent_thread_id: None,
+            worktree_id: None,
+            root_thread_id: None,
         };
 
         cx.update(|cx| {
@@ -3146,6 +3327,10 @@ mod tests {
             worktree_paths: linked_worktree_paths.clone(),
             remote_connection: None,
             user_order: None,
+            group_id: None,
+            parent_thread_id: None,
+            worktree_id: None,
+            root_thread_id: None,
         };
 
         let remote_linked_thread = ThreadMetadata {
@@ -3161,6 +3346,10 @@ mod tests {
             worktree_paths: linked_worktree_paths,
             remote_connection: Some(remote_a.clone()),
             user_order: None,
+            group_id: None,
+            parent_thread_id: None,
+            worktree_id: None,
+            root_thread_id: None,
         };
 
         cx.update(|cx| {
@@ -4289,6 +4478,156 @@ mod tests {
                 &[std::path::PathBuf::from("/project-a")],
                 "retained thread A's stored path must not be updated while the project is via collab"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_thread_group_metadata_round_trips_through_db(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let group_id = ThreadGroupId::new();
+        let parent_id = ThreadId::new();
+        let root_id = ThreadId::new();
+        let worktree_id: SharedString = "worktree:42".into();
+
+        let mut metadata = make_metadata("group-session", "Group Root", Utc::now(), PathList::default());
+        metadata.group_id = Some(group_id);
+        metadata.parent_thread_id = Some(parent_id);
+        metadata.worktree_id = Some(worktree_id.clone());
+        metadata.root_thread_id = Some(root_id);
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(metadata.clone(), cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            let retrieved = store
+                .entry(metadata.thread_id)
+                .expect("saved thread should be retrieved");
+            assert_eq!(retrieved.group_id, Some(group_id));
+            assert_eq!(retrieved.parent_thread_id, Some(parent_id));
+            assert_eq!(retrieved.worktree_id, Some(worktree_id));
+            assert_eq!(retrieved.root_thread_id, Some(root_id));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_thread_group_metadata_queries_and_hierarchy(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let group_id = ThreadGroupId::new();
+        let root_thread_id = ThreadId::new();
+        let child_1_id = ThreadId::new();
+        let child_2_id = ThreadId::new();
+        let worktree_id: SharedString = "worktree:100".into();
+
+        let mut root_thread = make_metadata("session-root", "Root Thread", Utc::now(), PathList::default());
+        root_thread.thread_id = root_thread_id;
+        root_thread.group_id = Some(group_id);
+        root_thread.parent_thread_id = None;
+        root_thread.worktree_id = Some(worktree_id.clone());
+        root_thread.root_thread_id = Some(root_thread_id);
+
+        let mut child_1 = make_metadata("session-child-1", "Child 1", Utc::now(), PathList::default());
+        child_1.thread_id = child_1_id;
+        child_1.group_id = Some(group_id);
+        child_1.parent_thread_id = Some(root_thread_id);
+        child_1.worktree_id = Some(worktree_id.clone());
+        child_1.root_thread_id = Some(root_thread_id);
+
+        let mut child_2 = make_metadata("session-child-2", "Child 2", Utc::now(), PathList::default());
+        child_2.thread_id = child_2_id;
+        child_2.group_id = Some(group_id);
+        child_2.parent_thread_id = Some(child_1_id);
+        child_2.worktree_id = Some(worktree_id.clone());
+        child_2.root_thread_id = Some(root_thread_id);
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(root_thread.clone(), cx);
+                store.save(child_1.clone(), cx);
+                store.save(child_2.clone(), cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            let group_meta = store
+                .group_metadata(group_id)
+                .expect("group metadata should exist");
+            assert_eq!(group_meta.group_id, group_id);
+            assert_eq!(group_meta.root_thread_id, Some(root_thread_id));
+            assert_eq!(group_meta.root_worktree_id, Some(worktree_id));
+            assert_eq!(group_meta.root_thread.as_ref().map(|t| t.thread_id), Some(root_thread_id));
+            assert_eq!(group_meta.child_threads.len(), 2);
+
+            let root = store.root_thread_for_group(group_id);
+            assert_eq!(root.map(|t| t.thread_id), Some(root_thread_id));
+
+            let children = store.child_threads_for_group(group_id);
+            assert_eq!(children.len(), 2);
+
+            let entries: Vec<_> = store.entries_for_group(group_id).collect();
+            assert_eq!(entries.len(), 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_delete_thread_and_descendants(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let group_id = ThreadGroupId::new();
+        let parent_id = ThreadId::new();
+        let child_id = ThreadId::new();
+
+        let mut parent = make_metadata("session-p", "Parent", Utc::now(), PathList::default());
+        parent.thread_id = parent_id;
+        parent.group_id = Some(group_id);
+
+        let mut child = make_metadata("session-c", "Child", Utc::now(), PathList::default());
+        child.thread_id = child_id;
+        child.group_id = Some(group_id);
+        child.parent_thread_id = Some(parent_id);
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(parent, cx);
+                store.save(child, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.delete_thread_and_descendants(parent_id, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            assert!(store.entry(parent_id).is_none());
+            assert!(store.entry(child_id).is_none());
+            assert!(store.group_metadata(group_id).is_none());
         });
     }
 }

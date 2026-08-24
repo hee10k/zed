@@ -4672,6 +4672,10 @@ pub(crate) mod tests {
                         remote_connection: None,
                         archived: false,
                         user_order: None,
+                        group_id: None,
+                        parent_thread_id: None,
+                        worktree_id: None,
+                        root_thread_id: None,
                     },
                     cx,
                 );

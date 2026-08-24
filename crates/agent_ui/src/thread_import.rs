@@ -883,6 +883,10 @@ fn collect_importable_threads(
                 remote_connection: remote_connection.clone(),
                 archived: true,
                 user_order: None,
+                group_id: None,
+                parent_thread_id: None,
+                worktree_id: None,
+                root_thread_id: None,
             });
         }
     }
