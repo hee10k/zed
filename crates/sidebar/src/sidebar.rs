@@ -484,6 +484,34 @@ struct SidebarContents {
     project_header_indices: Vec<usize>,
     has_open_projects: bool,
 }
+/// Drop boundary for a sidebar row. `Before` and `After` are kept explicit so
+/// hit testing and persistence do not depend on an implicit row convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropPosition {
+    Before,
+    After,
+}
+
+fn insertion_index(row_index: usize, position: DropPosition, row_count: usize) -> Option<usize> {
+    let index = match position {
+        DropPosition::Before => row_index,
+        DropPosition::After => row_index.saturating_add(1),
+    };
+    (index <= row_count).then_some(index)
+}
+
+#[cfg(test)]
+mod drag_position_tests {
+    use super::{DropPosition, insertion_index};
+
+    #[test]
+    fn computes_before_and_after_boundaries() {
+        assert_eq!(insertion_index(0, DropPosition::Before, 3), Some(0));
+        assert_eq!(insertion_index(0, DropPosition::After, 3), Some(1));
+        assert_eq!(insertion_index(2, DropPosition::After, 3), Some(3));
+        assert_eq!(insertion_index(3, DropPosition::After, 3), None);
+    }
+}
 
 /// Payload carried on a drag of a sidebar row, used to reorder entries within
 /// a project group. Retains the entry identity plus its group so a drop into
@@ -2397,7 +2425,10 @@ impl Sidebar {
                             .as_ref()
                             .is_some_and(|target| target.project_group_key() == dragged.project_group_key());
                         if same_group {
-                            style.bg(cx.theme().colors().ghost_element_hover)
+                            style
+                                .bg(cx.theme().colors().ghost_element_hover)
+                                .border_b_1()
+                                .border_color(cx.theme().colors().border)
                         } else {
                             style
                         }
@@ -2405,7 +2436,7 @@ impl Sidebar {
                 })
                 .on_drop(
                     cx.listener(move |this, dragged: &DraggedSidebarEntry, _window, cx| {
-                        this.reorder_entries(dragged, ix, cx);
+                        this.reorder_entries(dragged, ix, DropPosition::After, cx);
                     }),
                 )
                 .child(rendered)
@@ -6061,6 +6092,7 @@ impl Sidebar {
         &mut self,
         dragged: &DraggedSidebarEntry,
         drop_row_ix: usize,
+        position: DropPosition,
         cx: &mut Context<Self>,
     ) {
         let project_group_key = match dragged {
@@ -6111,11 +6143,11 @@ impl Sidebar {
             .enumerate()
             .collect();
 
-        // Compute the target position within the group (0-based row index).
-        let normalized_drop = drop_row_ix - header_ix - 1;
-        if normalized_drop >= rows.len() {
+        // Compute the target boundary within the group (0-based).
+        let row_index = drop_row_ix - header_ix - 1;
+        let Some(normalized_drop) = insertion_index(row_index, position, rows.len()) else {
             return;
-        }
+        };
 
         // Keep only the rows that are still present (drop target must be a row).
         let mut ordered = rows
