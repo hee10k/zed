@@ -200,6 +200,15 @@ fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshol
         }
     }
 }
+fn default_terminal_resume_commands() -> IndexMap<String, String> {
+    let mut commands = IndexMap::default();
+    commands.insert(
+        "omp".to_string(),
+        "omp --resume {locator}".to_string(),
+    );
+    commands
+}
+
 
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct AgentSettings {
@@ -234,6 +243,7 @@ pub struct AgentSettings {
     pub expand_edit_card: bool,
     pub expand_terminal_card: bool,
     pub terminal_init_command: Option<String>,
+    pub terminal_resume_commands: IndexMap<String, String>,
     pub thinking_display: ThinkingBlockDisplay,
     pub cancel_generation_on_terminal_stop: bool,
     pub use_modifier_to_send: bool,
@@ -811,6 +821,9 @@ impl Settings for AgentSettings {
             terminal_init_command: agent
                 .terminal_init_command
                 .filter(|command| !command.trim().is_empty()),
+            terminal_resume_commands: agent
+                .terminal_resume_commands
+                .unwrap_or_else(default_terminal_resume_commands),
             thinking_display: agent.thinking_display.unwrap(),
             cancel_generation_on_terminal_stop: agent.cancel_generation_on_terminal_stop.unwrap(),
             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
@@ -1110,6 +1123,63 @@ mod tests {
             AgentSettings::get_global(cx)
                 .terminal_init_command
                 .is_none()
+        );
+    }
+
+    #[gpui::test]
+    fn test_terminal_resume_commands_defaults_overrides_and_invalid_empty_template(
+        cx: &mut gpui::App,
+    ) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        let settings = AgentSettings::get_global(cx);
+        assert_eq!(
+            settings.terminal_resume_commands.get("omp").map(String::as_str),
+            Some("omp --resume {locator}")
+        );
+        assert_eq!(settings.terminal_resume_commands.len(), 1);
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "agent": { "terminal_resume_commands": {
+                        "omp": "omp --continue {locator}",
+                        "claude": "claude --resume {locator}"
+                    } } }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+        let settings = AgentSettings::get_global(cx);
+        assert_eq!(
+            settings.terminal_resume_commands.get("omp").map(String::as_str),
+            Some("omp --continue {locator}")
+        );
+        assert_eq!(
+            settings
+                .terminal_resume_commands
+                .get("claude")
+                .map(String::as_str),
+            Some("claude --resume {locator}")
+        );
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "agent": { "terminal_resume_commands": { "omp": "" } } }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            AgentSettings::get_global(cx)
+                .terminal_resume_commands
+                .get("omp")
+                .map(String::as_str),
+            Some("")
         );
     }
 

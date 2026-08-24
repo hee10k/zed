@@ -26,6 +26,7 @@ mod model_selector_popover;
 mod profile_selector;
 mod terminal_codegen;
 mod terminal_inline_assistant;
+pub mod terminal_resume;
 pub mod terminal_thread_metadata_store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
