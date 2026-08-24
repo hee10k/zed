@@ -870,24 +870,22 @@ fn collect_importable_threads(
             let Some(folder_paths) = session.work_dirs else {
                 continue;
             };
-            to_insert.push(ThreadMetadata {
-                thread_id: ThreadId::new(),
-                session_id: Some(session.session_id),
-                agent_id: agent_id.clone(),
-                title: session.title,
-                title_override: None,
-                updated_at: session.updated_at.unwrap_or_else(|| Utc::now()),
-                created_at: session.created_at,
-                interacted_at: None,
-                worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
-                remote_connection: remote_connection.clone(),
-                archived: true,
-                user_order: None,
-                group_id: None,
-                parent_thread_id: None,
-                worktree_id: None,
-                root_thread_id: None,
-            });
+            to_insert.push(ThreadMetadata { thread_id: ThreadId::new(),
+            session_id: Some(session.session_id),
+            agent_id: agent_id.clone(),
+            title: session.title,
+            title_override: None,
+            updated_at: session.updated_at.unwrap_or_else(|| Utc::now()),
+            created_at: session.created_at,
+            interacted_at: None,
+            worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
+            remote_connection: remote_connection.clone(),
+            archived: true,
+            user_order: None,
+            group_id: None,
+            parent_thread_id: None,
+            worktree_id: None,
+            root_thread_id: None, last_activity_at: None, activity_status: Default::default() });
         }
     }
     to_insert

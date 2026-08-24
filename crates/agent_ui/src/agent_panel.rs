@@ -18,7 +18,9 @@ use agent_settings::UserAgentsMd;
 use collections::HashSet;
 use db::kvp::{Dismissable, KeyValueStore};
 use itertools::Itertools;
-use remote::remote_connection_identity;
+use remote::{
+    RemoteConnectionOptions, remote_connection_identity, same_remote_connection_identity,
+};
 use project::{AgentId, ProjectItem, WorktreeId};
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +45,10 @@ use crate::terminal_thread_metadata_store::{
     SessionBoundary, TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore,
     compose_terminal_thread_title, terminal_title_without_prefix,
 };
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::thread_metadata_store::{
+    ActivityStatus, ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent,
+};
+use crate::terminal_resume::{build_resume_command, resume_comment};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
@@ -117,6 +122,36 @@ const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn terminal_matches_restored_workspace(
+    workspace_id: WorkspaceId,
+    candidate_worktree_paths: &project::WorktreePaths,
+    candidate_remote_connection: Option<&RemoteConnectionOptions>,
+    restored_worktree_paths: &project::WorktreePaths,
+    restored_remote_connection: Option<&RemoteConnectionOptions>,
+) -> bool {
+    let _ = workspace_id;
+    candidate_worktree_paths == restored_worktree_paths
+        && same_remote_connection_identity(
+            candidate_remote_connection,
+            restored_remote_connection,
+        )
+}
+
+async fn terminal_worktrees_exist(
+    fs: Arc<dyn Fs>,
+    worktree_paths: &project::WorktreePaths,
+) -> bool {
+    if worktree_paths.is_empty() {
+        return false;
+    }
+    for folder_path in worktree_paths.folder_path_list().ordered_paths() {
+        if !fs.is_dir(folder_path).await {
+            return false;
+        }
+    }
+    true
+}
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "agent", // Unfortunately, both Cursor cli + grok
     "agy",
@@ -1358,6 +1393,15 @@ impl AgentPanel {
             let has_open_project = workspace
                 .read_with(cx, |workspace, cx| !workspace.root_paths(cx).is_empty())
                 .unwrap_or(false);
+            let restored_project_identity = workspace
+                .read_with(cx, |workspace, cx| {
+                    let project = workspace.project().read(cx);
+                    (
+                        project.worktree_paths(cx),
+                        project.remote_connection_options(cx),
+                    )
+                })
+                .ok();
             let terminal_id_to_restore = if has_open_project {
                 serialized_panel
                     .as_ref()
@@ -1383,11 +1427,45 @@ impl AgentPanel {
                 }) {
                     Ok(Some((store, reload_task))) => {
                         reload_task.await;
-                        match store
-                            .read_with(cx, |store, _cx| store.entry(terminal_id).cloned())
-                        {
-                            Some(metadata) => Some(metadata),
-                            None => {
+                        let metadata = store
+                            .read_with(cx, |store, _cx| store.entry(terminal_id).cloned());
+                        match (workspace_id, restored_project_identity.as_ref(), metadata) {
+                            (Some(workspace_id), Some((worktree_paths, remote_connection)), Some(metadata))
+                                if metadata.restore_on_workspace_open
+                                    && terminal_matches_restored_workspace(
+                                        workspace_id,
+                                        &metadata.worktree_paths,
+                                        metadata.remote_connection.as_ref(),
+                                        worktree_paths,
+                                        remote_connection.as_ref(),
+                                    ) =>
+                            {
+                                let fs = workspace
+                                    .read_with(cx, |workspace, _| workspace.app_state().fs.clone())
+                                    .ok();
+                                let worktree_exists = if remote_connection.is_some() {
+                                    true
+                                } else if let Some(fs) = fs {
+                                    terminal_worktrees_exist(fs, &metadata.worktree_paths).await
+                                } else {
+                                    false
+                                };
+                                if worktree_exists {
+                                    Some(metadata)
+                                } else {
+                                    log::info!(
+                                        "last active terminal worktree is unavailable, skipping restoration"
+                                    );
+                                    None
+                                }
+                            }
+                            (_, _, Some(_)) => {
+                                log::info!(
+                                    "last active terminal does not match the restored workspace, skipping restoration"
+                                );
+                                None
+                            }
+                            (_, _, None) => {
                                 log::info!(
                                     "last active terminal is missing, skipping restoration"
                                 );
@@ -1625,6 +1703,9 @@ impl AgentPanel {
     }
 
     fn remove_worktree_lifecycle(&mut self, worktree_id: WorktreeId, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.workspace_id else {
+            return;
+        };
         let cached_key = self.worktree_lifecycle_keys.remove(&worktree_id);
         let Some(worktree) = self.worktree_lifecycle_worktrees.remove(&worktree_id) else {
             log::warn!(
@@ -1649,8 +1730,11 @@ impl AgentPanel {
                     }
                 },
             };
-            if let Err(error) = coordinator.mark_worktree_closing(&key).await {
-                log::error!("marking removed worktree lifecycle record closing: {error:#}");
+            if let Err(error) = coordinator
+                .release_worktree_owner(&key, workspace_id)
+                .await
+            {
+                log::error!("releasing removed worktree lifecycle owner: {error:#}");
             }
         }));
     }
@@ -1659,6 +1743,40 @@ impl AgentPanel {
         worktree_id: WorktreeId,
     ) -> Option<WorktreeLifecycleKey> {
         self.worktree_lifecycle_keys.get(&worktree_id).cloned()
+    }
+
+    pub(crate) fn confirm_worktree_lifecycle_deletion(
+        &mut self,
+        key: WorktreeLifecycleKey,
+        worktree_path: PathBuf,
+        remote_connection: Option<RemoteConnectionOptions>,
+        cx: &mut Context<Self>,
+    ) {
+        let coordinator = self.worktree_lifecycle.clone();
+        let previous_task = self._worktree_lifecycle_task.take();
+        let terminal_store = TerminalThreadMetadataStore::try_global(cx);
+        self._worktree_lifecycle_task = Some(cx.spawn(async move |_this, mut cx| {
+            if let Some(previous_task) = previous_task {
+                previous_task.await;
+            }
+            if let Err(error) = coordinator.mark_worktree_closing(&key).await {
+                log::error!("marking confirmed worktree lifecycle record closing: {error:#}");
+                return;
+            }
+            if let Some(store) = terminal_store {
+                store
+                    .update(&mut cx.clone(), |store, cx| {
+                        store.remove_worktree_path(
+                            &worktree_path,
+                            remote_connection.as_ref(),
+                            cx,
+                        );
+                    });
+            }
+            if let Err(error) = coordinator.remove_worktree(&key).await {
+                log::error!("removing confirmed worktree lifecycle record: {error:#}");
+            }
+        }));
     }
 
     pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -1747,7 +1865,7 @@ impl AgentPanel {
                         if let Some(previous_task) = previous_task {
                             previous_task.await;
                         }
-                        if let Err(error) = coordinator.mark_workspace_closing(workspace_id).await {
+                        if let Err(error) = coordinator.flush_workspace(workspace_id).await {
                             log::error!(
                                 "flushing worktree lifecycle records during AgentPanel release: {error:#}"
                             );
@@ -2226,6 +2344,7 @@ impl AgentPanel {
             true,
             false,
             Some(("omp".into(), locator)),
+            None,
             AgentThreadSource::AgentPanel,
             window,
             cx,
@@ -2297,6 +2416,7 @@ impl AgentPanel {
             focus,
             run_init_command,
             None,
+            None,
             source,
             window,
             cx,
@@ -2314,15 +2434,17 @@ impl AgentPanel {
         focus: bool,
         run_init_command: bool,
         session: Option<(SharedString, SharedString)>,
+        resume_metadata: Option<TerminalThreadMetadata>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let terminal_working_directory = working_directory.clone();
-        let init_command = session
-            .is_none()
-            .then(|| Self::terminal_init_command(run_init_command, cx))
-            .flatten();
+        let init_command = if session.is_none() && resume_metadata.is_none() {
+            Self::terminal_init_command(run_init_command, cx)
+        } else {
+            None
+        };
         let session_locator = session.as_ref().map(|(_, locator)| locator.clone());
         let terminal_task = self.project.update(cx, |project, cx| {
             project.create_terminal_shell(working_directory, cx)
@@ -2391,13 +2513,79 @@ impl AgentPanel {
                     init_command
                 };
                 Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
+                if let Some(metadata) = resume_metadata {
+                    Self::restore_terminal_resume_comment(
+                        &metadata,
+                        terminal_for_init_command,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
+                }
             })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
     }
 
+    pub fn restore_terminal_resume_comment(
+        metadata: &TerminalThreadMetadata,
+        terminal: Entity<terminal::Terminal>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let (Some(harness), Some(locator)) = (
+            metadata.harness.as_deref(),
+            metadata.resume_locator.as_deref(),
+        ) else {
+            return Task::ready(Ok(()));
+        };
+        let command = match build_resume_command(
+            harness,
+            locator,
+            &AgentSettings::get_global(cx).terminal_resume_commands,
+        )
+        .and_then(|command| resume_comment(&command))
+        .and_then(|comment| {
+            anyhow::ensure!(
+                comment.starts_with("# omp --resume "),
+                "resume comment must begin with '# omp --resume '"
+            );
+            Ok(comment)
+        })
+        {
+            Ok(comment) => comment,
+            Err(error) => return Task::ready(Err(error)),
+        };
 
+        if !terminal.read(cx).is_pty() {
+            terminal.update(cx, |terminal, _| {
+                terminal.write_init_command(command.into_bytes())
+            });
+            return Task::ready(Ok(()));
+        }
+
+        let startup = terminal.update(cx, |terminal, _| {
+            terminal.start_init_command_startup_handshake()
+        });
+        let terminal = terminal.downgrade();
+        cx.spawn(async move |_this, cx| {
+            let timeout = cx
+                .background_executor()
+                .timer(TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT);
+            futures::select_biased! {
+                _ = startup.fuse() => {}
+                _ = timeout.fuse() => {}
+            }
+
+            terminal.update(cx, move |terminal, cx| {
+                if !terminal.write_init_command_after_startup(command.into_bytes(), cx) {
+                    log::debug!(
+                        "skipping terminal resume comment because the terminal is no longer eligible"
+                    );
+                }
+            })?;
+            Ok(())
+        })
+    }
 
     fn terminal_init_command(run_init_command: bool, cx: &App) -> Option<String> {
         run_init_command
@@ -2508,7 +2696,10 @@ impl AgentPanel {
                     // deterministic transitions elsewhere.
                     this.schedule_terminal_status_inference(terminal_id, cx);
                 }
-                TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
+                TerminalEvent::Bell => {
+                    this.record_terminal_activity(terminal_id, ActivityStatus::WaitingForUser, cx);
+                    this.mark_terminal_notification(terminal_id, window, cx);
+                }
                 TerminalEvent::CloseTerminal => {
                     this.request_close_terminal_from_terminal_event(terminal_id, cx);
                 }
@@ -2517,6 +2708,7 @@ impl AgentPanel {
                 | TerminalEvent::NewNavigationTarget(_)
                 | TerminalEvent::Open(_) => {}
                 TerminalEvent::ProcessExited => {
+                    this.record_terminal_activity(terminal_id, ActivityStatus::Completed, cx);
                     this.mark_omp_session_sleeping(terminal_id, cx);
                 }
             },
@@ -2667,6 +2859,19 @@ impl AgentPanel {
         );
     }
 
+    fn record_terminal_activity(
+        &self,
+        terminal_id: TerminalId,
+        status: ActivityStatus,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| {
+                store.record_activity(terminal_id, status, Utc::now(), cx);
+            });
+        }
+    }
+
     fn refresh_terminal_metadata(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
         if let Some(terminal) = self.terminals.get_mut(&terminal_id)
             && terminal.refresh_metadata(cx)
@@ -2676,6 +2881,13 @@ impl AgentPanel {
                 self.clear_terminal_inferred_status(terminal_id);
             }
             self.persist_terminal_metadata(terminal_id, cx);
+            let status = match deterministic {
+                TerminalAgentStatus::Running => ActivityStatus::Running,
+                TerminalAgentStatus::WaitingForUserInput => ActivityStatus::WaitingForUser,
+                TerminalAgentStatus::Completed => ActivityStatus::Completed,
+                TerminalAgentStatus::Idle => ActivityStatus::Idle,
+            };
+            self.record_terminal_activity(terminal_id, status, cx);
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
         }
@@ -2780,6 +2992,15 @@ impl AgentPanel {
                 this.update(cx, |this, cx| {
                     this.inferred_terminal_waiting.insert(terminal_id, waiting);
                     this._terminal_inference_tasks.remove(&terminal_id);
+                    this.record_terminal_activity(
+                        terminal_id,
+                        if waiting {
+                            ActivityStatus::WaitingForUser
+                        } else {
+                            ActivityStatus::Idle
+                        },
+                        cx,
+                    );
                     cx.notify();
                 })
                 .log_err();
@@ -2844,31 +3065,37 @@ impl AgentPanel {
         let project = self.project.read(cx);
         let stored_metadata = TerminalThreadMetadataStore::try_global(cx)
             .and_then(|store| store.read(cx).entry(terminal_id).cloned());
-        Some(TerminalThreadMetadata {
-            terminal_id,
-            title: terminal.terminal_title(cx),
-            custom_title: terminal.custom_title(cx),
-            created_at: terminal.created_at,
-            worktree_paths: project.worktree_paths(cx),
-            remote_connection: project.remote_connection_options(cx),
-            working_directory: terminal.working_directory.clone(),
-            user_order: stored_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.user_order),
-            harness: stored_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.harness.clone()),
-            resume_locator: stored_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.resume_locator.clone()),
-            restore_on_workspace_open: stored_metadata
-                .as_ref()
-                .map(|metadata| metadata.restore_on_workspace_open)
-                .unwrap_or(true),
-            session_boundary: stored_metadata
-                .as_ref()
-                .map(|metadata| metadata.session_boundary)
-                .unwrap_or_default(),
+        Some(TerminalThreadMetadata { terminal_id,
+        title: terminal.terminal_title(cx),
+        custom_title: terminal.custom_title(cx),
+        created_at: terminal.created_at,
+        worktree_paths: project.worktree_paths(cx),
+        remote_connection: project.remote_connection_options(cx),
+        working_directory: terminal.working_directory.clone(),
+        user_order: stored_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.user_order),
+        harness: stored_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.harness.clone()),
+        resume_locator: stored_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.resume_locator.clone()),
+        restore_on_workspace_open: stored_metadata
+            .as_ref()
+            .map(|metadata| metadata.restore_on_workspace_open)
+            .unwrap_or(true),
+        session_boundary: stored_metadata
+            .as_ref()
+            .map(|metadata| metadata.session_boundary)
+            .unwrap_or_default(),
+        last_activity_at: stored_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.last_activity_at),
+        activity_status: stored_metadata
+            .as_ref()
+            .map(|metadata| metadata.activity_status)
+            .unwrap_or_default(),
         })
     }
     pub fn register_terminal_agent_session(
@@ -2950,7 +3177,7 @@ impl AgentPanel {
         self.pending_terminal_spawn = Some(metadata.terminal_id);
         let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
         let initial_title = Self::terminal_restore_initial_title(&metadata);
-        self.spawn_terminal(
+        self.spawn_terminal_with_session(
             metadata.terminal_id,
             working_directory,
             metadata.custom_title.clone(),
@@ -2958,7 +3185,9 @@ impl AgentPanel {
             Some(metadata.created_at),
             true,
             focus,
-            true,
+            false,
+            None,
+            Some(metadata),
             source,
             window,
             cx,
@@ -7262,11 +7491,18 @@ impl AgentPanel {
             Some(metadata.created_at),
             true,
             focus,
-            true,
+            false,
             source,
             window,
             cx,
-        )
+        )?;
+        let terminal = self
+            .terminals
+            .get(&metadata.terminal_id)
+            .map(|terminal| terminal.view.read(cx).terminal().clone())
+            .ok_or_else(|| anyhow!("restored terminal {} is missing", metadata.terminal_id))?;
+        Self::restore_terminal_resume_comment(&metadata, terminal, cx).detach_and_log_err(cx);
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -8220,6 +8456,132 @@ mod tests {
     }
 
 
+    #[test]
+    fn terminal_restore_candidate_matches_canonical_worktree_and_remote_identity() {
+        let workspace_id = WorkspaceId::from_i64(7);
+        let paths = WorktreePaths::from_path_lists(
+            PathList::new(&[PathBuf::from("/repo")]),
+            PathList::new(&[PathBuf::from("/repo/feature")]),
+        )
+        .expect("parallel worktree paths should be valid");
+        let remote_a = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 1 });
+        let remote_b = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 2 });
+        assert!(terminal_matches_restored_workspace(
+            workspace_id,
+            &paths,
+            Some(&remote_a),
+            &paths,
+            Some(&remote_a),
+        ));
+        assert!(!terminal_matches_restored_workspace(
+            workspace_id,
+            &paths,
+            Some(&remote_a),
+            &paths,
+            Some(&remote_b),
+        ));
+    }
+
+    #[gpui::test]
+    async fn restored_omp_terminal_writes_exact_resume_comment(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        let metadata = TerminalThreadMetadata { terminal_id: TerminalId::new(),
+        title: "Restored OMP".into(),
+        custom_title: None,
+        created_at: Utc::now(),
+        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[
+            PathBuf::from("/project"),
+        ])),
+        remote_connection: None,
+        working_directory: Some(PathBuf::from("/project/subdirectory")),
+        user_order: None,
+        harness: Some("omp".into()),
+        resume_locator: Some("session-1".into()),
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
+        let terminal_id = metadata.terminal_id;
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.restore_test_terminal(
+                    metadata,
+                    true,
+                    AgentThreadSource::AgentPanel,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .expect("OMP terminal should restore");
+        cx.run_until_parked();
+
+        let (working_directory, terminal) = panel.read_with(&cx, |panel, cx| {
+            let terminal = panel.terminals.get(&terminal_id).expect("terminal should exist");
+            (
+                terminal.working_directory.clone(),
+                terminal.view.read(cx).terminal().clone(),
+            )
+        });
+        let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
+        assert_eq!(working_directory, Some(PathBuf::from("/project/subdirectory")));
+        assert_eq!(input_log, vec![b"# omp --resume session-1\r".to_vec()]);
+        assert!(input_log.iter().all(|input| !input.starts_with(b"omp --resume ")));
+        let boundary = cx.update(|_, cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(terminal_id)
+                .map(|metadata| metadata.session_boundary)
+        });
+        assert_eq!(boundary, Some(SessionBoundary::Sleeping));
+    }
+
+    #[gpui::test]
+    async fn restored_terminal_without_locator_writes_no_comment(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let metadata = TerminalThreadMetadata { terminal_id: TerminalId::new(),
+        title: "Fresh Shell".into(),
+        custom_title: None,
+        created_at: Utc::now(),
+        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[
+            PathBuf::from("/project"),
+        ])),
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: Some("omp".into()),
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
+        let terminal_id = metadata.terminal_id;
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.restore_test_terminal(
+                    metadata,
+                    true,
+                    AgentThreadSource::AgentPanel,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .expect("fresh terminal should restore");
+        cx.run_until_parked();
+        let terminal = panel.read_with(&cx, |panel, cx| {
+            panel.terminals[&terminal_id].view.read(cx).terminal().clone()
+        });
+        assert!(terminal.update(&mut cx, |terminal, _| terminal.take_input_log()).is_empty());
+    }
+
+    #[gpui::test]
+    async fn missing_worktree_is_not_eligible_for_terminal_restore(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let paths = WorktreePaths::from_folder_paths(&PathList::new(&[
+            PathBuf::from("/missing"),
+        ]));
+        assert!(!terminal_worktrees_exist(fs, &paths).await);
+    }
+
     #[gpui::test]
     async fn test_terminal_restore_working_directory_does_not_read_leased_workspace(
         cx: &mut TestAppContext,
@@ -8268,20 +8630,18 @@ mod tests {
             None
         );
 
-        let metadata = TerminalThreadMetadata {
-            terminal_id: TerminalId::new(),
-            title: "Dev Server".into(),
-            custom_title: None,
-            created_at: Utc::now(),
-            worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
-            remote_connection: None,
-            working_directory: None,
-            user_order: None,
-            harness: None,
-            resume_locator: None,
-            restore_on_workspace_open: true,
-            session_boundary: SessionBoundary::Sleeping,
-        };
+        let metadata = TerminalThreadMetadata { terminal_id: TerminalId::new(),
+        title: "Dev Server".into(),
+        custom_title: None,
+        created_at: Utc::now(),
+        worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
         assert_eq!(metadata.working_directory, None);
 
         let working_directory = workspace.update_in(cx, |workspace, _window, cx| {
@@ -8347,30 +8707,28 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_restored_terminal_runs_init_command_once(cx: &mut TestAppContext) {
+    async fn test_restored_terminal_does_not_run_legacy_init_command(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         cx.update(|_, cx| {
             let mut settings = AgentSettings::get_global(cx).clone();
-            settings.terminal_init_command = Some(" claude --resume ".to_string());
+            settings.terminal_init_command = Some("claude --resume".to_string());
             AgentSettings::override_global(settings, cx);
         });
 
-        let metadata = TerminalThreadMetadata {
-            terminal_id: TerminalId::new(),
-            title: "Restored Terminal".into(),
-            custom_title: None,
-            created_at: Utc::now(),
-            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
-                "/project",
-            )])),
-            remote_connection: None,
-            working_directory: None,
-            user_order: None,
-            harness: None,
-            resume_locator: None,
-            restore_on_workspace_open: true,
-            session_boundary: SessionBoundary::Sleeping,
-        };
+        let metadata = TerminalThreadMetadata { terminal_id: TerminalId::new(),
+        title: "Restored Terminal".into(),
+        custom_title: None,
+        created_at: Utc::now(),
+        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+            "/project",
+        )])),
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
         let terminal_id = metadata.terminal_id;
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -8397,13 +8755,11 @@ mod tests {
                 .clone()
         });
         let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
-        assert_eq!(input_log, vec![b" claude --resume \r".to_vec()]);
         assert!(
-            !terminal.read_with(&cx, |terminal, _| terminal.keyboard_input_sent()),
-            "writing the init command must not mark the terminal as having received \
-             user keyboard input, otherwise a shell that fails to spawn would be \
-             auto-closed before the user can see the error"
+            input_log.is_empty(),
+            "restoration must not run the legacy terminal init command, got {input_log:?}"
         );
+        assert!(!terminal.read_with(&cx, |terminal, _| terminal.keyboard_input_sent()));
 
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -8539,22 +8895,20 @@ mod tests {
             );
         });
 
-        let metadata = TerminalThreadMetadata {
-            terminal_id: TerminalId::new(),
-            title: "Restored Terminal".into(),
-            custom_title: None,
-            created_at: Utc::now(),
-            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
-                "/project",
-            )])),
-            remote_connection: None,
-            working_directory: None,
-            user_order: None,
-            harness: None,
-            resume_locator: None,
-            restore_on_workspace_open: true,
-            session_boundary: SessionBoundary::Sleeping,
-        };
+        let metadata = TerminalThreadMetadata { terminal_id: TerminalId::new(),
+        title: "Restored Terminal".into(),
+        custom_title: None,
+        created_at: Utc::now(),
+        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+            "/project",
+        )])),
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
         panel
             .update_in(&mut cx, |panel, window, cx| {
                 panel.restore_test_terminal(
@@ -8760,20 +9114,22 @@ mod tests {
         cx.update(|_window, cx| {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(
-                    ThreadMetadata {
-                        thread_id: ThreadId::new(),
-                        session_id: Some(resume_session_id.clone()),
-                        agent_id: ProjectAgentId::new("Flaky"),
-                        title: Some("Persistent chat".into()),
-                        title_override: None,
-                        updated_at: Utc::now(),
-                        created_at: Some(Utc::now()),
-                        interacted_at: None,
-                        worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
-                        remote_connection: None,
-                        archived: false,
-                        user_order: None,
-                    },
+                    ThreadMetadata { thread_id: ThreadId::new(),
+                    session_id: Some(resume_session_id.clone()),
+                    agent_id: ProjectAgentId::new("Flaky"),
+                    title: Some("Persistent chat".into()),
+                    title_override: None,
+                    updated_at: Utc::now(),
+                    created_at: Some(Utc::now()),
+                    interacted_at: None,
+                    worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
+                    remote_connection: None,
+                    archived: false,
+                    user_order: None,
+                    group_id: None,
+                    parent_thread_id: None,
+                    worktree_id: None,
+                    root_thread_id: None, last_activity_at: None, activity_status: Default::default() },
                     cx,
                 );
             });
@@ -10508,22 +10864,20 @@ mod tests {
         let (panel, mut cx) = setup_panel(cx).await;
         let terminal_id = TerminalId::new();
         let now = Utc::now();
-        let metadata = TerminalThreadMetadata {
-            terminal_id,
-            title: "Persisted Shell Title".into(),
-            custom_title: None,
-            created_at: now,
-            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
-                "/project",
-            )])),
-            remote_connection: None,
-            working_directory: None,
-            user_order: None,
-            harness: None,
-            resume_locator: None,
-            restore_on_workspace_open: true,
-            session_boundary: SessionBoundary::Sleeping,
-        };
+        let metadata = TerminalThreadMetadata { terminal_id,
+        title: "Persisted Shell Title".into(),
+        custom_title: None,
+        created_at: now,
+        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+            "/project",
+        )])),
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
 
         panel.update_in(&mut cx, |panel, window, cx| {
             panel
@@ -10564,22 +10918,20 @@ mod tests {
         let (panel, mut cx) = setup_panel(cx).await;
         let terminal_id = TerminalId::new();
         let now = Utc::now();
-        let metadata = TerminalThreadMetadata {
-            terminal_id,
-            title: "Persisted Shell Title".into(),
-            custom_title: None,
-            created_at: now,
-            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
-                "/project",
-            )])),
-            remote_connection: None,
-            working_directory: None,
-            user_order: None,
-            harness: None,
-            resume_locator: None,
-            restore_on_workspace_open: true,
-            session_boundary: SessionBoundary::Sleeping,
-        };
+        let metadata = TerminalThreadMetadata { terminal_id,
+        title: "Persisted Shell Title".into(),
+        custom_title: None,
+        created_at: now,
+        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+            "/project",
+        )])),
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
 
         panel.update_in(&mut cx, |panel, window, cx| {
             panel

@@ -17,7 +17,10 @@ use ui::{App, Context, SharedString};
 use util::ResultExt as _;
 use workspace::PathList;
 
-use crate::{TerminalId, thread_metadata_store::WorktreePaths};
+use crate::{
+    TerminalId,
+    thread_metadata_store::{ActivityStatus, WorktreePaths},
+};
 
 pub fn init(cx: &mut App) {
     TerminalThreadMetadataStore::init_global(cx);
@@ -88,6 +91,8 @@ pub struct TerminalThreadMetadata {
     pub resume_locator: Option<SharedString>,
     pub restore_on_workspace_open: bool,
     pub session_boundary: SessionBoundary,
+    pub last_activity_at: Option<DateTime<Utc>>,
+    pub activity_status: ActivityStatus,
 }
 
 impl TerminalThreadMetadata {
@@ -332,6 +337,29 @@ impl TerminalThreadMetadataStore {
         self.save_internal(metadata);
         cx.notify();
     }
+    pub fn record_activity(
+        &mut self,
+        terminal_id: TerminalId,
+        status: ActivityStatus,
+        at: DateTime<Utc>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut terminal) = self.terminals.get(&terminal_id).cloned() else {
+            return;
+        };
+        let timestamp_changed = terminal
+            .last_activity_at
+            .map(|previous| at.signed_duration_since(previous).num_milliseconds() >= 500)
+            .unwrap_or(true);
+        if terminal.activity_status == status && !timestamp_changed {
+            return;
+        }
+        terminal.last_activity_at = Some(at);
+        terminal.activity_status = status;
+        self.save_internal(terminal);
+        cx.notify();
+    }
+
 
     pub fn update_session_metadata(
         &mut self,
@@ -616,6 +644,14 @@ impl Domain for TerminalThreadMetadataDbV2 {
             ALTER TABLE sidebar_terminal_threads_v2
             ADD COLUMN session_boundary TEXT NOT NULL DEFAULT "sleeping"
         ),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads_v2
+            ADD COLUMN last_activity_at TEXT
+        ),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads_v2
+            ADD COLUMN activity_status TEXT NOT NULL DEFAULT "idle"
+        ),
     ];
 }
 
@@ -627,7 +663,8 @@ impl TerminalThreadMetadataDbV2 {
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
             main_worktree_paths_order, remote_connection, user_order, harness, \
-            resume_locator, restore_on_workspace_open, session_boundary \
+            resume_locator, restore_on_workspace_open, session_boundary, \
+            last_activity_at, activity_status \
             FROM sidebar_terminal_threads_v2 \
             ORDER BY created_at DESC",
         )?()
@@ -666,10 +703,12 @@ impl TerminalThreadMetadataDbV2 {
         let resume_locator = row.resume_locator.as_ref().map(ToString::to_string);
         let restore_on_workspace_open = row.restore_on_workspace_open;
         let session_boundary = row.session_boundary.as_str().to_owned();
+        let last_activity_at = row.last_activity_at.map(|dt| dt.to_rfc3339());
+        let activity_status = row.activity_status.as_str();
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads_v2(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, user_order, harness, resume_locator, restore_on_workspace_open, session_boundary) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+            let sql = "INSERT INTO sidebar_terminal_threads_v2(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, user_order, harness, resume_locator, restore_on_workspace_open, session_boundary, last_activity_at, activity_status) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -684,7 +723,9 @@ impl TerminalThreadMetadataDbV2 {
                            harness = excluded.harness, \
                            resume_locator = excluded.resume_locator, \
                            restore_on_workspace_open = excluded.restore_on_workspace_open, \
-                           session_boundary = excluded.session_boundary";
+                           session_boundary = excluded.session_boundary, \
+                           last_activity_at = excluded.last_activity_at, \
+                           activity_status = excluded.activity_status";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -700,7 +741,9 @@ impl TerminalThreadMetadataDbV2 {
             i = stmt.bind(&harness, i)?;
             i = stmt.bind(&resume_locator, i)?;
             i = stmt.bind(&restore_on_workspace_open, i)?;
-            stmt.bind(&session_boundary, i)?;
+            i = stmt.bind(&session_boundary, i)?;
+            i = stmt.bind(&last_activity_at, i)?;
+            stmt.bind(&activity_status, i)?;
             stmt.exec()
         })
         .await
@@ -742,6 +785,10 @@ impl Column for TerminalThreadMetadata {
         let (restore_on_workspace_open, next): (Option<bool>, i32) =
             Column::column(statement, next)?;
         let (session_boundary, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (last_activity_at_str, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
+        let (activity_status_str, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -778,26 +825,40 @@ impl Column for TerminalThreadMetadata {
                 })
             })
             .unwrap_or_default();
+        let last_activity_at = last_activity_at_str
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()?
+            .map(|dt| dt.with_timezone(&Utc));
+        let activity_status = ActivityStatus::from_db_str(
+            activity_status_str.as_deref().unwrap_or("idle"),
+        );
+        let activity_status = if activity_status == ActivityStatus::Running {
+            ActivityStatus::Idle
+        } else {
+            activity_status
+        };
         let restore_on_workspace_open = restore_on_workspace_open.unwrap_or(true);
 
         Ok((
-            TerminalThreadMetadata {
-                terminal_id: TerminalId::from_key_string(&terminal_id)?,
-                title: SharedString::from(title),
-                custom_title: custom_title
-                    .filter(|title| !title.trim().is_empty())
-                    .map(SharedString::from),
-                created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
-                worktree_paths,
-                remote_connection,
-                working_directory: working_directory.map(PathBuf::from),
-                user_order,
-                harness: harness.map(SharedString::from),
-                resume_locator: resume_locator.map(SharedString::from),
-                restore_on_workspace_open,
-                session_boundary,
-            },
-            next,
+            TerminalThreadMetadata { terminal_id: TerminalId::from_key_string(&terminal_id)?,
+            title: SharedString::from(title),
+            custom_title: custom_title
+                .filter(|title| !title.trim().is_empty())
+                .map(SharedString::from),
+            created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+            worktree_paths,
+            remote_connection,
+            working_directory: working_directory.map(PathBuf::from),
+            user_order,
+            harness: harness.map(SharedString::from),
+            resume_locator: resume_locator.map(SharedString::from),
+            restore_on_workspace_open,
+            session_boundary,
+            last_activity_at,
+            activity_status,
+        },
+        next,
         ))
     }
 }
@@ -817,20 +878,18 @@ mod tests {
 
     fn metadata(title: &str, worktree_paths: WorktreePaths) -> TerminalThreadMetadata {
         let now = Utc::now();
-        TerminalThreadMetadata {
-            terminal_id: TerminalId::new(),
-            title: SharedString::from(title.to_string()),
-            custom_title: None,
-            created_at: now,
-            worktree_paths,
-            remote_connection: None,
-            working_directory: None,
-            user_order: None,
-            harness: None,
-            resume_locator: None,
-            restore_on_workspace_open: true,
-            session_boundary: SessionBoundary::Sleeping,
-        }
+        TerminalThreadMetadata { terminal_id: TerminalId::new(),
+        title: SharedString::from(title.to_string()),
+        custom_title: None,
+        created_at: now,
+        worktree_paths,
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() }
     }
 
     #[test]

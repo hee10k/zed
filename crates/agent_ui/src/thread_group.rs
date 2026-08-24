@@ -296,26 +296,24 @@ pub fn execute_move_or_clone(
             };
 
             let new_thread_id = ThreadId::new();
-            let cloned_metadata = ThreadMetadata {
-                thread_id: new_thread_id,
-                session_id: None,
-                agent_id: source_thread.agent_id.clone(),
-                title: source_thread.title.clone(),
-                title_override: source_thread.title_override.clone(),
-                updated_at: Utc::now(),
-                created_at: Some(Utc::now()),
-                interacted_at: None,
-                worktree_paths: cloned_paths,
-                remote_connection: source_thread.remote_connection.clone(),
-                archived: false,
-                user_order: None,
-                group_id: Some(target_group_id),
-                parent_thread_id: Some(target_root.thread_id),
-                worktree_id: Some(cloned_worktree_id),
-                root_thread_id: target_root
-                    .root_thread_id
-                    .or(Some(target_root.thread_id)),
-            };
+            let cloned_metadata = ThreadMetadata { thread_id: new_thread_id,
+            session_id: None,
+            agent_id: source_thread.agent_id.clone(),
+            title: source_thread.title.clone(),
+            title_override: source_thread.title_override.clone(),
+            updated_at: Utc::now(),
+            created_at: Some(Utc::now()),
+            interacted_at: None,
+            worktree_paths: cloned_paths,
+            remote_connection: source_thread.remote_connection.clone(),
+            archived: false,
+            user_order: None,
+            group_id: Some(target_group_id),
+            parent_thread_id: Some(target_root.thread_id),
+            worktree_id: Some(cloned_worktree_id),
+            root_thread_id: target_root
+                .root_thread_id
+                .or(Some(target_root.thread_id)), last_activity_at: None, activity_status: Default::default() };
 
             store.save(cloned_metadata, cx);
 
@@ -521,6 +519,8 @@ mod tests {
             parent_thread_id: None,
             worktree_id: Some("source-wt-id".into()),
             root_thread_id: Some(source_id),
+            last_activity_at: None,
+            activity_status: Default::default(),
         };
 
         let target_root_metadata = crate::thread_metadata_store::ThreadMetadata {
@@ -540,6 +540,8 @@ mod tests {
             parent_thread_id: None,
             worktree_id: Some("target-wt-id".into()),
             root_thread_id: Some(target_root_id),
+            last_activity_at: None,
+            activity_status: Default::default(),
         };
 
         cx.update(|cx| {
@@ -672,6 +674,8 @@ mod tests {
             parent_thread_id: None,
             worktree_id: Some("source-wt-id".into()),
             root_thread_id: Some(source_id),
+            last_activity_at: None,
+            activity_status: Default::default(),
         };
 
         let target_root_metadata = crate::thread_metadata_store::ThreadMetadata {
@@ -691,6 +695,8 @@ mod tests {
             parent_thread_id: None,
             worktree_id: Some("target-wt-id".into()),
             root_thread_id: Some(target_root_id),
+            last_activity_at: None,
+            activity_status: Default::default(),
         };
 
         cx.update(|cx| {

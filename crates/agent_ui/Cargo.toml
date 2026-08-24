@@ -31,6 +31,7 @@ action_log.workspace = true
 agent-client-protocol.workspace = true
 agent.workspace = true
 async-channel.workspace = true
+async-lock.workspace = true
 agent_servers.workspace = true
 agent_settings.workspace = true
 agent_skills.workspace = true

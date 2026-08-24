@@ -156,6 +156,8 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                         parent_thread_id: None,
                         worktree_id: None,
                         root_thread_id: None,
+                        last_activity_at: None,
+                        activity_status: ActivityStatus::Idle,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -317,6 +319,42 @@ fn migrate_thread_ids(cx: &mut App) {
 struct GlobalThreadMetadataStore(Entity<ThreadMetadataStore>);
 impl Global for GlobalThreadMetadataStore {}
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ActivityStatus {
+    #[default]
+    Idle,
+    Running,
+    WaitingForUser,
+    Completed,
+    Error,
+}
+
+impl ActivityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::WaitingForUser => "waiting_for_user",
+            Self::Completed => "completed",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Self {
+        match value {
+            "running" => Self::Running,
+            "waiting_for_user" => Self::WaitingForUser,
+            "completed" => Self::Completed,
+            "error" => Self::Error,
+            _ => Self::Idle,
+        }
+    }
+
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Running | Self::WaitingForUser)
+    }
+}
+
 /// Lightweight metadata for any thread (native or ACP), enough to populate
 /// the sidebar list and route to the correct load path when clicked.
 #[derive(Debug, Clone, PartialEq)]
@@ -344,6 +382,8 @@ pub struct ThreadMetadata {
     pub parent_thread_id: Option<ThreadId>,
     pub worktree_id: Option<SharedString>,
     pub root_thread_id: Option<ThreadId>,
+    pub last_activity_at: Option<DateTime<Utc>>,
+    pub activity_status: ActivityStatus,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -886,6 +926,29 @@ impl ThreadMetadataStore {
         }
     }
 
+    pub fn record_activity(
+        &mut self,
+        thread_id: ThreadId,
+        status: ActivityStatus,
+        at: DateTime<Utc>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut thread) = self.threads.get(&thread_id).cloned() else {
+            return;
+        };
+        let timestamp_changed = thread
+            .last_activity_at
+            .map(|previous| at.signed_duration_since(previous).num_milliseconds() >= 500)
+            .unwrap_or(true);
+        if thread.activity_status == status && !timestamp_changed {
+            return;
+        }
+        thread.last_activity_at = Some(at);
+        thread.activity_status = status;
+        self.save_internal(thread);
+        cx.notify();
+    }
+
     pub fn update_interacted_at(
         &mut self,
         thread_id: &ThreadId,
@@ -895,6 +958,8 @@ impl ThreadMetadataStore {
         if let Some(thread) = self.threads.get(thread_id) {
             self.save_internal(ThreadMetadata {
                 interacted_at: Some(time),
+                last_activity_at: Some(time),
+                activity_status: ActivityStatus::Running,
                 ..thread.clone()
             });
             cx.notify();
@@ -1502,6 +1567,12 @@ impl ThreadMetadataStore {
             parent_thread_id,
             worktree_id,
             root_thread_id,
+            last_activity_at: existing_thread
+                .and_then(|thread| thread.last_activity_at)
+                .or(Some(updated_at)),
+            activity_status: existing_thread
+                .map(|thread| thread.activity_status)
+                .unwrap_or_default(),
         };
 
         self.save(metadata, cx);
@@ -1623,6 +1694,10 @@ impl Domain for ThreadMetadataDb {
             ALTER TABLE sidebar_threads ADD COLUMN worktree_id TEXT;
             ALTER TABLE sidebar_threads ADD COLUMN root_thread_id BLOB;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN last_activity_at TEXT;
+            ALTER TABLE sidebar_threads ADD COLUMN activity_status TEXT;
+        ),
     ];
 }
 
@@ -1640,13 +1715,14 @@ impl ThreadMetadataDb {
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
         main_worktree_paths_order, remote_connection, title_override, user_order, \
-        group_id, parent_thread_id, worktree_id, root_thread_id \
+        group_id, parent_thread_id, worktree_id, root_thread_id, last_activity_at, activity_status \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
     const LEGACY_LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
         main_worktree_paths_order, remote_connection, title_override, user_order, \
-        NULL AS group_id, NULL AS parent_thread_id, NULL AS worktree_id, NULL AS root_thread_id \
+        NULL AS group_id, NULL AS parent_thread_id, NULL AS worktree_id, NULL AS root_thread_id, \
+        NULL AS last_activity_at, 'idle' AS activity_status \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1704,10 +1780,12 @@ impl ThreadMetadataDb {
         let parent_thread_id = row.parent_thread_id;
         let worktree_id = row.worktree_id.as_ref().map(|id| id.to_string());
         let root_thread_id = row.root_thread_id;
+        let last_activity_at = row.last_activity_at.map(|dt| dt.to_rfc3339());
+        let activity_status = row.activity_status.as_str();
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, user_order, group_id, parent_thread_id, worktree_id, root_thread_id) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, user_order, group_id, parent_thread_id, worktree_id, root_thread_id, last_activity_at, activity_status) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1726,7 +1804,9 @@ impl ThreadMetadataDb {
                            group_id = excluded.group_id, \
                            parent_thread_id = excluded.parent_thread_id, \
                            worktree_id = excluded.worktree_id, \
-                           root_thread_id = excluded.root_thread_id";
+                           root_thread_id = excluded.root_thread_id, \
+                           last_activity_at = excluded.last_activity_at, \
+                           activity_status = excluded.activity_status";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1746,7 +1826,9 @@ impl ThreadMetadataDb {
             i = stmt.bind(&group_id, i)?;
             i = stmt.bind(&parent_thread_id, i)?;
             i = stmt.bind(&worktree_id, i)?;
-            stmt.bind(&root_thread_id, i)?;
+            i = stmt.bind(&root_thread_id, i)?;
+            i = stmt.bind(&last_activity_at, i)?;
+            stmt.bind(&activity_status, i)?;
             stmt.exec()
         })
         .await
@@ -1909,6 +1991,10 @@ impl Column for ThreadMetadata {
         let (parent_thread_id, next): (Option<ThreadId>, i32) = Column::column(statement, next)?;
         let (worktree_id, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (root_thread_id, next): (Option<ThreadId>, i32) = Column::column(statement, next)?;
+        let (last_activity_at_str, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
+        let (activity_status_str, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -1926,6 +2012,19 @@ impl Column for ThreadMetadata {
             .map(DateTime::parse_from_rfc3339)
             .transpose()?
             .map(|dt| dt.with_timezone(&Utc));
+        let last_activity_at = last_activity_at_str
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()?
+            .map(|dt| dt.with_timezone(&Utc));
+        let activity_status = ActivityStatus::from_db_str(
+            activity_status_str.as_deref().unwrap_or("idle"),
+        );
+        let activity_status = if activity_status == ActivityStatus::Running {
+            ActivityStatus::Idle
+        } else {
+            activity_status
+        };
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -1980,6 +2079,8 @@ impl Column for ThreadMetadata {
                 parent_thread_id,
                 worktree_id: worktree_id.map(SharedString::from),
                 root_thread_id,
+                last_activity_at,
+                activity_status,
             },
             next,
         ))
@@ -2075,6 +2176,8 @@ mod tests {
             parent_thread_id: None,
             worktree_id: None,
             root_thread_id: None,
+            last_activity_at: None,
+            activity_status: Default::default(),
         }
     }
 
@@ -2374,6 +2477,8 @@ mod tests {
             parent_thread_id: None,
             worktree_id: None,
             root_thread_id: None,
+            last_activity_at: None,
+            activity_status: Default::default(),
         };
 
         cx.update(|cx| {
@@ -2464,6 +2569,8 @@ mod tests {
             parent_thread_id: None,
             worktree_id: None,
             root_thread_id: None,
+            last_activity_at: None,
+            activity_status: Default::default(),
         };
 
         cx.update(|cx| {
@@ -2595,6 +2702,8 @@ mod tests {
             parent_thread_id: None,
             worktree_id: None,
             root_thread_id: None,
+            last_activity_at: None,
+            activity_status: Default::default(),
         };
 
         cx.update(|cx| {
@@ -3344,6 +3453,8 @@ mod tests {
             parent_thread_id: None,
             worktree_id: None,
             root_thread_id: None,
+            last_activity_at: None,
+            activity_status: Default::default(),
         };
 
         let remote_linked_thread = ThreadMetadata {
@@ -3363,6 +3474,8 @@ mod tests {
             parent_thread_id: None,
             worktree_id: None,
             root_thread_id: None,
+            last_activity_at: None,
+            activity_status: Default::default(),
         };
 
         cx.update(|cx| {

@@ -9,7 +9,8 @@ use agent_ui::terminal_thread_metadata_store::{
     TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
 use agent_ui::thread_metadata_store::{
-    ThreadMetadata, ThreadMetadataStore, WorktreePaths, worktree_info_from_thread_paths,
+    ActivityStatus, ThreadMetadata, ThreadMetadataStore, WorktreePaths,
+    worktree_info_from_thread_paths,
 };
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
@@ -1585,8 +1586,15 @@ impl Sidebar {
                         status: live_terminal_statuses
                             .get(&metadata.terminal_id)
                             .copied()
-                            .unwrap_or_else(|| {
-                                TerminalAgentStatus::derive(metadata.display_title().as_ref())
+                            .unwrap_or_else(|| match metadata.activity_status {
+                                ActivityStatus::Running => TerminalAgentStatus::Idle,
+                                ActivityStatus::WaitingForUser => {
+                                    TerminalAgentStatus::WaitingForUserInput
+                                }
+                                ActivityStatus::Completed => TerminalAgentStatus::Completed,
+                                ActivityStatus::Error | ActivityStatus::Idle => {
+                                    TerminalAgentStatus::Idle
+                                }
                             }),
                         metadata,
                         workspace,
@@ -5955,7 +5963,10 @@ impl Sidebar {
     }
 
     fn thread_display_time(metadata: &ThreadMetadata) -> DateTime<Utc> {
-        metadata.interacted_at.unwrap_or(metadata.updated_at)
+        metadata
+            .last_activity_at
+            .or(metadata.interacted_at)
+            .unwrap_or(metadata.updated_at)
     }
 
     /// Resolves the project group key that owns an entry's workspace.
@@ -5982,7 +5993,9 @@ impl Sidebar {
                     DateTime::<Utc>::MAX_UTC
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
-                ListEntry::Terminal(terminal) => terminal.metadata.created_at,
+                ListEntry::Terminal(terminal) => {
+                    terminal.metadata.last_activity_at.unwrap_or(terminal.metadata.created_at)
+                }
                 ListEntry::ProjectHeader { .. } => unreachable!(),
             }
         }
@@ -6948,7 +6961,12 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = ElementId::from(format!("terminal-{}", terminal.metadata.terminal_id));
-        let timestamp = format_history_entry_timestamp(terminal.metadata.created_at);
+        let timestamp = format_history_entry_timestamp(
+            terminal
+                .metadata
+                .last_activity_at
+                .unwrap_or(terminal.metadata.created_at),
+        );
         let is_hovered = self.hovered_thread_index == Some(ix);
         let color = cx.theme().colors();
         let sidebar_bg = color
@@ -6969,22 +6987,24 @@ impl Sidebar {
                 Some((icon_char, title, positions)) => (Some(icon_char), title, positions),
                 None => (None, display_title, terminal.highlight_positions.clone()),
             };
-
-        let thread_item = ThreadItem::new(id, title)
-            .base_bg(sidebar_bg)
-            .icon(IconName::Terminal)
-            .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
-            .status(match terminal.status {
+        let thread_status = if terminal.metadata.activity_status == ActivityStatus::Error {
+            AgentThreadStatus::Error
+        } else {
+            match terminal.status {
                 TerminalAgentStatus::Running => AgentThreadStatus::Running,
-                // Waiting-for-input reuses the existing monotone warning
-                // badge (ADR 0005); Idle and Completed carry no badge.
                 TerminalAgentStatus::WaitingForUserInput => {
                     AgentThreadStatus::WaitingForConfirmation
                 }
                 TerminalAgentStatus::Idle | TerminalAgentStatus::Completed => {
                     AgentThreadStatus::Completed
                 }
-            })
+            }
+        };
+        let thread_item = ThreadItem::new(id, title)
+            .base_bg(sidebar_bg)
+            .icon(IconName::Terminal)
+            .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
+            .status(thread_status)
             .is_remote(is_remote)
             .worktrees(worktrees)
             .timestamp(timestamp)

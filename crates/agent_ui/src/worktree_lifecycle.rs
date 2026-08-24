@@ -1,16 +1,23 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use anyhow::{Context as _, Result, anyhow};
+use async_lock::Mutex;
 use fs::{Fs, RemoveOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use workspace::WorkspaceId;
 
 const WORKTREE_STATE_DIRECTORY: &str = "worktree-state";
+static GLOBAL_LIFECYCLE_OPERATION_LOCK: LazyLock<Arc<Mutex<()>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(())));
+
+fn global_lifecycle_operation_lock() -> Arc<Mutex<()>> {
+    GLOBAL_LIFECYCLE_OPERATION_LOCK.clone()
+}
 const LIFECYCLE_FILE_NAME: &str = "state.json";
 
 /// Stable identity for one worktree incarnation.
@@ -51,9 +58,23 @@ impl WorktreeLifecycleKey {
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
-    pub fn stable_key(&self) -> String {
-        self.stable_name()
+    pub fn stable_key(&self) -> gpui::SharedString {
+        gpui::SharedString::from(self.stable_name())
     }
+}
+
+/// Derives a restart-stable worktree identity string suitable for `ThreadMetadata.worktree_id`.
+pub fn stable_worktree_identity(
+    repository_path: impl AsRef<Path>,
+    worktree_path: impl AsRef<Path>,
+    remote_identity: impl AsRef<str>,
+) -> gpui::SharedString {
+    WorktreeLifecycleKey::new(
+        repository_path.as_ref(),
+        worktree_path.as_ref(),
+        remote_identity.as_ref(),
+    )
+    .stable_key()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -87,6 +108,8 @@ pub struct WorktreeLifecycleRecord {
     pub key: WorktreeLifecycleKey,
     pub workspace_id: Option<WorkspaceId>,
     pub last_seen_workspace_id: Option<WorkspaceId>,
+    #[serde(default)]
+    pub workspace_ids: Vec<WorkspaceId>,
     pub root_group_id: Option<String>,
     pub derived_worktree_ids: Vec<String>,
     pub derived_thread_ids: Vec<String>,
@@ -101,6 +124,7 @@ impl WorktreeLifecycleRecord {
             key,
             workspace_id: Some(workspace_id),
             last_seen_workspace_id: Some(workspace_id),
+            workspace_ids: vec![workspace_id],
             root_group_id: None,
             derived_worktree_ids: Vec::new(),
             derived_thread_ids: Vec::new(),
@@ -114,20 +138,28 @@ impl WorktreeLifecycleRecord {
         let old_state = self.state.clone();
         let workspace_changed = self.workspace_id != Some(workspace_id)
             || self.last_seen_workspace_id != Some(workspace_id);
+        let owner_added = if self.workspace_ids.contains(&workspace_id) {
+            false
+        } else {
+            self.workspace_ids.push(workspace_id);
+            true
+        };
         self.workspace_id = Some(workspace_id);
         self.last_seen_workspace_id = Some(workspace_id);
-        if !matches!(
-            &self.state,
-            WorktreeLifecycleState::Closing | WorktreeLifecycleState::Removed
-        ) && let Some(path_exists) = path_exists
+        if !matches!(&self.state, WorktreeLifecycleState::Removed)
+            && (owner_added && self.state == WorktreeLifecycleState::Closing
+                || !matches!(&self.state, WorktreeLifecycleState::Closing)
+                    && path_exists.is_some())
         {
-            self.state = if path_exists {
+            self.state = if owner_added && path_exists.is_none() {
+                WorktreeLifecycleState::Active
+            } else if path_exists.unwrap_or(true) {
                 WorktreeLifecycleState::Active
             } else {
                 WorktreeLifecycleState::Unavailable
             };
         }
-        workspace_changed || old_state != self.state
+        workspace_changed || owner_added || old_state != self.state
     }
 }
 
@@ -356,11 +388,15 @@ pub struct WorktreeDeletionConfirmation {
 #[derive(Clone)]
 pub struct WorktreeLifecycleCoordinator {
     store: WorktreeLifecycleStore,
+    operation_lock: Arc<Mutex<()>>,
 }
 
 impl WorktreeLifecycleCoordinator {
     pub fn new(store: WorktreeLifecycleStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            operation_lock: global_lifecycle_operation_lock(),
+        }
     }
 
     pub fn store(&self) -> &WorktreeLifecycleStore {
@@ -372,6 +408,7 @@ impl WorktreeLifecycleCoordinator {
         workspace_id: WorkspaceId,
         worktrees: &[WorktreeLifecycleWorktree],
     ) -> Result<Vec<WorktreeLifecycleRecord>> {
+        let _operation_guard = self.operation_lock.lock().await;
         let mut seen_keys = HashSet::with_capacity(worktrees.len());
         let mut reconciled = Vec::with_capacity(worktrees.len());
 
@@ -418,13 +455,84 @@ impl WorktreeLifecycleCoordinator {
         &self,
         key: &WorktreeLifecycleKey,
     ) -> Result<Option<WorktreeLifecycleRecord>> {
+        let _operation_guard = self.operation_lock.lock().await;
         self.store.mark_closing(key).await
     }
+
+    pub async fn release_worktree_owner(
+        &self,
+        key: &WorktreeLifecycleKey,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<WorktreeLifecycleRecord>> {
+        let _operation_guard = self.operation_lock.lock().await;
+        let Some(mut record) = self.store.load(key).await? else {
+            return Ok(None);
+        };
+        let old_state = record.state.clone();
+        let old_owners = record.workspace_ids.clone();
+        record.workspace_ids.retain(|owner| *owner != workspace_id);
+        if record.workspace_ids.is_empty() {
+            record.state = WorktreeLifecycleState::Closing;
+        } else {
+            record.state = WorktreeLifecycleState::Active;
+            record.workspace_id = record.workspace_ids.first().copied();
+        }
+        record.last_seen_workspace_id = Some(workspace_id);
+        if old_state != record.state || old_owners != record.workspace_ids {
+            self.store.save(&record).await?;
+        }
+        Ok(Some(record))
+    }
+
+    pub async fn release_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<WorktreeLifecycleRecord>> {
+        let _operation_guard = self.operation_lock.lock().await;
+        let mut changed = Vec::new();
+        for mut record in self.store.list().await? {
+            let owns_record = record.workspace_ids.contains(&workspace_id)
+                || (record.workspace_ids.is_empty()
+                    && record.workspace_id == Some(workspace_id));
+            if !owns_record {
+                continue;
+            }
+            let old_state = record.state.clone();
+            record.workspace_ids.retain(|owner| *owner != workspace_id);
+            if record.workspace_ids.is_empty() {
+                record.state = WorktreeLifecycleState::Closing;
+            } else {
+                record.state = WorktreeLifecycleState::Active;
+                record.workspace_id = record.workspace_ids.first().copied();
+            }
+            record.last_seen_workspace_id = Some(workspace_id);
+            if old_state != record.state {
+                changed.push(record.clone());
+            } else {
+                changed.push(record.clone());
+            }
+            self.store.save(&record).await?;
+        }
+        Ok(changed)
+    }
+    pub async fn flush_workspace(&self, workspace_id: WorkspaceId) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock().await;
+        for record in self.store.list().await? {
+            if record.workspace_ids.contains(&workspace_id)
+                || record.workspace_id == Some(workspace_id)
+            {
+                self.store.save(&record).await?;
+            }
+        }
+        Ok(())
+    }
+
 
     pub async fn mark_workspace_closing(
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<WorktreeLifecycleRecord>> {
+        let _operation_guard = self.operation_lock.lock().await;
         let mut records = self.store.list().await?;
         let mut changed = Vec::new();
         for record in &mut records {
@@ -436,7 +544,9 @@ impl WorktreeLifecycleCoordinator {
                 changed.push(record.clone());
             }
         }
-        self.flush(&changed).await?;
+        for record in &changed {
+            self.store.save(record).await?;
+        }
         Ok(changed)
     }
 
@@ -445,6 +555,7 @@ impl WorktreeLifecycleCoordinator {
         key: &WorktreeLifecycleKey,
         descendants: &[WorktreeLifecycleDescendant],
     ) -> Result<WorktreeDeletionConfirmation> {
+        let _operation_guard = self.operation_lock.lock().await;
         self.store.mark_closing(key).await?;
         let record = self
             .store
@@ -469,14 +580,17 @@ impl WorktreeLifecycleCoordinator {
     }
 
     pub async fn confirm_deletion(&self, key: &WorktreeLifecycleKey) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock().await;
         self.store.remove(key).await
     }
 
     pub async fn remove_worktree(&self, key: &WorktreeLifecycleKey) -> Result<()> {
-        self.confirm_deletion(key).await
+        let _operation_guard = self.operation_lock.lock().await;
+        self.store.remove(key).await
     }
 
     pub async fn flush(&self, records: &[WorktreeLifecycleRecord]) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock().await;
         for record in records {
             self.store.save(record).await?;
         }

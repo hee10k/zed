@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
+use fs::Fs;
 use gpui::{App, AsyncApp, Entity, Task};
 use project::{
     LocalProjectFlags, Project, WorktreeId,
@@ -41,7 +42,8 @@ pub struct RootPlan {
     pub root_path: PathBuf,
     /// Canonical repository identity used by worktree lifecycle records.
     pub repository_path: PathBuf,
-    /// Absolute path to the main git repository this worktree is linked to.
+    /// Local Zed filesystem used for lifecycle state under the local data dir.
+    pub lifecycle_fs: Arc<dyn Fs>,
     /// Used both for creating a git ref to prevent GC of WIP commits during
     /// [`persist_worktree_state`], and for `git worktree remove` during
     /// [`remove_root`].
@@ -79,9 +81,11 @@ pub struct RootPlan {
 /// hold a reference to the directory and `git worktree remove` would fail.
 #[derive(Clone)]
 pub struct AffectedProject {
+    pub workspace: Entity<Workspace>,
     pub project: Entity<Project>,
     pub worktree_id: WorktreeId,
     pub repository_path: PathBuf,
+    pub lifecycle_fs: Arc<dyn Fs>,
     pub lifecycle_key: Option<WorktreeLifecycleKey>,
 }
 
@@ -134,10 +138,11 @@ pub fn build_root_plan(
             remote_connection,
         )
     };
-
     let affected_projects = workspaces
         .iter()
         .filter_map(|workspace| {
+            let workspace = workspace.clone();
+            let lifecycle_fs = workspace.read(cx).app_state().fs.clone();
             let project = workspace.read(cx).project().clone();
             if !matches_target_connection(&project, cx) {
                 return None;
@@ -157,9 +162,11 @@ pub fn build_root_plan(
                 .panel::<AgentPanel>(cx)
                 .and_then(|panel| panel.read(cx).lifecycle_key_for_worktree(worktree_id));
             Some(AffectedProject {
+                workspace,
                 project,
                 worktree_id,
                 repository_path,
+                lifecycle_fs,
                 lifecycle_key,
             })
         })
@@ -168,6 +175,7 @@ pub fn build_root_plan(
     if affected_projects.is_empty() {
         return None;
     }
+    let lifecycle_fs = affected_projects.first()?.lifecycle_fs.clone();
     let repository_path = affected_projects.first()?.repository_path.clone();
     let linked_repo = workspaces
         .iter()
@@ -219,6 +227,7 @@ pub fn build_root_plan(
     Some(RootPlan {
         root_path: path,
         repository_path,
+        lifecycle_fs,
         main_repo_path,
         affected_projects,
         worktree_repo: repo,
@@ -364,20 +373,8 @@ async fn cleanup_confirmed_worktree_lifecycle(root: &RootPlan, cx: &mut AsyncApp
         .affected_projects
         .iter()
         .find_map(|affected| affected.lifecycle_key.clone());
-    let fs = cx.update(|cx| {
-        root.affected_projects
-            .first()
-            .map(|affected| affected.project.read(cx).fs().clone())
-    });
-    let Some(fs) = fs else {
-        log::warn!(
-            "confirmed worktree removal has no project filesystem for {}",
-            root.root_path.display()
-        );
-        return;
-    };
     let coordinator =
-        WorktreeLifecycleCoordinator::new(WorktreeLifecycleStore::new(fs));
+        WorktreeLifecycleCoordinator::new(WorktreeLifecycleStore::new(root.lifecycle_fs.clone()));
     let key = if let Some(key) = lifecycle_key {
         key
     } else {
@@ -407,25 +404,54 @@ async fn cleanup_confirmed_worktree_lifecycle(root: &RootPlan, cx: &mut AsyncApp
             }
         }
     };
+    let worktree_path = root.root_path.clone();
+    let remote_connection = root.remote_connection.clone();
 
+    for affected in &root.affected_projects {
+        let panel = cx.update(|cx| {
+            affected
+                .workspace
+                .read(cx)
+                .panel::<AgentPanel>(cx)
+        });
+        if let Some(panel) = panel {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.confirm_worktree_lifecycle_deletion(
+                        key.clone(),
+                        worktree_path.clone(),
+                        remote_connection.clone(),
+                        cx,
+                    );
+                });
+            return;
+        }
+    }
+
+    // No panel owns the lifecycle task chain, so this fallback is already
+    // serialized with every caller that can reach this path.
     if let Err(error) = coordinator.mark_worktree_closing(&key).await {
         log::error!(
             "marking confirmed worktree lifecycle record closing for {}: {error:#}",
-            root.root_path.display()
+            worktree_path.display()
         );
         return;
     }
     cx.update(|cx| {
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
-                store.remove_worktree_path(&root.root_path, root.remote_connection.as_ref(), cx);
+                store.remove_worktree_path(
+                    &worktree_path,
+                    remote_connection.as_ref(),
+                    cx,
+                );
             });
         }
     });
     if let Err(error) = coordinator.remove_worktree(&key).await {
         log::error!(
             "removing confirmed worktree lifecycle record for {}: {error:#}",
-            root.root_path.display()
+            worktree_path.display()
         );
     }
 }
