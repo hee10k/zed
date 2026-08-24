@@ -14,7 +14,7 @@ use agent_ui::thread_metadata_store::{
 };
 use agent_ui::thread_group::{
     MoveOrClonePayload, MoveOrCloneResult, MoveOrCloneThread, RebaseResult, ThreadGroupId,
-    stable_worktree_id,
+    group_id_for_worktree_paths, stable_worktree_id,
 };
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
@@ -533,6 +533,8 @@ struct PendingGroupTransfer {
     target_group_id: ThreadGroupId,
     target_root_thread_id: ThreadId,
     target_worktree_id: Option<SharedString>,
+    source_is_dirty: bool,
+    source_has_active_session: bool,
 }
 
 
@@ -6204,9 +6206,6 @@ impl Sidebar {
         let Some(ListEntry::Thread(target)) = self.contents.entries.get(drop_row_ix) else {
             return;
         };
-        let Some(target_group_id) = target.metadata.group_id else {
-            return;
-        };
         let Some(source) = ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(*thread_id)
@@ -6214,9 +6213,33 @@ impl Sidebar {
         else {
             return;
         };
-        if source.group_id == Some(target_group_id) {
+        let source_group_id = source
+            .group_id
+            .or_else(|| group_id_for_worktree_paths(&source.worktree_paths));
+        let target_group_id = target
+            .metadata
+            .group_id
+            .or_else(|| group_id_for_worktree_paths(&target.metadata.worktree_paths));
+        let (Some(source_group_id), Some(target_group_id)) = (source_group_id, target_group_id)
+        else {
+            return;
+        };
+        if source_group_id == target_group_id {
             return;
         }
+        let source_is_dirty = self
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread) if thread.metadata.thread_id == *thread_id => {
+                    Some(thread.diff_stats.lines_added > 0 || thread.diff_stats.lines_removed > 0)
+                }
+                _ => None,
+            })
+            .unwrap_or(false);
+        let source_has_active_session = source.activity_status.is_live();
+
         self.pending_group_transfer = Some(PendingGroupTransfer {
             source_thread_id: *thread_id,
             target_thread_id: target.metadata.thread_id,
@@ -6226,6 +6249,8 @@ impl Sidebar {
                 .root_thread_id
                 .unwrap_or(target.metadata.thread_id),
             target_worktree_id: target.metadata.worktree_id.clone(),
+            source_is_dirty,
+            source_has_active_session,
         });
         cx.notify();
     }
@@ -6244,8 +6269,8 @@ impl Sidebar {
             source_thread_id: pending.source_thread_id,
             target_group_id: pending.target_group_id,
             target_root_thread_id: pending.target_root_thread_id,
-            source_is_dirty: false,
-            source_has_active_session: false,
+            source_is_dirty: pending.source_is_dirty,
+            source_has_active_session: pending.source_has_active_session,
             confirmed: true,
         };
         let Some(workspace) = self.active_workspace(cx) else {
@@ -6437,6 +6462,7 @@ impl Sidebar {
         position: DropPosition,
         cx: &mut Context<Self>,
     ) {
+        self.pending_group_transfer = None;
         let project_group_key = match dragged {
             DraggedSidebarEntry::Thread {
                 project_group_key, ..

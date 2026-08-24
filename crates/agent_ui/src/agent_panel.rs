@@ -2727,6 +2727,7 @@ impl AgentPanel {
                     this.schedule_terminal_status_inference(terminal_id, cx);
                 }
                 TerminalEvent::Wakeup => {
+                    this.clear_terminal_inferred_status(terminal_id);
                     this.record_terminal_activity(terminal_id, ActivityStatus::Running, cx);
                     this.refresh_terminal_metadata(terminal_id, cx);
                     this.report_terminal_program(terminal_id, source, cx);
@@ -2744,6 +2745,7 @@ impl AgentPanel {
                 | TerminalEvent::NewNavigationTarget(_)
                 | TerminalEvent::Open(_) => {}
                 TerminalEvent::ProcessExited => {
+                    this.clear_terminal_inferred_status(terminal_id);
                     this.record_terminal_activity(terminal_id, ActivityStatus::Completed, cx);
                     this.mark_omp_session_sleeping(terminal_id, cx);
                 }

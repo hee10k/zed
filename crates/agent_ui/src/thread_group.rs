@@ -705,8 +705,8 @@ mod tests {
                 assert_eq!(retrieved.group_id, Some(target_group));
                 assert_eq!(retrieved.parent_thread_id, Some(target_root_id));
                 assert_eq!(retrieved.root_thread_id, Some(target_root_id));
-                assert_eq!(retrieved.worktree_id.as_deref(), Some("target-wt-id"));
-                assert_eq!(retrieved.worktree_paths, target_root_metadata.worktree_paths);
+                assert_eq!(retrieved.worktree_id.as_deref(), Some("source-wt-id"));
+                assert_eq!(retrieved.worktree_paths, source_metadata.worktree_paths);
             });
         });
     }

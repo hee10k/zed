@@ -1602,10 +1602,10 @@ impl ConversationView {
                 | AcpThreadEvent::ElicitationRequested(_) => {
                     Some(ActivityStatus::WaitingForUser)
                 }
-                AcpThreadEvent::Stopped(_) | AcpThreadEvent::Refusal => {
-                    Some(ActivityStatus::Completed)
-                }
-                AcpThreadEvent::Error => Some(ActivityStatus::Error),
+                AcpThreadEvent::Stopped(_) => Some(ActivityStatus::Completed),
+                AcpThreadEvent::Refusal
+                | AcpThreadEvent::Error
+                | AcpThreadEvent::LoadError(_) => Some(ActivityStatus::Error),
                 _ => None,
             };
             if let Some(activity_status) = activity_status
