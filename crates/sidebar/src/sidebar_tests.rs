@@ -4,7 +4,8 @@ use agent::ThreadStore;
 use agent_ui::{
     ThreadId,
     terminal_thread_metadata_store::{
-        TerminalThreadMetadata, TerminalThreadMetadataStore, TestTerminalMetadataDbName,
+        SessionBoundary, TerminalThreadMetadata, TerminalThreadMetadataStore,
+        TestTerminalMetadataDbName,
     },
     test_support::{
         active_session_id, active_thread_id, open_thread_with_connection,
@@ -1993,6 +1994,10 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         remote_connection: None,
         working_directory: None,
         user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping,
     };
 
     cx.update(|_, cx| {
@@ -3225,6 +3230,10 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         remote_connection: None,
         working_directory: None,
         user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3333,6 +3342,10 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         remote_connection: None,
         working_directory: None,
         user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3482,6 +3495,10 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         remote_connection: None,
         working_directory: None,
         user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {

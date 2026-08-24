@@ -39,7 +39,7 @@ use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
-    TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore,
+    SessionBoundary, TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore,
     compose_terminal_thread_title, terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
@@ -2581,6 +2581,10 @@ impl AgentPanel {
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
             user_order: stored_user_order,
+            harness: None,
+            resume_locator: None,
+            restore_on_workspace_open: true,
+            session_boundary: SessionBoundary::Sleeping,
         })
     }
 
@@ -7727,6 +7731,10 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             user_order: None,
+            harness: None,
+            resume_locator: None,
+            restore_on_workspace_open: true,
+            session_boundary: SessionBoundary::Sleeping,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -7812,6 +7820,10 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             user_order: None,
+            harness: None,
+            resume_locator: None,
+            restore_on_workspace_open: true,
+            session_boundary: SessionBoundary::Sleeping,
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -7992,6 +8004,10 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             user_order: None,
+            harness: None,
+            resume_locator: None,
+            restore_on_workspace_open: true,
+            session_boundary: SessionBoundary::Sleeping,
         };
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -9957,6 +9973,10 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             user_order: None,
+            harness: None,
+            resume_locator: None,
+            restore_on_workspace_open: true,
+            session_boundary: SessionBoundary::Sleeping,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -10009,6 +10029,10 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             user_order: None,
+            harness: None,
+            resume_locator: None,
+            restore_on_workspace_open: true,
+            session_boundary: SessionBoundary::Sleeping,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
