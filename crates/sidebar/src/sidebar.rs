@@ -1625,20 +1625,30 @@ impl Sidebar {
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
                     let has_notification =
                         live_notified_terminal_ids.contains(&metadata.terminal_id);
+                    let live_status = live_terminal_statuses.get(&metadata.terminal_id).copied();
+                    let status = match (live_status, metadata.activity_status) {
+                        (Some(status), _)
+                            if matches!(
+                                status,
+                                TerminalAgentStatus::Running
+                                    | TerminalAgentStatus::WaitingForUserInput
+                            ) =>
+                        {
+                            status
+                        }
+                        (_, ActivityStatus::WaitingForUser) => {
+                            TerminalAgentStatus::WaitingForUserInput
+                        }
+                        (Some(status), _) => status,
+                        (None, ActivityStatus::Running | ActivityStatus::Idle) => {
+                            TerminalAgentStatus::Idle
+                        }
+                        (None, ActivityStatus::Completed | ActivityStatus::Error) => {
+                            TerminalAgentStatus::Completed
+                        }
+                    };
                     TerminalEntry {
-                        status: live_terminal_statuses
-                            .get(&metadata.terminal_id)
-                            .copied()
-                            .unwrap_or_else(|| match metadata.activity_status {
-                                ActivityStatus::Running => TerminalAgentStatus::Idle,
-                                ActivityStatus::WaitingForUser => {
-                                    TerminalAgentStatus::WaitingForUserInput
-                                }
-                                ActivityStatus::Completed => TerminalAgentStatus::Completed,
-                                ActivityStatus::Error | ActivityStatus::Idle => {
-                                    TerminalAgentStatus::Idle
-                                }
-                            }),
+                        status,
                         metadata,
                         workspace,
                         worktrees,
@@ -6236,31 +6246,48 @@ impl Sidebar {
         };
 
         if operation == MoveOrCloneThread::Move {
-            let target_path = ThreadMetadataStore::global(cx)
+            let thread_store = ThreadMetadataStore::global(cx);
+            let source_path = thread_store
+                .read(cx)
+                .entry(pending.source_thread_id)
+                .and_then(|metadata| metadata.folder_paths().paths().first().cloned());
+            let target_path = thread_store
                 .read(cx)
                 .entry(pending.target_root_thread_id)
                 .and_then(|metadata| metadata.folder_paths().paths().first().cloned());
             let project = workspace.read(cx).project().clone();
-            let repository = target_path.as_ref().and_then(|target_path| {
-                project.read_with(cx, |project, cx| {
-                    project.repositories(cx).values().find_map(|repository| {
-                        let snapshot = repository.read(cx).snapshot();
-                        if snapshot.work_directory_abs_path.as_ref() == target_path {
-                            snapshot
-                                .branch
-                                .as_ref()
-                                .map(|branch| (repository.clone(), branch.name().to_string()))
-                        } else {
-                            snapshot
-                                .linked_worktrees()
-                                .iter()
-                                .find(|worktree| worktree.path == *target_path)
-                                .and_then(|worktree| {
-                                    worktree
-                                        .branch_name()
-                                        .map(|branch| (repository.clone(), branch.to_string()))
-                                })
-                        }
+            let repository = source_path.as_ref().and_then(|source_path| {
+                target_path.as_ref().and_then(|target_path| {
+                    project.read_with(cx, |project, cx| {
+                        project.repositories(cx).values().find_map(|repository| {
+                            let snapshot = repository.read(cx).snapshot();
+                            let source_matches =
+                                snapshot.work_directory_abs_path.as_ref() == source_path
+                                    || snapshot
+                                        .linked_worktrees()
+                                        .iter()
+                                        .any(|worktree| &worktree.path == source_path);
+                            if !source_matches {
+                                return None;
+                            }
+                            let upstream = if snapshot.work_directory_abs_path.as_ref()
+                                == target_path
+                            {
+                                snapshot
+                                    .branch
+                                    .as_ref()
+                                    .map(|branch| branch.name().to_string())
+                            } else {
+                                snapshot
+                                    .linked_worktrees()
+                                    .iter()
+                                    .find(|worktree| &worktree.path == target_path)
+                                    .and_then(|worktree| {
+                                        worktree.branch_name().map(ToString::to_string)
+                                    })
+                            };
+                            upstream.map(|upstream| (repository.clone(), upstream))
+                        })
                     })
                 })
             });
