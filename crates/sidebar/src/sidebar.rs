@@ -12,6 +12,10 @@ use agent_ui::thread_metadata_store::{
     ActivityStatus, ThreadMetadata, ThreadMetadataStore, WorktreePaths,
     worktree_info_from_thread_paths,
 };
+use agent_ui::thread_group::{
+    MoveOrClonePayload, MoveOrCloneResult, MoveOrCloneThread, ThreadGroupId,
+    unsupported_rebase_executor,
+};
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
     fuzzy_match_positions,
@@ -512,6 +516,15 @@ mod drag_position_tests {
         assert_eq!(insertion_index(3, DropPosition::After, 3), None);
     }
 }
+#[derive(Clone, Debug)]
+struct PendingGroupTransfer {
+    source_thread_id: ThreadId,
+    target_thread_id: ThreadId,
+    target_group_id: ThreadGroupId,
+    target_root_thread_id: ThreadId,
+    target_worktree_id: Option<SharedString>,
+}
+
 
 /// Payload carried on a drag of a sidebar row, used to reorder entries within
 /// a project group. Retains the entry identity plus its group so a drop into
@@ -895,6 +908,7 @@ pub struct Sidebar {
     /// Tracks which sidebar entry is currently active (highlighted).
     active_entry: Option<ActiveEntry>,
     hovered_thread_index: Option<usize>,
+    pending_group_transfer: Option<PendingGroupTransfer>,
     renaming_thread_id: Option<ThreadId>,
     /// Threads in the database-backed regeneration path need their own loading
     /// state because they do not have a live `agent::Thread` to report it.
@@ -1045,6 +1059,7 @@ impl Sidebar {
             contents: SidebarContents::default(),
             selection: None,
             active_entry: None,
+            pending_group_transfer: None,
             hovered_thread_index: None,
             renaming_thread_id: None,
             regenerating_titles: HashSet::new(),
@@ -2398,6 +2413,47 @@ impl Sidebar {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
         };
+        let pending_transfer_target = matches!(
+            entry,
+            ListEntry::Thread(thread)
+                if self
+                    .pending_group_transfer
+                    .as_ref()
+                    .is_some_and(|pending| pending.target_thread_id == thread.metadata.thread_id)
+        );
+        let rendered = if pending_transfer_target {
+            v_flex()
+                .child(rendered)
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .px_2()
+                        .child(
+                            Button::new(("group-transfer-move", ix), "Move")
+                                .style(ButtonStyle::Outlined)
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.apply_pending_group_transfer(
+                                        MoveOrCloneThread::Move,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new(("group-transfer-clone", ix), "Clone")
+                                .style(ButtonStyle::Outlined)
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.apply_pending_group_transfer(
+                                        MoveOrCloneThread::Clone,
+                                        cx,
+                                    );
+                                })),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            rendered
+        };
+
 
         // Wrap re-orderable rows (threads/terminals) so they can be dragged to
         // reposition within their project group.
@@ -6069,6 +6125,7 @@ impl Sidebar {
                 match (is_empty_draft(left), is_empty_draft(right)) {
                     (true, false) => return std::cmp::Ordering::Less,
                     (false, true) => return std::cmp::Ordering::Greater,
+
                     (true, true) => return std::cmp::Ordering::Equal,
                     (false, false) => {}
                 }
@@ -6098,6 +6155,85 @@ impl Sidebar {
         }
     }
 
+    fn begin_group_transfer(
+        &mut self,
+        dragged: &DraggedSidebarEntry,
+        drop_row_ix: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let DraggedSidebarEntry::Thread { thread_id, .. } = dragged else {
+            return;
+        };
+        let Some(ListEntry::Thread(target)) = self.contents.entries.get(drop_row_ix) else {
+            return;
+        };
+        let Some(target_group_id) = target.metadata.group_id else {
+            return;
+        };
+        let Some(source) = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(*thread_id)
+            .cloned()
+        else {
+            return;
+        };
+        if source.group_id == Some(target_group_id) {
+            return;
+        }
+        self.pending_group_transfer = Some(PendingGroupTransfer {
+            source_thread_id: *thread_id,
+            target_thread_id: target.metadata.thread_id,
+            target_group_id,
+            target_root_thread_id: target
+                .metadata
+                .root_thread_id
+                .unwrap_or(target.metadata.thread_id),
+            target_worktree_id: target.metadata.worktree_id.clone(),
+        });
+        cx.notify();
+    }
+
+    fn apply_pending_group_transfer(
+        &mut self,
+        operation: MoveOrCloneThread,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending_group_transfer.take() else {
+            return;
+        };
+        let payload = MoveOrClonePayload {
+            operation,
+            source_thread_id: pending.source_thread_id,
+            target_group_id: pending.target_group_id,
+            target_root_thread_id: pending.target_root_thread_id,
+            source_is_dirty: false,
+            source_has_active_session: false,
+            confirmed: true,
+        };
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+            return;
+        };
+        let result = panel.update(cx, |panel, cx| {
+            panel.execute_thread_group_transfer(
+                payload,
+                pending.target_worktree_id,
+                unsupported_rebase_executor,
+                || Err("derived worktree creation requires the worktree manager".to_string()),
+                cx,
+            )
+        });
+        if let MoveOrCloneResult::MoveFailed { reason, .. }
+        | MoveOrCloneResult::CloneFailed { reason } = result
+        {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_error(anyhow::anyhow!(reason), cx);
+            });
+        }
+        self.schedule_update_entries(false, cx);
+    }
     /// Reorders a sidebar entry to a new position within its project group and
     /// persists the resulting order to the thread/terminal metadata stores.
     ///
@@ -6141,6 +6277,13 @@ impl Sidebar {
         {
             // Cross-group drop: ignore.
             return;
+        }
+        if matches!(self.contents.entries.get(drop_row_ix), Some(ListEntry::Thread(_))) {
+            self.pending_group_transfer = None;
+            self.begin_group_transfer(dragged, drop_row_ix, cx);
+            if self.pending_group_transfer.is_some() {
+                return;
+            }
         }
         let group_end = self
             .contents
