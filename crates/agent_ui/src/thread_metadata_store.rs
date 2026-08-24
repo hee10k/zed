@@ -972,13 +972,27 @@ impl ThreadMetadataStore {
         archive_job: Option<(Task<()>, async_channel::Sender<()>)>,
         cx: &mut Context<Self>,
     ) {
-        self.update_archived(thread_id, true, cx);
+        let mut thread_ids = vec![thread_id];
+        let mut index = 0;
+        while index < thread_ids.len() {
+            let parent_id = thread_ids[index];
+            thread_ids.extend(
+                self.threads
+                    .values()
+                    .filter(|thread| thread.parent_thread_id == Some(parent_id))
+                    .map(|thread| thread.thread_id),
+            );
+            index += 1;
+        }
+
+        for id in &thread_ids {
+            self.update_archived(*id, true, cx);
+            cx.emit(ThreadMetadataStoreEvent::ThreadArchived(*id));
+        }
 
         if let Some(job) = archive_job {
             self.in_flight_archives.insert(thread_id, job);
         }
-
-        cx.emit(ThreadMetadataStoreEvent::ThreadArchived(thread_id));
     }
 
     pub fn unarchive(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {

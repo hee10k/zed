@@ -811,7 +811,8 @@ impl ThreadsArchiveView {
         agent: AgentId,
         cx: &mut Context<Self>,
     ) {
-        ThreadMetadataStore::global(cx).update(cx, |store, cx| store.delete(thread_id, cx));
+        ThreadMetadataStore::global(cx)
+            .update(cx, |store, cx| store.delete_thread_and_descendants(thread_id, cx));
 
         let agent = Agent::from(agent);
 

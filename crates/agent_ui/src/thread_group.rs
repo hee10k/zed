@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use db::sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
@@ -27,6 +27,17 @@ impl ThreadGroupId {
         self.0.hyphenated().to_string()
     }
 }
+/// Returns the restart-stable worktree identity used by lifecycle JSON records.
+pub fn stable_worktree_id(
+    repository_path: &Path,
+    worktree_path: &Path,
+    remote_identity: &str,
+) -> SharedString {
+    WorktreeLifecycleKey::new(repository_path, worktree_path, remote_identity)
+        .stable_key()
+        .into()
+}
+
 
 impl Bind for ThreadGroupId {
     fn bind(&self, statement: &Statement, start_index: i32) -> anyhow::Result<i32> {
@@ -47,6 +58,7 @@ use ui::{Context, SharedString};
 
 use crate::thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore};
 
+use crate::worktree_lifecycle::WorktreeLifecycleKey;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadGroupTransfer {
     Move,
