@@ -85,39 +85,16 @@ impl HerdrEndpoint {
 }
 
 #[cfg(windows)]
-fn windows_pipe_endpoint(marker_path: &str) -> String {
+fn windows_pipe_endpoint(endpoint_path: &str) -> String {
     const PIPE_PREFIX: &str = r"\\.\pipe\";
-    if marker_path.starts_with(PIPE_PREFIX) {
-        return marker_path.to_string();
+    if endpoint_path.starts_with(PIPE_PREFIX) {
+        endpoint_path.to_string()
+    } else {
+        // Herdr writes pid:nonce marker contents to endpoint_path. The
+        // namespaced pipe is derived from the configured path itself; marker
+        // contents are never a pipe name.
+        format!("{PIPE_PREFIX}{endpoint_path}")
     }
-    if let Ok(contents) = std::fs::read_to_string(marker_path) {
-        let endpoint = contents.trim();
-        if !endpoint.is_empty() {
-            if endpoint.starts_with(PIPE_PREFIX) {
-                return endpoint.to_string();
-            }
-            return format!("{PIPE_PREFIX}{endpoint}");
-        }
-    }
-    let path = Path::new(marker_path);
-    let name = match path
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|component| component.to_str())
-    {
-        Some(session)
-            if path
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .and_then(|component| component.to_str())
-                == Some("sessions") =>
-        {
-            format!("herdr-{session}")
-        }
-        _ => "herdr".to_string(),
-    };
-    format!("{PIPE_PREFIX}{name}")
 }
 
 pub(crate) enum HerdrStream {
@@ -301,5 +278,14 @@ mod tests {
     #[test]
     fn windows_marker_endpoint_is_namespaced() {
         assert!(windows_pipe_endpoint(r#"\\.\pipe\herdr-test"#).starts_with(r#"\\.\pipe\"#));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_marker_contents_are_not_used_as_pipe_name() {
+        let marker_path = r"C:\Users\test\AppData\Roaming\herdr\herdr.sock";
+        assert_eq!(
+            windows_pipe_endpoint(marker_path),
+            r"\\.\pipe\C:\Users\test\AppData\Roaming\herdr\herdr.sock"
+        );
     }
 }

@@ -64,3 +64,23 @@ cargo test -p agent_ui herdr_ --no-default-features
 Result: **15 passed, 0 failed**.
 
 Regression coverage includes request-ID response matching, string error codes, malformed JSON, official subscription payloads, tagged snapshots and pane reads, workspace/pane/status/output event decoding, target-based control payloads, workspace-create parameters, ping protocol validation, pending-request wakeup on disconnect, and Unix NDJSON transport round-tripping. The focused suite also includes the Windows named-pipe marker test under `cfg(windows)`.
+
+## Task 1 Review 2 Repair Evidence
+
+The second review findings were repaired against the official protocol/schema:
+
+1. **Connection ownership:** `HerdrClientHandle` now stores the resolved endpoint, opens a fresh request connection for every RPC, and uses a separate long-lived connection for each `events.subscribe`. Request responses are matched on their request id; EOF, malformed frames, connect failures, write failures, and timeouts wake only that request's waiter.
+2. **Bootstrap buffering:** Bootstrap records the event-log boundary before subscribing, waits for the subscription acknowledgement, requests the snapshot over a different connection, and replays every buffered event after the boundary in arrival order. It does not compare nonexistent snapshot/event top-level sequence fields.
+3. **Windows transport:** The named-pipe path is derived from the configured endpoint path under the `\\.\pipe\` namespace. The marker file's `pid:nonce` contents are not treated as a pipe name.
+4. **Input encoding:** `pane.send_input` omits `text` when the caller passes `None`; present text remains a JSON string.
+5. **Subscriptions:** Lifecycle subscriptions now include `workspace.moved` and `workspace.reordered`. Per-pane status, output-match, and scroll subscriptions use official pane-id filters and output fields (`source`, `match`, and `strip_ansi`) after snapshot pane ids are known.
+6. **Typed move decoding:** `pane.moved` now decodes the official previous pane/workspace/tab ids and nested destination `PaneInfo` into `HerdrEvent::PaneMoved`.
+
+
+Focused verification rerun:
+
+```text
+cargo test -p agent_ui herdr_ --no-default-features
+```
+
+Result: **18 passed, 0 failed**. New regressions cover arrival-order replay with zero sequences, pane-moved decoding, absent `pane.send_input` text, official lifecycle subscriptions and pane filters, plus the Windows path-derived mapping under `cfg(windows)`.

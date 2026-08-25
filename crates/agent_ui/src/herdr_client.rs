@@ -235,6 +235,13 @@ pub(crate) enum HerdrEvent {
     WorkspaceClosed { workspace_id: String, sequence: u64 },
     PaneCreated { pane: HerdrPaneSnapshot, sequence: u64 },
     PaneUpdated { pane: HerdrPaneSnapshot, sequence: u64 },
+    PaneMoved {
+        pane: HerdrPaneSnapshot,
+        previous_pane_id: Option<String>,
+        previous_workspace_id: Option<String>,
+        previous_tab_id: Option<String>,
+        sequence: u64,
+    },
     PaneAgentDetected {
         pane_id: String,
         workspace_id: String,
@@ -269,9 +276,9 @@ impl HerdrEvent {
             | Self::PaneAgentDetected { workspace_id, .. }
             | Self::PaneFocused { workspace_id, .. }
             | Self::PaneClosed { workspace_id, .. } => Some(workspace_id),
-            Self::PaneCreated { pane, .. } | Self::PaneUpdated { pane, .. } => {
-                Some(&pane.workspace_id)
-            }
+            Self::PaneCreated { pane, .. }
+            | Self::PaneUpdated { pane, .. }
+            | Self::PaneMoved { pane, .. } => Some(&pane.workspace_id),
             _ => None,
         }
     }
@@ -285,7 +292,9 @@ impl HerdrEvent {
             | Self::PaneExited { pane_id, .. }
             | Self::PaneOutput { pane_id, .. }
             | Self::PaneScrollChanged { pane_id, .. } => Some(pane_id),
-            Self::PaneCreated { pane, .. } | Self::PaneUpdated { pane, .. } => Some(&pane.pane_id),
+            Self::PaneCreated { pane, .. }
+            | Self::PaneUpdated { pane, .. }
+            | Self::PaneMoved { pane, .. } => Some(&pane.pane_id),
             _ => None,
         }
     }
@@ -299,6 +308,7 @@ impl HerdrEvent {
             | Self::WorkspaceClosed { sequence, .. }
             | Self::PaneCreated { sequence, .. }
             | Self::PaneUpdated { sequence, .. }
+            | Self::PaneMoved { sequence, .. }
             | Self::PaneAgentDetected { sequence, .. }
             | Self::PaneAgentStatusChanged { sequence, .. }
             | Self::PaneFocused { sequence, .. }
@@ -465,6 +475,30 @@ pub(crate) fn decode_event(input: &str) -> Result<HerdrEvent, HerdrClientError> 
                 .map_err(|error| HerdrClientError::Codec(error.to_string()))?;
             Ok(HerdrEvent::PaneUpdated { pane, sequence })
         }
+        "pane_moved" | "pane.moved" => {
+            let pane = data
+                .get("pane")
+                .cloned()
+                .unwrap_or_else(|| data.clone());
+            let pane = serde_json::from_value(pane)
+                .map_err(|error| HerdrClientError::Codec(error.to_string()))?;
+            Ok(HerdrEvent::PaneMoved {
+                pane,
+                previous_pane_id: data
+                    .get("previous_pane_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                previous_workspace_id: data
+                    .get("previous_workspace_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                previous_tab_id: data
+                    .get("previous_tab_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                sequence,
+            })
+        }
         "pane_focused" | "pane.focused" => Ok(HerdrEvent::PaneFocused {
             pane_id: required_string(&data, "pane_id")?,
             workspace_id: required_string(&data, "workspace_id")?,
@@ -568,158 +602,74 @@ fn record_event(event_log: &Arc<Mutex<Vec<HerdrEvent>>>, event: HerdrEvent) {
         Err(poisoned) => poisoned.into_inner().push(event),
     }
 }
+fn event_log_len(event_log: &Arc<Mutex<Vec<HerdrEvent>>>) -> usize {
+    match event_log.lock() {
+        Ok(events) => events.len(),
+        Err(poisoned) => poisoned.into_inner().len(),
+    }
+}
+
+fn response_result(response: HerdrResponse) -> PendingResult {
+    match (response.result, response.error) {
+        (_, Some(error)) => Err(HerdrClientError::ProtocolError {
+            code: error.code,
+            message: error.message,
+        }),
+        (Some(result), None) => Ok(result),
+        (None, None) => Err(HerdrClientError::Codec(
+            "success response missing result".to_string(),
+        )),
+    }
+}
+fn events_since(
+    event_log: &Arc<Mutex<Vec<HerdrEvent>>>,
+    start: usize,
+) -> Vec<HerdrEvent> {
+    match event_log.lock() {
+        Ok(events) => events[start..].to_vec(),
+        Err(poisoned) => poisoned.into_inner()[start..].to_vec(),
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct HerdrClientHandle {
+    endpoint: HerdrEndpoint,
     next_id: Arc<AtomicU64>,
     pending: PendingRequests,
+    event_tx: Sender<HerdrEvent>,
     event_rx: Receiver<HerdrEvent>,
     event_log: Arc<Mutex<Vec<HerdrEvent>>>,
-    writer_tx: Sender<String>,
     executor: BackgroundExecutor,
 }
 
 impl HerdrClientHandle {
-    pub(crate) fn new(stream: HerdrStream, cx: &App) -> Result<Self, HerdrClientError> {
-        Self::new_with_executor(stream, cx.background_executor().clone())
+    pub(crate) fn new(endpoint: HerdrEndpoint, cx: &App) -> Result<Self, HerdrClientError> {
+        Ok(Self::new_with_executor(
+            endpoint,
+            cx.background_executor().clone(),
+        ))
     }
 
-    fn new_with_executor(
-        stream: HerdrStream,
-        executor: BackgroundExecutor,
-    ) -> Result<Self, HerdrClientError> {
-        let write_stream = stream
-            .try_clone()
-            .map_err(|error| HerdrClientError::Io(error.to_string()))?;
+    fn new_with_executor(endpoint: HerdrEndpoint, executor: BackgroundExecutor) -> Self {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, event_rx) = async_channel::unbounded();
-        let (writer_tx, writer_rx) = async_channel::unbounded::<String>();
-        let event_log = Arc::new(Mutex::new(Vec::new()));
-
-        let pending_for_reader = pending.clone();
-        let event_tx_for_reader = event_tx.clone();
-        let event_log_for_reader = event_log.clone();
-        executor
-            .clone()
-            .spawn(async move {
-                let mut line_reader = HerdrLineReader::new(stream);
-                loop {
-                    let line = match line_reader.read_line() {
-                        Ok(Some(line)) => line,
-                        Ok(None) => {
-                            fail_pending(&pending_for_reader, HerdrClientError::Disconnected);
-                            break;
-                        }
-                        Err(error) => {
-                            fail_pending(
-                                &pending_for_reader,
-                                HerdrClientError::Io(error.to_string()),
-                            );
-                            break;
-                        }
-                    };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let value: Value = match serde_json::from_str(&line) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            fail_pending(
-                                &pending_for_reader,
-                                HerdrClientError::Codec(error.to_string()),
-                            );
-                            break;
-                        }
-                    };
-                    if value.get("id").is_some() {
-                        let response = match decode_response(&line) {
-                            Ok(response) => response,
-                            Err(error) => {
-                                fail_pending(&pending_for_reader, error);
-                                break;
-                            }
-                        };
-                        let sender = match pending_for_reader.lock() {
-                            Ok(mut pending) => pending.remove(&response.id),
-                            Err(poisoned) => poisoned.into_inner().remove(&response.id),
-                        };
-                        if let Some(sender) = sender {
-                            let result = match (response.result, response.error) {
-                                (_, Some(error)) => Err(HerdrClientError::ProtocolError {
-                                    code: error.code,
-                                    message: error.message,
-                                }),
-                                (Some(result), None) => Ok(result),
-                                (None, None) => Err(HerdrClientError::Codec(
-                                    "success response missing result".to_string(),
-                                )),
-                            };
-                            if sender.send(result).is_err() {
-                                log::debug!("Herdr response waiter was already dropped");
-                            }
-                        }
-                    } else if value.get("event").is_some() {
-                        let event = match decode_event(&line) {
-                            Ok(event) => event,
-                            Err(error) => {
-                                fail_pending(&pending_for_reader, error);
-                                break;
-                            }
-                        };
-                        record_event(&event_log_for_reader, event.clone());
-                        if event_tx_for_reader.send(event).await.is_err() {
-                            fail_pending(
-                                &pending_for_reader,
-                                HerdrClientError::Disconnected,
-                            );
-                            break;
-                        }
-                    } else {
-                        fail_pending(
-                            &pending_for_reader,
-                            HerdrClientError::Codec("frame is neither response nor event".to_string()),
-                        );
-                        break;
-                    }
-                }
-            })
-            .detach();
-
-        let pending_for_writer = pending.clone();
-        executor
-            .clone()
-            .spawn(async move {
-                let mut stream = write_stream;
-                while let Ok(line) = writer_rx.recv().await {
-                    if let Err(error) = stream.send_line(&line) {
-                        fail_pending(
-                            &pending_for_writer,
-                            HerdrClientError::Io(error.to_string()),
-                        );
-                        break;
-                    }
-                }
-                fail_pending(&pending_for_writer, HerdrClientError::Disconnected);
-            })
-            .detach();
-        Ok(Self {
+        Self {
+            endpoint,
             next_id: Arc::new(AtomicU64::new(1)),
             pending,
+            event_tx,
             event_rx,
-            event_log,
-            writer_tx,
+            event_log: Arc::new(Mutex::new(Vec::new())),
             executor,
-        })
+        }
     }
 
     pub(crate) fn connect(endpoint: &HerdrEndpoint, cx: &App) -> Task<Result<Self, HerdrClientError>> {
         let endpoint = endpoint.clone();
         let executor = cx.background_executor().clone();
-        executor.clone().spawn(async move {
-            let stream = HerdrStream::connect(&endpoint)
-                .map_err(|error| HerdrClientError::EndpointNotFound(error.to_string()))?;
-            Self::new_with_executor(stream, executor)
-        })
+        executor
+            .clone()
+            .spawn(async move { Ok(Self::new_with_executor(endpoint, executor)) })
     }
 
     pub(crate) fn request(
@@ -731,6 +681,8 @@ impl HerdrClientHandle {
         self.request_on_executor(method, params.unwrap_or_else(|| serde_json::Map::new().into()))
     }
 
+    /// Herdr accepts one initial request per connection. Open a fresh request
+    /// connection for every RPC and keep the subscription connection separate.
     fn request_on_executor(&self, method: &str, params: Value) -> Task<PendingResult> {
         let request_id = format!("req-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let (sender, receiver) = oneshot::channel();
@@ -742,26 +694,78 @@ impl HerdrClientHandle {
                 poisoned.into_inner().insert(request_id.clone(), sender);
             }
         }
+
         let request = HerdrRequest {
             id: request_id.clone(),
             method: method.to_string(),
             params,
         };
-        let writer_tx = self.writer_tx.clone();
+        let endpoint = self.endpoint.clone();
         let pending = self.pending.clone();
+        let event_tx = self.event_tx.clone();
+        let event_log = self.event_log.clone();
         let executor = self.executor.clone();
         executor.clone().spawn(async move {
-            let encoded = match serde_json::to_string(&request) {
-                Ok(encoded) => encoded,
-                Err(error) => {
-                    remove_pending(&pending, &request_id);
-                    return Err(HerdrClientError::Codec(error.to_string()));
+            let result = match HerdrStream::connect(&endpoint) {
+                Err(error) => Err(HerdrClientError::EndpointNotFound(error.to_string())),
+                Ok(mut stream) => {
+                    let encoded = match serde_json::to_string(&request) {
+                        Ok(encoded) => encoded,
+                        Err(error) => Err(HerdrClientError::Codec(error.to_string()))?,
+                    };
+                    if let Err(error) = stream.send_line(&encoded) {
+                        Err(HerdrClientError::Io(error.to_string()))?
+                    }
+
+                    let mut reader = HerdrLineReader::new(stream);
+                    loop {
+                        let line = match reader.read_line() {
+                            Ok(Some(line)) => line,
+                            Ok(None) => break Err(HerdrClientError::Disconnected),
+                            Err(error) => break Err(HerdrClientError::Io(error.to_string())),
+                        };
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let value: Value = match serde_json::from_str(&line) {
+                            Ok(value) => value,
+                            Err(error) => break Err(HerdrClientError::Codec(error.to_string())),
+                        };
+                        if value.get("id").is_some() {
+                            let response = match decode_response(&line) {
+                                Ok(response) => response,
+                                Err(error) => break Err(error),
+                            };
+                            if response.id != request_id {
+                                continue;
+                            }
+                            break response_result(response);
+                        }
+                        if value.get("event").is_some() {
+                            let event = match decode_event(&line) {
+                                Ok(event) => event,
+                                Err(error) => break Err(error),
+                            };
+                            record_event(&event_log, event.clone());
+                            if event_tx.send(event).await.is_err() {
+                                break Err(HerdrClientError::Disconnected);
+                            }
+                        } else {
+                            break Err(HerdrClientError::Codec(
+                                "frame is neither response nor event".to_string(),
+                            ));
+                        }
+                    }
                 }
             };
-            if let Err(error) = writer_tx.send(encoded).await {
-                remove_pending(&pending, &request_id);
-                return Err(HerdrClientError::Io(error.to_string()));
+
+            let sender = take_pending(&pending, &request_id);
+            if let Some(sender) = sender {
+                if sender.send(result).is_err() {
+                    log::debug!("Herdr response waiter was already dropped");
+                }
             }
+
             let timeout = executor.timer(REQUEST_TIMEOUT);
             futures::pin_mut!(receiver, timeout);
             match futures::future::select(receiver, timeout).await {
@@ -778,6 +782,184 @@ impl HerdrClientHandle {
         self.event_rx.clone()
     }
 
+    /// Start the one-request, long-lived subscription connection.
+    fn start_subscription(&self, params: Value) -> Task<Result<(String, usize), HerdrClientError>> {
+        let request_id = format!("req-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+        let request = HerdrRequest {
+            id: request_id.clone(),
+            method: "events.subscribe".to_string(),
+            params,
+        };
+        let endpoint = self.endpoint.clone();
+        let event_tx = self.event_tx.clone();
+        let event_log = self.event_log.clone();
+        let executor = self.executor.clone();
+        let (ready_tx, ready_rx) = oneshot::channel();
+
+        executor
+            .clone()
+            .spawn(async move {
+                let ready_tx = Some(ready_tx);
+                let mut stream = match HerdrStream::connect(&endpoint) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        if let Some(ready_tx) = ready_tx {
+                            let _ = ready_tx.send(Err(HerdrClientError::EndpointNotFound(
+                                error.to_string(),
+                            )));
+                        }
+                        return;
+                    }
+                };
+                let encoded = match serde_json::to_string(&request) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        if let Some(ready_tx) = ready_tx {
+                            let _ = ready_tx.send(Err(HerdrClientError::Codec(error.to_string())));
+                        }
+                        return;
+                    }
+                };
+                if let Err(error) = stream.send_line(&encoded) {
+                    if let Some(ready_tx) = ready_tx {
+                        let _ = ready_tx.send(Err(HerdrClientError::Io(error.to_string())));
+                    }
+                    return;
+                }
+
+                let mut reader = HerdrLineReader::new(stream);
+                let mut ready_tx = ready_tx;
+                loop {
+                    let line = match reader.read_line() {
+                        Ok(Some(line)) => line,
+                        Ok(None) => {
+                            if let Some(ready_tx) = ready_tx.take() {
+                                let _ = ready_tx.send(Err(HerdrClientError::Disconnected));
+                            }
+                            return;
+                        }
+                        Err(error) => {
+                            if let Some(ready_tx) = ready_tx.take() {
+                                let _ = ready_tx.send(Err(HerdrClientError::Io(error.to_string())));
+                            }
+                            return;
+                        }
+                    };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let value: Value = match serde_json::from_str(&line) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            if let Some(ready_tx) = ready_tx.take() {
+                                let _ = ready_tx.send(Err(HerdrClientError::Codec(error.to_string())));
+                            }
+                            return;
+                        }
+                    };
+                    if value.get("id").is_none() {
+                        continue;
+                    }
+                    let response = match decode_response(&line) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            if let Some(ready_tx) = ready_tx.take() {
+                                let _ = ready_tx.send(Err(error));
+                            }
+                            return;
+                        }
+                    };
+                    if response.id != request_id {
+                        continue;
+                    }
+                    let result = match response_result(response) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            if let Some(ready_tx) = ready_tx.take() {
+                                let _ = ready_tx.send(Err(error));
+                            }
+                            return;
+                        }
+                    };
+                    let value = match value_from_raw(&result) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            if let Some(ready_tx) = ready_tx.take() {
+                                let _ = ready_tx.send(Err(error));
+                            }
+                            return;
+                        }
+                    };
+                    if value.get("type").and_then(Value::as_str) != Some("subscription_started") {
+                        if let Some(ready_tx) = ready_tx.take() {
+                            let _ = ready_tx.send(Err(HerdrClientError::Codec(
+                                "events.subscribe did not return subscription_started".to_string(),
+                            )));
+                        }
+                        return;
+                    }
+                    let subscription_id = value
+                        .get("subscription_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("default")
+                        .to_string();
+                    let boundary = event_log_len(&event_log);
+                    if let Some(ready_tx) = ready_tx.take() {
+                        let _ = ready_tx.send(Ok((subscription_id, boundary)));
+                    }
+                    break;
+                }
+
+                loop {
+                    let line = match reader.read_line() {
+                        Ok(Some(line)) => line,
+                        Ok(None) => {
+                            log::error!("Herdr subscription disconnected");
+                            return;
+                        }
+                        Err(error) => {
+                            log::error!("Herdr subscription read failed: {error}");
+                            return;
+                        }
+                    };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let value: Value = match serde_json::from_str(&line) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            log::error!("Herdr subscription frame was malformed: {error}");
+                            return;
+                        }
+                    };
+                    if value.get("event").is_none() {
+                        continue;
+                    }
+                    let event = match decode_event(&line) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            log::error!("Herdr subscription event was malformed: {error}");
+                            return;
+                        }
+                    };
+                    record_event(&event_log, event.clone());
+                    if event_tx.send(event).await.is_err() {
+                        log::error!("Herdr subscription event channel closed");
+                        return;
+                    }
+                }
+            })
+            .detach();
+        executor.clone().spawn(async move {
+            let timeout = executor.timer(REQUEST_TIMEOUT);
+            futures::pin_mut!(ready_rx, timeout);
+            match futures::future::select(ready_rx, timeout).await {
+                Either::Left((result, _)) => result.unwrap_or(Err(HerdrClientError::Disconnected)),
+                Either::Right((_, _)) => Err(HerdrClientError::Timeout),
+            }
+        })
+    }
+
     pub(crate) fn bootstrap(&self, _cx: &App) -> Task<Result<HerdrBootstrap, HerdrClientError>> {
         let client = self.clone();
         let event_log = self.event_log.clone();
@@ -786,51 +968,41 @@ impl HerdrClientHandle {
             let ping = client.request_on_executor("ping", empty_params()).await?;
             validate_ping_result(ping.get())?;
 
-            let subscription = client
-                .request_on_executor("events.subscribe", subscription_params())
-                .await?;
-            let subscription_value = value_from_raw(&subscription)?;
-            if subscription_value.get("type").and_then(Value::as_str)
-                != Some("subscription_started")
-            {
-                return Err(HerdrClientError::Codec(
-                    "events.subscribe did not return subscription_started".to_string(),
-                ));
-            }
-            let subscription_id = subscription_value
-                .get("subscription_id")
-                .and_then(Value::as_str)
-                .unwrap_or("default")
-                .to_string();
-            let start = match event_log.lock() {
-                Ok(events) => events.len(),
-                Err(poisoned) => poisoned.into_inner().len(),
-            };
-
+            let start = event_log_len(&event_log);
+            let (subscription_id, _) = client.start_subscription(subscription_params()).await?;
             let snapshot = decode_snapshot_result(
                 client
                     .request_on_executor("session.snapshot", empty_params())
                     .await?
                     .get(),
             )?;
-            let events = match event_log.lock() {
-                Ok(events) => events[start..]
-                    .iter()
-                    .filter(|event| event.sequence() > snapshot.sequence)
-                    .cloned()
-                    .collect(),
-                Err(poisoned) => poisoned.into_inner()[start..]
-                    .iter()
-                    .filter(|event| event.sequence() > snapshot.sequence)
-                    .cloned()
-                    .collect(),
-            };
+            let pane_ids: Vec<String> = snapshot
+                .panes
+                .iter()
+                .map(|pane| pane.pane_id.clone())
+                .filter(|pane_id| !pane_id.is_empty())
+                .collect();
+            if !pane_ids.is_empty() {
+                let _ = client
+                    .start_subscription(pane_filter_subscription_params(&pane_ids))
+                    .await?;
+            }
+            let events = events_since(&event_log, start);
             Ok(HerdrBootstrap {
                 snapshot,
                 subscription_id,
                 events,
             })
         })
+    }
+}
+fn take_pending(
+    pending: &PendingRequests,
+    request_id: &str,
+) -> Option<oneshot::Sender<PendingResult>> {
+    match pending.lock() {
+        Ok(mut pending) => pending.remove(request_id),
+        Err(poisoned) => poisoned.into_inner().remove(request_id),
     }
 }
 fn remove_pending(pending: &PendingRequests, request_id: &str) {
@@ -876,7 +1048,6 @@ pub(crate) trait HerdrApi: Send + Sync {
 fn empty_params() -> Value {
     serde_json::Map::new().into()
 }
-
 fn subscription_params() -> Value {
     serde_json::json!({
         "subscriptions": [
@@ -884,6 +1055,8 @@ fn subscription_params() -> Value {
             {"type": "workspace.updated"},
             {"type": "workspace.metadata_updated"},
             {"type": "workspace.renamed"},
+            {"type": "workspace.moved"},
+            {"type": "workspace.reordered"},
             {"type": "workspace.closed"},
             {"type": "workspace.focused"},
             {"type": "pane.created"},
@@ -897,6 +1070,35 @@ fn subscription_params() -> Value {
     })
 }
 
+fn pane_filter_subscription_params(pane_ids: &[String]) -> Value {
+    let mut subscriptions = Vec::with_capacity(pane_ids.len() * 3);
+    for pane_id in pane_ids {
+        subscriptions.push(serde_json::json!({
+            "type": "pane.agent_status_changed",
+            "pane_id": pane_id
+        }));
+        subscriptions.push(serde_json::json!({
+            "type": "pane.output_matched",
+            "pane_id": pane_id,
+            "source": "recent",
+            "match": {"type": "substring", "value": ""},
+            "strip_ansi": true
+        }));
+        subscriptions.push(serde_json::json!({
+            "type": "pane.scroll_changed",
+            "pane_id": pane_id
+        }));
+    }
+    serde_json::json!({"subscriptions": subscriptions})
+}
+
+fn pane_input_params(pane_id: &str, text: Option<&str>, keys: &[String]) -> Value {
+    let mut params = serde_json::json!({"pane_id": pane_id, "keys": keys});
+    if let Some(text) = text {
+        params["text"] = Value::String(text.to_string());
+    }
+    params
+}
 fn agent_prompt_params(target: &str, text: &str) -> Value {
     serde_json::json!({"target": target, "text": text})
 }
@@ -929,22 +1131,10 @@ impl HerdrApi for HerdrClientHandle {
     }
 
     fn subscribe_events(&self, _cx: &App) -> Task<Result<String, HerdrClientError>> {
-        let task = self.request_on_executor("events.subscribe", subscription_params());
-        let executor = self.executor.clone();
-        executor.spawn(async move {
-            let result = task.await?;
-            let value = value_from_raw(&result)?;
-            if value.get("type").and_then(Value::as_str) != Some("subscription_started") {
-                return Err(HerdrClientError::Codec(
-                    "events.subscribe did not return subscription_started".to_string(),
-                ));
-            }
-            Ok(value
-                .get("subscription_id")
-                .and_then(Value::as_str)
-                .unwrap_or("default")
-                .to_string())
-        })
+        let task = self.start_subscription(subscription_params());
+        self.executor
+            .clone()
+            .spawn(async move { task.await.map(|(subscription_id, _)| subscription_id) })
     }
 
     fn bootstrap(&self, cx: &App) -> Task<Result<HerdrBootstrap, HerdrClientError>> {
@@ -1022,11 +1212,10 @@ impl HerdrApi for HerdrClientHandle {
         let executor = self.executor.clone();
         executor.spawn(async move { task.await.map(|_| ()) })
     }
-
     fn send_pane_input(&self, pane_id: &str, text: Option<&str>, keys: Vec<String>, _cx: &App) -> Task<Result<(), HerdrClientError>> {
         let task = self.request_on_executor(
             "pane.send_input",
-            serde_json::json!({"pane_id": pane_id, "text": text, "keys": keys}),
+            pane_input_params(pane_id, text, &keys),
         );
         let executor = self.executor.clone();
         executor.spawn(async move { task.await.map(|_| ()) })
@@ -1117,8 +1306,17 @@ mod tests {
     fn encodes_official_subscription_payload() {
         let payload = subscription_params();
         assert_eq!(payload["subscriptions"][0], serde_json::json!({"type": "workspace.created"}));
-        assert_eq!(payload["subscriptions"].as_array().map(Vec::len), Some(13));
-        assert_eq!(payload["subscriptions"][12]["type"], "pane.agent_detected");
+        assert_eq!(payload["subscriptions"].as_array().map(Vec::len), Some(15));
+        assert_eq!(payload["subscriptions"][12]["type"], "pane.moved");
+        assert_eq!(payload["subscriptions"][13]["type"], "pane.exited");
+        assert_eq!(payload["subscriptions"][14]["type"], "pane.agent_detected");
+        assert!(pane_filter_subscription_params(&["w1:p1".to_string()])["subscriptions"]
+            .as_array()
+            .is_some_and(|subscriptions| subscriptions.len() == 3));
+        assert_eq!(
+            pane_filter_subscription_params(&["w1:p1".to_string()])["subscriptions"][0],
+            serde_json::json!({"type": "pane.agent_status_changed", "pane_id": "w1:p1"})
+        );
         assert!(payload.get("events").is_none());
     }
 
@@ -1136,6 +1334,32 @@ mod tests {
         )
         .expect("pane read");
         assert_eq!(pane, (4, "output".to_string()));
+    }
+
+    #[test]
+    fn replays_buffered_events_in_arrival_order_without_sequences() {
+        let event_log = Arc::new(Mutex::new(Vec::new()));
+        let start = event_log_len(&event_log);
+        record_event(
+            &event_log,
+            HerdrEvent::WorkspaceFocused {
+                workspace_id: "w1".to_string(),
+                operation_id: None,
+                sequence: 0,
+            },
+        );
+        record_event(
+            &event_log,
+            HerdrEvent::PaneScrollChanged {
+                pane_id: "w1:p1".to_string(),
+                sequence: 0,
+            },
+        );
+        let events = events_since(&event_log, start);
+        assert!(matches!(events.as_slice(), [
+            HerdrEvent::WorkspaceFocused { workspace_id, .. },
+            HerdrEvent::PaneScrollChanged { pane_id, .. },
+        ] if workspace_id == "w1" && pane_id == "w1:p1"));
     }
 
     #[test]
@@ -1161,6 +1385,34 @@ mod tests {
         assert!(matches!(status, HerdrEvent::PaneAgentStatusChanged { status: HerdrAgentStatus::Working, .. }));
         let output = decode_event(r#"{"event":"pane.output_matched","data":{"type":"pane.output_matched","pane_id":"p1","revision":9,"text":"hello"}}"#).expect("output event");
         assert!(matches!(output, HerdrEvent::PaneOutput { revision: 9, delta, .. } if delta == "hello"));
+    }
+    
+    #[test]
+    fn decodes_typed_pane_moved_event() {
+        let event = decode_event(
+            r#"{"event":"pane.moved","data":{"type":"pane_moved","previous_pane_id":"w1:p1","previous_workspace_id":"w1","previous_tab_id":"w1:t1","pane":{"pane_id":"w2:p2","workspace_id":"w2","tab_id":"w2:t1"}}}"#,
+        )
+        .expect("pane moved event");
+        assert!(matches!(
+            event,
+            HerdrEvent::PaneMoved {
+                pane,
+                previous_pane_id: Some(previous),
+                ..
+            } if pane.pane_id == "w2:p2" && previous == "w1:p1"
+        ));
+    }
+
+    #[test]
+    fn omits_absent_pane_input_text() {
+        assert_eq!(
+            pane_input_params("w1:p1", None, &["enter".to_string()]),
+            serde_json::json!({"pane_id":"w1:p1","keys":["enter"]})
+        );
+        assert_eq!(
+            pane_input_params("w1:p1", Some("hello"), &[]),
+            serde_json::json!({"pane_id":"w1:p1","text":"hello","keys":[]})
+        );
     }
     #[test]
     fn decodes_string_protocol_error_code() {
