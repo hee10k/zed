@@ -4679,15 +4679,15 @@ impl AgentPanel {
             return false;
         };
         let Some(metadata) = bridge.read(cx).root_metadata(herdr_workspace_id).cloned() else {
-            return true;
+            return false;
         };
         let herdr_paths = metadata.folder_paths().paths();
         let current_workspace = self.workspace.upgrade();
         let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() else {
             return current_workspace.is_some_and(|workspace| {
                 let paths = workspace.read(cx).root_paths(cx);
-                herdr_paths.is_empty()
-                    || paths.iter().any(|path| {
+                !herdr_paths.is_empty()
+                    && paths.iter().any(|path| {
                         herdr_paths
                             .iter()
                             .any(|herdr_path| herdr_path.as_path() == path.as_ref())
@@ -4701,15 +4701,15 @@ impl AgentPanel {
             .collect::<Vec<_>>();
         let owner = workspaces.iter().find(|workspace| {
             let paths = workspace.read(cx).root_paths(cx);
-            herdr_paths.is_empty()
-                || paths.iter().any(|path| {
+            !herdr_paths.is_empty()
+                && paths.iter().any(|path| {
                     herdr_paths
                         .iter()
                         .any(|herdr_path| herdr_path.as_path() == path.as_ref())
                 })
         });
         let Some(owner) = owner.cloned() else {
-            return true;
+            return false;
         };
         if current_workspace.as_ref() != Some(&owner) {
             let source = current_workspace.as_ref().map(Entity::downgrade);
