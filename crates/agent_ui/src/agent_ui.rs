@@ -9,7 +9,10 @@ mod completion_provider;
 mod config_options;
 mod context;
 mod context_server_configuration;
+pub(crate) mod herdr_client;
+pub(crate) mod herdr_transport;
 pub(crate) mod conversation_view;
+
 mod diagnostics;
 pub mod draft_prompt_store;
 mod entry_view_state;
