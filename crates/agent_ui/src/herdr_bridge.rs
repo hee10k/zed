@@ -1,16 +1,17 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use db::kvp::KeyValueStore;
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task, TaskExt, WindowId};
+use gpui::{App, AppContext as _, Context, Entity, Global, Task, TaskExt, WindowId};
 use workspace::PathList;
 
 use crate::{
@@ -23,7 +24,7 @@ use crate::{
         SessionMappings, upsert_record,
     },
     herdr_state::{
-        AppliedEvent, BridgeState, FocusTarget, HerdrOperationOrigin, OutboundRequest,
+        AppliedEvent, BridgeState, HerdrOperationOrigin, OutboundRequest,
         ReconciliationAction, apply_event, initiate_workspace_focus, reconcile_snapshot,
     },
     herdr_transport::HerdrEndpoint,
@@ -106,18 +107,14 @@ pub(crate) enum HerdrBridgeEvent {
         key: HerdrMappingKey,
         message: String,
     },
+    RequestFailed {
+        workspace_id: Option<String>,
+        operation: String,
+        message: String,
+    },
 }
 
 impl gpui::EventEmitter<HerdrBridgeEvent> for HerdrThreadBridge {}
-
-/// A request sent to Herdr by a bridge action. The origin is retained even
-/// though the current Herdr RPC surface carries the operation ID in params.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct HerdrOperationRequest {
-    pub operation_id: String,
-    pub origin: HerdrOperationOrigin,
-    pub target: FocusTarget,
-}
 
 /// GPUI entity holding one Herdr session's mapping and lifecycle state.
 ///
@@ -135,7 +132,12 @@ pub(crate) struct HerdrThreadBridge {
     events: Vec<HerdrBridgeEvent>,
     outbound_requests: Vec<OutboundRequest>,
     pending_authoritative_focus: Option<String>,
+    current_focus_workspace: Option<String>,
+    metadata_dirty: HashSet<String>,
+    active_subscription_id: Option<String>,
     active: Arc<AtomicBool>,
+    sync_generation: Arc<AtomicU64>,
+    sync_started: bool,
 }
 impl HerdrThreadBridge {
     fn new(
@@ -161,7 +163,12 @@ impl HerdrThreadBridge {
             events: Vec::new(),
             outbound_requests: Vec::new(),
             pending_authoritative_focus: None,
+            current_focus_workspace: None,
+            metadata_dirty: HashSet::default(),
+            active_subscription_id: None,
             active: Arc::new(AtomicBool::new(true)),
+            sync_generation: Arc::new(AtomicU64::new(0)),
+            sync_started: false,
         }
     }
 
@@ -258,16 +265,63 @@ impl HerdrThreadBridge {
         }
     }
 
+
+    fn event_for_state(&self, event: &HerdrEvent) -> HerdrEvent {
+        let Some(origin) = event.operation_origin() else {
+            return event.clone();
+        };
+        if origin.eq_ignore_ascii_case("zed") {
+            return event.clone();
+        }
+        match event {
+            HerdrEvent::WorkspaceFocused {
+                workspace_id,
+                sequence,
+                ..
+            } => HerdrEvent::WorkspaceFocused {
+                workspace_id: workspace_id.clone(),
+                operation_id: None,
+                sequence: *sequence,
+            },
+            HerdrEvent::PaneFocused {
+                pane_id,
+                workspace_id,
+                sequence,
+                ..
+            } => HerdrEvent::PaneFocused {
+                pane_id: pane_id.clone(),
+                workspace_id: workspace_id.clone(),
+                operation_id: None,
+                sequence: *sequence,
+            },
+            _ => event.clone(),
+        }
+    }
+
+    fn note_focus_event(&mut self, event: &HerdrEvent, applied: &AppliedEvent) {
+        if applied
+            .actions
+            .iter()
+            .any(|action| matches!(action, ReconciliationAction::Activate(_)))
+        {
+            self.current_focus_workspace = event.workspace_id().map(ToOwned::to_owned);
+        }
+    }
+
     /// Apply one pushed Herdr event without requiring a GPUI context. This is
     /// intentionally useful for deterministic lifecycle tests.
     pub(crate) fn apply_event(&mut self, event: HerdrEvent) {
-        let applied = apply_event(&mut self.state, &event);
+        let state_event = self.event_for_state(&event);
+        let applied = apply_event(&mut self.state, &state_event);
+        self.note_focus_event(&event, &applied);
         self.apply_actions(applied);
     }
 
     fn apply_event_in_context(&mut self, event: HerdrEvent, cx: &mut Context<Self>) {
         let start = self.events.len();
-        let applied = apply_event(&mut self.state, &event);
+        let state_event = self.event_for_state(&event);
+        let applied = apply_event(&mut self.state, &state_event);
+        self.note_focus_event(&event, &applied);
         self.apply_actions_in_context(applied, cx);
         self.emit_new_events(start, cx);
         self.persist_mappings(cx);
@@ -322,6 +376,7 @@ impl HerdrThreadBridge {
         let mapping_before = self.state.mappings.clone();
         self.apply_action(action);
         self.persist_metadata_changes(&mapping_before, cx);
+        self.persist_dirty_metadata(cx);
         self.emit_new_events(event_before, cx);
     }
 
@@ -350,6 +405,7 @@ impl HerdrThreadBridge {
         let metadata = self.metadata_for_workspace(&record, workspace);
         self.root_metadata
             .insert(workspace.workspace_id.clone(), metadata);
+        self.metadata_dirty.insert(workspace.workspace_id.clone());
         if !restored {
             self.events.push(HerdrBridgeEvent::RootCreated {
                 workspace_id: workspace.workspace_id.clone(),
@@ -367,6 +423,7 @@ impl HerdrThreadBridge {
         if let Some(metadata) = self.root_metadata.get_mut(&workspace_id) {
             metadata.archived = false;
             metadata.updated_at = Utc::now();
+            self.metadata_dirty.insert(workspace_id);
         }
     }
 
@@ -409,13 +466,12 @@ impl HerdrThreadBridge {
         };
         metadata.title = Some(title.clone().into());
         metadata.updated_at = Utc::now();
-        if metadata.title_override.is_none() {
-            self.events.push(HerdrBridgeEvent::RootRenamed {
-                workspace_id: key.workspace_id.clone(),
-                thread_id: metadata.thread_id,
-                title,
-            });
-        }
+        self.metadata_dirty.insert(key.workspace_id.clone());
+        self.events.push(HerdrBridgeEvent::RootRenamed {
+            workspace_id: key.workspace_id.clone(),
+            thread_id: metadata.thread_id,
+            title,
+        });
     }
 
     fn activate_mapping(&mut self, key: &HerdrMappingKey) {
@@ -441,6 +497,7 @@ impl HerdrThreadBridge {
         if let Some(metadata) = self.root_metadata.get_mut(&key.workspace_id) {
             metadata.archived = true;
             metadata.updated_at = Utc::now();
+            self.metadata_dirty.insert(key.workspace_id.clone());
             self.events.push(HerdrBridgeEvent::RootClosed {
                 workspace_id: key.workspace_id.clone(),
                 thread_id: metadata.thread_id,
@@ -522,6 +579,37 @@ impl HerdrThreadBridge {
             }
         }
     }
+    fn persist_dirty_metadata(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = ThreadMetadataStore::try_global(cx) else {
+            return;
+        };
+        let dirty = std::mem::take(&mut self.metadata_dirty);
+        for workspace_id in dirty {
+            let Some(metadata) = self.root_metadata.get(&workspace_id).cloned() else {
+                continue;
+            };
+            if metadata.archived {
+                store.update(cx, |store, cx| store.archive(metadata.thread_id, None, cx));
+            } else {
+                store.update(cx, |store, cx| store.save(metadata, cx));
+            }
+        }
+    }
+
+    fn persist_all_root_metadata(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = ThreadMetadataStore::try_global(cx) else {
+            return;
+        };
+        let metadata = self.root_metadata.values().cloned().collect::<Vec<_>>();
+        self.metadata_dirty.clear();
+        for metadata in metadata {
+            if metadata.archived {
+                store.update(cx, |store, cx| store.archive(metadata.thread_id, None, cx));
+            } else {
+                store.update(cx, |store, cx| store.save(metadata, cx));
+            }
+        }
+    }
 
     fn persist_mappings(&self, cx: &mut Context<Self>) {
         let kvp = KeyValueStore::global(cx);
@@ -537,6 +625,8 @@ impl HerdrThreadBridge {
         if !snapshot.session.is_empty() && snapshot.session != self.state.session {
             self.state.session = snapshot.session;
         }
+        self.current_focus_workspace = None;
+        self.pending_authoritative_focus = snapshot.active_workspace_id;
         let actions = reconcile_snapshot(
             &self.state.session,
             &snapshot.workspaces,
@@ -562,12 +652,14 @@ impl HerdrThreadBridge {
                     self.create_or_restore_root(workspace, true);
                     if let Some(metadata) = self.root_metadata.get_mut(&workspace.workspace_id) {
                         metadata.thread_id = record.zed_root_thread_id;
+                        self.metadata_dirty.insert(workspace.workspace_id.clone());
                     }
                 }
             }
         }
-        self.state.last_sequence = snapshot.sequence;
-        self.pending_authoritative_focus = snapshot.active_workspace_id;
+        // Snapshot sequence is not a reliable replay cursor across Herdr
+        // versions. The client-provided event boundary controls replay.
+        self.state.last_sequence = 0;
     }
 
     fn merge_existing_metadata(
@@ -598,31 +690,41 @@ impl HerdrThreadBridge {
                     metadata.title = existing.title;
                 }
                 metadata.archived = false;
+                metadata.updated_at = Utc::now();
+                self.metadata_dirty.insert(workspace.workspace_id.clone());
             }
         }
     }
-
     fn apply_bootstrap(&mut self, bootstrap: HerdrBootstrap, cx: &mut Context<Self>) {
         let start = self.events.len();
         self.set_status(HerdrConnectionStatus::Synchronizing);
         self.apply_snapshot(bootstrap.snapshot.clone());
         self.merge_existing_metadata(&bootstrap.snapshot.workspaces, cx);
         for event in bootstrap.events {
-            if event.sequence() > bootstrap.snapshot.sequence {
-                let applied = apply_event(&mut self.state, &event);
-                self.apply_actions_in_context(applied, cx);
+            let state_event = self.event_for_state(&event);
+            let applied = apply_event(&mut self.state, &state_event);
+            self.note_focus_event(&event, &applied);
+            self.apply_actions_in_context(applied, cx);
+        }
+        if self.current_focus_workspace.is_none() {
+            if let Some(workspace_id) = self.pending_authoritative_focus.take() {
+                let key = self.state.workspace_key(&workspace_id);
+                self.activate_mapping(&key);
             }
+        } else {
+            self.pending_authoritative_focus = None;
         }
-        if let Some(workspace_id) = self.pending_authoritative_focus.take() {
-            let key = self.state.workspace_key(&workspace_id);
-            self.activate_mapping(&key);
-        }
+        // Persist roots before Ready is observable. This also writes rows
+        // created by a snapshot even when no mapping changed.
+        self.persist_all_root_metadata(cx);
+        self.active_subscription_id = Some(bootstrap.subscription_id);
         self.set_status(HerdrConnectionStatus::Ready);
         self.emit_new_events(start, cx);
         self.persist_mappings(cx);
     }
     fn start_sync(&mut self, cx: &mut Context<Self>) {
         self.active.store(true, Ordering::SeqCst);
+        let generation = self.sync_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let status_start = self.events.len();
         self.set_status(HerdrConnectionStatus::Reconnecting);
         self.emit_new_events(status_start, cx);
@@ -632,73 +734,184 @@ impl HerdrThreadBridge {
             self.emit_new_events(status_start, cx);
             return;
         };
-        let bootstrap = client.bootstrap(cx);
         let events = self.event_receiver.clone();
         let active = self.active.clone();
+        let sync_generation = self.sync_generation.clone();
         cx.spawn(async move |this, cx| {
-            match bootstrap.await {
-                Ok(bootstrap) => {
-                    let started = this.update(cx, |bridge, cx| {
-                        if !active.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        bridge.apply_bootstrap(bootstrap, cx);
-                    });
-                    if let Err(error) = started {
-                        log::debug!("Herdr bridge bootstrap target was released: {error}");
-                        return;
-                    }
-                }
-                Err(error) => {
-                    let updated = this.update(cx, |bridge, cx| {
-                        let status_start = bridge.events.len();
-                        bridge.set_status(HerdrConnectionStatus::Unavailable);
-                        bridge.emit_new_events(status_start, cx);
-                        log::warn!("Herdr bridge bootstrap failed: {error}");
-                    });
-                    if let Err(update_error) = updated {
-                        log::debug!(
-                            "Herdr bridge could not publish bootstrap failure: {update_error}"
-                        );
-                    }
+            let mut backoff = Duration::from_millis(100);
+            loop {
+                if !active.load(Ordering::SeqCst)
+                    || sync_generation.load(Ordering::SeqCst) != generation
+                {
                     return;
                 }
-            }
 
-            let Some(events) = events else {
-                return;
-            };
-            while active.load(Ordering::SeqCst) {
-                let Ok(event) = events.recv().await else {
-                    let updated = this.update(cx, |bridge, cx| {
-                        let status_start = bridge.events.len();
-                        bridge.set_status(HerdrConnectionStatus::Unavailable);
-                        bridge.emit_new_events(status_start, cx);
-                    });
-                    if let Err(error) = updated {
-                        log::debug!("Herdr bridge could not publish disconnect: {error}");
-                    }
-                    break;
+                let bootstrap = match this.update(cx, |_bridge, cx| client.bootstrap(cx)) {
+                    Ok(task) => task.await,
+                    Err(_) => return,
                 };
-                let updated = this.update(cx, |bridge, cx| {
-                    bridge.apply_event_in_context(event, cx);
-                });
-                if let Err(error) = updated {
-                    log::debug!("Herdr bridge event target was released: {error}");
-                    break;
+                match bootstrap {
+                    Ok(bootstrap) => {
+                        let reload_task = this
+                            .update(cx, |_bridge, cx| {
+                                ThreadMetadataStore::try_global(cx)
+                                    .map(|store| store.read(cx).reload_task())
+                            })
+                            .ok()
+                            .flatten();
+                        if let Some(reload_task) = reload_task {
+                            reload_task.await;
+                        }
+                        let applied = this
+                            .update(cx, |bridge, cx| {
+                                if !active.load(Ordering::SeqCst)
+                                    || sync_generation.load(Ordering::SeqCst) != generation
+                                {
+                                    return false;
+                                }
+                                bridge.apply_bootstrap(bootstrap, cx);
+                                true
+                            })
+                            .unwrap_or(false);
+                        if !applied {
+                            return;
+                        }
+                        backoff = Duration::from_millis(100);
+
+                        let Some(events) = events.clone() else {
+                            return;
+                        };
+                        let mut reconnect = false;
+                        while active.load(Ordering::SeqCst)
+                            && sync_generation.load(Ordering::SeqCst) == generation
+                        {
+                            let event = match events.recv().await {
+                                Ok(event) => event,
+                                Err(_) => {
+                                    reconnect = true;
+                                    let _ = this.update(cx, |bridge, cx| {
+                                        let start = bridge.events.len();
+                                        bridge.set_status(HerdrConnectionStatus::Unavailable);
+                                        bridge.emit_new_events(start, cx);
+                                    });
+                                    break;
+                                }
+                            };
+                            let ended_subscription_id = match &event {
+                                HerdrEvent::Unknown { event, data }
+                                    if event == "subscription_ended" =>
+                                {
+                                    serde_json::from_str::<serde_json::Value>(data.get())
+                                        .ok()
+                                        .and_then(|value| {
+                                            value
+                                                .get("subscription_id")
+                                                .and_then(serde_json::Value::as_str)
+                                                .map(ToOwned::to_owned)
+                                        })
+                                }
+                                _ => None,
+                            };
+                            if let Some(subscription_id) = ended_subscription_id {
+                                let is_main = this
+                                    .update(cx, |bridge, _cx| {
+                                        bridge.active_subscription_id.as_deref()
+                                            == Some(subscription_id.as_str())
+                                    })
+                                    .unwrap_or(false);
+                                if is_main {
+                                    reconnect = true;
+                                    let _ = this.update(cx, |bridge, cx| {
+                                        let start = bridge.events.len();
+                                        bridge.active_subscription_id = None;
+                                        bridge.set_status(HerdrConnectionStatus::Unavailable);
+                                        bridge.emit_new_events(start, cx);
+                                    });
+                                    break;
+                                }
+                                continue;
+                            }
+                            if this
+                                .update(cx, |bridge, cx| {
+                                    if !active.load(Ordering::SeqCst)
+                                        || sync_generation.load(Ordering::SeqCst) != generation
+                                    {
+                                        return false;
+                                    }
+                                    bridge.apply_event_in_context(event, cx);
+                                    true
+                                })
+                                .unwrap_or(false)
+                                == false
+                            {
+                                return;
+                            }
+                        }
+
+                        if !reconnect
+                            || !active.load(Ordering::SeqCst)
+                            || sync_generation.load(Ordering::SeqCst) != generation
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = this.update(cx, |bridge, cx| {
+                            if !active.load(Ordering::SeqCst)
+                                || sync_generation.load(Ordering::SeqCst) != generation
+                            {
+                                return;
+                            }
+                            let start = bridge.events.len();
+                            bridge.active_subscription_id = None;
+                            bridge.set_status(HerdrConnectionStatus::Unavailable);
+                            bridge.events.push(HerdrBridgeEvent::RequestFailed {
+                                workspace_id: None,
+                                operation: "bootstrap".to_string(),
+                                message: error.to_string(),
+                            });
+                            bridge.emit_new_events(start, cx);
+                        });
+                    }
                 }
+
+                if !active.load(Ordering::SeqCst)
+                    || sync_generation.load(Ordering::SeqCst) != generation
+                {
+                    return;
+                }
+                cx.background_executor().timer(backoff).await;
+                let _ = this.update(cx, |bridge, cx| {
+                    if !active.load(Ordering::SeqCst)
+                        || sync_generation.load(Ordering::SeqCst) != generation
+                    {
+                        return;
+                    }
+                    let start = bridge.events.len();
+                    bridge.set_status(HerdrConnectionStatus::Reconnecting);
+                    bridge.emit_new_events(start, cx);
+                });
+                backoff = std::cmp::min(Duration::from_secs(2), backoff.saturating_mul(2));
             }
         })
         .detach();
     }
 
     pub(crate) fn begin_sync(&mut self, cx: &mut Context<Self>) {
+        if self.sync_started {
+            return;
+        }
+        self.sync_started = true;
         self.start_sync(cx);
     }
 
     pub(crate) fn stop(&mut self) {
         self.active.store(false, Ordering::SeqCst);
+        self.sync_generation.fetch_add(1, Ordering::SeqCst);
+        self.sync_started = false;
+        self.active_subscription_id = None;
         self.client = None;
+        self.event_receiver = None;
         self.set_status(HerdrConnectionStatus::Unavailable);
     }
 
@@ -710,10 +923,15 @@ impl HerdrThreadBridge {
             return Err(anyhow!("Herdr session name cannot be empty"));
         }
         self.active.store(false, Ordering::SeqCst);
+        self.sync_generation.fetch_add(1, Ordering::SeqCst);
+        self.sync_started = false;
+        self.active_subscription_id = None;
         self.client = None;
         self.event_receiver = None;
         self.state = BridgeState::new(session.clone());
         self.pending_authoritative_focus = None;
+        self.current_focus_workspace = None;
+        self.metadata_dirty.clear();
         self.root_metadata.clear();
         self.outbound_requests.clear();
         self.selection = HerdrSessionSelection::Named(session);
@@ -726,8 +944,8 @@ impl HerdrThreadBridge {
         selection: HerdrSessionSelection,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        self.pending_authoritative_focus = None;
         self.rebind_session(selection.session_name())?;
+        self.selection = selection.clone();
         let endpoint = selection.endpoint();
         self.client = match HerdrClientHandle::new(endpoint, cx) {
             Ok(client) => {
@@ -740,10 +958,10 @@ impl HerdrThreadBridge {
                 None
             }
         };
+        self.sync_started = true;
         self.start_sync(cx);
         Ok(())
     }
-
     /// Request Herdr to focus a mapped root and return the fenced operation.
     /// Reflected events with this operation ID are consumed by Task 2's state
     /// machine and never produce another outbound request.
@@ -765,13 +983,17 @@ impl HerdrThreadBridge {
         let OutboundRequest::FocusWorkspace {
             workspace_id,
             operation_id,
-            origin: _,
+            origin,
         } = request
         else {
             return None;
         };
         let client = self.client.clone()?;
-        let task = client.focus_workspace(&workspace_id, Some(&operation_id), cx);
+        let origin = match origin {
+            HerdrOperationOrigin::Zed => "zed",
+            HerdrOperationOrigin::Herdr => "herdr",
+        };
+        let task = client.focus_workspace(&workspace_id, Some(&operation_id), Some(origin), cx);
         Some(task)
     }
 
@@ -844,14 +1066,6 @@ impl HerdrBridgeRegistry {
     ) -> Entity<HerdrThreadBridge> {
         if let Some(bridge) = self.bridges.get(&window_id).cloned() {
             *self.panel_counts.entry(window_id).or_default() += 1;
-            if bridge.read(cx).selection() != &session {
-                let result = bridge.update(cx, |bridge, cx| {
-                    bridge.rebind_selection(session.clone(), cx)
-                });
-                if let Err(error) = result {
-                    log::warn!("Herdr bridge session rebind failed: {error}");
-                }
-            }
             return bridge;
         }
 
@@ -897,7 +1111,6 @@ impl HerdrBridgeRegistry {
         });
         self.bridges.insert(window_id, bridge.clone());
         self.panel_counts.insert(window_id, 1);
-        bridge.update(cx, |bridge, cx| bridge.begin_sync(cx));
         bridge
     }
 

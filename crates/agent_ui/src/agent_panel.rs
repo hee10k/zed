@@ -1562,6 +1562,11 @@ impl AgentPanel {
                 },
             )
         });
+        // Subscribe before starting bootstrap so RootCreated/StatusChanged
+        // events cannot be emitted into a lifecycle-before-discovery gap.
+        if let Some(bridge) = herdr_bridge.as_ref() {
+            bridge.update(cx, |bridge, cx| bridge.begin_sync(cx));
+        }
 
         let base_view = BaseView::Uninitialized;
 
@@ -3539,7 +3544,19 @@ impl AgentPanel {
             let task = bridge.update(cx, |bridge, cx| {
                 bridge.request_close_workspace(&workspace_id, cx)
             });
-            task.detach_and_log_err(cx);
+            let workspace = self.workspace.clone();
+            cx.spawn_in(window, async move |_this, cx| {
+                if let Err(error) = task.await {
+                    let _ = cx.update(|_window, cx| {
+                        Self::show_herdr_toast(
+                            &workspace,
+                            format!("Herdr close failed: {error}"),
+                            cx,
+                        );
+                    });
+                }
+            })
+            .detach();
             return;
         }
         self.retained_threads.remove(&id);
@@ -3584,8 +3601,7 @@ impl AgentPanel {
             _ => None,
         }
     }
-
-    pub fn has_terminal(&self, terminal_id: TerminalId) -> bool {
+    pub(crate) fn has_terminal(&self, terminal_id: TerminalId) -> bool {
         self.terminals.contains_key(&terminal_id)
     }
 
@@ -4626,6 +4642,85 @@ impl AgentPanel {
         );
     }
 
+    fn show_herdr_toast(
+        workspace: &WeakEntity<workspace::Workspace>,
+        message: impl Into<String>,
+        cx: &mut App,
+    ) {
+        let workspace = workspace.clone();
+        let message = message.into();
+        cx.defer(move |cx| {
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    struct HerdrErrorToast;
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            workspace::notifications::NotificationId::unique::<HerdrErrorToast>(),
+                            message,
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                });
+            }
+        });
+    }
+
+    /// Route one Herdr workspace event to the Zed workspace whose project
+    /// roots own the mirrored Herdr metadata. A MultiWorkspace activation is
+    /// performed before panel focus so only the owning panel handles it.
+    fn route_herdr_workspace(
+        &self,
+        herdr_workspace_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(bridge) = self.herdr_bridge.as_ref() else {
+            return false;
+        };
+        let Some(metadata) = bridge.read(cx).root_metadata(herdr_workspace_id).cloned() else {
+            return true;
+        };
+        let herdr_paths = metadata.folder_paths().paths();
+        let current_workspace = self.workspace.upgrade();
+        let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() else {
+            return current_workspace.is_some_and(|workspace| {
+                let paths = workspace.read(cx).root_paths(cx);
+                herdr_paths.is_empty()
+                    || paths.iter().any(|path| {
+                        herdr_paths
+                            .iter()
+                            .any(|herdr_path| herdr_path.as_path() == path.as_ref())
+                    })
+            });
+        };
+        let workspaces = multi_workspace
+            .read(cx)
+            .workspaces()
+            .cloned()
+            .collect::<Vec<_>>();
+        let owner = workspaces.iter().find(|workspace| {
+            let paths = workspace.read(cx).root_paths(cx);
+            herdr_paths.is_empty()
+                || paths.iter().any(|path| {
+                    herdr_paths
+                        .iter()
+                        .any(|herdr_path| herdr_path.as_path() == path.as_ref())
+                })
+        });
+        let Some(owner) = owner.cloned() else {
+            return true;
+        };
+        if current_workspace.as_ref() != Some(&owner) {
+            let source = current_workspace.as_ref().map(Entity::downgrade);
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.activate(owner, source, window, cx);
+            });
+            return false;
+        }
+        true
+    }
+
     fn handle_herdr_event(
         &mut self,
         event: &HerdrBridgeEvent,
@@ -4633,16 +4728,65 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         match event {
-            HerdrBridgeEvent::RootFocused { thread_id, .. } => {
+            HerdrBridgeEvent::RootFocused {
+                workspace_id,
+                thread_id,
+            } => {
+                if !self.route_herdr_workspace(workspace_id, window, cx) {
+                    return;
+                }
                 self.herdr_focus_suppressed = true;
                 self.load_herdr_thread(*thread_id, true, window, cx);
                 self.herdr_focus_suppressed = false;
             }
-            HerdrBridgeEvent::RootClosed { thread_id, .. } => {
+            HerdrBridgeEvent::RootClosed {
+                workspace_id,
+                thread_id,
+            } => {
+                if !self.route_herdr_workspace(workspace_id, window, cx) {
+                    return;
+                }
                 if self.herdr_active_thread == Some(*thread_id) {
                     self.herdr_active_thread = None;
+                    let old_view =
+                        std::mem::replace(&mut self.base_view, BaseView::Uninitialized);
+                    self.retain_running_thread(old_view, cx);
+                    self.refresh_base_view_subscriptions(window, cx);
+                    self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
                     cx.emit(AgentPanelEvent::ActiveViewChanged);
                     cx.notify();
+                }
+            }
+            HerdrBridgeEvent::RootRenamed { workspace_id, .. } => {
+                if self.route_herdr_workspace(workspace_id, window, cx) {
+                    // ThreadMetadataStore was updated by the bridge before
+                    // this event, so the sidebar observes the durable title.
+                    cx.notify();
+                }
+            }
+            HerdrBridgeEvent::Conflict { key, message } => {
+                if self.route_herdr_workspace(&key.workspace_id, window, cx) {
+                    Self::show_herdr_toast(
+                        &self.workspace,
+                        format!("Herdr conflict: {message}"),
+                        cx,
+                    );
+                }
+            }
+            HerdrBridgeEvent::RequestFailed {
+                workspace_id,
+                operation,
+                message,
+            } => {
+                let owns = workspace_id
+                    .as_deref()
+                    .map_or(true, |id| self.route_herdr_workspace(id, window, cx));
+                if owns {
+                    Self::show_herdr_toast(
+                        &self.workspace,
+                        format!("Herdr {operation} failed: {message}"),
+                        cx,
+                    );
                 }
             }
             HerdrBridgeEvent::StatusChanged(_) => cx.notify(),
@@ -4685,7 +4829,19 @@ impl AgentPanel {
             if let Some(task) = bridge.update(cx, |bridge, cx| {
                 bridge.focus_root_in_context(&workspace_id, cx)
             }) {
-                task.detach_and_log_err(cx);
+                let workspace = self.workspace.clone();
+                cx.spawn_in(window, async move |_this, cx| {
+                    if let Err(error) = task.await {
+                        let _ = cx.update(|_window, cx| {
+                            Self::show_herdr_toast(
+                                &workspace,
+                                format!("Herdr focus failed: {error}"),
+                                cx,
+                            );
+                        });
+                    }
+                })
+                .detach();
             }
         }
         cx.emit(AgentPanelEvent::ActiveViewChanged);

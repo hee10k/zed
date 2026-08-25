@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{
-    Arc, Mutex,
+    Arc, LazyLock, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
@@ -239,7 +239,11 @@ pub(crate) enum HerdrEvent {
     WorkspaceCreated { workspace: HerdrWorkspaceSnapshot, sequence: u64 },
     WorkspaceUpdated { workspace: HerdrWorkspaceSnapshot, sequence: u64 },
     WorkspaceRenamed { workspace_id: String, label: String, sequence: u64 },
-    WorkspaceFocused { workspace_id: String, operation_id: Option<String>, sequence: u64 },
+    WorkspaceFocused {
+        workspace_id: String,
+        operation_id: Option<String>,
+        sequence: u64,
+    },
     WorkspaceClosed { workspace_id: String, sequence: u64 },
     WorkspaceMoved {
         workspace_id: String,
@@ -283,6 +287,21 @@ pub(crate) enum HerdrEvent {
     SubscriptionStarted { subscription_id: String },
     Unknown { event: String, data: Box<RawValue> },
 }
+static FOCUS_OPERATION_ORIGINS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn focus_operation_origins() -> &'static Mutex<HashMap<String, String>> {
+    &FOCUS_OPERATION_ORIGINS
+}
+
+fn remember_focus_origin(operation_id: Option<&str>, origin: Option<&str>) {
+    let (Some(operation_id), Some(origin)) = (operation_id, origin) else {
+        return;
+    };
+    if let Ok(mut origins) = focus_operation_origins().lock() {
+        origins.insert(operation_id.to_string(), origin.to_string());
+    }
+}
 
 impl HerdrEvent {
     pub(crate) fn workspace_id(&self) -> Option<&str> {
@@ -302,6 +321,17 @@ impl HerdrEvent {
             | Self::PaneMoved { pane, .. } => Some(&pane.workspace_id),
             _ => None,
         }
+    }
+    pub(crate) fn operation_origin(&self) -> Option<String> {
+        let operation_id = match self {
+            Self::WorkspaceFocused { operation_id, .. }
+            | Self::PaneFocused { operation_id, .. } => operation_id.as_deref(),
+            _ => None,
+        }?;
+        focus_operation_origins()
+            .lock()
+            .ok()
+            .and_then(|origins| origins.get(operation_id).cloned())
     }
 
     pub(crate) fn pane_id(&self) -> Option<&str> {
@@ -488,11 +518,23 @@ pub(crate) fn decode_event(input: &str) -> Result<HerdrEvent, HerdrClientError> 
             label: required_string(&data, "label")?,
             sequence,
         }),
-        "workspace_focused" | "workspace.focused" => Ok(HerdrEvent::WorkspaceFocused {
-            workspace_id: required_string(&data, "workspace_id")?,
-            operation_id: data.get("operation_id").and_then(Value::as_str).map(ToOwned::to_owned),
-            sequence,
-        }),
+        "workspace_focused" | "workspace.focused" => {
+            let workspace_id = required_string(&data, "workspace_id")?;
+            let operation_id = data
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let origin = data
+                .get("origin")
+                .or_else(|| data.get("operation_origin"))
+                .and_then(Value::as_str);
+            remember_focus_origin(operation_id.as_deref(), origin);
+            Ok(HerdrEvent::WorkspaceFocused {
+                workspace_id,
+                operation_id,
+                sequence,
+            })
+        }
         "workspace_closed" | "workspace.closed" => Ok(HerdrEvent::WorkspaceClosed {
             workspace_id: required_string(&data, "workspace_id")?,
             sequence,
@@ -568,12 +610,25 @@ pub(crate) fn decode_event(input: &str) -> Result<HerdrEvent, HerdrClientError> 
                 sequence,
             })
         }
-        "pane_focused" | "pane.focused" => Ok(HerdrEvent::PaneFocused {
-            pane_id: required_string(&data, "pane_id")?,
-            workspace_id: required_string(&data, "workspace_id")?,
-            operation_id: data.get("operation_id").and_then(Value::as_str).map(ToOwned::to_owned),
-            sequence,
-        }),
+        "pane_focused" | "pane.focused" => {
+            let pane_id = required_string(&data, "pane_id")?;
+            let workspace_id = required_string(&data, "workspace_id")?;
+            let operation_id = data
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let origin = data
+                .get("origin")
+                .or_else(|| data.get("operation_origin"))
+                .and_then(Value::as_str);
+            remember_focus_origin(operation_id.as_deref(), origin);
+            Ok(HerdrEvent::PaneFocused {
+                pane_id,
+                workspace_id,
+                operation_id,
+                sequence,
+            })
+        }
         "pane_closed" | "pane.closed" => Ok(HerdrEvent::PaneClosed {
             pane_id: required_string(&data, "pane_id")?,
             workspace_id: required_string(&data, "workspace_id")?,
@@ -1108,7 +1163,8 @@ impl HerdrClientHandle {
                 .filter(|pane_id| !pane_id.is_empty())
                 .collect();
 
-            let (subscription_id, _, _) = client.start_subscription(subscription_params()).await?;
+            let (subscription_id, boundary, _) =
+                client.start_subscription(subscription_params()).await?;
             if !pane_ids.is_empty() {
                 client
                     .start_subscription(pane_filter_subscription_params(&pane_ids))
@@ -1119,14 +1175,19 @@ impl HerdrClientHandle {
             }
             client.start_watch_supervisor();
 
-            let start = event_log_len(&event_log);
+            // The subscription handshake returns the event-log boundary. Keep
+            // every event that arrived after that boundary, including events
+            // received while per-pane discovery is being registered. The
+            // snapshot has no reliable cursor on every Herdr version, so
+            // replay is deliberately based on this arrival boundary rather
+            // than comparing invented snapshot sequences.
             let snapshot = decode_snapshot_result(
                 client
                     .request_on_executor("session.snapshot", empty_params())
                     .await?
                     .get(),
             )?;
-            let events = events_since(&event_log, start);
+            let events = events_since(&event_log, boundary);
             Ok(HerdrBootstrap {
                 snapshot,
                 subscription_id,
@@ -1314,6 +1375,7 @@ fn run_subscription_connection(
     }
 
     let mut reader = HerdrLineReader::new(stream);
+    let subscription_id: String;
     loop {
         let line = match reader.read_line() {
             Ok(Some(line)) => line,
@@ -1386,13 +1448,13 @@ fn run_subscription_connection(
             )));
             return;
         }
-        let subscription_id = value
+        subscription_id = value
             .get("subscription_id")
             .and_then(Value::as_str)
             .unwrap_or("default")
             .to_string();
         let boundary = event_log_len(&event_log);
-        if ready_tx.send(Ok((subscription_id, boundary, kill_switch))).is_err() {
+        if ready_tx.send(Ok((subscription_id.clone(), boundary, kill_switch))).is_err() {
             return;
         }
         break;
@@ -1409,6 +1471,18 @@ fn run_subscription_connection(
     }
     if let Err(error) = pump_subscription_events(&mut reader, &event_tx, &lifecycle_tx, &event_log) {
         log::error!("Herdr subscription terminated: {error}");
+        let data = serde_json::from_str::<Box<RawValue>>(
+            &serde_json::json!({
+                "subscription_id": subscription_id,
+                "error": error.to_string()
+            })
+            .to_string(),
+        )
+        .expect("subscription-ended payload is valid JSON");
+        let _ = futures::executor::block_on(event_tx.send(HerdrEvent::Unknown {
+            event: "subscription_ended".to_string(),
+            data,
+        }));
     }
 }
 
@@ -1476,11 +1550,23 @@ pub(crate) trait HerdrApi: Send + Sync {
     fn subscribe_events(&self, cx: &App) -> Task<Result<String, HerdrClientError>>;
     fn bootstrap(&self, cx: &App) -> Task<Result<HerdrBootstrap, HerdrClientError>>;
     fn get_snapshot(&self, cx: &App) -> Task<Result<HerdrSnapshot, HerdrClientError>>;
-    fn focus_workspace(&self, workspace_id: &str, operation_id: Option<&str>, cx: &App) -> Task<Result<(), HerdrClientError>>;
+    fn focus_workspace(
+        &self,
+        workspace_id: &str,
+        operation_id: Option<&str>,
+        origin: Option<&str>,
+        cx: &App,
+    ) -> Task<Result<(), HerdrClientError>>;
     fn create_workspace(&self, label: &str, paths: Vec<String>, cx: &App) -> Task<Result<HerdrWorkspaceSnapshot, HerdrClientError>>;
     fn rename_workspace(&self, workspace_id: &str, label: &str, cx: &App) -> Task<Result<(), HerdrClientError>>;
     fn close_workspace(&self, workspace_id: &str, cx: &App) -> Task<Result<(), HerdrClientError>>;
-    fn focus_pane(&self, pane_id: &str, operation_id: Option<&str>, cx: &App) -> Task<Result<(), HerdrClientError>>;
+    fn focus_pane(
+        &self,
+        pane_id: &str,
+        operation_id: Option<&str>,
+        origin: Option<&str>,
+        cx: &App,
+    ) -> Task<Result<(), HerdrClientError>>;
     fn close_pane(&self, pane_id: &str, cx: &App) -> Task<Result<(), HerdrClientError>>;
     fn prompt_agent(&self, pane_id: &str, prompt: &str, cx: &App) -> Task<Result<(), HerdrClientError>>;
     fn send_agent_keys(&self, pane_id: &str, keys: &str, cx: &App) -> Task<Result<(), HerdrClientError>>;
@@ -1573,6 +1659,35 @@ fn agent_prompt_params(target: &str, text: &str) -> Value {
 fn agent_keys_params(target: &str, keys: &[String]) -> Value {
     serde_json::json!({"target": target, "keys": keys})
 }
+fn focus_workspace_params(
+    workspace_id: &str,
+    operation_id: Option<&str>,
+    origin: Option<&str>,
+) -> Value {
+    let mut params = serde_json::json!({"workspace_id": workspace_id});
+    if let Some(operation_id) = operation_id {
+        params["operation_id"] = Value::String(operation_id.to_string());
+    }
+    if let Some(origin) = origin {
+        params["origin"] = Value::String(origin.to_string());
+    }
+    params
+}
+
+fn focus_pane_params(
+    pane_id: &str,
+    operation_id: Option<&str>,
+    origin: Option<&str>,
+) -> Value {
+    let mut params = serde_json::json!({"pane_id": pane_id});
+    if let Some(operation_id) = operation_id {
+        params["operation_id"] = Value::String(operation_id.to_string());
+    }
+    if let Some(origin) = origin {
+        params["origin"] = Value::String(origin.to_string());
+    }
+    params
+}
 
 fn pane_target_params(pane_id: &str) -> Value {
     serde_json::json!({"pane_id": pane_id})
@@ -1617,8 +1732,17 @@ impl HerdrApi for HerdrClientHandle {
         })
     }
 
-    fn focus_workspace(&self, workspace_id: &str, _operation_id: Option<&str>, _cx: &App) -> Task<Result<(), HerdrClientError>> {
-        let task = self.request_on_executor("workspace.focus", serde_json::json!({"workspace_id": workspace_id}));
+    fn focus_workspace(
+        &self,
+        workspace_id: &str,
+        operation_id: Option<&str>,
+        origin: Option<&str>,
+        _cx: &App,
+    ) -> Task<Result<(), HerdrClientError>> {
+        let task = self.request_on_executor(
+            "workspace.focus",
+            focus_workspace_params(workspace_id, operation_id, origin),
+        );
         let executor = self.executor.clone();
         executor.spawn(async move { task.await.map(|_| ()) })
     }
@@ -1641,8 +1765,17 @@ impl HerdrApi for HerdrClientHandle {
         executor.spawn(async move { task.await.map(|_| ()) })
     }
 
-    fn focus_pane(&self, pane_id: &str, _operation_id: Option<&str>, _cx: &App) -> Task<Result<(), HerdrClientError>> {
-        let task = self.request_on_executor("pane.focus", pane_target_params(pane_id));
+    fn focus_pane(
+        &self,
+        pane_id: &str,
+        operation_id: Option<&str>,
+        origin: Option<&str>,
+        _cx: &App,
+    ) -> Task<Result<(), HerdrClientError>> {
+        let task = self.request_on_executor(
+            "pane.focus",
+            focus_pane_params(pane_id, operation_id, origin),
+        );
         let executor = self.executor.clone();
         executor.spawn(async move { task.await.map(|_| ()) })
     }
@@ -1796,6 +1929,34 @@ mod tests {
             serde_json::json!({"type": "pane.scroll_changed", "pane_id": "w1:p1"})
         );
         assert!(payload.get("events").is_none());
+    }
+    #[test]
+    fn encodes_focus_operation_id_and_origin_payload() {
+        assert_eq!(
+            focus_workspace_params("w1", Some("op-1"), Some("zed")),
+            serde_json::json!({
+                "workspace_id": "w1",
+                "operation_id": "op-1",
+                "origin": "zed"
+            })
+        );
+        assert_eq!(
+            focus_pane_params("p1", Some("op-2"), Some("zed")),
+            serde_json::json!({
+                "pane_id": "p1",
+                "operation_id": "op-2",
+                "origin": "zed"
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_focus_operation_origin_for_reflection_matching() {
+        let event = decode_event(
+            r#"{"event":"workspace.focused","data":{"type":"workspace_focused","workspace_id":"w1","operation_id":"op-origin","origin":"zed"}}"#,
+        )
+        .expect("focus event");
+        assert_eq!(event.operation_origin().as_deref(), Some("zed"));
     }
 
     #[test]
