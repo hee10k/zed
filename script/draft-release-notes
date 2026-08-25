@@ -54,11 +54,13 @@ function fallbackReleaseEntry(subject) {
     match[1].toLowerCase()
   ];
   const verb = SECTION_VERBS[section];
+  const leadingVerbPattern = {
+    New: /^(?:add|adds|added)\b[\s:,-]*/i,
+    Fixes: /^(?:fix|fixes|fixed)\b[\s:,-]*/i,
+    Improvements: /^(?:improve|improves|improved|reduce|reduces|reduced)\b[\s:,-]*/i,
+  }[section];
   const description = match[2]
-    .replace(
-      /^(?:add|adds|added|improve|improves|improved|fix|fixes|fixed|reduce|reduces|reduced)\b[\s:,-]*/i,
-      "",
-    )
+    .replace(leadingVerbPattern, "")
     .replace(/\s+\(#\d+\)\s*$/, "")
     .trim();
   return {

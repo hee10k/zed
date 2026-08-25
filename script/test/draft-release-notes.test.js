@@ -56,6 +56,10 @@ test("creates conservative conventional-commit fallbacks", () => {
     section: "New",
     text: "Added grouped rows",
   });
+  assert.deepEqual(fallbackReleaseEntry("feat: Fix project search (#42)"), {
+    section: "New",
+    text: "Added fix project search",
+  });
   assert.deepEqual(fallbackReleaseEntry("fix: Prevent duplicate tabs"), {
     section: "Fixes",
     text: "Fixed prevent duplicate tabs",
