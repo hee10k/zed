@@ -162,15 +162,19 @@ An agent pane without an agent session identity can report status but does not c
 
 1. Resolve the selected Herdr session endpoint.
 2. Connect through the platform transport.
-3. Validate the Herdr protocol response.
-4. Request `session.snapshot`.
-5. Load persisted mappings for the current session.
-6. Reconcile every Herdr workspace, including workspaces with no agent panes.
-7. Create or restore Zed root thread metadata for missing workspaces.
-8. Reconcile recognized agent panes with session identities into Herdr-backed subthreads.
-9. Apply Herdr's current workspace, tab, and pane focus to Zed.
-10. Register subscriptions for workspace, pane, agent, and relevant lifecycle events.
-11. Mark the bridge synchronized only after snapshot reconciliation and subscription registration succeed.
+3. Send `ping` and validate the Herdr protocol version/capabilities.
+4. Register `events.subscribe` before requesting the snapshot; buffer pushed events received after subscription acceptance.
+5. Request `session.snapshot`.
+6. Load persisted mappings for the current session.
+7. Reconcile every Herdr workspace, including workspaces with no agent panes.
+8. Create or restore Zed root thread metadata for missing workspaces.
+9. Reconcile recognized agent panes with session identities into Herdr-backed subthreads.
+10. Apply Herdr's current workspace, tab, and pane focus to Zed.
+11. Replay buffered events whose sequence is newer than the snapshot state.
+12. Mark the bridge synchronized only after snapshot reconciliation, buffered-event replay, and subscription registration succeed.
+
+Subscribing before the snapshot prevents a lifecycle event between bootstrap requests from being lost because Herdr subscriptions do not replay events emitted before subscription acceptance.
+
 
 ## Event and action flow
 
@@ -186,23 +190,24 @@ An agent pane without an agent session identity can report status but does not c
 - `pane_exited` marks the subthread complete and leaves a tombstone mapping.
 - agent session changes reconcile the subthread identity before applying focus or status.
 
-Herdr output is read through its pane/agent read API and reflected in the Herdr-backed subthread transcript. Output updates must be revision- or sequence-aware so older reads cannot overwrite newer content.
+Herdr output is read through its pane/agent read API and reflected in the Herdr-backed subthread transcript. Subscribe to pane output/revision events where available, and use a revision-aware pane read to hydrate the initial transcript. Older reads must not overwrite newer content.
 
 ### Zed to Herdr
 
 - Selecting a Herdr-backed root thread calls `workspace.focus`.
 - Selecting a Herdr-backed subthread calls `pane.focus`.
-- Prompt submission calls the Herdr agent/pane prompt or input API.
-- Cancel/interrupt calls the corresponding Herdr pane or agent control API.
+- Prompt submission calls `agent.prompt` for a recognized agent target.
+- Cancel/interrupt sends the supported Herdr key sequence through `agent.send_keys` or `pane.send_keys`; Herdr has no separate agent-cancel method.
 - Title editing calls `workspace.rename` or the supported pane metadata/title API.
 - Closing a Herdr-backed root thread requests Herdr workspace closure.
-- Closing a Herdr-backed subthread requests pane/agent interruption and closure, then waits for Herdr confirmation.
+- Closing a Herdr-backed subthread requests `pane.close` after any required interruption and waits for Herdr confirmation.
 - Creating a Herdr-backed root thread creates a Herdr workspace.
 - Creating a Herdr-backed subthread creates or attaches a Herdr agent pane.
 
 ACP-native Zed thread creation and actions keep their existing behavior and do not create or control Herdr resources.
 
 Herdr remains the authority for process execution, prompt delivery, agent state, and closure. Zed actions are requests, not local state mutations that bypass Herdr.
+
 
 ## Lifecycle and conflict policy
 
@@ -235,11 +240,13 @@ A lost connection moves the bridge to `Unavailable` or `Reconnecting` while pres
 
 Reconnect uses bounded exponential backoff. After reconnect:
 
-1. request a fresh snapshot;
-2. reconcile mappings;
-3. discard stale events by sequence;
-4. replace the old subscription;
-5. reapply the authoritative current Herdr focus.
+1. send `ping` and validate protocol compatibility;
+2. register a fresh subscription and begin buffering events;
+3. request a fresh snapshot;
+4. reconcile mappings;
+5. discard stale events by sequence and replay buffered events newer than the snapshot;
+6. reapply the authoritative current Herdr focus;
+7. replace the old subscription and return to `Ready`.
 
 ## Error and security policy
 
