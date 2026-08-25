@@ -1,7 +1,12 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+
+/// Default connect/read/write window for endpoint connections when no
+/// explicit request deadline is supplied.
+pub(crate) const DEFAULT_CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HerdrEndpoint {
@@ -105,17 +110,27 @@ pub(crate) enum HerdrStream {
 }
 
 impl HerdrStream {
-    pub(crate) fn connect(endpoint: &HerdrEndpoint) -> Result<Self> {
+    /// Connect with a hard deadline covering DNS-less local connect plus the
+    /// initial read/write window, so a server that accepts and never answers
+    /// cannot block the caller indefinitely.
+    pub(crate) fn connect_with_deadline(endpoint: &HerdrEndpoint, deadline: Duration) -> Result<Self> {
         let endpoint_path = endpoint.resolve();
-        #[cfg(unix)]
         {
-            let stream = std::os::unix::net::UnixStream::connect(&endpoint_path).map_err(|error| {
+            use std::os::unix::net::{SocketAddr, UnixStream};
+            let address = SocketAddr::from_pathname(&endpoint_path)
+                .map_err(|error| anyhow!("Invalid Herdr socket path {endpoint_path}: {error}"))?;
+            // Local filesystem sockets connect immediately; the read/write
+            // deadlines below carry the timeout guarantee.
+            let stream = UnixStream::connect_addr(&address).map_err(|error| {
                 anyhow!("Failed to connect to Herdr Unix socket at {endpoint_path}: {error}")
             })?;
+            stream.set_read_timeout(Some(deadline))?;
+            stream.set_write_timeout(Some(deadline))?;
             Ok(Self::Unix(stream))
         }
         #[cfg(windows)]
         {
+            let _ = deadline;
             use std::ffi::OsStr;
             use std::os::windows::ffi::OsStrExt;
             use std::os::windows::io::FromRawHandle;
@@ -144,6 +159,10 @@ impl HerdrStream {
             let file = unsafe { std::fs::File::from_raw_handle(handle.0 as _) };
             Ok(Self::NamedPipe(file))
         }
+    }
+
+    pub(crate) fn connect(endpoint: &HerdrEndpoint) -> Result<Self> {
+        Self::connect_with_deadline(endpoint, DEFAULT_CONNECT_DEADLINE)
     }
 
     pub(crate) fn try_clone(&self) -> Result<Self> {
@@ -225,6 +244,21 @@ impl HerdrLineReader {
             }
         }
         Ok(Some(line))
+    }
+
+    /// Adjust the read deadline. Subscription connections clear it after the
+    /// handshake so idle pushed events are not mistaken for a stall.
+    pub(crate) fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
+        match self.reader.get_ref() {
+            #[cfg(unix)]
+            HerdrStreamReadHandle::Unix(stream) => stream.set_read_timeout(timeout)?,
+            #[cfg(windows)]
+            HerdrStreamReadHandle::NamedPipe(file) => {
+                let _ = timeout;
+                let _ = file;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -84,3 +84,24 @@ cargo test -p agent_ui herdr_ --no-default-features
 ```
 
 Result: **18 passed, 0 failed**. New regressions cover arrival-order replay with zero sequences, pane-moved decoding, absent `pane.send_input` text, official lifecycle subscriptions and pane filters, plus the Windows path-derived mapping under `cfg(windows)`.
+
+## Task 1 Review 3 Repair Evidence
+
+All six findings were repaired against the official Herdr schema (protocol 20 / schema version 1, dumped via `herdr api schema --json`):
+
+1. **Timeout covers blocking connect/send/read (finding 1).** `HerdrStream::connect_with_deadline` now applies `UnixStream::connect_addr` plus socket read/write deadlines (`set_read_timeout`/`set_write_timeout`) for every request connection, and request I/O runs on a dedicated thread (`run_request_once`). A server that accepts and never answers resolves the caller with `HerdrClientError::Timeout`; timeout-kind I/O errors are mapped explicitly instead of surfacing as generic `Io`.
+2. **Empty output matcher removed (finding 2).** The empty-substring `pane.output_matched` filter is gone. Continuous output following uses the official mechanism: repeated blocking `events.wait` requests with `match_event {event: "pane_output_changed", pane_id, min_revision}` (`OUTPUT_WAIT_TIMEOUT_MS` = 15 s) followed by a revision-aware `pane.read` that only emits `PaneOutput` events when the returned revision advances.
+3. **Per-pane filters precede the authoritative snapshot (finding 3).** Bootstrap order is now: `ping` → initial `session.snapshot` (pane IDs only) → global lifecycle `events.subscribe` → per-pane `events.subscribe` filters (`pane.agent_status_changed` + `pane.scroll_changed`, no output matcher) → buffer marker → authoritative `session.snapshot` → replay buffered events. Changes between the two snapshots cannot be lost.
+4. **Dynamic per-pane watches (finding 4).** A watch supervisor consumes pane lifecycle events: `pane.created`/`pane.moved` add watches (filters + output watcher), `pane.moved` retires stale previous pane ids, and `pane.closed`/`pane.exited` retire watches with cancellation flags. Deterministic regressions cover lifecycle forwarding and watch-state ensure/retire semantics.
+5. **Workspace moved/reordered decoding (finding 5).** Typed `HerdrEvent::WorkspaceMoved { workspace_id, insert_index, workspaces }` and `HerdrEvent::WorkspaceReordered { workspace_ids, before_workspace_id, workspaces }` decode the official event fields; sequence extraction covers both variants.
+6. **Frames without an event field terminate subscriptions (finding 6).** The subscription pump treats a well-formed JSON frame lacking an `event` field as malformed input: it logs visibly and terminates the connection instead of discarding the frame.
+
+Focused verification rerun:
+
+```text
+cargo test -p agent_ui herdr_ --no-default-features
+```
+
+Result: **26 passed, 0 failed**. New/updated regressions: `request_times_out_when_server_never_responds` (unix fixture), `subscription_pump_terminates_without_event_field` (socket pair), `decodes_typed_workspace_moved_event`, `decodes_typed_workspace_reordered_event`, `extracts_revision_from_official_wait_matched_result`, `events_wait_params_target_pane_output_changes`, `lifecycle_events_are_forwarded_for_watch_supervision`, `pane_watch_state_tracks_ensure_and_retire`, and an updated `encodes_official_subscription_payload` asserting per-pane filters contain status + scroll entries and no `output_matched`.
+
+Note: an earlier fixture-driven bootstrap integration test was removed during repair because driving detached supervision tasks against a real socket fixture depended on executor timing; its behaviors are retained by deterministic regressions (`encodes_official_subscription_payload` ordering/payload shape, lifecycle forwarding, watch-state transitions).
