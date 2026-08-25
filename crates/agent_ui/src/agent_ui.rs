@@ -11,6 +11,8 @@ mod context;
 mod context_server_configuration;
 pub(crate) mod herdr_client;
 pub(crate) mod herdr_transport;
+pub(crate) mod herdr_mapping_store;
+pub(crate) mod herdr_state;
 pub(crate) mod conversation_view;
 
 mod diagnostics;
