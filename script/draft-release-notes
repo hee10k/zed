@@ -14,15 +14,19 @@ function parseReleaseNotes(body) {
     return { kind: "missing", text: "" };
   }
 
-  const note = match[1]
-    .split(/\r?\n\r?\n/, 1)[0]
-    .split(/\r?\n/)
-    .find((line) => /^\s*-\s+\S/.test(line));
-  if (!note) {
+  const lines = match[1].split(/\r?\n\r?\n/, 1)[0].split(/\r?\n/);
+  const firstBulletIndex = lines.findIndex((line) => /^\s*-\s+\S/.test(line));
+  if (firstBulletIndex === -1) {
     return { kind: "missing", text: "" };
   }
 
-  const text = note.replace(/^\s*-\s+/, "").trim();
+  const bulletLines = [lines[firstBulletIndex].replace(/^\s*-\s+/, "").trim()];
+  for (const line of lines.slice(firstBulletIndex + 1)) {
+    if (line.trim() === "" || /^\s*-\s+\S/.test(line)) break;
+    bulletLines.push(line.trim());
+  }
+
+  const text = bulletLines.join(" ").trim();
   if (/^N\/A\b/i.test(text)) {
     return { kind: "skip", text: "" };
   }
@@ -50,9 +54,16 @@ function fallbackReleaseEntry(subject) {
     match[1].toLowerCase()
   ];
   const verb = SECTION_VERBS[section];
+  const description = match[2]
+    .replace(
+      /^(?:add|adds|added|improve|improves|improved|fix|fixes|fixed|reduce|reduces|reduced)\b[\s:,-]*/i,
+      "",
+    )
+    .replace(/\s+\(#\d+\)\s*$/, "")
+    .trim();
   return {
     section,
-    text: `${verb} ${lowercaseFirstCharacter(match[2].trim())}`,
+    text: `${verb} ${lowercaseFirstCharacter(description)}`,
   };
 }
 
@@ -60,6 +71,7 @@ function normalizeExplicitEntry(text) {
   const section = classifyReleaseEntry(text);
   if (!section) return null;
   const description = text.replace(/^(Added|Improved|Fixed)\b/i, "").trim();
+  if (!description) return null;
   return {
     section,
     text: `${SECTION_VERBS[section]} ${description}`,
@@ -67,7 +79,7 @@ function normalizeExplicitEntry(text) {
 }
 
 function attachLink(text, commit) {
-  if (/https:\/\/github\.com\/[^)\s]+\/(?:pull|issues|commit)\//i.test(text)) {
+  if (/https:\/\/github\.com\/zed-industries\/zed\/(?:pull|issues|commit)\//i.test(text)) {
     return text;
   }
   if (commit.pr) {
