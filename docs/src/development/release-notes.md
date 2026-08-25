@@ -17,8 +17,29 @@ Release Notes:
 
 On Wednesdays, we run [`get-preview-channel-changes`](https://github.com/zed-industries/zed/blob/main/script/get-preview-channel-changes), which collects `Release Notes` lines from pull requests landing in preview, as described in the [Release](https://zed.dev/docs/development/release-notes) docs.
 
-The script outputs everything below the `Release Notes` line, including metadata such as the pull request author (if they are not a Zed team member) and a link to the pull request.
-If you use `N/A`, the script skips your pull request entirely.
+The preview compiler outputs everything below the `Release Notes` line, including metadata such as the pull request author (if they are not a Zed team member) and a link to the pull request. If you use `N/A`, it skips your pull request entirely.
+
+## GitHub draft release changelogs
+
+The GitHub release workflow also generates a deterministic user-facing changelog from the same `Release Notes` data. Entries are grouped into `New`, `Improvements`, and `Fixes` sections, with pull-request or commit links preserved.
+
+Explicit PR release notes remain authoritative. When a user-facing commit has no explicit note, only conventional `feat`, `fix`, and `perf` subjects receive deterministic fallback wording. Documentation, test, refactor, chore, untyped, and `N/A` entries are omitted.
+
+The generated release body uses this order and omits empty sections:
+
+```md
+## New
+
+- Added ...
+
+## Improvements
+
+- Improved ...
+
+## Fixes
+
+- Fixed ...
+```
 
 ## Guidelines for crafting your `Release Notes` line(s)
 

@@ -2,31 +2,179 @@
 
 const { execFileSync } = require("child_process");
 
-main();
+const SECTION_VERBS = {
+  New: "Added",
+  Improvements: "Improved",
+  Fixes: "Fixed",
+};
 
-async function main() {
-  let version = process.argv[2];
-  let channel = process.argv[3];
-  let parts = version.split(".");
+function parseReleaseNotes(body) {
+  const match = String(body || "").match(/(?:^|\n)Release Notes:\s*\n([\s\S]*)/i);
+  if (!match) {
+    return { kind: "missing", text: "" };
+  }
+
+  const note = match[1]
+    .split(/\r?\n\r?\n/, 1)[0]
+    .split(/\r?\n/)
+    .find((line) => /^\s*-\s+\S/.test(line));
+  if (!note) {
+    return { kind: "missing", text: "" };
+  }
+
+  const text = note.replace(/^\s*-\s+/, "").trim();
+  if (/^N\/A\b/i.test(text)) {
+    return { kind: "skip", text: "" };
+  }
+  return { kind: "explicit", text };
+}
+
+function classifyReleaseEntry(text) {
+  if (/^Added\b/i.test(text)) return "New";
+  if (/^Improved\b/i.test(text)) return "Improvements";
+  if (/^Fixed\b/i.test(text)) return "Fixes";
+  return null;
+}
+
+function lowercaseFirstCharacter(text) {
+  return text.length === 0 ? text : text[0].toLowerCase() + text.slice(1);
+}
+
+function fallbackReleaseEntry(subject) {
+  const match = String(subject || "").match(
+    /^(feat|fix|perf)(?:\([^)]*\))?!?:\s*(.+)$/i,
+  );
+  if (!match) return null;
+
+  const section = { feat: "New", fix: "Fixes", perf: "Improvements" }[
+    match[1].toLowerCase()
+  ];
+  const verb = SECTION_VERBS[section];
+  return {
+    section,
+    text: `${verb} ${lowercaseFirstCharacter(match[2].trim())}`,
+  };
+}
+
+function normalizeExplicitEntry(text) {
+  const section = classifyReleaseEntry(text);
+  if (!section) return null;
+  const description = text.replace(/^(Added|Improved|Fixed)\b/i, "").trim();
+  return {
+    section,
+    text: `${SECTION_VERBS[section]} ${description}`,
+  };
+}
+
+function attachLink(text, commit) {
+  if (/https:\/\/github\.com\/[^)\s]+\/(?:pull|issues|commit)\//i.test(text)) {
+    return text;
+  }
+  if (commit.pr) {
+    return `${text} ([#${commit.pr}](https://github.com/zed-industries/zed/pull/${commit.pr}))`;
+  }
+  return `${text} ([commit](https://github.com/zed-industries/zed/commit/${commit.hash}))`;
+}
+
+function formatCommitEntry(commit) {
+  const parsed = parseReleaseNotes(commit.body);
+  if (parsed.kind === "skip") return null;
+
+  const entry =
+    parsed.kind === "explicit"
+      ? normalizeExplicitEntry(parsed.text)
+      : fallbackReleaseEntry(commit.firstLine);
+  if (!entry) return null;
+
+  const text = attachLink(entry.text, commit);
+  return {
+    section: entry.section,
+    text,
+    key: `${entry.section}\n${text}`,
+  };
+}
+
+function renderReleaseNotes(entries, compareUrl) {
+  const seen = new Set();
+  const grouped = new Map([
+    ["New", []],
+    ["Improvements", []],
+    ["Fixes", []],
+  ]);
+
+  for (const entry of entries) {
+    if (!entry || seen.has(entry.key)) continue;
+    seen.add(entry.key);
+    grouped.get(entry.section)?.push(entry.text);
+  }
+
+  const sections = [];
+  for (const section of ["New", "Improvements", "Fixes"]) {
+    const entriesForSection = grouped.get(section);
+    if (!entriesForSection || entriesForSection.length === 0) continue;
+    sections.push(`## ${section}\n\n${entriesForSection.map((entry) => `- ${entry}`).join("\n")}`);
+  }
+
+  if (sections.length === 0) {
+    return `No public-facing changes in this release. [View the commits](${compareUrl}).\n`;
+  }
+  return `${sections.join("\n\n")}\n`;
+}
+
+function getCommits(oldTag, newTag) {
+  const log = execFileSync(
+    "git",
+    [
+      "-C",
+      "target/shallow_clone",
+      "log",
+      `${oldTag}..${newTag}`,
+      "--format=DIVIDER%n%H|||%s%n%b",
+    ],
+    { encoding: "utf8" },
+  )
+    .replace(/\r\n/g, "\n")
+    .split("DIVIDER\n")
+    .filter((commit) => commit.length > 0)
+    .map((commit) => {
+      const [header, ...bodyLines] = commit.split("\n");
+      const [hash, ...subjectParts] = header.split("|||");
+      const firstLine = subjectParts.join("|||").trim();
+      const cherryPick = firstLine.match(/\(cherry-pick #([0-9]+)\)/)?.[1] || "";
+      const pr = firstLine.match(/\(#(\d+)\)$/)?.[1] || "";
+      return {
+        hash,
+        cherryPick,
+        pr,
+        firstLine,
+        body: bodyLines.join("\n"),
+      };
+    });
+
+  return log;
+}
+
+function main() {
+  const version = process.argv[2];
+  const channel = process.argv[3];
+  const parts = String(version || "").split(".");
 
   if (
-    process.argv.length != 4 ||
-    parts.length != 3 ||
-    parts.find((part) => isNaN(part)) != null ||
-    (channel != "stable" && channel != "preview")
+    process.argv.length !== 4 ||
+    parts.length !== 3 ||
+    parts.some((part) => !/^\d+$/.test(part)) ||
+    (channel !== "stable" && channel !== "preview")
   ) {
     console.log("Usage: draft-release-notes <version> {stable|preview}");
     process.exit(1);
   }
 
-  // currently we can only draft notes for patch releases.
-  if (parts[2] === 0) {
-    process.exit(0);
-  }
+  // We currently draft notes only for patch releases.
+  if (parts[2] === "0") process.exit(0);
 
-  let priorVersion = [parts[0], parts[1], parts[2] - 1].join(".");
-  let suffix = channel == "preview" ? "-pre" : "";
-  let [tag, priorTag] = [`v${version}${suffix}`, `v${priorVersion}${suffix}`];
+  const priorVersion = [parts[0], parts[1], Number(parts[2]) - 1].join(".");
+  const suffix = channel === "preview" ? "-pre" : "";
+  const [tag, priorTag] = [`v${version}${suffix}`, `v${priorVersion}${suffix}`];
 
   try {
     execFileSync("rm", ["-rf", "target/shallow_clone"]);
@@ -44,77 +192,30 @@ async function main() {
     execFileSync("git", ["-C", "target/shallow_clone", "rev-parse", "--verify", tag]);
     try {
       execFileSync("git", ["-C", "target/shallow_clone", "rev-parse", "--verify", priorTag]);
-    } catch (e) {
+    } catch {
       console.error(`Prior tag ${priorTag} not found`);
       process.exit(0);
     }
-  } catch (e) {
-    console.error(e.stderr.toString());
+  } catch (error) {
+    console.error(error.stderr?.toString() || error.toString());
     process.exit(1);
   }
 
-  const newCommits = getCommits(priorTag, tag);
-
-  let releaseNotes = [];
-  let missing = [];
-  let skipped = [];
-
-  for (const commit of newCommits) {
-    let link = "https://github.com/zed-industries/zed/pull/" + commit.pr;
-    let notes = commit.releaseNotes;
-    if (commit.pr == "") {
-      link = "https://github.com/zed-industries/zed/commits/" + commit.hash;
-    } else if (!notes.includes("zed-industries/zed/issues")) {
-      notes = notes + " ([#" + commit.pr + "](" + link + "))";
-    }
-
-    if (commit.releaseNotes == "") {
-      missing.push("- MISSING " + commit.firstLine + " " + link);
-    } else if (commit.releaseNotes.startsWith("- N/A")) {
-      skipped.push("- N/A " + commit.firstLine + " " + link);
-    } else {
-      releaseNotes.push(notes);
-    }
-  }
-
-  if (releaseNotes.length === 0) {
-    const compareUrl = `https://github.com/zed-industries/zed/compare/${priorTag}...${tag}#commits_bucket`;
-    console.log(`No public-facing changes in this release. [View the commits](${compareUrl}).\n`);
-  } else {
-    console.log(releaseNotes.join("\n") + "\n");
-  }
+  const compareUrl = `https://github.com/zed-industries/zed/compare/${priorTag}...${tag}#commits_bucket`;
+  const entries = getCommits(priorTag, tag)
+    .map(formatCommitEntry)
+    .filter((entry) => entry !== null);
+  console.log(renderReleaseNotes(entries, compareUrl));
 }
 
-function getCommits(oldTag, newTag) {
-  const pullRequestNumbers = execFileSync(
-    "git",
-    ["-C", "target/shallow_clone", "log", `${oldTag}..${newTag}`, "--format=DIVIDER\n%H|||%B"],
-    { encoding: "utf8" },
-  )
-    .replace(/\r\n/g, "\n")
-    .split("DIVIDER\n")
-    .filter((commit) => commit.length > 0)
-    .map((commit) => {
-      let [hash, firstLine] = commit.split("\n")[0].split("|||");
-      let cherryPick = firstLine.match(/\(cherry-pick #([0-9]+)\)/)?.[1] || "";
-      let pr = firstLine.match(/\(#(\d+)\)$/)?.[1] || "";
-      let releaseNotes = (commit.split(/Release notes:.*\n/i)[1] || "")
-        .split("\n\n")[0]
-        .trim()
-        .replace(/\n(?![\n-])/g, " ");
-
-      if (releaseNotes.includes("<public_issue_number_if_exists>")) {
-        releaseNotes = "";
-      }
-
-      return {
-        hash,
-        pr,
-        cherryPick,
-        releaseNotes,
-        firstLine,
-      };
-    });
-
-  return pullRequestNumbers;
+if (require.main === module) {
+  main();
 }
+
+module.exports = {
+  classifyReleaseEntry,
+  fallbackReleaseEntry,
+  formatCommitEntry,
+  parseReleaseNotes,
+  renderReleaseNotes,
+};
