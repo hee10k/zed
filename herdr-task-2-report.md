@@ -114,3 +114,26 @@ cargo test: 35 passed (1 suite, 471 filtered, 17 warnings, 0.00s)
 
 The focused commands above were run after the final source changes. No
 formatter, linter, or project-wide suite was run.
+
+## Task 2 review 2 amendment evidence
+
+Review 2 finding 1 is addressed in `herdr_state.rs`: agent-session restoration and `PaneMoved` rebinds now scan every live mapping at the destination workspace/pane before rekeying. A different live agent identity produces `RecordConflict`; the source and destination mappings remain intact and no duplicate live subthread is inserted.
+
+Review 2 finding 2 is addressed in `herdr_state.rs`: sequence fences still reject zero/missing destructive lifecycle events, while sequence-less buffered `WorkspaceFocused`, `PaneFocused`, `PaneAgentStatusChanged`, `PaneOutput`, and `PaneScrollChanged` events are allowed to apply only non-destructive effects. Non-zero events continue through the existing global and persisted sequence fences.
+
+Regression tests added:
+
+- `agent_session_restoration_preserves_source_on_live_destination_collision`
+- `sequence_less_buffered_non_lifecycle_events_apply_safe_effects`
+
+### Final focused suite evidence
+
+```text
+$ cargo test -p agent_ui herdr_mapping_store::tests
+cargo test: 12 passed (1 suite, 496 filtered, 17 warnings, 0.00s)
+
+$ cargo test -p agent_ui herdr_state::tests
+cargo test: 37 passed (1 suite, 471 filtered, 17 warnings, 0.00s)
+```
+
+No formatter, linter, or project-wide suite was run.

@@ -395,12 +395,15 @@ fn rebind_record_for_location(
     };
     let target_key =
         HerdrMappingKey::subthread(record.key.session.clone(), workspace_id, pane_id, agent_session);
+    if live_subthreads_at(mappings, &record.key.session, workspace_id, pane_id)
+        .iter()
+        .any(|candidate| candidate.key != record.key)
+    {
+        return Err("destination pane already has a live mapping".to_string());
+    }
     if let Some(target) = mappings.get(&target_key.to_key_string()) {
         if target.key != record.key && target.is_tombstone() {
             return Err("destination subthread mapping is a retained tombstone".to_string());
-        }
-        if target.key != record.key && !target.is_tombstone() {
-            return Err("destination pane already has a live mapping".to_string());
         }
     }
     let root_key =
@@ -428,17 +431,20 @@ pub(crate) fn apply_event(state: &mut BridgeState, event: &HerdrEvent) -> Applie
     let sequence = event.sequence();
     if sequence_guarded(event) {
         if sequence == 0 {
-            return zero_sequence_conflict(state, event);
+            if sequence_required(event) {
+                return zero_sequence_conflict(state, event);
+            }
+        } else {
+            // The bridge-wide fence handles ordinary in-memory ordering. The
+            // resource fence below also protects a restarted bridge whose loaded
+            // records are newer than its newly initialized global fence.
+            if sequence <= state.last_sequence
+                || event_is_stale_against_persisted_mapping(state, event, sequence)
+            {
+                return AppliedEvent::none();
+            }
+            state.last_sequence = sequence;
         }
-        // The bridge-wide fence handles ordinary in-memory ordering. The
-        // resource fence below also protects a restarted bridge whose loaded
-        // records are newer than its newly initialized global fence.
-        if sequence <= state.last_sequence
-            || event_is_stale_against_persisted_mapping(state, event, sequence)
-        {
-            return AppliedEvent::none();
-        }
-        state.last_sequence = sequence;
     }
 
     match event {
@@ -548,6 +554,19 @@ fn sequence_guarded(event: &HerdrEvent) -> bool {
     !matches!(
         event,
         HerdrEvent::SubscriptionStarted { .. } | HerdrEvent::Unknown { .. }
+    )
+}
+
+fn sequence_required(event: &HerdrEvent) -> bool {
+    !matches!(
+        event,
+        HerdrEvent::WorkspaceFocused { .. }
+            | HerdrEvent::PaneFocused { .. }
+            | HerdrEvent::PaneAgentStatusChanged { .. }
+            | HerdrEvent::PaneOutput { .. }
+            | HerdrEvent::PaneScrollChanged { .. }
+            | HerdrEvent::SubscriptionStarted { .. }
+            | HerdrEvent::Unknown { .. }
     )
 }
 
@@ -1665,6 +1684,56 @@ mod tests {
     }
 
     #[test]
+    fn agent_session_restoration_preserves_source_on_live_destination_collision() {
+        let session = "alpha";
+        let old_root = root_record(session, "w-old");
+        let new_root = root_record(session, "w-new");
+        let restored = subthread_record(session, "w-old", "p-old", "agent-1");
+        let destination = subthread_record(session, "w-new", "p-new", "agent-2");
+        let old_key = restored.key.clone();
+        let destination_key = destination.key.clone();
+        let target_key = HerdrMappingKey::subthread(
+            session,
+            "w-new",
+            "p-new",
+            HerdrAgentSessionIdentity::id("agent-1"),
+        );
+        let mut state = BridgeState::new(session);
+        upsert_record(&mut state.mappings, old_root);
+        upsert_record(&mut state.mappings, new_root);
+        upsert_record(&mut state.mappings, restored);
+        upsert_record(&mut state.mappings, destination);
+
+        let applied = apply_event(
+            &mut state,
+            &HerdrEvent::PaneAgentDetected {
+                pane_id: "p-new".into(),
+                workspace_id: "w-new".into(),
+                agent_type: None,
+                session_identity: Some(HerdrAgentSessionIdentity::id("agent-1")),
+                sequence: 1,
+            },
+        );
+
+        assert!(matches!(
+            &applied.actions[..],
+            [ReconciliationAction::RecordConflict(key, message)]
+                if key == &target_key && message.contains("destination pane")
+        ));
+        assert!(state.mappings.contains_key(&old_key.to_key_string()));
+        assert!(state.mappings.contains_key(&destination_key.to_key_string()));
+        assert!(!state.mappings.contains_key(&target_key.to_key_string()));
+        assert_eq!(
+            state
+                .mappings
+                .values()
+                .filter(|record| !record.is_tombstone() && record.key.pane_id.is_some())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn generated_operation_ids_are_unique() {
         let mut state = BridgeState::new("alpha");
         let first = initiate_workspace_focus(&mut state, "w1");
@@ -2038,6 +2107,87 @@ mod tests {
         assert!(!state.mappings[&key.to_key_string()].is_tombstone());
         assert_eq!(state.last_sequence, 0);
     }
+
+    #[test]
+    fn sequence_less_buffered_non_lifecycle_events_apply_safe_effects() {
+        let session = "alpha";
+        let root = root_record(session, "w1");
+        let root_key = root.key.clone();
+        let subthread = subthread_record(session, "w1", "p1", "agent-1");
+        let subthread_key = subthread.key.clone();
+        let mut state = BridgeState::new(session);
+        upsert_record(&mut state.mappings, root);
+        upsert_record(&mut state.mappings, subthread);
+
+        let applied = apply_event(
+            &mut state,
+            &HerdrEvent::WorkspaceFocused {
+                workspace_id: "w1".into(),
+                operation_id: None,
+                sequence: 0,
+            },
+        );
+        assert_eq!(applied.actions, vec![ReconciliationAction::Activate(root_key)]);
+        assert!(applied.outbound.is_empty());
+
+        let applied = apply_event(
+            &mut state,
+            &HerdrEvent::PaneFocused {
+                pane_id: "p1".into(),
+                workspace_id: "w1".into(),
+                operation_id: None,
+                sequence: 0,
+            },
+        );
+        assert_eq!(
+            applied.actions,
+            vec![ReconciliationAction::Activate(subthread_key.clone())]
+        );
+        assert!(applied.outbound.is_empty());
+
+        let applied = apply_event(
+            &mut state,
+            &HerdrEvent::PaneAgentStatusChanged {
+                pane_id: "p1".into(),
+                status: HerdrAgentStatus::Working,
+                sequence: 0,
+            },
+        );
+        assert_eq!(
+            applied.actions,
+            vec![ReconciliationAction::UpdateStatus(
+                subthread_key.clone(),
+                HerdrAgentStatus::Working
+            )]
+        );
+        assert!(applied.outbound.is_empty());
+
+        let applied = apply_event(
+            &mut state,
+            &HerdrEvent::PaneOutput {
+                pane_id: "p1".into(),
+                revision: 1,
+                delta: "buffered".into(),
+                sequence: 0,
+            },
+        );
+        assert!(applied.actions.is_empty());
+        assert!(applied.outbound.is_empty());
+
+        let applied = apply_event(
+            &mut state,
+            &HerdrEvent::PaneScrollChanged {
+                pane_id: "p1".into(),
+                sequence: 0,
+            },
+        );
+        assert!(applied.actions.is_empty());
+        assert!(applied.outbound.is_empty());
+
+        assert_eq!(state.last_sequence, 0);
+        assert_eq!(state.mappings[&subthread_key.to_key_string()].last_seen_sequence, 0);
+    }
+
 
     #[test]
     fn rebind_without_current_root_conflicts_and_preserves_old_mapping() {
