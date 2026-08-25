@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -105,8 +106,11 @@ fn windows_pipe_endpoint(endpoint_path: &str) -> String {
 pub(crate) enum HerdrStream {
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
+    /// The pipe file is shared with the connection's kill switch so a
+    /// deadline watchdog or pane teardown can cancel an in-flight blocking
+    /// read from another thread.
     #[cfg(windows)]
-    NamedPipe(std::fs::File),
+    NamedPipe(Arc<std::fs::File>),
 }
 
 impl HerdrStream {
@@ -115,6 +119,7 @@ impl HerdrStream {
     /// cannot block the caller indefinitely.
     pub(crate) fn connect_with_deadline(endpoint: &HerdrEndpoint, deadline: Duration) -> Result<Self> {
         let endpoint_path = endpoint.resolve();
+        #[cfg(unix)]
         {
             use std::os::unix::net::{SocketAddr, UnixStream};
             let address = SocketAddr::from_pathname(&endpoint_path)
@@ -152,11 +157,11 @@ impl HerdrStream {
                     None,
                     OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL,
-                    HANDLE::default(),
+                    Some(HANDLE::default()),
                 )
             }
             .map_err(|error| anyhow!("Failed to connect to Herdr named pipe at {pipe_path}: {error}"))?;
-            let file = unsafe { std::fs::File::from_raw_handle(handle.0 as _) };
+            let file = Arc::new(unsafe { std::fs::File::from_raw_handle(handle.0 as _) });
             Ok(Self::NamedPipe(file))
         }
     }
@@ -164,13 +169,12 @@ impl HerdrStream {
     pub(crate) fn connect(endpoint: &HerdrEndpoint) -> Result<Self> {
         Self::connect_with_deadline(endpoint, DEFAULT_CONNECT_DEADLINE)
     }
-
     pub(crate) fn try_clone(&self) -> Result<Self> {
         match self {
             #[cfg(unix)]
             Self::Unix(stream) => Ok(Self::Unix(stream.try_clone()?)),
             #[cfg(windows)]
-            Self::NamedPipe(file) => Ok(Self::NamedPipe(file.try_clone()?)),
+            Self::NamedPipe(file) => Ok(Self::NamedPipe(Arc::new((**file).try_clone()?))),
         }
     }
 
@@ -188,11 +192,136 @@ impl HerdrStream {
             }
             #[cfg(windows)]
             Self::NamedPipe(file) => {
-                file.write_all(line_with_newline.as_bytes())?;
-                file.flush()?;
+                (&**file).write_all(line_with_newline.as_bytes())?;
+                (&**file).flush()?;
             }
         }
         Ok(())
+    }
+
+    /// Derive a switch that terminates this connection's pending reads when
+    /// triggered. Create it before the stream moves into a reader.
+    pub(crate) fn kill_switch(&self) -> Result<ConnectionKillSwitch> {
+        let inner = match self {
+            #[cfg(unix)]
+            Self::Unix(stream) => KillSwitchInner::Unix(stream.try_clone()?),
+            #[cfg(windows)]
+            Self::NamedPipe(file) => KillSwitchInner::NamedPipe(file.clone()),
+        };
+        Ok(ConnectionKillSwitch {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Arm a watchdog that cancels in-flight I/O on this connection once
+    /// `deadline` elapses, so a peer that accepts but never answers cannot
+    /// block the request thread forever.
+    #[cfg(windows)]
+    pub(crate) fn arm_io_deadline(&self, deadline: Duration) -> Result<IoDeadline> {
+        let kill = self.kill_switch()?;
+        IoDeadline::spawn(deadline, kill)
+    }
+
+    /// Unix connections bound every blocking operation with socket
+    /// read/write timeouts, so no cancellation watchdog is needed.
+    #[cfg(not(windows))]
+    pub(crate) fn arm_io_deadline(&self, deadline: Duration) -> Result<IoDeadline> {
+        let _ = deadline;
+        Ok(IoDeadline::noop())
+    }
+}
+
+/// Forcibly unblocks reads pending on the connection this switch was derived
+/// from: Unix sockets are shut down, Windows pipe reads are cancelled with
+/// `CancelIoEx`. Used to enforce request deadlines on Windows and to tear
+/// down retired per-pane subscription connections on every platform.
+#[derive(Clone)]
+pub(crate) struct ConnectionKillSwitch {
+    inner: Arc<KillSwitchInner>,
+}
+
+enum KillSwitchInner {
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+    #[cfg(windows)]
+    NamedPipe(Arc<std::fs::File>),
+}
+
+impl ConnectionKillSwitch {
+    /// Terminate any read currently blocked on the connection. Safe to call
+    /// repeatedly; triggering with nothing pending is a no-op.
+    pub(crate) fn trigger(&self) {
+        match &*self.inner {
+            #[cfg(unix)]
+            KillSwitchInner::Unix(stream) => {
+                use std::net::Shutdown;
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            #[cfg(windows)]
+            KillSwitchInner::NamedPipe(file) => {
+                use std::os::windows::io::AsRawHandle;
+                use windows::Win32::Foundation::HANDLE;
+                use windows::Win32::System::IO::CancelIoEx;
+                let handle = HANDLE(file.as_raw_handle() as _);
+                // ERROR_NOT_FOUND simply means nothing was in flight.
+                let _ = unsafe { CancelIoEx(handle, None) };
+            }
+        }
+    }
+}
+
+/// Watchdog armed around a bounded request. When it fires it cancels the
+/// connection's in-flight I/O instead of abandoning a blocked worker; the
+/// blocked read then completes with an abort error and the worker exits.
+pub(crate) struct IoDeadline {
+    cancel_tx: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl IoDeadline {
+    #[cfg(windows)]
+    fn spawn(deadline: Duration, kill: ConnectionKillSwitch) -> Result<Self> {
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::Builder::new()
+            .name("herdr-io-deadline".to_string())
+            .spawn(move || {
+                if cancel_rx.recv_timeout(deadline)
+                    == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
+                    kill.trigger();
+                }
+            })?;
+        Ok(Self {
+            cancel_tx: Some(cancel_tx),
+            worker: Some(worker),
+        })
+    }
+
+    fn noop() -> Self {
+        Self {
+            cancel_tx: None,
+            worker: None,
+        }
+    }
+
+    /// Cancel the pending deadline without firing the kill switch.
+    pub(crate) fn disarm(mut self) {
+        self.cancel();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+
+    fn cancel(&mut self) {
+        if let Some(cancel_tx) = self.cancel_tx.take() {
+            let _ = cancel_tx.send(());
+        }
+    }
+}
+
+impl Drop for IoDeadline {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -203,8 +332,10 @@ pub(crate) struct HerdrLineReader {
 pub(crate) enum HerdrStreamReadHandle {
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
+    /// Shared with the connection kill switch so teardown can cancel an
+    /// in-flight blocking read.
     #[cfg(windows)]
-    NamedPipe(std::fs::File),
+    NamedPipe(Arc<std::fs::File>),
 }
 
 impl Read for HerdrStreamReadHandle {
@@ -213,7 +344,7 @@ impl Read for HerdrStreamReadHandle {
             #[cfg(unix)]
             Self::Unix(stream) => stream.read(buffer),
             #[cfg(windows)]
-            Self::NamedPipe(file) => file.read(buffer),
+            Self::NamedPipe(file) => (&**file).read(buffer),
         }
     }
 }
@@ -306,6 +437,36 @@ mod tests {
         assert_eq!(reader.read_line().expect("read response").as_deref(), Some(r#"{"id":"1","result":{}}"#));
         server.join().expect("fixture thread");
         std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    /// Kill switch terminates a reader blocked on the connection: this is
+    /// what bounds a silent-peer pipe request on Windows and tears down
+    /// retired per-pane subscription connections everywhere.
+    #[cfg(unix)]
+    #[test]
+    fn kill_switch_unblocks_a_blocked_reader() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Instant;
+
+        let (server_side, client_side) = UnixStream::pair().expect("socket pair");
+        let switch = HerdrStream::Unix(client_side.try_clone().expect("clone socket"))
+            .kill_switch()
+            .expect("kill switch");
+        let mut reader = HerdrLineReader::new(HerdrStream::Unix(client_side));
+
+        let waiter = std::thread::spawn(move || {
+            let _ = reader.read_line();
+        });
+        // Give the reader time to block inside read_line.
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        switch.trigger();
+        waiter.join().expect("reader thread exits");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "trigger must unblock a pending read promptly"
+        );
+        drop(server_side);
     }
 
     #[cfg(windows)]

@@ -11,10 +11,18 @@ use gpui::{App, BackgroundExecutor, Task};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 
-use crate::herdr_transport::{HerdrEndpoint, HerdrLineReader, HerdrStream};
+use crate::herdr_transport::{
+    ConnectionKillSwitch, HerdrEndpoint, HerdrLineReader, HerdrStream,
+};
 
 const HERDR_PROTOCOL: u64 = 20;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Margin added on top of the server-side `events.wait` hold time so the
+/// request deadline always exceeds the server wait by a bounded amount: a
+/// wait cycle never abandons a live server waiter, yet never blocks past
+/// the server's own timeout plus this margin.
+const EVENTS_WAIT_DEADLINE_MARGIN_MS: u64 = 5_000;
 
 type PendingResult = Result<Box<RawValue>, HerdrClientError>;
 type PendingRequests = Arc<Mutex<HashMap<String, oneshot::Sender<PendingResult>>>>;
@@ -753,10 +761,20 @@ impl HerdrClientHandle {
 
     /// Herdr accepts one initial request per connection. Open a fresh request
     /// connection for every RPC and keep the subscription connection separate.
-    /// Blocking connect/send/read runs on a dedicated thread under socket
-    /// deadlines, so a server that accepts and never responds resolves the
+    /// Blocking connect/send/read runs on a dedicated thread under a hard
+    /// deadline (socket timeouts on Unix, an I/O-cancelling watchdog on
+    /// Windows), so a server that accepts and never responds resolves the
     /// caller's task with `Timeout` instead of hanging forever.
     fn request_on_executor(&self, method: &str, params: Value) -> Task<PendingResult> {
+        self.request_on_executor_with_deadline(method, params, REQUEST_TIMEOUT)
+    }
+
+    fn request_on_executor_with_deadline(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+    ) -> Task<PendingResult> {
         let request_id = format!("req-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let (sender, receiver) = oneshot::channel();
         match self.pending.lock() {
@@ -784,7 +802,7 @@ impl HerdrClientHandle {
                 let _ = run_request_once(
                     endpoint,
                     request,
-                    REQUEST_TIMEOUT,
+                    deadline,
                     pending,
                     event_tx,
                     lifecycle_tx,
@@ -809,7 +827,10 @@ impl HerdrClientHandle {
     /// Start the long-lived subscription connection. Resolves once
     /// `subscription_started` is acknowledged; pushed events then flow through
     /// the shared event channel until the connection terminates.
-    fn start_subscription(&self, params: Value) -> Task<Result<(String, usize), HerdrClientError>> {
+    fn start_subscription(
+        &self,
+        params: Value,
+    ) -> Task<Result<(String, usize, ConnectionKillSwitch), HerdrClientError>> {
         let request_id = format!("req-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let request = HerdrRequest {
             id: request_id.clone(),
@@ -820,8 +841,9 @@ impl HerdrClientHandle {
         let event_tx = self.event_tx.clone();
         let lifecycle_tx = self.lifecycle_tx.clone();
         let event_log = self.event_log.clone();
-        let (ready_tx, ready_rx) =
-            oneshot::channel::<Result<(String, usize), HerdrClientError>>();
+        let (ready_tx, ready_rx) = oneshot::channel::<
+            Result<(String, usize, ConnectionKillSwitch), HerdrClientError>,
+        >();
         let spawned = std::thread::Builder::new()
             .name("herdr-subscription".to_string())
             .spawn(move || {
@@ -853,12 +875,20 @@ impl HerdrClientHandle {
         };
 
         let filters = self.start_subscription(pane_filter_subscription_params(&[pane_id.clone()]));
-        let filter_executor = self.executor.clone();
+        let registrar = self.clone();
         let filter_pane_id = pane_id.clone();
-        filter_executor
+        self.executor
+            .clone()
             .spawn(async move {
-                if let Err(error) = filters.await {
-                    log::error!("Herdr per-pane subscription failed for {filter_pane_id}: {error}");
+                match filters.await {
+                    Ok((_, _, kill)) => {
+                        registrar.store_filter_kill_switch(&filter_pane_id, kill);
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Herdr per-pane subscription failed for {filter_pane_id}: {error}"
+                        );
+                    }
                 }
             })
             .detach();
@@ -880,14 +910,43 @@ impl HerdrClientHandle {
             return None;
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        watched.insert(pane_id.to_string(), cancel.clone());
+        watched.insert(
+            pane_id.to_string(),
+            PaneWatch {
+                watcher_cancel: cancel.clone(),
+                filter_kill: None,
+            },
+        );
         Some(cancel)
     }
 
+    /// Record a pane filter connection's kill switch once its handshake
+    /// completes. If the pane was retired before the handshake finished,
+    /// tear the connection down immediately instead of registering an
+    /// orphaned subscription loop.
+    fn store_filter_kill_switch(&self, pane_id: &str, kill: ConnectionKillSwitch) {
+        let mut watched = watched_lock(&self.watched_panes);
+        match watched.get_mut(pane_id) {
+            Some(watch) => watch.filter_kill = Some(kill),
+            None => drop(kill.trigger()),
+        }
+    }
+
+    /// Retire a pane: cancel its output watcher and terminate its dedicated
+    /// filter-subscription connection so neither loop outlives the pane.
+    /// Covers closed panes, exited agents, and stale moved-away pane ids.
     fn retire_pane(&self, pane_id: &str) {
-        let cancel = watched_lock(&self.watched_panes).remove(pane_id);
-        if let Some(cancel) = cancel {
-            cancel.store(true, Ordering::SeqCst);
+        let retired = watched_lock(&self.watched_panes).remove(pane_id);
+        if let Some(PaneWatch {
+            watcher_cancel,
+            filter_kill,
+        }) = retired
+        {
+            watcher_cancel.store(true, Ordering::SeqCst);
+            if let Some(kill) = filter_kill {
+                log::debug!("Tearing down Herdr filter subscription for {pane_id}");
+                kill.trigger();
+            }
         }
     }
 
@@ -906,9 +965,10 @@ impl HerdrClientHandle {
                         return;
                     }
                     let wait = client
-                        .request_on_executor(
+                        .request_on_executor_with_deadline(
                             "events.wait",
                             events_wait_params(&pane_id, last_revision.saturating_add(1)),
+                            events_wait_deadline(),
                         )
                         .await;
                     let notified_revision = match wait {
@@ -1040,7 +1100,7 @@ impl HerdrClientHandle {
                 .filter(|pane_id| !pane_id.is_empty())
                 .collect();
 
-            let (subscription_id, _) = client.start_subscription(subscription_params()).await?;
+            let (subscription_id, _, _) = client.start_subscription(subscription_params()).await?;
             if !pane_ids.is_empty() {
                 client
                     .start_subscription(pane_filter_subscription_params(&pane_ids))
@@ -1067,10 +1127,17 @@ impl HerdrClientHandle {
         })
     }
 }
+type WatchedPanes = Arc<Mutex<HashMap<String, PaneWatch>>>;
 
-type WatchedPanes = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+/// Per-pane watch ownership: the output watcher's cancellation flag plus the
+/// kill switch for the pane's dedicated filter-subscription connection, so
+/// retiring the pane terminates both loops.
+struct PaneWatch {
+    watcher_cancel: Arc<AtomicBool>,
+    filter_kill: Option<ConnectionKillSwitch>,
+}
 
-fn watched_lock(watched: &WatchedPanes) -> std::sync::MutexGuard<'_, HashMap<String, Arc<AtomicBool>>> {
+fn watched_lock(watched: &WatchedPanes) -> std::sync::MutexGuard<'_, HashMap<String, PaneWatch>> {
     match watched.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -1086,6 +1153,11 @@ fn read_error_to_client_error(error: anyhow::Error) -> HerdrClientError {
                 io_error.kind(),
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
             ) {
+                return HerdrClientError::Timeout;
+            }
+            // A Windows deadline watchdog cancelled the in-flight pipe read
+            // (ERROR_OPERATION_ABORTED); surface it as the request timeout.
+            if io_error.raw_os_error() == Some(995) {
                 return HerdrClientError::Timeout;
             }
         }
@@ -1133,6 +1205,11 @@ fn run_request_once(
     let attempt = (|| -> PendingResult {
         let mut stream = HerdrStream::connect_with_deadline(&endpoint, deadline)
             .map_err(|error| HerdrClientError::EndpointNotFound(error.to_string()))?;
+        // Bounded-request watchdog: on Windows a silent pipe peer would
+        // otherwise block this worker forever; the watchdog cancels the
+        // in-flight read at the deadline (a no-op on Unix, whose socket
+        // timeouts already bound every operation). Dropped with `attempt`.
+        let _io_deadline = stream.arm_io_deadline(deadline).ok();
         let encoded = serde_json::to_string(&request)
             .map_err(|error| HerdrClientError::Codec(error.to_string()))?;
         stream
@@ -1194,7 +1271,7 @@ fn run_subscription_connection(
     endpoint: HerdrEndpoint,
     request: HerdrRequest,
     handshake_deadline: Duration,
-    ready_tx: oneshot::Sender<Result<(String, usize), HerdrClientError>>,
+    ready_tx: oneshot::Sender<Result<(String, usize, ConnectionKillSwitch), HerdrClientError>>,
     event_tx: Sender<HerdrEvent>,
     lifecycle_tx: Sender<HerdrEvent>,
     event_log: Arc<Mutex<Vec<HerdrEvent>>>,
@@ -1206,6 +1283,16 @@ fn run_subscription_connection(
             return;
         }
     };
+    // The kill switch lets the pane owner terminate this connection later;
+    // the handshake watchdog bounds a silent peer during setup.
+    let kill_switch = match stream.kill_switch() {
+        Ok(kill) => kill,
+        Err(error) => {
+            let _ = ready_tx.send(Err(HerdrClientError::Io(error.to_string())));
+            return;
+        }
+    };
+    let handshake_watchdog = stream.arm_io_deadline(handshake_deadline).ok();
     let encoded = match serde_json::to_string(&request) {
         Ok(encoded) => encoded,
         Err(error) => {
@@ -1297,13 +1384,17 @@ fn run_subscription_connection(
             .unwrap_or("default")
             .to_string();
         let boundary = event_log_len(&event_log);
-        if ready_tx.send(Ok((subscription_id, boundary))).is_err() {
+        if ready_tx.send(Ok((subscription_id, boundary, kill_switch))).is_err() {
             return;
         }
         break;
     }
 
+    if let Some(watchdog) = handshake_watchdog {
+        watchdog.disarm();
+    }
     // Established: idle pushes must not be cut off by the handshake deadline.
+
     if let Err(error) = reader.set_read_timeout(None) {
         log::error!("Herdr subscription could not clear its read deadline: {error}");
         return;
@@ -1438,7 +1529,16 @@ fn pane_filter_subscription_params(pane_ids: &[String]) -> Value {
     serde_json::json!({"subscriptions": subscriptions})
 }
 
+/// Server-side hold time of a matched `events.wait` long poll.
 const OUTPUT_WAIT_TIMEOUT_MS: u64 = 15_000;
+
+/// Request deadline for `events.wait`: the server holds the request open for
+/// `OUTPUT_WAIT_TIMEOUT_MS`, so the client deadline must exceed that wait by
+/// this bounded margin. A shorter deadline would abandon live server waiters
+/// every cycle; an unbounded one would leak the request worker.
+fn events_wait_deadline() -> Duration {
+    Duration::from_millis(OUTPUT_WAIT_TIMEOUT_MS + EVENTS_WAIT_DEADLINE_MARGIN_MS)
+}
 
 fn events_wait_params(pane_id: &str, min_revision: u64) -> Value {
     serde_json::json!({
@@ -1493,7 +1593,7 @@ impl HerdrApi for HerdrClientHandle {
         let task = self.start_subscription(subscription_params());
         self.executor
             .clone()
-            .spawn(async move { task.await.map(|(subscription_id, _)| subscription_id) })
+            .spawn(async move { task.await.map(|(subscription_id, _, _)| subscription_id) })
     }
 
     fn bootstrap(&self, _cx: &App) -> Task<Result<HerdrBootstrap, HerdrClientError>> {
@@ -2041,5 +2141,148 @@ mod tests {
         assert!(cancel.load(Ordering::SeqCst), "retirement cancels watcher");
         assert!(!watched_lock(&handle.watched_panes).contains_key("w1:p1"));
         handle.retire_pane("w1:p1"); // retiring an unknown pane is a no-op
+    }
+
+    /// Review 4 finding 3: the `events.wait` request deadline must exceed
+    /// the server-side wait by the bounded margin.
+    #[test]
+    fn events_wait_deadline_exceeds_server_wait_with_bounded_margin() {
+        let deadline = events_wait_deadline();
+        assert_eq!(
+            deadline,
+            Duration::from_millis(OUTPUT_WAIT_TIMEOUT_MS + EVENTS_WAIT_DEADLINE_MARGIN_MS)
+        );
+        assert!(
+            deadline > Duration::from_millis(OUTPUT_WAIT_TIMEOUT_MS),
+            "request deadline must outlive the server wait"
+        );
+    }
+
+    /// Review 4 finding 4 (race): a filter handshake that completes after
+    /// its pane was retired is torn down immediately instead of registering
+    /// an orphaned subscription loop.
+    #[cfg(unix)]
+    #[test]
+    fn storing_filter_switch_after_retire_triggers_teardown() {
+        use std::os::unix::net::UnixStream;
+
+        let dispatcher = Arc::new(gpui::TestDispatcher::new(0));
+        let executor = gpui::BackgroundExecutor::new(dispatcher);
+        let handle =
+            HerdrClientHandle::new_with_executor(HerdrEndpoint::Default, executor);
+
+        let cancel = handle.ensure_watched("w1:p9").expect("watch");
+        handle.retire_pane("w1:p9");
+        assert!(cancel.load(Ordering::SeqCst));
+
+        let (server_side, client_side) = UnixStream::pair().expect("socket pair");
+        let kill = HerdrStream::Unix(client_side)
+            .kill_switch()
+            .expect("kill switch");
+        drop(server_side);
+        handle.store_filter_kill_switch("w1:p9", kill);
+        assert!(
+            !watched_lock(&handle.watched_panes).contains_key("w1:p9"),
+            "retired pane stays retired"
+        );
+    }
+
+    /// Review 4 finding 4: retiring a pane (close, agent exit, or stale
+    /// moved-away id) terminates its per-pane filter subscription connection,
+    /// not only the output watcher.
+    #[cfg(unix)]
+    #[test]
+    fn retire_pane_tears_down_filter_subscription_connection() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("filters.sock");
+        let listener = UnixListener::bind(&path).expect("bind fixture");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture");
+            let mut subscribe_line = String::new();
+            BufReader::new(stream.try_clone().expect("clone fixture"))
+                .read_line(&mut subscribe_line)
+                .expect("read subscribe line");
+            let request: Value =
+                serde_json::from_str(subscribe_line.trim()).expect("subscribe frame");
+            // Acknowledge whatever id the client used, then hold the socket
+            // open like a live Herdr server would.
+            let ack = format!(
+                "{{\"id\":{},\"result\":{{\"type\":\"subscription_started\",\"subscription_id\":\"s1\"}}}}\n",
+                request["id"]
+            );
+            stream
+                .write_all(ack.as_bytes())
+                .expect("write acknowledgement");
+
+            // Teardown must close the connection: this read returns EOF
+            // instead of blocking forever.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("server read timeout");
+            let mut after = String::new();
+            match BufReader::new(stream).read_line(&mut after) {
+                Ok(0) => {}
+                Ok(count) => panic!("filter connection stayed open; got {count} bytes"),
+                Err(error) => panic!("filter read failed unexpectedly: {error}"),
+            }
+        });
+
+        let dispatcher = Arc::new(gpui::TestDispatcher::new(0));
+        let executor = gpui::BackgroundExecutor::new(dispatcher);
+        let handle = HerdrClientHandle::new_with_executor(
+            HerdrEndpoint::Explicit(path.to_string_lossy().into_owned()),
+            executor,
+        );
+
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let (lifecycle_tx, _lifecycle_rx) = async_channel::unbounded();
+        let event_log = Arc::new(Mutex::new(Vec::new()));
+        handle.ensure_watched("w1:p1").expect("register watch");
+
+        // Drive the connection thread directly: awaiting a GPUI-executor
+        // task under block_on would deadlock the test dispatcher.
+        let (ready_tx, ready_rx) = oneshot::channel::<
+            Result<(String, usize, ConnectionKillSwitch), HerdrClientError>,
+        >();
+        std::thread::Builder::new()
+            .name("herdr-subscription-fixture".to_string())
+            .spawn({
+                let endpoint = HerdrEndpoint::Explicit(path.to_string_lossy().into_owned());
+                move || {
+                    run_subscription_connection(
+                        endpoint,
+                        HerdrRequest {
+                            id: "req-sub".to_string(),
+                            method: "events.subscribe".to_string(),
+                            params: pane_filter_subscription_params(&[
+                                "w1:p1".to_string(),
+                            ]),
+                        },
+                        Duration::from_secs(5),
+                        ready_tx,
+                        event_tx,
+                        lifecycle_tx,
+                        event_log,
+                    );
+                }
+            })
+            .expect("spawn fixture subscription");
+        let (_, boundary, kill) = futures::executor::block_on(ready_rx)
+            .expect("handshake channel")
+            .expect("handshake success");
+        assert_eq!(boundary, 0);
+        handle.store_filter_kill_switch("w1:p1", kill);
+        assert!(
+            watched_lock(&handle.watched_panes)["w1:p1"]
+                .filter_kill
+                .is_some(),
+            "filter ownership recorded before retirement"
+        );
+
+        handle.retire_pane("w1:p1");
+        server.join().expect("fixture observes teardown");
     }
 }
