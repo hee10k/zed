@@ -1,4 +1,6 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+
 use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8,19 +10,61 @@ pub(crate) enum HerdrEndpoint {
     Explicit(String),
 }
 
+fn herdr_config_dir() -> PathBuf {
+    if let Ok(config_dir) = std::env::var("HERDR_CONFIG_DIR") {
+        if !config_dir.is_empty() {
+            return PathBuf::from(config_dir);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(app_data) = std::env::var("APPDATA") {
+            if !app_data.is_empty() {
+                return PathBuf::from(app_data).join("herdr");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                return PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("herdr");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(xdg_config_home) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg_config_home.is_empty() {
+                return PathBuf::from(xdg_config_home).join("herdr");
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                return PathBuf::from(home).join(".config").join("herdr");
+            }
+        }
+    }
+
+    PathBuf::from("/tmp").join("herdr")
+}
+
+fn named_session_path(name: &str) -> PathBuf {
+    herdr_config_dir().join("sessions").join(name).join("herdr.sock")
+}
+
 impl HerdrEndpoint {
     pub(crate) fn resolve(&self) -> String {
         match self {
-            HerdrEndpoint::Explicit(path) => path.clone(),
-            HerdrEndpoint::NamedSession(name) => {
-                if cfg!(windows) {
-                    format!(r"\\.\pipe\herdr-{name}")
-                } else {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                    format!("{home}/.config/herdr/herdr-{name}.sock")
-                }
-            }
-            HerdrEndpoint::Default => {
+            Self::Explicit(path) => path.clone(),
+            Self::NamedSession(name) => named_session_path(name).to_string_lossy().into_owned(),
+            Self::Default => {
                 if let Ok(socket_path) = std::env::var("HERDR_SOCKET_PATH") {
                     if !socket_path.is_empty() {
                         return socket_path;
@@ -28,18 +72,52 @@ impl HerdrEndpoint {
                 }
                 if let Ok(session) = std::env::var("HERDR_SESSION") {
                     if !session.is_empty() {
-                        return HerdrEndpoint::NamedSession(session).resolve();
+                        return named_session_path(&session).to_string_lossy().into_owned();
                     }
                 }
-                if cfg!(windows) {
-                    r"\\.\pipe\herdr".to_string()
-                } else {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                    format!("{home}/.config/herdr/herdr.sock")
-                }
+                herdr_config_dir()
+                    .join("herdr.sock")
+                    .to_string_lossy()
+                    .into_owned()
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_pipe_endpoint(marker_path: &str) -> String {
+    const PIPE_PREFIX: &str = r"\\.\pipe\";
+    if marker_path.starts_with(PIPE_PREFIX) {
+        return marker_path.to_string();
+    }
+    if let Ok(contents) = std::fs::read_to_string(marker_path) {
+        let endpoint = contents.trim();
+        if !endpoint.is_empty() {
+            if endpoint.starts_with(PIPE_PREFIX) {
+                return endpoint.to_string();
+            }
+            return format!("{PIPE_PREFIX}{endpoint}");
+        }
+    }
+    let path = Path::new(marker_path);
+    let name = match path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|component| component.to_str())
+    {
+        Some(session)
+            if path
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(|component| component.to_str())
+                == Some("sessions") =>
+        {
+            format!("herdr-{session}")
+        }
+        _ => "herdr".to_string(),
+    };
+    format!("{PIPE_PREFIX}{name}")
 }
 
 pub(crate) enum HerdrStream {
@@ -51,23 +129,26 @@ pub(crate) enum HerdrStream {
 
 impl HerdrStream {
     pub(crate) fn connect(endpoint: &HerdrEndpoint) -> Result<Self> {
-        let path_str = endpoint.resolve();
+        let endpoint_path = endpoint.resolve();
         #[cfg(unix)]
         {
-            let stream = std::os::unix::net::UnixStream::connect(&path_str)
-                .map_err(|e| anyhow!("Failed to connect to Herdr Unix socket at {path_str}: {e}"))?;
-            Ok(HerdrStream::Unix(stream))
+            let stream = std::os::unix::net::UnixStream::connect(&endpoint_path).map_err(|error| {
+                anyhow!("Failed to connect to Herdr Unix socket at {endpoint_path}: {error}")
+            })?;
+            Ok(Self::Unix(stream))
         }
         #[cfg(windows)]
         {
             use std::ffi::OsStr;
             use std::os::windows::ffi::OsStrExt;
-            use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
+            use std::os::windows::io::FromRawHandle;
+            use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
             use windows::Win32::Storage::FileSystem::{
-                CreateFileW, FILE_SHARE_NONE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING,
             };
 
-            let wide: Vec<u16> = OsStr::new(&path_str)
+            let pipe_path = windows_pipe_endpoint(&endpoint_path);
+            let wide: Vec<u16> = OsStr::new(&pipe_path)
                 .encode_wide()
                 .chain(std::iter::once(0))
                 .collect();
@@ -81,23 +162,19 @@ impl HerdrStream {
                     FILE_ATTRIBUTE_NORMAL,
                     HANDLE::default(),
                 )
-            };
-            if handle.is_err() || handle == Ok(INVALID_HANDLE_VALUE) {
-                return Err(anyhow!("Failed to connect to Herdr named pipe at {path_str}"));
             }
-            let handle = handle.unwrap();
-            use std::os::windows::io::FromRawHandle;
+            .map_err(|error| anyhow!("Failed to connect to Herdr named pipe at {pipe_path}: {error}"))?;
             let file = unsafe { std::fs::File::from_raw_handle(handle.0 as _) };
-            Ok(HerdrStream::NamedPipe(file))
+            Ok(Self::NamedPipe(file))
         }
     }
 
     pub(crate) fn try_clone(&self) -> Result<Self> {
         match self {
             #[cfg(unix)]
-            HerdrStream::Unix(s) => Ok(HerdrStream::Unix(s.try_clone()?)),
+            Self::Unix(stream) => Ok(Self::Unix(stream.try_clone()?)),
             #[cfg(windows)]
-            HerdrStream::NamedPipe(f) => Ok(HerdrStream::NamedPipe(f.try_clone()?)),
+            Self::NamedPipe(file) => Ok(Self::NamedPipe(file.try_clone()?)),
         }
     }
 
@@ -107,17 +184,16 @@ impl HerdrStream {
         } else {
             format!("{line}\n")
         };
-        let bytes = line_with_newline.as_bytes();
         match self {
             #[cfg(unix)]
-            HerdrStream::Unix(s) => {
-                s.write_all(bytes)?;
-                s.flush()?;
+            Self::Unix(stream) => {
+                stream.write_all(line_with_newline.as_bytes())?;
+                stream.flush()?;
             }
             #[cfg(windows)]
-            HerdrStream::NamedPipe(f) => {
-                f.write_all(bytes)?;
-                f.flush()?;
+            Self::NamedPipe(file) => {
+                file.write_all(line_with_newline.as_bytes())?;
+                file.flush()?;
             }
         }
         Ok(())
@@ -135,13 +211,13 @@ pub(crate) enum HerdrStreamReadHandle {
     NamedPipe(std::fs::File),
 }
 
-impl std::io::Read for HerdrStreamReadHandle {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl Read for HerdrStreamReadHandle {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         match self {
             #[cfg(unix)]
-            HerdrStreamReadHandle::Unix(s) => s.read(buf),
+            Self::Unix(stream) => stream.read(buffer),
             #[cfg(windows)]
-            HerdrStreamReadHandle::NamedPipe(f) => f.read(buf),
+            Self::NamedPipe(file) => file.read(buffer),
         }
     }
 }
@@ -150,9 +226,9 @@ impl HerdrLineReader {
     pub(crate) fn new(stream: HerdrStream) -> Self {
         let handle = match stream {
             #[cfg(unix)]
-            HerdrStream::Unix(s) => HerdrStreamReadHandle::Unix(s),
+            HerdrStream::Unix(stream) => HerdrStreamReadHandle::Unix(stream),
             #[cfg(windows)]
-            HerdrStream::NamedPipe(f) => HerdrStreamReadHandle::NamedPipe(f),
+            HerdrStream::NamedPipe(file) => HerdrStreamReadHandle::NamedPipe(file),
         };
         Self {
             reader: BufReader::new(handle),
@@ -163,16 +239,15 @@ impl HerdrLineReader {
         let mut line = String::new();
         let bytes_read = self.reader.read_line(&mut line)?;
         if bytes_read == 0 {
-            Ok(None)
-        } else {
-            if line.ends_with('\n') {
-                line.pop();
-                if line.ends_with('\r') {
-                    line.pop();
-                }
-            }
-            Ok(Some(line))
+            return Ok(None);
         }
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        Ok(Some(line))
     }
 }
 
@@ -187,9 +262,44 @@ mod tests {
     }
 
     #[test]
-    fn resolves_named_session() {
+    fn resolves_named_session_under_session_directory() {
         let endpoint = HerdrEndpoint::NamedSession("test-session".to_string());
         let resolved = endpoint.resolve();
-        assert!(resolved.contains("test-session"));
+        assert!(resolved.ends_with("sessions/test-session/herdr.sock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_fixture_round_trips_ndjson() {
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        let path = std::env::temp_dir().join(format!("herdr-test-{}", std::process::id()));
+        let listener = UnixListener::bind(&path).expect("bind fixture");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture");
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().expect("clone fixture"))
+                .read_line(&mut line)
+                .expect("read fixture");
+            assert_eq!(line, "{\"id\":\"1\"}\n");
+            stream.write_all(b"{\"id\":\"1\",\"result\":{}}\n").expect("write fixture");
+        });
+
+        let mut stream = HerdrStream::connect(&HerdrEndpoint::Explicit(
+            path.to_string_lossy().into_owned(),
+        ))
+        .expect("connect fixture");
+        stream.send_line(r#"{"id":"1"}"#).expect("send fixture");
+        let mut reader = HerdrLineReader::new(stream);
+        assert_eq!(reader.read_line().expect("read response").as_deref(), Some(r#"{"id":"1","result":{}}"#));
+        server.join().expect("fixture thread");
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_marker_endpoint_is_namespaced() {
+        assert!(windows_pipe_endpoint(r#"\\.\pipe\herdr-test"#).starts_with(r#"\\.\pipe\"#));
     }
 }
