@@ -105,3 +105,36 @@ cargo test -p agent_ui herdr_ --no-default-features
 Result: **26 passed, 0 failed**. New/updated regressions: `request_times_out_when_server_never_responds` (unix fixture), `subscription_pump_terminates_without_event_field` (socket pair), `decodes_typed_workspace_moved_event`, `decodes_typed_workspace_reordered_event`, `extracts_revision_from_official_wait_matched_result`, `events_wait_params_target_pane_output_changes`, `lifecycle_events_are_forwarded_for_watch_supervision`, `pane_watch_state_tracks_ensure_and_retire`, and an updated `encodes_official_subscription_payload` asserting per-pane filters contain status + scroll entries and no `output_matched`.
 
 Note: an earlier fixture-driven bootstrap integration test was removed during repair because driving detached supervision tasks against a real socket fixture depended on executor timing; its behaviors are retained by deterministic regressions (`encodes_official_subscription_payload` ordering/payload shape, lifecycle forwarding, watch-state transitions).
+
+## Task 1 Review 4 Amendment Evidence
+
+All four Review 4 findings were repaired:
+
+1. **Windows compilation restored (finding 1).** The Unix `SocketAddr` / `UnixStream` connect block in `HerdrStream::connect_with_deadline` carries its `#[cfg(unix)]` attribute again; the Windows named-pipe branch remains the only other arm.
+2. **Bounded silent-peer pipe requests (finding 2).** Windows request connections arm an `IoDeadline` watchdog derived from the connection kill switch. When the deadline elapses the watchdog cancels the connection's I/O (`CancelIoEx`), the blocked read completes with `ERROR_OPERATION_ABORTED` (995), which `read_error_to_client_error` maps to `HerdrClientError::Timeout`, and the worker exits instead of being abandoned. Unix connections rely on socket read/write timeouts that bound every operation.
+3. **Long-poll timing aligned (finding 3).** `events.wait` requests use `events_wait_deadline()` = `OUTPUT_WAIT_TIMEOUT_MS` + a bounded margin (`EVENTS_WAIT_DEADLINE_MARGIN_MS`), so the request deadline outlives the server-side wait; no per-cycle waiters or threads are abandoned.
+4. **Pane retirement tears down filter subscriptions (finding 4).** `PaneWatch` owns both the output-watcher cancel flag and the filter connection's `ConnectionKillSwitch`. `retire_pane` triggers both for closed panes, exited agents, and stale moved-away pane ids; a filter handshake completing after retirement is triggered immediately instead of registering an orphaned subscription loop.
+
+Focused verification recorded at amendment time:
+
+```text
+cargo test -p agent_ui herdr_ --no-default-features
+```
+
+Result: **30 passed, 0 failed**.
+
+## Task 1 Review 5 Repair Evidence
+
+All three Review 5 findings were repaired:
+
+1. **In-repo amendment evidence (finding 1).** The "Task 1 Review 4 Amendment Evidence" section above now records the four repairs and the exact focused command/result in this repository file.
+2. **Stale filter handshakes no longer clobber live switches (finding 2).** `store_filter_kill_switch` now triggers the previous kill switch when replacing it (`if let Some(previous) = watch.filter_kill.replace(kill) { previous.trigger(); }`). A reused pane id whose late previous-generation handshake completes tears down the superseded subscription connection instead of silently overwriting (and leaking) the live one; retired pane ids still trigger immediately. Regression: `storing_filter_switch_over_a_live_one_triggers_the_previous` blocks a reader on the registered live connection, stores a stale-generation switch over it, and asserts the superseded read completes promptly while the newest switch stays registered.
+3. **Windows deadline covers reads started after expiry (finding 3).** The `IoDeadline` watchdog no longer fires exactly one cancellation: after expiry it keeps cancelling every `DEADLINE_REARM_INTERVAL` (25 ms) until disarmed or dropped (`run_deadline_watchdog`, kept platform-neutral so its semantics are unit-testable). One `CancelIoEx` pass only reaches I/O already in flight, so sustained re-cancellation guarantees no blocked request worker survives an expired deadline, including workers whose read starts after the nominal deadline elapsed. Regressions: `deadline_watchdog_keeps_cancelling_after_expiry` (cancellation count grows past the first post-expiry pass) and `deadline_watchdog_stays_idle_until_expiry_and_stops_on_disarm` (no cancellations before expiry; clean stop on disarm).
+
+Focused verification rerun:
+
+```text
+cargo test -p agent_ui herdr_ --no-default-features
+```
+
+Result: **33 passed, 0 failed**. New regressions: `storing_filter_switch_over_a_live_one_triggers_the_previous`, `deadline_watchdog_keeps_cancelling_after_expiry`, `deadline_watchdog_stays_idle_until_expiry_and_stops_on_disarm`.

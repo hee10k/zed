@@ -213,9 +213,10 @@ impl HerdrStream {
         })
     }
 
-    /// Arm a watchdog that cancels in-flight I/O on this connection once
-    /// `deadline` elapses, so a peer that accepts but never answers cannot
-    /// block the request thread forever.
+    /// Arm a watchdog that cancels I/O on this connection once `deadline`
+    /// elapses and *keeps* cancelling until disarmed, so every blocking
+    /// operation started after expiry also fails: a peer that accepts but
+    /// never answers cannot block the request thread forever.
     #[cfg(windows)]
     pub(crate) fn arm_io_deadline(&self, deadline: Duration) -> Result<IoDeadline> {
         let kill = self.kill_switch()?;
@@ -270,9 +271,39 @@ impl ConnectionKillSwitch {
     }
 }
 
-/// Watchdog armed around a bounded request. When it fires it cancels the
-/// connection's in-flight I/O instead of abandoning a blocked worker; the
-/// blocked read then completes with an abort error and the worker exits.
+/// Interval between repeated cancellations once a deadline has expired.
+const DEADLINE_REARM_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Deadline watchdog loop, kept platform-neutral so its expiry semantics
+/// are unit-testable. Waits out `deadline`, then keeps invoking
+/// `cancel_io` on `DEADLINE_REARM_INTERVAL` until the cancel channel
+/// closes (disarm or drop). One cancellation pass only reaches I/O already
+/// in flight at that instant — Windows `CancelIoEx` cancels nothing for a
+/// read that starts later — so cancellation must stay active after expiry.
+fn run_deadline_watchdog(
+    cancel_rx: std::sync::mpsc::Receiver<()>,
+    deadline: Duration,
+    mut cancel_io: impl FnMut(),
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    match cancel_rx.recv_timeout(deadline) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+        Err(RecvTimeoutError::Timeout) => {}
+    }
+    loop {
+        cancel_io();
+        match cancel_rx.recv_timeout(DEADLINE_REARM_INTERVAL) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => continue,
+        }
+    }
+}
+
+/// Watchdog armed around a bounded request. Once its deadline elapses it
+/// keeps cancelling the connection's I/O until disarmed or dropped, so no
+/// blocked request worker — including one whose read starts after expiry —
+/// can survive the deadline; each cancelled read completes with an abort
+/// error and the worker exits.
 pub(crate) struct IoDeadline {
     cancel_tx: Option<std::sync::mpsc::Sender<()>>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -284,13 +315,7 @@ impl IoDeadline {
         let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
         let worker = std::thread::Builder::new()
             .name("herdr-io-deadline".to_string())
-            .spawn(move || {
-                if cancel_rx.recv_timeout(deadline)
-                    == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                {
-                    kill.trigger();
-                }
-            })?;
+            .spawn(move || run_deadline_watchdog(cancel_rx, deadline, || kill.trigger()))?;
         Ok(Self {
             cancel_tx: Some(cancel_tx),
             worker: Some(worker),
@@ -396,6 +421,64 @@ impl HerdrLineReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 5 finding 3: a watchdog that fires exactly one cancellation
+    /// leaves every read started after expiry unbounded (one CancelIoEx
+    /// pass only reaches I/O already in flight). Cancellation must stay
+    /// active after the deadline until the watchdog is disarmed.
+    #[test]
+    fn deadline_watchdog_keeps_cancelling_after_expiry() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&cancellations);
+        let worker = std::thread::Builder::new()
+            .name("herdr-watchdog-fixture".to_string())
+            .spawn(move || {
+                run_deadline_watchdog(cancel_rx, Duration::from_millis(50), || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .expect("spawn fixture watchdog");
+        // Outlive the deadline plus several re-arm intervals: reads started
+        // anywhere in this window must have been covered by a later pass.
+        std::thread::sleep(Duration::from_millis(150));
+        drop(cancel_tx);
+        worker.join().expect("watchdog exits after expiry");
+        assert!(
+            cancellations.load(Ordering::SeqCst) >= 2,
+            "cancellation must stay active after expiry"
+        );
+    }
+
+    #[test]
+    fn deadline_watchdog_stays_idle_until_expiry_and_stops_on_disarm() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&cancellations);
+        let worker = std::thread::Builder::new()
+            .name("herdr-watchdog-fixture".to_string())
+            .spawn(move || {
+                run_deadline_watchdog(cancel_rx, Duration::from_secs(30), || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .expect("spawn fixture watchdog");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            cancellations.load(Ordering::SeqCst),
+            0,
+            "nothing is cancelled before the deadline elapses"
+        );
+        cancel_tx.send(()).expect("disarm watchdog");
+        worker.join().expect("watchdog stops on disarm");
+        assert_eq!(cancellations.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn resolves_explicit_endpoint() {

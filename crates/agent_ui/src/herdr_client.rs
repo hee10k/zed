@@ -923,11 +923,19 @@ impl HerdrClientHandle {
     /// Record a pane filter connection's kill switch once its handshake
     /// completes. If the pane was retired before the handshake finished,
     /// tear the connection down immediately instead of registering an
-    /// orphaned subscription loop.
+    /// orphaned subscription loop. Pane ids can be reused: a late
+    /// handshake from a previous generation must trigger the live switch
+    /// it replaces, or that connection would leak and its pump would keep
+    /// running against a pane id it no longer owns.
     fn store_filter_kill_switch(&self, pane_id: &str, kill: ConnectionKillSwitch) {
         let mut watched = watched_lock(&self.watched_panes);
         match watched.get_mut(pane_id) {
-            Some(watch) => watch.filter_kill = Some(kill),
+            Some(watch) => {
+                if let Some(previous) = watch.filter_kill.replace(kill) {
+                    log::debug!("Replacing stale Herdr filter subscription for {pane_id}");
+                    previous.trigger();
+                }
+            }
             None => drop(kill.trigger()),
         }
     }
@@ -2185,6 +2193,66 @@ mod tests {
             !watched_lock(&handle.watched_panes).contains_key("w1:p9"),
             "retired pane stays retired"
         );
+    }
+
+    /// Review 5 finding 2 (race): a reused pane id can hold a live filter
+    /// subscription when a stale-generation handshake completes; storing it
+    /// must trigger the kill switch it replaces so the superseded
+    /// subscription connection is torn down instead of leaking.
+    #[cfg(unix)]
+    #[test]
+    fn storing_filter_switch_over_a_live_one_triggers_the_previous() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Instant;
+
+        let dispatcher = Arc::new(gpui::TestDispatcher::new(0));
+        let executor = gpui::BackgroundExecutor::new(dispatcher);
+        let handle =
+            HerdrClientHandle::new_with_executor(HerdrEndpoint::Default, executor);
+
+        let make_pair = || {
+            let (server_side, client_side) = UnixStream::pair().expect("socket pair");
+            let kill = HerdrStream::Unix(client_side.try_clone().expect("clone socket"))
+                .kill_switch()
+                .expect("kill switch");
+            (kill, client_side, server_side)
+        };
+
+        // Live watch whose filter handshake already completed: pane "w1:p1"
+        // was retired and its id reused, so this switch belongs to the new
+        // generation.
+        handle.ensure_watched("w1:p1").expect("watch");
+        let (live_kill, live_client, live_server) = make_pair();
+        handle.store_filter_kill_switch("w1:p1", live_kill);
+
+        // A pump blocked reading the live connection.
+        let mut live_reader = HerdrLineReader::new(HerdrStream::Unix(live_client));
+        let live_waiter = std::thread::spawn(move || live_reader.read_line());
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Stale-generation handshake arrives late and must replace-and-
+        // trigger the live switch instead of silently overwriting it.
+        let (stale_kill, _, stale_server) = make_pair();
+        let started = Instant::now();
+        handle.store_filter_kill_switch("w1:p1", stale_kill);
+
+        let unblocked = live_waiter.join().expect("reader thread exits");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "replacing the filter switch must tear down the previous connection"
+        );
+        assert!(
+            unblocked.is_ok(),
+            "the superseded connection's read completes after teardown"
+        );
+        assert!(
+            watched_lock(&handle.watched_panes)["w1:p1"]
+                .filter_kill
+                .is_some(),
+            "the newest switch stays registered"
+        );
+        drop(stale_server);
+        drop(live_server);
     }
 
     /// Review 4 finding 4: retiring a pane (close, agent exit, or stale
