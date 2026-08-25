@@ -1091,6 +1091,18 @@ pub trait GitRepository: Send + Sync {
         mode: MergeMode,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>>;
+    /// Rebases the current worktree onto an upstream ref.
+    fn rebase(
+        &self,
+        upstream: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async move {
+            let _ = (upstream, env);
+            anyhow::bail!("rebase is not supported by this repository backend")
+        }
+        .boxed()
+    }
 
     fn operation_state(&self) -> BoxFuture<'_, Result<Option<GitOperationKind>>>;
 
@@ -2665,6 +2677,19 @@ impl GitRepository for RealGitRepository {
             }
             args.push(commit);
             run_git_mutation(&git, &args, &env).await
+        }
+        .boxed()
+    }
+    fn rebase(
+        &self,
+        upstream: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        async move {
+            let git = git?;
+            let upstream = resolve_commit_oid(&git, &upstream).await?;
+            run_git_mutation(&git, &["rebase".to_string(), upstream], &env).await
         }
         .boxed()
     }

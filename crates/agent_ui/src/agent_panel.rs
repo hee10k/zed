@@ -18,14 +18,17 @@ use agent_settings::UserAgentsMd;
 use collections::HashSet;
 use db::kvp::{Dismissable, KeyValueStore};
 use itertools::Itertools;
-use project::{AgentId, ProjectItem};
+use remote::{
+    RemoteConnectionOptions, remote_connection_identity, same_remote_connection_identity,
+};
+use project::{AgentId, ProjectItem, WorktreeId};
 use serde::{Deserialize, Serialize};
 
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
-        ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
+        AddSelectionToThread, ConflictContent, LogoutAgent, NewOmpTerminal, OpenSettings,
+        ReauthenticateAgent, ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
         ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
     },
     assistant::{
@@ -39,13 +42,23 @@ use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
-    TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore,
+    SessionBoundary, TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore,
     compose_terminal_thread_title, terminal_title_without_prefix,
 };
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::thread_metadata_store::{
+    ActivityStatus, ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent,
+};
+use crate::thread_group::{
+    MoveOrClonePayload, MoveOrCloneResult, RebaseResult, execute_move_or_clone_payload,
+};
+use crate::terminal_resume::{build_resume_command, resume_comment};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
+};
+use crate::worktree_lifecycle::{
+    WorktreeLifecycleCoordinator, WorktreeLifecycleKey, WorktreeLifecycleStore,
+    WorktreeLifecycleWorktree,
 };
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow,
@@ -112,6 +125,36 @@ const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn terminal_matches_restored_workspace(
+    workspace_id: WorkspaceId,
+    candidate_worktree_paths: &project::WorktreePaths,
+    candidate_remote_connection: Option<&RemoteConnectionOptions>,
+    restored_worktree_paths: &project::WorktreePaths,
+    restored_remote_connection: Option<&RemoteConnectionOptions>,
+) -> bool {
+    let _ = workspace_id;
+    candidate_worktree_paths == restored_worktree_paths
+        && same_remote_connection_identity(
+            candidate_remote_connection,
+            restored_remote_connection,
+        )
+}
+
+async fn terminal_worktrees_exist(
+    fs: Arc<dyn Fs>,
+    worktree_paths: &project::WorktreePaths,
+) -> bool {
+    if worktree_paths.is_empty() {
+        return false;
+    }
+    for folder_path in worktree_paths.folder_path_list().ordered_paths() {
+        if !fs.is_dir(folder_path).await {
+            return false;
+        }
+    }
+    true
+}
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "agent", // Unfortunately, both Cursor cli + grok
     "agy",
@@ -403,6 +446,14 @@ pub fn init(cx: &mut App) {
                                 window,
                                 cx,
                             )
+                        });
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
+                })
+                .register_action(|workspace, _: &NewOmpTerminal, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.new_omp_terminal(window, cx);
                         });
                         workspace.focus_panel::<AgentPanel>(window, cx);
                     }
@@ -1178,6 +1229,10 @@ pub struct AgentPanel {
     connection_store: Entity<AgentConnectionStore>,
     context_server_registry: Entity<ContextServerRegistry>,
     focus_handle: FocusHandle,
+    worktree_lifecycle: WorktreeLifecycleCoordinator,
+    _worktree_lifecycle_task: Option<Task<()>>,
+    worktree_lifecycle_worktrees: HashMap<WorktreeId, WorktreeLifecycleWorktree>,
+    worktree_lifecycle_keys: HashMap<WorktreeId, WorktreeLifecycleKey>,
     base_view: BaseView,
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
@@ -1209,6 +1264,22 @@ pub struct AgentPanel {
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
+}
+
+fn omp_creation_command(shell_kind: task::ShellKind, locator: &str) -> Option<String> {
+    shell_kind
+        .try_quote(locator)
+        .map(|locator| format!("omp --session-dir {locator}"))
+}
+
+fn ensure_local_omp_project(is_local: bool) -> Result<()> {
+    if is_local {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "OMP agent terminals require a local project; remote projects cannot access Zed's local session directory"
+        ))
+    }
 }
 
 impl AgentPanel {
@@ -1325,6 +1396,15 @@ impl AgentPanel {
             let has_open_project = workspace
                 .read_with(cx, |workspace, cx| !workspace.root_paths(cx).is_empty())
                 .unwrap_or(false);
+            let restored_project_identity = workspace
+                .read_with(cx, |workspace, cx| {
+                    let project = workspace.project().read(cx);
+                    (
+                        project.worktree_paths(cx),
+                        project.remote_connection_options(cx),
+                    )
+                })
+                .ok();
             let terminal_id_to_restore = if has_open_project {
                 serialized_panel
                     .as_ref()
@@ -1350,11 +1430,45 @@ impl AgentPanel {
                 }) {
                     Ok(Some((store, reload_task))) => {
                         reload_task.await;
-                        match store
-                            .read_with(cx, |store, _cx| store.entry(terminal_id).cloned())
-                        {
-                            Some(metadata) => Some(metadata),
-                            None => {
+                        let metadata = store
+                            .read_with(cx, |store, _cx| store.entry(terminal_id).cloned());
+                        match (workspace_id, restored_project_identity.as_ref(), metadata) {
+                            (Some(workspace_id), Some((worktree_paths, remote_connection)), Some(metadata))
+                                if metadata.restore_on_workspace_open
+                                    && terminal_matches_restored_workspace(
+                                        workspace_id,
+                                        &metadata.worktree_paths,
+                                        metadata.remote_connection.as_ref(),
+                                        worktree_paths,
+                                        remote_connection.as_ref(),
+                                    ) =>
+                            {
+                                let fs = workspace
+                                    .read_with(cx, |workspace, _| workspace.app_state().fs.clone())
+                                    .ok();
+                                let worktree_exists = if remote_connection.is_some() {
+                                    true
+                                } else if let Some(fs) = fs {
+                                    terminal_worktrees_exist(fs, &metadata.worktree_paths).await
+                                } else {
+                                    false
+                                };
+                                if worktree_exists {
+                                    Some(metadata)
+                                } else {
+                                    log::info!(
+                                        "last active terminal worktree is unavailable, skipping restoration"
+                                    );
+                                    None
+                                }
+                            }
+                            (_, _, Some(_)) => {
+                                log::info!(
+                                    "last active terminal does not match the restored workspace, skipping restoration"
+                                );
+                                None
+                            }
+                            (_, _, None) => {
                                 log::info!(
                                     "last active terminal is missing, skipping restoration"
                                 );
@@ -1516,8 +1630,162 @@ impl AgentPanel {
         })
     }
 
+    fn reconcile_worktree_lifecycle(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.workspace_id else {
+            return;
+        };
+        let (worktrees, observed_worktrees) = self.project.read_with(cx, |project, cx| {
+            let remote_identity = project
+                .remote_connection_options(cx)
+                .map(|options| {
+                    format!(
+                        "remote-v1:{}",
+                        remote_connection_identity(&options).persistence_key()
+                    )
+                })
+                .unwrap_or_else(|| "local".to_string());
+            let mut observed_worktrees = Vec::new();
+            let worktrees = project
+                .worktrees(cx)
+                .map(|worktree| {
+                    let worktree = worktree.read(cx);
+                    let worktree_path = worktree.abs_path().to_path_buf();
+                    let repository_path = worktree
+                        .root_repo_common_dir()
+                        .map(|path| path.to_path_buf())
+                        .unwrap_or_else(|| worktree_path.clone());
+                    let lifecycle_worktree = WorktreeLifecycleWorktree::new(
+                        repository_path,
+                        worktree_path,
+                        remote_identity.clone(),
+                    );
+                    observed_worktrees.push((worktree.id(), lifecycle_worktree.clone()));
+                    lifecycle_worktree
+                })
+                .collect::<Vec<_>>();
+            (worktrees, observed_worktrees)
+        });
+        let observed_ids: HashSet<_> = observed_worktrees
+            .iter()
+            .map(|(worktree_id, _)| *worktree_id)
+            .collect();
+        self.worktree_lifecycle_worktrees
+            .retain(|worktree_id, _| observed_ids.contains(worktree_id));
+        self.worktree_lifecycle_keys
+            .retain(|worktree_id, _| observed_ids.contains(worktree_id));
+        self.worktree_lifecycle_worktrees
+            .extend(observed_worktrees.clone());
+
+        let coordinator = self.worktree_lifecycle.clone();
+        let previous_task = self._worktree_lifecycle_task.take();
+        let observed_worktrees_for_keys = observed_worktrees;
+        self._worktree_lifecycle_task = Some(cx.spawn(async move |this, cx| {
+            // Keep every lifecycle read-modify-write in event order. In
+            // particular, a reconcile queued after a removal must not race
+            // the Closing transition and resurrect the record.
+            if let Some(previous_task) = previous_task {
+                previous_task.await;
+            }
+            let Ok(records) = coordinator
+                .reconcile_workspace(workspace_id, &worktrees)
+                .await
+            else {
+                log::error!("reconciling worktree lifecycle records failed");
+                return;
+            };
+            this.update(cx, |panel, _cx| {
+                panel.worktree_lifecycle_keys.extend(
+                    observed_worktrees_for_keys
+                        .into_iter()
+                        .zip(records)
+                        .map(|((worktree_id, _), record)| (worktree_id, record.key)),
+                );
+            })
+            .ok();
+        }));
+    }
+
+    fn remove_worktree_lifecycle(&mut self, worktree_id: WorktreeId, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.workspace_id else {
+            return;
+        };
+        let cached_key = self.worktree_lifecycle_keys.remove(&worktree_id);
+        let Some(worktree) = self.worktree_lifecycle_worktrees.remove(&worktree_id) else {
+            log::warn!(
+                "worktree lifecycle removal had no captured worktree for {worktree_id:?}"
+            );
+            return;
+        };
+
+        let coordinator = self.worktree_lifecycle.clone();
+        let previous_task = self._worktree_lifecycle_task.take();
+        self._worktree_lifecycle_task = Some(cx.background_spawn(async move {
+            if let Some(previous_task) = previous_task {
+                previous_task.await;
+            }
+            let key = match cached_key {
+                Some(key) => key,
+                None => match coordinator.key_for(&worktree).await {
+                    Ok(key) => key,
+                    Err(error) => {
+                        log::error!("resolving removed worktree lifecycle key: {error:#}");
+                        return;
+                    }
+                },
+            };
+            if let Err(error) = coordinator
+                .release_worktree_owner(&key, workspace_id)
+                .await
+            {
+                log::error!("releasing removed worktree lifecycle owner: {error:#}");
+            }
+        }));
+    }
+    pub(crate) fn lifecycle_key_for_worktree(
+        &self,
+        worktree_id: WorktreeId,
+    ) -> Option<WorktreeLifecycleKey> {
+        self.worktree_lifecycle_keys.get(&worktree_id).cloned()
+    }
+
+    pub(crate) fn confirm_worktree_lifecycle_deletion(
+        &mut self,
+        key: WorktreeLifecycleKey,
+        worktree_path: PathBuf,
+        remote_connection: Option<RemoteConnectionOptions>,
+        cx: &mut Context<Self>,
+    ) {
+        let coordinator = self.worktree_lifecycle.clone();
+        let previous_task = self._worktree_lifecycle_task.take();
+        let terminal_store = TerminalThreadMetadataStore::try_global(cx);
+        self._worktree_lifecycle_task = Some(cx.spawn(async move |_this, mut cx| {
+            if let Some(previous_task) = previous_task {
+                previous_task.await;
+            }
+            if let Err(error) = coordinator.mark_worktree_closing(&key).await {
+                log::error!("marking confirmed worktree lifecycle record closing: {error:#}");
+                return;
+            }
+            if let Some(store) = terminal_store {
+                store
+                    .update(&mut cx.clone(), |store, cx| {
+                        store.remove_worktree_path(
+                            &worktree_path,
+                            remote_connection.as_ref(),
+                            cx,
+                        );
+                    });
+            }
+            if let Err(error) = coordinator.remove_worktree(&key).await {
+                log::error!("removing confirmed worktree lifecycle record: {error:#}");
+            }
+        }));
+    }
+
     pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
+        let worktree_lifecycle =
+            WorktreeLifecycleCoordinator::new(WorktreeLifecycleStore::new(fs.clone()));
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
         let language_registry = project.read(cx).languages().clone();
@@ -1564,12 +1832,14 @@ impl AgentPanel {
                 project::Event::WorktreeAdded(_)
                 | project::Event::WorktreeOrderChanged
                 | project::Event::WorktreePathsChanged { .. } => {
+                    this.reconcile_worktree_lifecycle(cx);
                     this.ensure_native_agent_connection(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
                     cx.notify();
                 }
-                project::Event::WorktreeRemoved(_) => {
+                project::Event::WorktreeRemoved(worktree_id) => {
+                    this.remove_worktree_lifecycle(*worktree_id, cx);
                     this.ensure_native_agent_connection(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
@@ -1590,10 +1860,41 @@ impl AgentPanel {
 
         cx.on_release(|this, cx| {
             this.dismiss_all_terminal_notifications(cx);
+            let thread_flush = ThreadMetadataStore::try_global(cx)
+                .map(|store| store.read(cx).flush_pending(cx));
+            let terminal_flush = TerminalThreadMetadataStore::try_global(cx)
+                .map(|store| store.read(cx).flush_pending(cx));
+            let lifecycle_flush = this.workspace_id.map(|workspace_id| {
+                (
+                    this.worktree_lifecycle.clone(),
+                    this._worktree_lifecycle_task.take(),
+                    workspace_id,
+                )
+            });
+            cx.background_executor()
+                .spawn(async move {
+                    if let Some(task) = thread_flush {
+                        task.await;
+                    }
+                    if let Some(task) = terminal_flush {
+                        task.await;
+                    }
+                    if let Some((coordinator, previous_task, workspace_id)) = lifecycle_flush {
+                        if let Some(previous_task) = previous_task {
+                            previous_task.await;
+                        }
+                        if let Err(error) = coordinator.flush_workspace(workspace_id).await {
+                            log::error!(
+                                "flushing worktree lifecycle records during AgentPanel release: {error:#}"
+                            );
+                        }
+                    }
+                })
+                .detach();
         })
         .detach();
 
-        let panel = Self {
+        let mut panel = Self {
             workspace_id,
             base_view,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
@@ -1604,6 +1905,10 @@ impl AgentPanel {
             language_registry,
             connection_store,
             focus_handle: cx.focus_handle(),
+            worktree_lifecycle,
+            _worktree_lifecycle_task: None,
+            worktree_lifecycle_worktrees: HashMap::default(),
+            worktree_lifecycle_keys: HashMap::default(),
             context_server_registry,
             draft_thread: None,
             retained_threads: HashMap::default(),
@@ -1631,7 +1936,7 @@ impl AgentPanel {
             last_context_source: None,
             is_active: false,
         };
-
+        panel.reconcile_worktree_lifecycle(cx);
         panel.ensure_native_agent_connection(cx);
         panel
     }
@@ -1999,6 +2304,29 @@ impl AgentPanel {
             cx.notify();
         }
     }
+    /// Executes a confirmed thread-group transfer at the panel boundary.
+    /// Callers own the confirmation and provide the Git/worktree operation;
+    /// metadata is changed only after those operations report success.
+    pub fn execute_thread_group_transfer(
+        &mut self,
+        payload: MoveOrClonePayload,
+        target_worktree_id: Option<SharedString>,
+        rebase_executor: impl FnOnce() -> RebaseResult,
+        worktree_factory: impl FnOnce() -> Result<(project::WorktreePaths, SharedString), String>,
+        cx: &mut Context<Self>,
+    ) -> MoveOrCloneResult {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            execute_move_or_clone_payload(
+                payload,
+                target_worktree_id,
+                rebase_executor,
+                worktree_factory,
+                store,
+                cx,
+            )
+        })
+    }
+
 
     pub fn new_terminal(
         &mut self,
@@ -2026,7 +2354,43 @@ impl AgentPanel {
             cx,
         );
     }
+    /// Starts a dedicated OMP terminal and assigns its session locator before
+    /// sending the creation command to the interactive shell.
+    pub fn new_omp_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.supports_terminal(cx) {
+            return;
+        }
+        if let Err(error) = ensure_local_omp_project(self.project.read(cx).is_local()) {
+            self.workspace
+                .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                .log_err();
+            return;
+        }
 
+        self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Terminal, cx);
+        let terminal_id = TerminalId::new();
+        let locator = paths::data_dir()
+            .join("agent_sessions")
+            .join("omp")
+            .join(terminal_id.to_key_string());
+        let locator = SharedString::from(locator.to_string_lossy().into_owned());
+        let working_directory = self.terminal_working_directory(None, cx);
+        self.spawn_terminal_with_session(
+            terminal_id,
+            working_directory,
+            None,
+            None,
+            None,
+            true,
+            true,
+            false,
+            Some(("omp".into(), locator)),
+            None,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+    }
 
     fn terminal_working_directory(
         &self,
@@ -2083,8 +2447,46 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.spawn_terminal_with_session(
+            terminal_id,
+            working_directory,
+            custom_title,
+            initial_title,
+            created_at,
+            select,
+            focus,
+            run_init_command,
+            None,
+            None,
+            source,
+            window,
+            cx,
+        );
+    }
+
+    fn spawn_terminal_with_session(
+        &mut self,
+        terminal_id: TerminalId,
+        working_directory: Option<PathBuf>,
+        custom_title: Option<SharedString>,
+        initial_title: Option<SharedString>,
+        created_at: Option<DateTime<Utc>>,
+        select: bool,
+        focus: bool,
+        run_init_command: bool,
+        session: Option<(SharedString, SharedString)>,
+        resume_metadata: Option<TerminalThreadMetadata>,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let terminal_working_directory = working_directory.clone();
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = if session.is_none() && resume_metadata.is_none() {
+            Self::terminal_init_command(run_init_command, cx)
+        } else {
+            None
+        };
+        let session_locator = session.as_ref().map(|(_, locator)| locator.clone());
         let terminal_task = self.project.update(cx, |project, cx| {
             project.create_terminal_shell(working_directory, cx)
         });
@@ -2131,11 +2533,92 @@ impl AgentPanel {
                     window,
                     cx,
                 );
+                if let Some((harness, locator)) = session {
+                    if let Err(error) =
+                        this.register_terminal_agent_session(terminal_id, harness, locator, cx)
+                    {
+                        log::error!(
+                            "failed to register OMP terminal session {terminal_id}: {error:#}"
+                        );
+                    }
+                }
+                let init_command = if let Some(locator) = session_locator {
+                    let shell_kind = terminal_for_init_command.read(cx).shell_kind();
+                    omp_creation_command(shell_kind, locator.as_ref()).or_else(|| {
+                        log::error!(
+                            "failed to quote OMP session locator for terminal {terminal_id}"
+                        );
+                        None
+                    })
+                } else {
+                    init_command
+                };
                 Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
+                if let Some(metadata) = resume_metadata {
+                    Self::restore_terminal_resume_comment(
+                        &metadata,
+                        terminal_for_init_command,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
+                }
             })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    pub fn restore_terminal_resume_comment(
+        metadata: &TerminalThreadMetadata,
+        terminal: Entity<terminal::Terminal>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let (Some(harness), Some(locator)) = (
+            metadata.harness.as_deref(),
+            metadata.resume_locator.as_deref(),
+        ) else {
+            return Task::ready(Ok(()));
+        };
+        let command = match build_resume_command(
+            harness,
+            locator,
+            &AgentSettings::get_global(cx).terminal_resume_commands,
+        )
+        .and_then(|command| resume_comment(&command))
+        {
+            Ok(comment) => comment,
+            Err(error) => return Task::ready(Err(error)),
+        };
+
+        if !terminal.read(cx).is_pty() {
+            terminal.update(cx, |terminal, _| {
+                terminal.write_init_command(command.into_bytes())
+            });
+            return Task::ready(Ok(()));
+        }
+
+        let startup = terminal.update(cx, |terminal, _| {
+            terminal.start_init_command_startup_handshake()
+        });
+        let terminal = terminal.downgrade();
+        cx.spawn(async move |_this, cx| {
+            let timeout = cx
+                .background_executor()
+                .timer(TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT);
+            futures::select_biased! {
+                _ = startup.fuse() => {}
+                _ = timeout.fuse() => {}
+            }
+
+            terminal.update(cx, move |terminal, cx| {
+                if !terminal.write_init_command_after_startup(command.into_bytes(), cx) {
+                    log::debug!(
+                        "skipping terminal resume comment because the terminal is no longer eligible"
+                    );
+                }
+            })?;
+            Ok(())
+        })
     }
 
     fn terminal_init_command(run_init_command: bool, cx: &App) -> Option<String> {
@@ -2144,6 +2627,7 @@ impl AgentPanel {
             .flatten()
             .filter(|command| !command.trim().is_empty())
     }
+
 
 
     fn write_terminal_init_command(
@@ -2237,24 +2721,34 @@ impl AgentPanel {
             &terminal_entity,
             window,
             move |this, _terminal, event: &TerminalEvent, window, cx| match event {
-                TerminalEvent::TitleChanged
-                | TerminalEvent::Wakeup
-                | TerminalEvent::BreadcrumbsChanged => {
+                TerminalEvent::TitleChanged | TerminalEvent::BreadcrumbsChanged => {
                     this.refresh_terminal_metadata(terminal_id, cx);
                     this.report_terminal_program(terminal_id, source, cx);
-                    // Debounced Idle-vs-waiting inference; cleared by
-                    // deterministic transitions elsewhere.
                     this.schedule_terminal_status_inference(terminal_id, cx);
                 }
-                TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
+                TerminalEvent::Wakeup => {
+                    this.clear_terminal_inferred_status(terminal_id);
+                    this.record_terminal_activity(terminal_id, ActivityStatus::Running, cx);
+                    this.refresh_terminal_metadata(terminal_id, cx);
+                    this.report_terminal_program(terminal_id, source, cx);
+                    this.schedule_terminal_status_inference(terminal_id, cx);
+                }
+                TerminalEvent::Bell => {
+                    this.record_terminal_activity(terminal_id, ActivityStatus::WaitingForUser, cx);
+                    this.mark_terminal_notification(terminal_id, window, cx);
+                }
                 TerminalEvent::CloseTerminal => {
                     this.request_close_terminal_from_terminal_event(terminal_id, cx);
                 }
                 TerminalEvent::BlinkChanged(_)
                 | TerminalEvent::SelectionsChanged
                 | TerminalEvent::NewNavigationTarget(_)
-                | TerminalEvent::Open(_)
-                | TerminalEvent::ProcessExited => {}
+                | TerminalEvent::Open(_) => {}
+                TerminalEvent::ProcessExited => {
+                    this.clear_terminal_inferred_status(terminal_id);
+                    this.record_terminal_activity(terminal_id, ActivityStatus::Completed, cx);
+                    this.mark_omp_session_sleeping(terminal_id, cx);
+                }
             },
         );
 
@@ -2350,8 +2844,17 @@ impl AgentPanel {
             return;
         }
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+            let is_omp = store
+                .read(cx)
+                .entry(terminal_id)
+                .and_then(|metadata| metadata.harness.as_deref())
+                == Some("omp");
             store.update(cx, |store, cx| {
-                store.delete(terminal_id, cx);
+                if is_omp {
+                    store.mark_session_boundary(terminal_id, SessionBoundary::Cleared, cx);
+                } else {
+                    store.delete(terminal_id, cx);
+                }
             });
         }
         if was_active {
@@ -2394,6 +2897,19 @@ impl AgentPanel {
         );
     }
 
+    fn record_terminal_activity(
+        &self,
+        terminal_id: TerminalId,
+        status: ActivityStatus,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| {
+                store.record_activity(terminal_id, status, Utc::now(), cx);
+            });
+        }
+    }
+
     fn refresh_terminal_metadata(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
         if let Some(terminal) = self.terminals.get_mut(&terminal_id)
             && terminal.refresh_metadata(cx)
@@ -2403,6 +2919,13 @@ impl AgentPanel {
                 self.clear_terminal_inferred_status(terminal_id);
             }
             self.persist_terminal_metadata(terminal_id, cx);
+            let status = match deterministic {
+                TerminalAgentStatus::Running => ActivityStatus::Running,
+                TerminalAgentStatus::WaitingForUserInput => ActivityStatus::WaitingForUser,
+                TerminalAgentStatus::Completed => ActivityStatus::Completed,
+                TerminalAgentStatus::Idle => ActivityStatus::Idle,
+            };
+            self.record_terminal_activity(terminal_id, status, cx);
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
         }
@@ -2507,6 +3030,15 @@ impl AgentPanel {
                 this.update(cx, |this, cx| {
                     this.inferred_terminal_waiting.insert(terminal_id, waiting);
                     this._terminal_inference_tasks.remove(&terminal_id);
+                    this.record_terminal_activity(
+                        terminal_id,
+                        if waiting {
+                            ActivityStatus::WaitingForUser
+                        } else {
+                            ActivityStatus::Idle
+                        },
+                        cx,
+                    );
                     cx.notify();
                 })
                 .log_err();
@@ -2569,19 +3101,92 @@ impl AgentPanel {
     ) -> Option<TerminalThreadMetadata> {
         let terminal = self.terminals.get(&terminal_id)?;
         let project = self.project.read(cx);
-        let stored_user_order = TerminalThreadMetadataStore::try_global(cx)
-            .and_then(|store| store.read(cx).entry(terminal_id).cloned())
-            .and_then(|metadata| metadata.user_order);
-        Some(TerminalThreadMetadata {
-            terminal_id,
-            title: terminal.terminal_title(cx),
-            custom_title: terminal.custom_title(cx),
-            created_at: terminal.created_at,
-            worktree_paths: project.worktree_paths(cx),
-            remote_connection: project.remote_connection_options(cx),
-            working_directory: terminal.working_directory.clone(),
-            user_order: stored_user_order,
+        let stored_metadata = TerminalThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry(terminal_id).cloned());
+        Some(TerminalThreadMetadata { terminal_id,
+        title: terminal.terminal_title(cx),
+        custom_title: terminal.custom_title(cx),
+        created_at: terminal.created_at,
+        worktree_paths: project.worktree_paths(cx),
+        remote_connection: project.remote_connection_options(cx),
+        working_directory: terminal.working_directory.clone(),
+        user_order: stored_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.user_order),
+        harness: stored_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.harness.clone()),
+        resume_locator: stored_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.resume_locator.clone()),
+        restore_on_workspace_open: stored_metadata
+            .as_ref()
+            .map(|metadata| metadata.restore_on_workspace_open)
+            .unwrap_or(true),
+        session_boundary: stored_metadata
+            .as_ref()
+            .map(|metadata| metadata.session_boundary)
+            .unwrap_or_default(),
+        last_activity_at: stored_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.last_activity_at),
+        activity_status: stored_metadata
+            .as_ref()
+            .map(|metadata| metadata.activity_status)
+            .unwrap_or_default(),
         })
+    }
+    pub fn register_terminal_agent_session(
+        &mut self,
+        terminal_id: TerminalId,
+        harness: SharedString,
+        locator: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let mut metadata = self
+            .terminal_metadata(terminal_id, cx)
+            .ok_or_else(|| anyhow!("terminal {terminal_id} is not live"))?;
+        metadata.harness = Some(harness);
+        metadata.resume_locator = Some(locator);
+        metadata.restore_on_workspace_open = true;
+        metadata.session_boundary = SessionBoundary::Live;
+
+        let store = TerminalThreadMetadataStore::try_global(cx)
+            .ok_or_else(|| anyhow!("terminal metadata store is not initialized"))?;
+        store.update(cx, |store, cx| {
+            store.save(metadata, cx);
+        });
+        Ok(())
+    }
+
+    pub fn resume_locator_for_terminal(
+        &self,
+        terminal_id: TerminalId,
+        cx: &App,
+    ) -> Option<SharedString> {
+        TerminalThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry(terminal_id).cloned())
+            .and_then(|metadata| metadata.resume_locator)
+    }
+
+    fn mark_omp_session_sleeping(
+        &mut self,
+        terminal_id: TerminalId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
+            return;
+        };
+        let is_omp = store
+            .read(cx)
+            .entry(terminal_id)
+            .and_then(|metadata| metadata.harness.as_deref())
+            == Some("omp");
+        if is_omp {
+            store.update(cx, |store, cx| {
+                store.mark_session_boundary(terminal_id, SessionBoundary::Sleeping, cx);
+            });
+        }
     }
 
 
@@ -2610,7 +3215,7 @@ impl AgentPanel {
         self.pending_terminal_spawn = Some(metadata.terminal_id);
         let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
         let initial_title = Self::terminal_restore_initial_title(&metadata);
-        self.spawn_terminal(
+        self.spawn_terminal_with_session(
             metadata.terminal_id,
             working_directory,
             metadata.custom_title.clone(),
@@ -2618,7 +3223,9 @@ impl AgentPanel {
             Some(metadata.created_at),
             true,
             focus,
-            true,
+            false,
+            None,
+            Some(metadata),
             source,
             window,
             cx,
@@ -6651,6 +7258,10 @@ impl Render for AgentPanel {
                 cx.stop_propagation();
                 this.new_terminal(None, AgentThreadSource::AgentPanel, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &NewOmpTerminal, window, cx| {
+                cx.stop_propagation();
+                this.new_omp_terminal(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_configuration(window, cx);
             }))
@@ -6918,11 +7529,18 @@ impl AgentPanel {
             Some(metadata.created_at),
             true,
             focus,
-            true,
+            false,
             source,
             window,
             cx,
-        )
+        )?;
+        let terminal = self
+            .terminals
+            .get(&metadata.terminal_id)
+            .map(|terminal| terminal.view.read(cx).terminal().clone())
+            .ok_or_else(|| anyhow!("restored terminal {} is missing", metadata.terminal_id))?;
+        Self::restore_terminal_resume_comment(&metadata, terminal, cx).detach_and_log_err(cx);
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -7033,6 +7651,7 @@ impl AgentPanel {
 mod tests {
     use super::*;
     use crate::NewWorktreeBranchTarget;
+    use crate::terminal_thread_metadata_store::SessionBoundary;
     use crate::conversation_view::tests::{StubAgentServer, init_test};
     use crate::test_support::{
         active_session_id, active_thread_id, open_thread_with_connection,
@@ -7671,6 +8290,337 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_terminal_metadata_preserves_cached_session_recovery_fields(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Recoverable terminal", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+
+        let mut cached_metadata = panel
+            .read_with(&cx, |panel, cx| {
+                panel
+                    .terminal_metadata(terminal_id, cx)
+                    .expect("terminal metadata should exist")
+            });
+        cached_metadata.harness = Some("omp".into());
+        cached_metadata.resume_locator = Some("/tmp/omp-session-1".into());
+        cached_metadata.restore_on_workspace_open = false;
+        cached_metadata.session_boundary = SessionBoundary::Live;
+
+        cx.update(|_window, cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(cached_metadata, cx);
+            });
+        });
+
+        let metadata = panel
+            .read_with(&cx, |panel, cx| {
+                panel
+                    .terminal_metadata(terminal_id, cx)
+                    .expect("terminal metadata should exist")
+            });
+        assert_eq!(metadata.harness.as_deref(), Some("omp"));
+        assert_eq!(
+            metadata.resume_locator.as_deref(),
+            Some("/tmp/omp-session-1")
+        );
+        assert!(!metadata.restore_on_workspace_open);
+        assert_eq!(metadata.session_boundary, SessionBoundary::Live);
+    }
+    #[test]
+    fn omp_creation_command_quotes_whitespace_paths() {
+        let locator = "/Users/example/Library/Application Support/Zed/agent_sessions/omp/terminal";
+        assert_eq!(
+            omp_creation_command(task::ShellKind::Posix, locator).as_deref(),
+            Some("omp --session-dir '/Users/example/Library/Application Support/Zed/agent_sessions/omp/terminal'")
+        );
+    }
+
+    #[test]
+    fn omp_terminal_requires_local_project() {
+        let error = ensure_local_omp_project(false).expect_err("remote projects must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("OMP agent terminals require a local project")
+        );
+    }
+
+    #[gpui::test]
+    async fn new_omp_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        cx.executor().allow_parking();
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::init_global(cx);
+            let mut settings = TerminalSettings::get_global(cx).clone();
+            settings.shell = task::Shell::WithArguments {
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "while IFS= read -r line; do printf '%s\\n' \"$line\"; done".to_string(),
+                ],
+                title_override: None,
+            };
+            TerminalSettings::override_global(settings, cx);
+        });
+        cx.run_until_parked();
+
+
+        cx.dispatch_action(NewOmpTerminal);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (terminal_id, terminal, input_log) = loop {
+            cx.run_until_parked();
+            let active_terminal = panel.read_with(&cx, |panel, cx| {
+                panel.active_terminal_id().and_then(|terminal_id| {
+                    panel
+                        .terminals
+                        .get(&terminal_id)
+                        .map(|terminal| (terminal_id, terminal.view.read(cx).terminal().clone()))
+                })
+            });
+            if let Some((terminal_id, terminal)) = active_terminal {
+                let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
+                if !input_log.is_empty() {
+                    break (terminal_id, terminal, input_log);
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("OMP terminal creation command was not sent before timeout");
+            }
+            cx.executor().timer(Duration::from_millis(50)).await;
+        };
+
+        assert_eq!(input_log.len(), 1, "OMP creation should send only one command");
+        let command = String::from_utf8(input_log.concat()).expect("command should be UTF-8");
+
+        let metadata = cx
+            .update(|_, cx| {
+                TerminalThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(terminal_id)
+                    .cloned()
+            })
+            .expect("OMP terminal metadata should be persisted");
+        let locator = metadata
+            .resume_locator
+            .as_deref()
+            .expect("OMP metadata should have a locator");
+        assert_eq!(
+            command,
+            format!(
+                "omp --session-dir {}\r",
+                task::ShellKind::Posix
+                    .try_quote(locator)
+                    .expect("POSIX should quote the OMP locator")
+            )
+        );
+        let expected_root = paths::data_dir().join("agent_sessions").join("omp");
+        assert_eq!(metadata.harness.as_deref(), Some("omp"));
+        assert!(Path::new(locator).starts_with(&expected_root));
+        assert_eq!(metadata.session_boundary, SessionBoundary::Live);
+        assert!(metadata.restore_on_workspace_open);
+        assert_eq!(
+            panel.read_with(&cx, |panel, cx| {
+                panel.resume_locator_for_terminal(terminal_id, cx)
+            }),
+            Some(locator.into())
+        );
+        assert_eq!(panel.read_with(&cx, |panel, cx| panel.terminals(cx).len()), 1);
+        drop(terminal);
+    }
+
+
+    #[gpui::test]
+    async fn terminal_session_boundary(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::init_global(cx);
+        });
+        let omp_terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("OMP terminal", true, window, cx)
+            })
+            .expect("OMP terminal should be inserted");
+        let plain_terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Plain terminal", false, window, cx)
+            })
+            .expect("plain terminal should be inserted");
+
+        let locator = SharedString::from("/tmp/omp-session-boundary");
+        panel.update(&mut cx, |panel, cx| {
+            panel
+                .register_terminal_agent_session(
+                    omp_terminal_id,
+                    SharedString::from("omp"),
+                    locator.clone(),
+                    cx,
+                )
+                .expect("OMP session should register");
+            panel.emit_test_terminal_process_exited(omp_terminal_id, cx);
+            panel.emit_test_terminal_process_exited(plain_terminal_id, cx);
+        });
+
+        let (omp_metadata, plain_metadata) = cx.update(|_, cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            (
+                store.entry(omp_terminal_id).cloned(),
+                store.entry(plain_terminal_id).cloned(),
+            )
+        });
+        let omp_metadata = omp_metadata.expect("OMP metadata should remain after exit");
+        let plain_metadata = plain_metadata.expect("plain metadata should remain after exit");
+        assert_eq!(omp_metadata.session_boundary, SessionBoundary::Sleeping);
+        assert_eq!(omp_metadata.harness.as_deref(), Some("omp"));
+        assert_eq!(omp_metadata.resume_locator, Some(locator));
+        assert_eq!(plain_metadata.harness, None);
+        assert_eq!(plain_metadata.resume_locator, None);
+        assert_eq!(plain_metadata.session_boundary, SessionBoundary::Sleeping);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal_without_activating_draft(omp_terminal_id, window, cx);
+        });
+        cx.update(|_, cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert!(store.entry(omp_terminal_id).is_none());
+            assert!(store.entry(plain_terminal_id).is_some());
+        });
+    }
+
+
+    #[test]
+    fn terminal_restore_candidate_matches_canonical_worktree_and_remote_identity() {
+        let workspace_id = WorkspaceId::from_i64(7);
+        let paths = WorktreePaths::from_path_lists(
+            PathList::new(&[PathBuf::from("/repo")]),
+            PathList::new(&[PathBuf::from("/repo/feature")]),
+        )
+        .expect("parallel worktree paths should be valid");
+        let remote_a = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 1 });
+        let remote_b = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 2 });
+        assert!(terminal_matches_restored_workspace(
+            workspace_id,
+            &paths,
+            Some(&remote_a),
+            &paths,
+            Some(&remote_a),
+        ));
+        assert!(!terminal_matches_restored_workspace(
+            workspace_id,
+            &paths,
+            Some(&remote_a),
+            &paths,
+            Some(&remote_b),
+        ));
+    }
+
+    #[gpui::test]
+    async fn restored_omp_terminal_writes_exact_resume_comment(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        let metadata = TerminalThreadMetadata { terminal_id: TerminalId::new(),
+        title: "Restored OMP".into(),
+        custom_title: None,
+        created_at: Utc::now(),
+        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[
+            PathBuf::from("/project"),
+        ])),
+        remote_connection: None,
+        working_directory: Some(PathBuf::from("/project/subdirectory")),
+        user_order: None,
+        harness: Some("omp".into()),
+        resume_locator: Some("session-1".into()),
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
+        let terminal_id = metadata.terminal_id;
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.restore_test_terminal(
+                    metadata,
+                    true,
+                    AgentThreadSource::AgentPanel,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .expect("OMP terminal should restore");
+        cx.run_until_parked();
+
+        let (working_directory, terminal) = panel.read_with(&cx, |panel, cx| {
+            let terminal = panel.terminals.get(&terminal_id).expect("terminal should exist");
+            (
+                terminal.working_directory.clone(),
+                terminal.view.read(cx).terminal().clone(),
+            )
+        });
+        let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
+        assert_eq!(working_directory, Some(PathBuf::from("/project/subdirectory")));
+        assert_eq!(input_log, vec![b"# omp --resume session-1\r".to_vec()]);
+        assert!(input_log.iter().all(|input| !input.starts_with(b"omp --resume ")));
+        let boundary = cx.update(|_, cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(terminal_id)
+                .map(|metadata| metadata.session_boundary)
+        });
+        assert_eq!(boundary, Some(SessionBoundary::Sleeping));
+    }
+
+    #[gpui::test]
+    async fn restored_terminal_without_locator_writes_no_comment(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let metadata = TerminalThreadMetadata { terminal_id: TerminalId::new(),
+        title: "Fresh Shell".into(),
+        custom_title: None,
+        created_at: Utc::now(),
+        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[
+            PathBuf::from("/project"),
+        ])),
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: Some("omp".into()),
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
+        let terminal_id = metadata.terminal_id;
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.restore_test_terminal(
+                    metadata,
+                    true,
+                    AgentThreadSource::AgentPanel,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .expect("fresh terminal should restore");
+        cx.run_until_parked();
+        let terminal = panel.read_with(&cx, |panel, cx| {
+            panel.terminals[&terminal_id].view.read(cx).terminal().clone()
+        });
+        assert!(terminal.update(&mut cx, |terminal, _| terminal.take_input_log()).is_empty());
+    }
+
+    #[gpui::test]
+    async fn missing_worktree_is_not_eligible_for_terminal_restore(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let paths = WorktreePaths::from_folder_paths(&PathList::new(&[
+            PathBuf::from("/missing"),
+        ]));
+        assert!(!terminal_worktrees_exist(fs, &paths).await);
+    }
+
+    #[gpui::test]
     async fn test_terminal_restore_working_directory_does_not_read_leased_workspace(
         cx: &mut TestAppContext,
     ) {
@@ -7718,16 +8668,18 @@ mod tests {
             None
         );
 
-        let metadata = TerminalThreadMetadata {
-            terminal_id: TerminalId::new(),
-            title: "Dev Server".into(),
-            custom_title: None,
-            created_at: Utc::now(),
-            worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
-            remote_connection: None,
-            working_directory: None,
-            user_order: None,
-        };
+        let metadata = TerminalThreadMetadata { terminal_id: TerminalId::new(),
+        title: "Dev Server".into(),
+        custom_title: None,
+        created_at: Utc::now(),
+        worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
         assert_eq!(metadata.working_directory, None);
 
         let working_directory = workspace.update_in(cx, |workspace, _window, cx| {
@@ -7793,26 +8745,28 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_restored_terminal_runs_init_command_once(cx: &mut TestAppContext) {
+    async fn test_restored_terminal_does_not_run_legacy_init_command(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         cx.update(|_, cx| {
             let mut settings = AgentSettings::get_global(cx).clone();
-            settings.terminal_init_command = Some(" claude --resume ".to_string());
+            settings.terminal_init_command = Some("claude --resume".to_string());
             AgentSettings::override_global(settings, cx);
         });
 
-        let metadata = TerminalThreadMetadata {
-            terminal_id: TerminalId::new(),
-            title: "Restored Terminal".into(),
-            custom_title: None,
-            created_at: Utc::now(),
-            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
-                "/project",
-            )])),
-            remote_connection: None,
-            working_directory: None,
-            user_order: None,
-        };
+        let metadata = TerminalThreadMetadata { terminal_id: TerminalId::new(),
+        title: "Restored Terminal".into(),
+        custom_title: None,
+        created_at: Utc::now(),
+        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+            "/project",
+        )])),
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
         let terminal_id = metadata.terminal_id;
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -7839,13 +8793,11 @@ mod tests {
                 .clone()
         });
         let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
-        assert_eq!(input_log, vec![b" claude --resume \r".to_vec()]);
         assert!(
-            !terminal.read_with(&cx, |terminal, _| terminal.keyboard_input_sent()),
-            "writing the init command must not mark the terminal as having received \
-             user keyboard input, otherwise a shell that fails to spawn would be \
-             auto-closed before the user can see the error"
+            input_log.is_empty(),
+            "restoration must not run the legacy terminal init command, got {input_log:?}"
         );
+        assert!(!terminal.read_with(&cx, |terminal, _| terminal.keyboard_input_sent()));
 
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -7981,18 +8933,20 @@ mod tests {
             );
         });
 
-        let metadata = TerminalThreadMetadata {
-            terminal_id: TerminalId::new(),
-            title: "Restored Terminal".into(),
-            custom_title: None,
-            created_at: Utc::now(),
-            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
-                "/project",
-            )])),
-            remote_connection: None,
-            working_directory: None,
-            user_order: None,
-        };
+        let metadata = TerminalThreadMetadata { terminal_id: TerminalId::new(),
+        title: "Restored Terminal".into(),
+        custom_title: None,
+        created_at: Utc::now(),
+        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+            "/project",
+        )])),
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
         panel
             .update_in(&mut cx, |panel, window, cx| {
                 panel.restore_test_terminal(
@@ -8198,20 +9152,22 @@ mod tests {
         cx.update(|_window, cx| {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(
-                    ThreadMetadata {
-                        thread_id: ThreadId::new(),
-                        session_id: Some(resume_session_id.clone()),
-                        agent_id: ProjectAgentId::new("Flaky"),
-                        title: Some("Persistent chat".into()),
-                        title_override: None,
-                        updated_at: Utc::now(),
-                        created_at: Some(Utc::now()),
-                        interacted_at: None,
-                        worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
-                        remote_connection: None,
-                        archived: false,
-                        user_order: None,
-                    },
+                    ThreadMetadata { thread_id: ThreadId::new(),
+                    session_id: Some(resume_session_id.clone()),
+                    agent_id: ProjectAgentId::new("Flaky"),
+                    title: Some("Persistent chat".into()),
+                    title_override: None,
+                    updated_at: Utc::now(),
+                    created_at: Some(Utc::now()),
+                    interacted_at: None,
+                    worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
+                    remote_connection: None,
+                    archived: false,
+                    user_order: None,
+                    group_id: None,
+                    parent_thread_id: None,
+                    worktree_id: None,
+                    root_thread_id: None, last_activity_at: None, activity_status: Default::default() },
                     cx,
                 );
             });
@@ -9946,18 +10902,20 @@ mod tests {
         let (panel, mut cx) = setup_panel(cx).await;
         let terminal_id = TerminalId::new();
         let now = Utc::now();
-        let metadata = TerminalThreadMetadata {
-            terminal_id,
-            title: "Persisted Shell Title".into(),
-            custom_title: None,
-            created_at: now,
-            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
-                "/project",
-            )])),
-            remote_connection: None,
-            working_directory: None,
-            user_order: None,
-        };
+        let metadata = TerminalThreadMetadata { terminal_id,
+        title: "Persisted Shell Title".into(),
+        custom_title: None,
+        created_at: now,
+        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+            "/project",
+        )])),
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
 
         panel.update_in(&mut cx, |panel, window, cx| {
             panel
@@ -9998,18 +10956,20 @@ mod tests {
         let (panel, mut cx) = setup_panel(cx).await;
         let terminal_id = TerminalId::new();
         let now = Utc::now();
-        let metadata = TerminalThreadMetadata {
-            terminal_id,
-            title: "Persisted Shell Title".into(),
-            custom_title: None,
-            created_at: now,
-            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
-                "/project",
-            )])),
-            remote_connection: None,
-            working_directory: None,
-            user_order: None,
-        };
+        let metadata = TerminalThreadMetadata { terminal_id,
+        title: "Persisted Shell Title".into(),
+        custom_title: None,
+        created_at: now,
+        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+            "/project",
+        )])),
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() };
 
         panel.update_in(&mut cx, |panel, window, cx| {
             panel

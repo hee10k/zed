@@ -315,6 +315,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: ""
     pub terminal_init_command: Option<String>,
+    /// Per-harness command templates used to resume terminal-backed sessions.
+    /// Templates must contain `{locator}`; the locator is validated before rendering.
+    ///
+    /// Default: `{ "omp": "omp --resume {locator}" }`
+    pub terminal_resume_commands: Option<IndexMap<String, String>>,
     /// How thinking blocks should be displayed by default in the agent panel.
     ///
     /// Default: automatic

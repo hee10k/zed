@@ -17,7 +17,10 @@ use ui::{App, Context, SharedString};
 use util::ResultExt as _;
 use workspace::PathList;
 
-use crate::{TerminalId, thread_metadata_store::WorktreePaths};
+use crate::{
+    TerminalId,
+    thread_metadata_store::{ActivityStatus, WorktreePaths},
+};
 
 pub fn init(cx: &mut App) {
     TerminalThreadMetadataStore::init_global(cx);
@@ -45,6 +48,33 @@ impl TestTerminalMetadataDbName {
 }
 
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SessionBoundary {
+    Live,
+    #[default]
+    Sleeping,
+    Cleared,
+}
+
+impl SessionBoundary {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Sleeping => "sleeping",
+            Self::Cleared => "cleared",
+        }
+    }
+
+    fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "live" => Ok(Self::Live),
+            "sleeping" => Ok(Self::Sleeping),
+            "cleared" => Ok(Self::Cleared),
+            unknown => anyhow::bail!("unknown terminal session boundary {unknown:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalThreadMetadata {
     pub terminal_id: TerminalId,
@@ -57,6 +87,12 @@ pub struct TerminalThreadMetadata {
     /// User-assigned sidebar position (fractional midpoint) within its project
     /// group. `None` means fall back to recency sorting.
     pub user_order: Option<f64>,
+    pub harness: Option<SharedString>,
+    pub resume_locator: Option<SharedString>,
+    pub restore_on_workspace_open: bool,
+    pub session_boundary: SessionBoundary,
+    pub last_activity_at: Option<DateTime<Utc>>,
+    pub activity_status: ActivityStatus,
 }
 
 impl TerminalThreadMetadata {
@@ -183,17 +219,31 @@ pub struct TerminalThreadMetadataStore {
     _db_operations_task: Task<()>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 enum DbOperation {
     Upsert(TerminalThreadMetadata),
     Delete(TerminalId),
+    Flush(async_channel::Sender<()>),
 }
 
+impl PartialEq for DbOperation {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Upsert(left), Self::Upsert(right)) => left == right,
+            (Self::Delete(left), Self::Delete(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for DbOperation {}
+
 impl DbOperation {
-    fn id(&self) -> TerminalId {
+    fn id(&self) -> Option<TerminalId> {
         match self {
-            DbOperation::Upsert(metadata) => metadata.terminal_id,
-            DbOperation::Delete(terminal_id) => *terminal_id,
+            DbOperation::Upsert(metadata) => Some(metadata.terminal_id),
+            DbOperation::Delete(terminal_id) => Some(*terminal_id),
+            DbOperation::Flush(_) => None,
         }
     }
 }
@@ -301,6 +351,79 @@ impl TerminalThreadMetadataStore {
         self.save_internal(metadata);
         cx.notify();
     }
+    pub fn record_activity(
+        &mut self,
+        terminal_id: TerminalId,
+        status: ActivityStatus,
+        at: DateTime<Utc>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut terminal) = self.terminals.get(&terminal_id).cloned() else {
+            return;
+        };
+        let timestamp_changed = terminal
+            .last_activity_at
+            .map(|previous| at.signed_duration_since(previous).num_milliseconds() >= 500)
+            .unwrap_or(true);
+        if terminal.activity_status == status && !timestamp_changed {
+            return;
+        }
+        terminal.last_activity_at = Some(at);
+        terminal.activity_status = status;
+        self.save_internal(terminal);
+        cx.notify();
+    }
+    pub fn flush_pending(&self, cx: &App) -> Task<()> {
+        let (done_tx, done_rx) = async_channel::bounded(1);
+        self.pending_terminal_ops_tx
+            .try_send(DbOperation::Flush(done_tx))
+            .log_err();
+        cx.background_spawn(async move {
+            done_rx.recv().await.log_err();
+        })
+    }
+
+
+
+    pub fn update_session_metadata(
+        &mut self,
+        terminal_id: TerminalId,
+        harness: Option<SharedString>,
+        resume_locator: Option<SharedString>,
+        session_boundary: SessionBoundary,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(mut terminal) = self.terminals.get(&terminal_id).cloned() {
+            terminal.harness = harness;
+            terminal.resume_locator = resume_locator;
+            terminal.session_boundary = session_boundary;
+            self.save_internal(terminal);
+            cx.notify();
+        }
+    }
+
+    pub fn mark_session_boundary(
+        &mut self,
+        terminal_id: TerminalId,
+        session_boundary: SessionBoundary,
+        cx: &mut Context<Self>,
+    ) {
+        if session_boundary == SessionBoundary::Cleared {
+            self.delete(terminal_id, cx);
+        } else {
+            self.update_session_metadata(
+                terminal_id,
+                self.terminals
+                    .get(&terminal_id)
+                    .and_then(|terminal| terminal.harness.clone()),
+                self.terminals
+                    .get(&terminal_id)
+                    .and_then(|terminal| terminal.resume_locator.clone()),
+                session_boundary,
+                cx,
+            );
+        }
+    }
 
     pub fn change_worktree_paths(
         &mut self,
@@ -337,6 +460,42 @@ impl TerminalThreadMetadataStore {
         }
 
         cx.notify();
+    }
+    /// Removes one worktree folder association from terminals on the target
+    /// remote connection while preserving each terminal row, session boundary,
+    /// and resume locator.
+    pub fn remove_worktree_path(
+        &mut self,
+        worktree_path: &Path,
+        remote_connection: Option<&RemoteConnectionOptions>,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal_ids: Vec<_> = self
+            .terminals
+            .values()
+            .filter(|terminal| {
+                same_remote_connection_identity(
+                    terminal.remote_connection.as_ref(),
+                    remote_connection,
+                ) && terminal
+                    .folder_paths()
+                    .paths()
+                    .iter()
+                    .any(|folder_path| folder_path.as_path() == worktree_path)
+            })
+            .map(|terminal| terminal.terminal_id)
+            .collect();
+
+        for terminal_id in terminal_ids.iter().copied() {
+            if let Some(mut terminal) = self.terminals.get(&terminal_id).cloned() {
+                terminal.worktree_paths.remove_folder_path(worktree_path);
+                self.save_internal(terminal);
+            }
+        }
+
+        if !terminal_ids.is_empty() {
+            cx.notify();
+        }
     }
 
     fn save_internal(&mut self, metadata: TerminalThreadMetadata) {
@@ -417,6 +576,9 @@ impl TerminalThreadMetadataStore {
                             DbOperation::Delete(terminal_id) => {
                                 db.delete(terminal_id).await.log_err();
                             }
+                            DbOperation::Flush(done) => {
+                                done.send(()).await.log_err();
+                            }
                         }
                     }
                 }
@@ -437,14 +599,16 @@ impl TerminalThreadMetadataStore {
     }
 
     fn dedup_db_operations(operations: Vec<DbOperation>) -> Vec<DbOperation> {
-        let mut ops = HashMap::default();
+        let mut seen = HashSet::default();
+        let mut deduped = Vec::new();
         for operation in operations.into_iter().rev() {
-            if ops.contains_key(&operation.id()) {
+            if let Some(id) = operation.id() && !seen.insert(id) {
                 continue;
             }
-            ops.insert(operation.id(), operation);
+            deduped.push(operation);
         }
-        ops.into_values().collect()
+        deduped.reverse();
+        deduped
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -483,21 +647,41 @@ struct TerminalThreadMetadataDbV2(ThreadSafeConnection);
 impl Domain for TerminalThreadMetadataDbV2 {
     const NAME: &str = stringify!(TerminalThreadMetadataDbV2);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS sidebar_terminal_threads_v2(
-            terminal_id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            custom_title TEXT,
-            created_at TEXT NOT NULL,
-            working_directory TEXT,
-            folder_paths TEXT,
-            folder_paths_order TEXT,
-            main_worktree_paths TEXT,
-            main_worktree_paths_order TEXT,
-            remote_connection TEXT,
-            user_order REAL
-        ) STRICT;
-    )];
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE IF NOT EXISTS sidebar_terminal_threads_v2(
+                terminal_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                custom_title TEXT,
+                created_at TEXT NOT NULL,
+                working_directory TEXT,
+                folder_paths TEXT,
+                folder_paths_order TEXT,
+                main_worktree_paths TEXT,
+                main_worktree_paths_order TEXT,
+                remote_connection TEXT,
+                user_order REAL
+            ) STRICT;
+        ),
+        sql!(ALTER TABLE sidebar_terminal_threads_v2 ADD COLUMN harness TEXT),
+        sql!(ALTER TABLE sidebar_terminal_threads_v2 ADD COLUMN resume_locator TEXT),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads_v2
+            ADD COLUMN restore_on_workspace_open INTEGER NOT NULL DEFAULT 1
+        ),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads_v2
+            ADD COLUMN session_boundary TEXT NOT NULL DEFAULT "sleeping"
+        ),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads_v2
+            ADD COLUMN last_activity_at TEXT
+        ),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads_v2
+            ADD COLUMN activity_status TEXT NOT NULL DEFAULT "idle"
+        ),
+    ];
 }
 
 db::static_connection!(TerminalThreadMetadataDbV2, []);
@@ -507,7 +691,9 @@ impl TerminalThreadMetadataDbV2 {
         self.select::<TerminalThreadMetadata>(
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-            main_worktree_paths_order, remote_connection, user_order \
+            main_worktree_paths_order, remote_connection, user_order, harness, \
+            resume_locator, restore_on_workspace_open, session_boundary, \
+            last_activity_at, activity_status \
             FROM sidebar_terminal_threads_v2 \
             ORDER BY created_at DESC",
         )?()
@@ -542,10 +728,16 @@ impl TerminalThreadMetadataDbV2 {
             .transpose()
             .context("serialize terminal thread remote connection")?;
         let user_order = row.user_order;
+        let harness = row.harness.as_ref().map(ToString::to_string);
+        let resume_locator = row.resume_locator.as_ref().map(ToString::to_string);
+        let restore_on_workspace_open = row.restore_on_workspace_open;
+        let session_boundary = row.session_boundary.as_str().to_owned();
+        let last_activity_at = row.last_activity_at.map(|dt| dt.to_rfc3339());
+        let activity_status = row.activity_status.as_str();
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads_v2(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, user_order) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+            let sql = "INSERT INTO sidebar_terminal_threads_v2(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, user_order, harness, resume_locator, restore_on_workspace_open, session_boundary, last_activity_at, activity_status) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -556,7 +748,13 @@ impl TerminalThreadMetadataDbV2 {
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
-                           user_order = excluded.user_order";
+                           user_order = excluded.user_order, \
+                           harness = excluded.harness, \
+                           resume_locator = excluded.resume_locator, \
+                           restore_on_workspace_open = excluded.restore_on_workspace_open, \
+                           session_boundary = excluded.session_boundary, \
+                           last_activity_at = excluded.last_activity_at, \
+                           activity_status = excluded.activity_status";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -568,7 +766,13 @@ impl TerminalThreadMetadataDbV2 {
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&user_order, i)?;
+            i = stmt.bind(&user_order, i)?;
+            i = stmt.bind(&harness, i)?;
+            i = stmt.bind(&resume_locator, i)?;
+            i = stmt.bind(&restore_on_workspace_open, i)?;
+            i = stmt.bind(&session_boundary, i)?;
+            i = stmt.bind(&last_activity_at, i)?;
+            stmt.bind(&activity_status, i)?;
             stmt.exec()
         })
         .await
@@ -605,6 +809,15 @@ impl Column for TerminalThreadMetadata {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (user_order, next): (Option<f64>, i32) = Column::column(statement, next)?;
+        let (harness, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (resume_locator, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (restore_on_workspace_open, next): (Option<bool>, i32) =
+            Column::column(statement, next)?;
+        let (session_boundary, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (last_activity_at_str, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
+        let (_activity_status_str, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -632,21 +845,42 @@ impl Column for TerminalThreadMetadata {
 
         let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
             .unwrap_or_else(|_| WorktreePaths::default());
+        let session_boundary = session_boundary
+            .as_deref()
+            .map(|value| {
+                SessionBoundary::from_db_str(value).unwrap_or_else(|error| {
+                    log::error!("failed to load terminal session boundary: {error}");
+                    SessionBoundary::Sleeping
+                })
+            })
+            .unwrap_or_default();
+        let last_activity_at = last_activity_at_str
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()?
+            .map(|dt| dt.with_timezone(&Utc));
+        let activity_status = ActivityStatus::Idle;
+        let restore_on_workspace_open = restore_on_workspace_open.unwrap_or(true);
 
         Ok((
-            TerminalThreadMetadata {
-                terminal_id: TerminalId::from_key_string(&terminal_id)?,
-                title: SharedString::from(title),
-                custom_title: custom_title
-                    .filter(|title| !title.trim().is_empty())
-                    .map(SharedString::from),
-                created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
-                worktree_paths,
-                remote_connection,
-                working_directory: working_directory.map(PathBuf::from),
-                user_order,
-            },
-            next,
+            TerminalThreadMetadata { terminal_id: TerminalId::from_key_string(&terminal_id)?,
+            title: SharedString::from(title),
+            custom_title: custom_title
+                .filter(|title| !title.trim().is_empty())
+                .map(SharedString::from),
+            created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+            worktree_paths,
+            remote_connection,
+            working_directory: working_directory.map(PathBuf::from),
+            user_order,
+            harness: harness.map(SharedString::from),
+            resume_locator: resume_locator.map(SharedString::from),
+            restore_on_workspace_open,
+            session_boundary,
+            last_activity_at,
+            activity_status,
+        },
+        next,
         ))
     }
 }
@@ -666,16 +900,18 @@ mod tests {
 
     fn metadata(title: &str, worktree_paths: WorktreePaths) -> TerminalThreadMetadata {
         let now = Utc::now();
-        TerminalThreadMetadata {
-            terminal_id: TerminalId::new(),
-            title: SharedString::from(title.to_string()),
-            custom_title: None,
-            created_at: now,
-            worktree_paths,
-            remote_connection: None,
-            working_directory: None,
-            user_order: None,
-        }
+        TerminalThreadMetadata { terminal_id: TerminalId::new(),
+        title: SharedString::from(title.to_string()),
+        custom_title: None,
+        created_at: now,
+        worktree_paths,
+        remote_connection: None,
+        working_directory: None,
+        user_order: None,
+        harness: None,
+        resume_locator: None,
+        restore_on_workspace_open: true,
+        session_boundary: SessionBoundary::Sleeping, last_activity_at: None, activity_status: Default::default() }
     }
 
     #[test]
@@ -811,6 +1047,49 @@ mod tests {
             );
         });
     }
+    #[gpui::test]
+    async fn test_remove_worktree_path_preserves_metadata_and_remote_scope(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let folder_path = Path::new("/repo-feature");
+        let mut local_metadata = metadata(
+            "OMP session",
+            WorktreePaths::from_folder_paths(&PathList::new(&[folder_path])),
+        );
+        local_metadata.harness = Some("omp".into());
+        local_metadata.resume_locator = Some("/tmp/session".into());
+        let local_id = local_metadata.terminal_id;
+        let mut remote_metadata = metadata(
+            "Remote session",
+            WorktreePaths::from_folder_paths(&PathList::new(&[folder_path])),
+        );
+        remote_metadata.remote_connection =
+            Some(RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 1 }));
+        let remote_id = remote_metadata.terminal_id;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(local_metadata, cx);
+                store.save(remote_metadata, cx);
+            });
+        });
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.remove_worktree_path(folder_path, None, cx);
+            });
+        });
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let local = store.read(cx).entry(local_id).expect("local row remains");
+            assert!(local.worktree_paths.is_empty());
+            assert_eq!(local.harness.as_deref(), Some("omp"));
+            assert_eq!(local.resume_locator.as_deref(), Some("/tmp/session"));
+            let remote = store.read(cx).entry(remote_id).expect("remote row remains");
+            assert!(!remote.worktree_paths.is_empty());
+        });
+    }
 
 
     #[gpui::test]
@@ -866,6 +1145,218 @@ mod tests {
         assert_eq!(second_row.user_order, Some(3.0));
         assert_eq!(second_row.title.as_ref(), "Second");
     }
+    #[gpui::test]
+    async fn test_session_recovery_metadata_round_trips_through_db(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let db = cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            store.read(cx).db.clone()
+        });
+
+        let mut row = metadata("Recoverable terminal", WorktreePaths::default());
+        row.harness = Some("omp".into());
+        row.resume_locator = Some("/tmp/omp-session-1".into());
+        row.restore_on_workspace_open = true;
+        row.session_boundary = SessionBoundary::Sleeping;
+
+        let terminal_id = row.terminal_id;
+        db.save(row).await.unwrap();
+
+        let rows = db.list().unwrap();
+        let row = rows
+            .into_iter()
+            .find(|row| row.terminal_id == terminal_id)
+            .expect("terminal should be listed");
+        assert_eq!(row.harness.as_deref(), Some("omp"));
+        assert_eq!(row.resume_locator.as_deref(), Some("/tmp/omp-session-1"));
+        assert!(row.restore_on_workspace_open);
+        assert_eq!(row.session_boundary, SessionBoundary::Sleeping);
+    }
+
+    #[gpui::test]
+    async fn test_legacy_v2_row_uses_recovery_metadata_defaults(cx: &mut TestAppContext) {
+        let test_name = std::thread::current()
+            .name()
+            .unwrap_or("unknown_test")
+            .to_string();
+        let db_name = format!("TERMINAL_THREAD_METADATA_DB_{test_name}");
+        let legacy_db = db::open_test_db::<()>(&db_name).await;
+        let terminal_id = TerminalId::new();
+        let terminal_id_key = terminal_id.to_key_string();
+
+        legacy_db
+            .write(move |conn| {
+                conn.exec(
+                    "CREATE TABLE sidebar_terminal_threads_v2(\
+                        terminal_id TEXT PRIMARY KEY,\
+                        title TEXT NOT NULL,\
+                        custom_title TEXT,\
+                        created_at TEXT NOT NULL,\
+                        working_directory TEXT,\
+                        folder_paths TEXT,\
+                        folder_paths_order TEXT,\
+                        main_worktree_paths TEXT,\
+                        main_worktree_paths_order TEXT,\
+                        remote_connection TEXT,\
+                        user_order REAL\
+                    ) STRICT",
+                )?()?;
+                let mut stmt = Statement::prepare(
+                    conn,
+                    "INSERT INTO sidebar_terminal_threads_v2(terminal_id, title, created_at) \
+                     VALUES (?1, ?2, ?3)",
+                )?;
+                let mut index = stmt.bind(&terminal_id_key, 1)?;
+                index = stmt.bind(&"Legacy V2 terminal", index)?;
+                stmt.bind(&"2026-08-24T00:00:00Z", index)?;
+                stmt.exec()
+            })
+            .await
+            .unwrap();
+
+        init_test(cx);
+
+        let db = cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            store.read(cx).db.clone()
+        });
+        let row = db
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.terminal_id == terminal_id)
+            .expect("legacy terminal should be listed");
+        assert_eq!(row.harness, None);
+        assert_eq!(row.resume_locator, None);
+        assert!(row.restore_on_workspace_open);
+        assert_eq!(row.session_boundary, SessionBoundary::Sleeping);
+    }
+
+    #[gpui::test]
+    async fn test_session_metadata_updates_cache_and_boundary_transitions(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let row = metadata("Recoverable terminal", WorktreePaths::default());
+        let terminal_id = row.terminal_id;
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(row, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.update_session_metadata(
+                    terminal_id,
+                    Some("omp".into()),
+                    Some("/tmp/omp-session-1".into()),
+                    SessionBoundary::Live,
+                    cx,
+                );
+            });
+        });
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let row = store.read(cx).entry(terminal_id).unwrap();
+            assert_eq!(row.harness.as_deref(), Some("omp"));
+            assert_eq!(row.resume_locator.as_deref(), Some("/tmp/omp-session-1"));
+            assert_eq!(row.session_boundary, SessionBoundary::Live);
+        });
+        cx.run_until_parked();
+
+        let db = cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .db
+                .clone()
+        });
+        let row = db
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.terminal_id == terminal_id)
+            .expect("updated terminal should be listed");
+        assert_eq!(row.session_boundary, SessionBoundary::Live);
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.mark_session_boundary(terminal_id, SessionBoundary::Sleeping, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            db.list()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.terminal_id == terminal_id)
+                .unwrap()
+                .session_boundary,
+            SessionBoundary::Sleeping
+        );
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.mark_session_boundary(terminal_id, SessionBoundary::Cleared, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                TerminalThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(terminal_id)
+                    .is_none()
+            );
+        });
+        assert!(
+            db.list()
+                .unwrap()
+                .into_iter()
+                .all(|row| row.terminal_id != terminal_id)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unknown_session_boundary_falls_back_to_sleeping(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let db = cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .db
+                .clone()
+        });
+        let row = metadata("Unknown boundary", WorktreePaths::default());
+        let terminal_id = row.terminal_id;
+        db.save(row).await.unwrap();
+        let terminal_id_key = terminal_id.to_key_string();
+        db.write(move |conn| {
+            let mut stmt = Statement::prepare(
+                conn,
+                "UPDATE sidebar_terminal_threads_v2 \
+                 SET session_boundary = ?1 WHERE terminal_id = ?2",
+            )?;
+            let index = stmt.bind(&"future-boundary", 1)?;
+            stmt.bind(&terminal_id_key, index)?;
+            stmt.exec()
+        })
+        .await
+        .unwrap();
+
+        let row = db
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.terminal_id == terminal_id)
+            .expect("terminal with unknown boundary should be listed");
+        assert_eq!(row.title.as_ref(), "Unknown boundary");
+        assert_eq!(row.session_boundary, SessionBoundary::Sleeping);
+    }
+
     #[gpui::test]
     async fn test_v2_ignores_legacy_terminal_metadata(cx: &mut TestAppContext) {
         let test_name = std::thread::current()

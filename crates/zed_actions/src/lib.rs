@@ -609,6 +609,8 @@ pub mod agent {
             ResetAgentZoom,
             /// Pastes clipboard content without any formatting.
             PasteRaw,
+            /// Starts a dedicated OMP terminal session.
+            NewOmpTerminal,
         ]
     );
 

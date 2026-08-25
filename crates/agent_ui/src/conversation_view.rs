@@ -88,7 +88,7 @@ use crate::entry_view_state::{EntryViewEvent, ViewEvent};
 use crate::message_editor::{InputAttempt, MessageEditor, MessageEditorEvent};
 use crate::profile_selector::{ProfileProvider, ProfileSelector};
 
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore};
+use crate::thread_metadata_store::{ActivityStatus, ThreadId, ThreadMetadataStore};
 use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
@@ -1590,6 +1590,50 @@ impl ConversationView {
             return;
         };
         let is_subagent = thread.read(cx).parent_session_id().is_some();
+        if !is_subagent {
+            let activity_status = match event {
+                AcpThreadEvent::StatusChanged => Some(if matches!(
+                    thread.read(cx).status(),
+                    ThreadStatus::Generating
+                ) {
+                    ActivityStatus::Running
+                } else {
+                    ActivityStatus::Idle
+                }),
+                AcpThreadEvent::NewEntry
+                | AcpThreadEvent::EntryUpdated(_)
+                | AcpThreadEvent::EntriesRemoved(_) => Some(if matches!(
+                    thread.read(cx).status(),
+                    ThreadStatus::Generating
+                ) {
+                    ActivityStatus::Running
+                } else {
+                    ActivityStatus::Completed
+                }),
+                AcpThreadEvent::ToolAuthorizationRequested(_)
+                | AcpThreadEvent::ElicitationRequested(_) => {
+                    Some(ActivityStatus::WaitingForUser)
+                }
+                AcpThreadEvent::Stopped(_) => Some(ActivityStatus::Completed),
+                AcpThreadEvent::Refusal
+                | AcpThreadEvent::Error
+                | AcpThreadEvent::LoadError(_) => Some(ActivityStatus::Error),
+                _ => None,
+            };
+            if let Some(activity_status) = activity_status
+                && let Some(store) = ThreadMetadataStore::try_global(cx)
+            {
+                store.update(cx, |store, cx| {
+                    store.record_activity(
+                        self.thread_id,
+                        activity_status,
+                        chrono::Utc::now(),
+                        cx,
+                    );
+                });
+            }
+        }
+
         if !is_subagent && affects_thread_metadata(event) {
             cx.emit(RootThreadUpdated);
         }
@@ -4691,20 +4735,22 @@ pub(crate) mod tests {
         cx.update(|_window, cx| {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(
-                    ThreadMetadata {
-                        thread_id: ThreadId::new(),
-                        session_id: Some(resume_session_id.clone()),
-                        agent_id: ProjectAgentId::new("Flaky"),
-                        title: Some(stored_title.clone()),
-                        title_override: None,
-                        updated_at: Utc::now(),
-                        created_at: Some(Utc::now()),
-                        interacted_at: None,
-                        worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
-                        remote_connection: None,
-                        archived: false,
-                        user_order: None,
-                    },
+                    ThreadMetadata { thread_id: ThreadId::new(),
+                    session_id: Some(resume_session_id.clone()),
+                    agent_id: ProjectAgentId::new("Flaky"),
+                    title: Some(stored_title.clone()),
+                    title_override: None,
+                    updated_at: Utc::now(),
+                    created_at: Some(Utc::now()),
+                    interacted_at: None,
+                    worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
+                    remote_connection: None,
+                    archived: false,
+                    user_order: None,
+                    group_id: None,
+                    parent_thread_id: None,
+                    worktree_id: None,
+                    root_thread_id: None, last_activity_at: None, activity_status: Default::default() },
                     cx,
                 );
             });

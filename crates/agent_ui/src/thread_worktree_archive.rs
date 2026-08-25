@@ -5,18 +5,27 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
+use fs::Fs;
 use gpui::{App, AsyncApp, Entity, Task};
 use project::{
     LocalProjectFlags, Project, WorktreeId,
     git_store::{Repository, resolve_git_worktree_to_main_repo, worktrees_directory_for_repo},
     project_settings::ProjectSettings,
 };
-use remote::{RemoteConnectionOptions, same_remote_connection_identity};
+use remote::{
+    RemoteConnectionOptions, remote_connection_identity, same_remote_connection_identity,
+};
 use settings::Settings;
 use util::{ResultExt, paths::PathStyle};
 use workspace::{AppState, MultiWorkspace, Workspace};
 
+use crate::agent_panel::AgentPanel;
+use crate::terminal_thread_metadata_store::TerminalThreadMetadataStore;
 use crate::thread_metadata_store::{ArchivedGitWorktree, ThreadId, ThreadMetadataStore};
+use crate::worktree_lifecycle::{
+    WorktreeLifecycleCoordinator, WorktreeLifecycleKey, WorktreeLifecycleStore,
+    WorktreeLifecycleWorktree,
+};
 
 /// The plan for archiving a single git worktree root.
 ///
@@ -27,12 +36,14 @@ use crate::thread_metadata_store::{ArchivedGitWorktree, ThreadId, ThreadMetadata
 /// All fields are gathered synchronously by [`build_root_plan`] while the
 /// worktree is still loaded in open projects. This is important because
 /// workspace removal tears down project and repository entities, making
-/// them unavailable for the later async persist/remove steps.
 #[derive(Clone)]
 pub struct RootPlan {
     /// Absolute path of the git worktree on disk.
     pub root_path: PathBuf,
-    /// Absolute path to the main git repository this worktree is linked to.
+    /// Canonical repository identity used by worktree lifecycle records.
+    pub repository_path: PathBuf,
+    /// Local Zed filesystem used for lifecycle state under the local data dir.
+    pub lifecycle_fs: Arc<dyn Fs>,
     /// Used both for creating a git ref to prevent GC of WIP commits during
     /// [`persist_worktree_state`], and for `git worktree remove` during
     /// [`remove_root`].
@@ -70,8 +81,12 @@ pub struct RootPlan {
 /// hold a reference to the directory and `git worktree remove` would fail.
 #[derive(Clone)]
 pub struct AffectedProject {
+    pub workspace: Entity<Workspace>,
     pub project: Entity<Project>,
     pub worktree_id: WorktreeId,
+    pub repository_path: PathBuf,
+    pub lifecycle_fs: Arc<dyn Fs>,
+    pub lifecycle_key: Option<WorktreeLifecycleKey>,
 }
 
 fn archived_worktree_ref_name(id: i64) -> String {
@@ -123,10 +138,11 @@ pub fn build_root_plan(
             remote_connection,
         )
     };
-
     let affected_projects = workspaces
         .iter()
         .filter_map(|workspace| {
+            let workspace = workspace.clone();
+            let lifecycle_fs = workspace.read(cx).app_state().fs.clone();
             let project = workspace.read(cx).project().clone();
             if !matches_target_connection(&project, cx) {
                 return None;
@@ -135,10 +151,23 @@ pub fn build_root_plan(
                 .read(cx)
                 .visible_worktrees(cx)
                 .find(|worktree| worktree.read(cx).abs_path().as_ref() == path.as_path())?;
-            let worktree_id = worktree.read(cx).id();
+            let worktree = worktree.read(cx);
+            let worktree_id = worktree.id();
+            let repository_path = worktree
+                .root_repo_common_dir()
+                .map(|path| path.to_path_buf())
+                .unwrap_or_else(|| path.clone());
+            let lifecycle_key = workspace
+                .read(cx)
+                .panel::<AgentPanel>(cx)
+                .and_then(|panel| panel.read(cx).lifecycle_key_for_worktree(worktree_id));
             Some(AffectedProject {
+                workspace,
                 project,
                 worktree_id,
+                repository_path,
+                lifecycle_fs,
+                lifecycle_key,
             })
         })
         .collect::<Vec<_>>();
@@ -146,7 +175,8 @@ pub fn build_root_plan(
     if affected_projects.is_empty() {
         return None;
     }
-
+    let lifecycle_fs = affected_projects.first()?.lifecycle_fs.clone();
+    let repository_path = affected_projects.first()?.repository_path.clone();
     let linked_repo = workspaces
         .iter()
         .filter(|workspace| matches_target_connection(workspace.read(cx).project(), cx))
@@ -196,6 +226,8 @@ pub fn build_root_plan(
 
     Some(RootPlan {
         root_path: path,
+        repository_path,
+        lifecycle_fs,
         main_repo_path,
         affected_projects,
         worktree_repo: repo,
@@ -234,6 +266,7 @@ pub async fn remove_root(root: RootPlan, cx: &mut AsyncApp) -> Result<()> {
         rollback_root(&root, cx).await;
         return Err(error);
     }
+    cleanup_confirmed_worktree_lifecycle(&root, cx).await;
 
     // The worktree is gone, so its registry record is now stale. If the
     // user later creates a new worktree at the same path outside Zed, a
@@ -334,6 +367,93 @@ async fn remove_root_after_worktree_removal(
     drop(project);
     result.context("git worktree metadata cleanup failed")?;
     Ok(())
+}
+async fn cleanup_confirmed_worktree_lifecycle(root: &RootPlan, cx: &mut AsyncApp) {
+    let lifecycle_key = root
+        .affected_projects
+        .iter()
+        .find_map(|affected| affected.lifecycle_key.clone());
+    let coordinator =
+        WorktreeLifecycleCoordinator::new(WorktreeLifecycleStore::new(root.lifecycle_fs.clone()));
+    let key = if let Some(key) = lifecycle_key {
+        key
+    } else {
+        let remote_identity = root
+            .remote_connection
+            .as_ref()
+            .map(|options| {
+                format!(
+                    "remote-v1:{}",
+                    remote_connection_identity(options).persistence_key()
+                )
+            })
+            .unwrap_or_else(|| "local".to_string());
+        let worktree = WorktreeLifecycleWorktree::new(
+            root.repository_path.clone(),
+            root.root_path.clone(),
+            remote_identity,
+        );
+        match coordinator.key_for(&worktree).await {
+            Ok(key) => key,
+            Err(error) => {
+                log::error!(
+                    "resolving confirmed worktree lifecycle key for {}: {error:#}",
+                    root.root_path.display()
+                );
+                return;
+            }
+        }
+    };
+    let worktree_path = root.root_path.clone();
+    let remote_connection = root.remote_connection.clone();
+
+    for affected in &root.affected_projects {
+        let panel = cx.update(|cx| {
+            affected
+                .workspace
+                .read(cx)
+                .panel::<AgentPanel>(cx)
+        });
+        if let Some(panel) = panel {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.confirm_worktree_lifecycle_deletion(
+                        key.clone(),
+                        worktree_path.clone(),
+                        remote_connection.clone(),
+                        cx,
+                    );
+                });
+            return;
+        }
+    }
+
+    // No panel owns the lifecycle task chain, so this fallback is already
+    // serialized with every caller that can reach this path.
+    if let Err(error) = coordinator.mark_worktree_closing(&key).await {
+        log::error!(
+            "marking confirmed worktree lifecycle record closing for {}: {error:#}",
+            worktree_path.display()
+        );
+        return;
+    }
+    cx.update(|cx| {
+        if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| {
+                store.remove_worktree_path(
+                    &worktree_path,
+                    remote_connection.as_ref(),
+                    cx,
+                );
+            });
+        }
+    });
+    if let Err(error) = coordinator.remove_worktree(&key).await {
+        log::error!(
+            "removing confirmed worktree lifecycle record for {}: {error:#}",
+            worktree_path.display()
+        );
+    }
 }
 
 /// Finds a live `Repository` entity for the given path, or creates a temporary
