@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
+
 use uuid::Uuid;
 
 use crate::herdr_client::{
     HerdrAgentSessionIdentity, HerdrAgentSnapshot, HerdrAgentStatus, HerdrEvent,
-    HerdrWorkspaceSnapshot,
+    HerdrPaneSnapshot, HerdrWorkspaceSnapshot,
 };
 use crate::herdr_mapping_store::{
     HerdrMappingKey, HerdrMappingRecord, SessionMappings, tombstone_record, upsert_record,
@@ -47,6 +49,10 @@ pub(crate) struct BridgeState {
     /// and rejected.
     pub last_sequence: u64,
     pub pending_focus: Option<PendingFocus>,
+    /// Every Zed-issued focus operation remains fenced until Herdr reflects
+    /// that exact operation ID. Keeping superseded IDs prevents a delayed
+    /// reflection from activating an older target after a newer focus wins.
+    pub issued_focus: BTreeMap<String, PendingFocus>,
 }
 
 impl BridgeState {
@@ -63,11 +69,14 @@ impl BridgeState {
         operation_id: impl Into<String>,
         target: FocusTarget,
     ) -> Self {
-        self.pending_focus = Some(PendingFocus {
+        let pending = PendingFocus {
             operation_id: operation_id.into(),
             target,
             origin: HerdrOperationOrigin::Zed,
-        });
+        };
+        self.issued_focus
+            .insert(pending.operation_id.clone(), pending.clone());
+        self.pending_focus = Some(pending);
         self
     }
 
@@ -215,7 +224,7 @@ pub(crate) fn reconcile_snapshot(
     let mut actions = Vec::new();
     for workspace in workspaces {
         let key = HerdrMappingKey::workspace(session, &workspace.workspace_id);
-        match mappings.get(&key.to_key_string()) {
+        let root_is_closed = match mappings.get(&key.to_key_string()) {
             Some(record) if record.is_tombstone() => {
                 actions.push(ReconciliationAction::RecordConflict(
                     key,
@@ -224,17 +233,26 @@ pub(crate) fn reconcile_snapshot(
                         workspace.workspace_id
                     ),
                 ));
+                true
             }
             Some(record) => {
                 actions.push(ReconciliationAction::RestoreWorkspaceRoot(record.clone()));
+                false
             }
-            None => actions.push(ReconciliationAction::CreateWorkspaceRoot(workspace.clone())),
+            None => {
+                actions.push(ReconciliationAction::CreateWorkspaceRoot(workspace.clone()));
+                false
+            }
+        };
+        if root_is_closed {
+            // A closed root fences every child below it. In particular, do
+            // not create a fresh child merely because its pane identity
+            // differs from a retained tombstone.
+            continue;
         }
 
         for agent in &workspace.agents {
             let Some(identity) = agent.session_identity.as_ref() else {
-                // A pane without an agent session identity reports status
-                // only; it never becomes a Zed subthread.
                 continue;
             };
             let workspace_id = if agent.workspace_id.is_empty() {
@@ -242,25 +260,54 @@ pub(crate) fn reconcile_snapshot(
             } else {
                 &agent.workspace_id
             };
-            match resolve_agent_identity(mappings, session, workspace_id, &agent.pane_id, identity)
-            {
-                Ok(Some(record)) => {
-                    actions.push(ReconciliationAction::RestoreAgentSubthread(record));
-                }
+            let target_key =
+                HerdrMappingKey::subthread(session, workspace_id, &agent.pane_id, identity.clone());
+            match resolve_agent_identity(mappings, session, workspace_id, &agent.pane_id, identity) {
+                Ok(Some(record)) => match rebind_record_for_location(
+                    mappings,
+                    &record,
+                    workspace_id,
+                    &agent.pane_id,
+                    agent.last_seen_sequence,
+                ) {
+                    Ok(rebound) => {
+                        actions.push(ReconciliationAction::RestoreAgentSubthread(rebound))
+                    }
+                    Err(message) => {
+                        actions.push(ReconciliationAction::RecordConflict(target_key, message))
+                    }
+                },
                 Ok(None) => {
-                    actions.push(ReconciliationAction::CreateAgentSubthread(HerdrAgentSnapshot {
-                        pane_id: agent.pane_id.clone(),
-                        workspace_id: workspace_id.clone(),
-                        agent_type: agent.agent_type.clone(),
-                        session_identity: Some(identity.clone()),
-                        status: agent.status.clone(),
-                        title: agent.title.clone(),
-                        cwd: agent.cwd.clone(),
-                        last_seen_sequence: agent.last_seen_sequence,
-                    }));
+                    let same_pane = live_subthreads_at(mappings, session, workspace_id, &agent.pane_id);
+                    if same_pane.len() == 1 {
+                        actions.push(ReconciliationAction::RecordConflict(
+                            target_key,
+                            "pane already has a live mapping for a different agent session"
+                                .to_string(),
+                        ));
+                    } else if same_pane.len() > 1 {
+                        actions.push(ReconciliationAction::RecordConflict(
+                            target_key,
+                            "pane has multiple live mappings; refusing to create a duplicate"
+                                .to_string(),
+                        ));
+                    } else {
+                        actions.push(ReconciliationAction::CreateAgentSubthread(
+                            HerdrAgentSnapshot {
+                                pane_id: agent.pane_id.clone(),
+                                workspace_id: workspace_id.clone(),
+                                agent_type: agent.agent_type.clone(),
+                                session_identity: Some(identity.clone()),
+                                status: agent.status.clone(),
+                                title: agent.title.clone(),
+                                cwd: agent.cwd.clone(),
+                                last_seen_sequence: agent.last_seen_sequence,
+                            },
+                        ));
+                    }
                 }
                 Err(message) => actions.push(ReconciliationAction::RecordConflict(
-                    HerdrMappingKey::subthread(session, workspace_id, &agent.pane_id, identity.clone()),
+                    target_key,
                     message,
                 )),
             }
@@ -270,10 +317,10 @@ pub(crate) fn reconcile_snapshot(
 }
 
 /// Resolves one (pane, agent-session) identity against persisted mappings.
-/// `Ok(Some(record))` is a restoration candidate; `Ok(None)` means the
-/// identity is genuinely new; `Err(message)` is a visible conflict. Exact
-/// session-qualified matches win over agent-session restoration; cwd and
-/// worktree identity never participate in matching.
+/// Exact session-qualified matches win over agent-session restoration; cwd and
+/// worktree identity never participate in matching. Tombstones are included
+/// in fallback candidates so a closed identity is a conflict, never a
+/// candidate for creation.
 fn resolve_agent_identity(
     mappings: &SessionMappings,
     session: &str,
@@ -295,38 +342,112 @@ fn resolve_agent_identity(
     let candidates: Vec<&HerdrMappingRecord> = mappings
         .values()
         .filter(|record| {
-            !record.is_tombstone()
-                && record.key.session == session
+            record.key.session == session
                 && record.key.pane_id.is_some()
                 && record.key.agent_session.as_ref() == Some(identity)
         })
         .collect();
     match candidates.as_slice() {
         [] => Ok(None),
+        [only] if only.is_tombstone() => Err(format!(
+            "agent session {} is retained as a closed mapping; refusing to resurrect it",
+            identity.value
+        )),
         [only] => Ok(Some((*only).clone())),
         _ => Err(format!(
-            "ambiguous agent session {}: {} live mappings claim this identity",
+            "ambiguous agent session {}: {} mappings claim this identity",
             identity.value,
             candidates.len()
         )),
     }
 }
 
+fn live_subthreads_at<'a>(
+    mappings: &'a SessionMappings,
+    session: &str,
+    workspace_id: &str,
+    pane_id: &str,
+) -> Vec<&'a HerdrMappingRecord> {
+    mappings
+        .values()
+        .filter(|record| {
+            !record.is_tombstone()
+                && record.key.session == session
+                && record.key.workspace_id == workspace_id
+                && record.key.pane_id.as_deref() == Some(pane_id)
+        })
+        .collect()
+}
+
+/// Builds the record that represents a restored resource at its current
+/// location. This is deliberately transactional: callers validate the
+/// destination and root before replacing the old key, and a failed validation
+/// leaves the old record untouched.
+fn rebind_record_for_location(
+    mappings: &SessionMappings,
+    record: &HerdrMappingRecord,
+    workspace_id: &str,
+    pane_id: &str,
+    sequence: u64,
+) -> Result<HerdrMappingRecord, String> {
+    let Some(agent_session) = record.key.agent_session.clone() else {
+        return Err("subthread mapping lacks an agent identity".to_string());
+    };
+    let target_key =
+        HerdrMappingKey::subthread(record.key.session.clone(), workspace_id, pane_id, agent_session);
+    if let Some(target) = mappings.get(&target_key.to_key_string()) {
+        if target.key != record.key && target.is_tombstone() {
+            return Err("destination subthread mapping is a retained tombstone".to_string());
+        }
+        if target.key != record.key && !target.is_tombstone() {
+            return Err("destination pane already has a live mapping".to_string());
+        }
+    }
+    let root_key =
+        HerdrMappingKey::workspace(record.key.session.clone(), workspace_id).to_key_string();
+    let destination_root = mappings.get(&root_key);
+    if let Some(root) = destination_root {
+        if root.is_tombstone() {
+            return Err("destination workspace mapping is a retained tombstone".to_string());
+        }
+    } else if record.key.workspace_id != workspace_id {
+        return Err("destination workspace has no live root mapping".to_string());
+    }
+
+    let mut rebound = record.clone();
+    rebound.key = target_key;
+    if let Some(root) = destination_root {
+        rebound.zed_root_thread_id = root.zed_root_thread_id;
+    }
+    rebound.last_seen_sequence = rebound.last_seen_sequence.max(sequence);
+    Ok(rebound)
+}
+
 
 pub(crate) fn apply_event(state: &mut BridgeState, event: &HerdrEvent) -> AppliedEvent {
     let sequence = event.sequence();
-    if sequence != 0 && sequence <= state.last_sequence {
-        // Herdr event sequences are monotonic. A repeated frame is as stale
-        // as a reversed one and must not apply a second lifecycle action.
-        return AppliedEvent::none();
-    }
-    if sequence != 0 {
+    if sequence_guarded(event) {
+        if sequence == 0 {
+            return zero_sequence_conflict(state, event);
+        }
+        // The bridge-wide fence handles ordinary in-memory ordering. The
+        // resource fence below also protects a restarted bridge whose loaded
+        // records are newer than its newly initialized global fence.
+        if sequence <= state.last_sequence
+            || event_is_stale_against_persisted_mapping(state, event, sequence)
+        {
+            return AppliedEvent::none();
+        }
         state.last_sequence = sequence;
     }
 
     match event {
-        HerdrEvent::WorkspaceCreated { workspace, .. } => reconcile_workspace_created(state, workspace),
-        HerdrEvent::WorkspaceUpdated { workspace, .. } => reconcile_workspace_updated(state, workspace),
+        HerdrEvent::WorkspaceCreated { workspace, sequence } => {
+            reconcile_workspace_created(state, workspace, *sequence)
+        }
+        HerdrEvent::WorkspaceUpdated { workspace, sequence } => {
+            reconcile_workspace_updated(state, workspace, *sequence)
+        }
         HerdrEvent::WorkspaceFocused {
             workspace_id,
             operation_id,
@@ -363,29 +484,27 @@ pub(crate) fn apply_event(state: &mut BridgeState, event: &HerdrEvent) -> Applie
             let Some(identity) = session_identity else {
                 return AppliedEvent::none();
             };
-            match resolve_agent_identity(&state.mappings, &state.session, workspace_id, pane_id, identity)
-            {
-                Ok(Some(record)) => {
-                    rebind_subthread_location(state, &record, workspace_id, pane_id, sequence);
-                    AppliedEvent::single(ReconciliationAction::RestoreAgentSubthread(record))
-                }
-                Ok(None) => {
-                    let snapshot = HerdrAgentSnapshot {
-                        pane_id: pane_id.clone(),
-                        workspace_id: workspace_id.clone(),
-                        agent_type: agent_type.clone(),
-                        session_identity: Some(identity.clone()),
-                        last_seen_sequence: sequence,
-                        ..Default::default()
-                    };
-                    AppliedEvent::single(ReconciliationAction::CreateAgentSubthread(snapshot))
-                }
-                Err(message) => AppliedEvent::single(ReconciliationAction::RecordConflict(
-                    state.subthread_key(workspace_id, pane_id, identity),
-                    message,
-                )),
-            }
+            restore_or_create_agent(
+                state,
+                workspace_id,
+                pane_id,
+                identity,
+                agent_type.clone(),
+                sequence,
+            )
         }
+        HerdrEvent::PaneMoved {
+            pane,
+            previous_pane_id,
+            previous_workspace_id,
+            ..
+        } => apply_pane_moved(
+            state,
+            pane,
+            previous_workspace_id.as_deref(),
+            previous_pane_id.as_deref(),
+            sequence,
+        ),
         HerdrEvent::PaneAgentStatusChanged {
             pane_id, status, ..
         } => match live_subthread_by_id(state, pane_id) {
@@ -425,21 +544,375 @@ pub(crate) fn apply_event(state: &mut BridgeState, event: &HerdrEvent) -> Applie
     }
 }
 
+fn sequence_guarded(event: &HerdrEvent) -> bool {
+    !matches!(
+        event,
+        HerdrEvent::SubscriptionStarted { .. } | HerdrEvent::Unknown { .. }
+    )
+}
+
+fn event_is_stale_against_persisted_mapping(
+    state: &BridgeState,
+    event: &HerdrEvent,
+    sequence: u64,
+) -> bool {
+    mapping_keys_for_event(state, event).into_iter().any(|key| {
+        state
+            .mappings
+            .get(&key.to_key_string())
+            .is_some_and(|record| sequence <= record.last_seen_sequence)
+    })
+}
+
+fn add_workspace_mapping_keys(
+    state: &BridgeState,
+    keys: &mut Vec<HerdrMappingKey>,
+    workspace_id: &str,
+) {
+    keys.push(state.workspace_key(workspace_id));
+    keys.extend(
+        state
+            .mappings
+            .values()
+            .filter(|record| {
+                record.key.session == state.session && record.key.workspace_id == workspace_id
+            })
+            .map(|record| record.key.clone()),
+    );
+}
+
+fn add_pane_mapping_keys(
+    state: &BridgeState,
+    keys: &mut Vec<HerdrMappingKey>,
+    workspace_id: Option<&str>,
+    pane_id: &str,
+) {
+    keys.extend(
+        state
+            .mappings
+            .values()
+            .filter(|record| {
+                record.key.pane_id.is_some()
+                    && record.key.session == state.session
+                    && record.key.pane_id.as_deref() == Some(pane_id)
+                    && workspace_id.map_or(true, |workspace| record.key.workspace_id == workspace)
+            })
+            .map(|record| record.key.clone()),
+    );
+}
+fn mapping_keys_for_event(state: &BridgeState, event: &HerdrEvent) -> Vec<HerdrMappingKey> {
+    let mut keys = Vec::new();
+    match event {
+        HerdrEvent::WorkspaceCreated { workspace, .. }
+        | HerdrEvent::WorkspaceUpdated { workspace, .. } => {
+            add_workspace_mapping_keys(state, &mut keys, &workspace.workspace_id)
+        }
+        HerdrEvent::WorkspaceRenamed { workspace_id, .. }
+        | HerdrEvent::WorkspaceFocused { workspace_id, .. }
+        | HerdrEvent::WorkspaceClosed { workspace_id, .. }
+        | HerdrEvent::WorkspaceMoved { workspace_id, .. } => {
+            add_workspace_mapping_keys(state, &mut keys, workspace_id)
+        }
+        HerdrEvent::PaneCreated { pane, .. } | HerdrEvent::PaneUpdated { pane, .. } => {
+            add_workspace_mapping_keys(state, &mut keys, &pane.workspace_id);
+            add_pane_mapping_keys(state, &mut keys, Some(&pane.workspace_id), &pane.pane_id);
+        }
+        HerdrEvent::PaneMoved {
+            pane,
+            previous_workspace_id,
+            previous_pane_id,
+            ..
+        } => {
+            add_workspace_mapping_keys(state, &mut keys, &pane.workspace_id);
+            add_pane_mapping_keys(state, &mut keys, Some(&pane.workspace_id), &pane.pane_id);
+            if let Some(previous_workspace_id) = previous_workspace_id.as_deref() {
+                add_workspace_mapping_keys(state, &mut keys, previous_workspace_id);
+                if let Some(previous_pane_id) = previous_pane_id.as_deref() {
+                    add_pane_mapping_keys(
+                        state,
+                        &mut keys,
+                        Some(previous_workspace_id),
+                        previous_pane_id,
+                    );
+                }
+            }
+        }
+        HerdrEvent::PaneAgentDetected {
+            pane_id,
+            workspace_id,
+            session_identity,
+            ..
+        } => {
+            add_workspace_mapping_keys(state, &mut keys, workspace_id);
+            add_pane_mapping_keys(state, &mut keys, Some(workspace_id), pane_id);
+            if let Some(identity) = session_identity {
+                keys.push(state.subthread_key(workspace_id, pane_id, identity));
+                keys.extend(
+                    state
+                        .mappings
+                        .values()
+                        .filter(|record| {
+                            record.key.session == state.session
+                                && record.key.agent_session.as_ref() == Some(identity)
+                        })
+                        .map(|record| record.key.clone()),
+                );
+            }
+        }
+        HerdrEvent::PaneAgentStatusChanged { pane_id, .. }
+        | HerdrEvent::PaneExited { pane_id, .. }
+        | HerdrEvent::PaneOutput { pane_id, .. }
+        | HerdrEvent::PaneScrollChanged { pane_id, .. } => {
+            add_pane_mapping_keys(state, &mut keys, None, pane_id)
+        }
+        HerdrEvent::PaneFocused {
+            pane_id,
+            workspace_id,
+            ..
+        }
+        | HerdrEvent::PaneClosed {
+            pane_id,
+            workspace_id,
+            ..
+        } => add_pane_mapping_keys(state, &mut keys, Some(workspace_id), pane_id),
+        HerdrEvent::WorkspaceReordered { .. }
+        | HerdrEvent::SubscriptionStarted { .. }
+        | HerdrEvent::Unknown { .. } => {}
+    }
+    keys
+}
+
+fn zero_sequence_conflict(state: &BridgeState, event: &HerdrEvent) -> AppliedEvent {
+    let key = match event {
+        HerdrEvent::WorkspaceCreated { workspace, .. }
+        | HerdrEvent::WorkspaceUpdated { workspace, .. } => {
+            state.workspace_key(&workspace.workspace_id)
+        }
+        HerdrEvent::WorkspaceRenamed { workspace_id, .. }
+        | HerdrEvent::WorkspaceFocused { workspace_id, .. }
+        | HerdrEvent::WorkspaceClosed { workspace_id, .. }
+        | HerdrEvent::WorkspaceMoved { workspace_id, .. } => state.workspace_key(workspace_id),
+        HerdrEvent::PaneCreated { pane, .. }
+        | HerdrEvent::PaneUpdated { pane, .. }
+        | HerdrEvent::PaneMoved { pane, .. } => pane
+            .session_identity
+            .as_ref()
+            .map(|identity| state.subthread_key(&pane.workspace_id, &pane.pane_id, identity))
+            .or_else(|| {
+                any_subthread_by_pane(state, &pane.workspace_id, &pane.pane_id)
+            })
+            .unwrap_or_else(|| state.workspace_key(&pane.workspace_id)),
+        HerdrEvent::PaneAgentDetected {
+            pane_id,
+            workspace_id,
+            session_identity,
+            ..
+        } => session_identity
+            .as_ref()
+            .map(|identity| state.subthread_key(workspace_id, pane_id, identity))
+            .or_else(|| any_subthread_by_pane(state, workspace_id, pane_id))
+            .unwrap_or_else(|| state.workspace_key(workspace_id)),
+        HerdrEvent::PaneAgentStatusChanged { pane_id, .. }
+        | HerdrEvent::PaneExited { pane_id, .. }
+        | HerdrEvent::PaneOutput { pane_id, .. }
+        | HerdrEvent::PaneScrollChanged { pane_id, .. } => any_subthread_by_pane(state, "", pane_id)
+            .unwrap_or_else(|| state.workspace_key(&format!("pane:{pane_id}"))),
+        HerdrEvent::PaneFocused {
+            pane_id,
+            workspace_id,
+            ..
+        }
+        | HerdrEvent::PaneClosed {
+            pane_id,
+            workspace_id,
+            ..
+        } => any_subthread_by_pane(state, workspace_id, pane_id)
+            .unwrap_or_else(|| state.workspace_key(workspace_id)),
+        HerdrEvent::WorkspaceReordered { .. }
+        | HerdrEvent::SubscriptionStarted { .. }
+        | HerdrEvent::Unknown { .. } => state.workspace_key("unknown"),
+    };
+    AppliedEvent::single(ReconciliationAction::RecordConflict(
+        key,
+        "event has a missing or zero sequence; refresh is required".to_string(),
+    ))
+}
+
+fn any_subthread_by_pane(
+    state: &BridgeState,
+    workspace_id: &str,
+    pane_id: &str,
+) -> Option<HerdrMappingKey> {
+    state
+        .mappings
+        .values()
+        .find(|record| {
+            record.key.session == state.session
+                && record.key.pane_id.as_deref() == Some(pane_id)
+                && (workspace_id.is_empty() || record.key.workspace_id == workspace_id)
+        })
+        .map(|record| record.key.clone())
+}
+
+fn restore_or_create_agent(
+    state: &mut BridgeState,
+    workspace_id: &str,
+    pane_id: &str,
+    identity: &HerdrAgentSessionIdentity,
+    agent_type: Option<String>,
+    sequence: u64,
+) -> AppliedEvent {
+    let target_key = state.subthread_key(workspace_id, pane_id, identity);
+    if state
+        .mappings
+        .get(&state.workspace_key(workspace_id).to_key_string())
+        .is_some_and(|record| record.is_tombstone())
+    {
+        return AppliedEvent::single(ReconciliationAction::RecordConflict(
+            state.workspace_key(workspace_id),
+            "agent event belongs to a closed workspace mapping".to_string(),
+        ));
+    }
+
+    match resolve_agent_identity(&state.mappings, &state.session, workspace_id, pane_id, identity) {
+        Ok(Some(record)) => match rebind_subthread_location(
+            state,
+            &record,
+            workspace_id,
+            pane_id,
+            sequence,
+        ) {
+            Ok(rebound) => {
+                AppliedEvent::single(ReconciliationAction::RestoreAgentSubthread(rebound))
+            }
+            Err(message) => {
+                AppliedEvent::single(ReconciliationAction::RecordConflict(target_key, message))
+            }
+        },
+        Ok(None) => {
+            let same_pane = live_subthreads_at(&state.mappings, &state.session, workspace_id, pane_id);
+            if !same_pane.is_empty() {
+                return AppliedEvent::single(ReconciliationAction::RecordConflict(
+                    target_key,
+                    if same_pane.len() == 1 {
+                        "pane already has a live mapping for a different agent session"
+                            .to_string()
+                    } else {
+                        "pane has multiple live mappings; refusing to create a duplicate"
+                            .to_string()
+                    },
+                ));
+            }
+            AppliedEvent::single(ReconciliationAction::CreateAgentSubthread(
+                HerdrAgentSnapshot {
+                    pane_id: pane_id.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    agent_type,
+                    session_identity: Some(identity.clone()),
+                    last_seen_sequence: sequence,
+                    ..Default::default()
+                },
+            ))
+        }
+        Err(message) => {
+            AppliedEvent::single(ReconciliationAction::RecordConflict(target_key, message))
+        }
+    }
+}
+
+fn apply_pane_moved(
+    state: &mut BridgeState,
+    pane: &HerdrPaneSnapshot,
+    previous_workspace_id: Option<&str>,
+    previous_pane_id: Option<&str>,
+    sequence: u64,
+) -> AppliedEvent {
+    if let Some(identity) = pane.session_identity.as_ref() {
+        return restore_or_create_agent(
+            state,
+            &pane.workspace_id,
+            &pane.pane_id,
+            identity,
+            pane.agent_type.clone(),
+            sequence,
+        );
+    }
+
+    let old_workspace = previous_workspace_id.unwrap_or(&pane.workspace_id);
+    let old_pane = previous_pane_id.unwrap_or(&pane.pane_id);
+    let candidates: Vec<HerdrMappingRecord> =
+        live_subthreads_at(&state.mappings, &state.session, old_workspace, old_pane)
+            .into_iter()
+            .cloned()
+            .collect();
+    match candidates.as_slice() {
+        [record] => match rebind_subthread_location(
+            state,
+            record,
+            &pane.workspace_id,
+            &pane.pane_id,
+            sequence,
+        ) {
+            Ok(rebound) => {
+                AppliedEvent::single(ReconciliationAction::RestoreAgentSubthread(rebound))
+            }
+            Err(message) => {
+                let conflict_key = record
+                    .key
+                    .agent_session
+                    .clone()
+                    .map(|identity| {
+                        HerdrMappingKey::subthread(
+                            state.session.clone(),
+                            &pane.workspace_id,
+                            &pane.pane_id,
+                            identity,
+                        )
+                    })
+                    .unwrap_or_else(|| state.workspace_key(&pane.workspace_id));
+                AppliedEvent::single(ReconciliationAction::RecordConflict(
+                    conflict_key,
+                    message,
+                ))
+            }
+        },
+        [] => AppliedEvent::none(),
+        _ => AppliedEvent::single(ReconciliationAction::RecordConflict(
+            state.workspace_key(&pane.workspace_id),
+            "pane move has multiple source mappings".to_string(),
+        )),
+    }
+}
+
 fn apply_focus(
     state: &mut BridgeState,
     target: FocusTarget,
     operation_id: Option<&str>,
     sequence: u64,
 ) -> AppliedEvent {
-    // HerdrEvent carries an operation ID but no explicit origin field. A
-    // matching operation can only have originated with our recorded Zed
-    // request, while an unmatched event is Herdr-originated user activity.
-    let incoming_origin = HerdrOperationOrigin::Herdr;
-    if let (Some(pending), Some(operation_id)) = (state.pending_focus.clone(), operation_id) {
-        if pending.origin == HerdrOperationOrigin::Zed
-            && incoming_origin == HerdrOperationOrigin::Herdr
-            && pending.operation_id == operation_id
-            && pending.target == target
+    // A reflected operation is fenced by ID, even after a newer focus
+    // supersedes it. This prevents delayed A from activating A after B.
+    if let Some(operation_id) = operation_id {
+        if state.issued_focus.remove(operation_id).is_some() {
+            if state
+                .pending_focus
+                .as_ref()
+                .is_some_and(|pending| pending.operation_id == operation_id)
+            {
+                state.pending_focus = None;
+            }
+            return AppliedEvent::none();
+        }
+        // Keep compatibility with callers that construct `pending_focus`
+        // directly rather than through the registration helpers.
+        if state
+            .pending_focus
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.origin == HerdrOperationOrigin::Zed
+                    && pending.operation_id == operation_id
+                    && pending.target == target
+            })
         {
             state.pending_focus = None;
             return AppliedEvent::none();
@@ -468,11 +941,15 @@ pub(crate) fn initiate_workspace_focus(
     workspace_id: &str,
 ) -> OutboundRequest {
     let operation_id = Uuid::new_v4().to_string();
-    state.pending_focus = Some(PendingFocus {
+    let pending = PendingFocus {
         operation_id: operation_id.clone(),
         target: FocusTarget::Workspace(workspace_id.to_string()),
         origin: HerdrOperationOrigin::Zed,
-    });
+    };
+    state
+        .issued_focus
+        .insert(operation_id.clone(), pending.clone());
+    state.pending_focus = Some(pending);
     OutboundRequest::FocusWorkspace {
         workspace_id: workspace_id.to_string(),
         operation_id,
@@ -486,14 +963,18 @@ pub(crate) fn initiate_pane_focus(
     pane_id: &str,
 ) -> OutboundRequest {
     let operation_id = Uuid::new_v4().to_string();
-    state.pending_focus = Some(PendingFocus {
+    let pending = PendingFocus {
         operation_id: operation_id.clone(),
         target: FocusTarget::Pane {
             workspace_id: workspace_id.to_string(),
             pane_id: pane_id.to_string(),
         },
         origin: HerdrOperationOrigin::Zed,
-    });
+    };
+    state
+        .issued_focus
+        .insert(operation_id.clone(), pending.clone());
+    state.pending_focus = Some(pending);
     OutboundRequest::FocusPane {
         workspace_id: workspace_id.to_string(),
         pane_id: pane_id.to_string(),
@@ -550,8 +1031,9 @@ fn close_mapping(state: &mut BridgeState, key: &HerdrMappingKey, sequence: u64) 
 }
 
 fn reconcile_workspace_created(
-    state: &BridgeState,
+    state: &mut BridgeState,
     workspace: &HerdrWorkspaceSnapshot,
+    sequence: u64,
 ) -> AppliedEvent {
     let key = state.workspace_key(&workspace.workspace_id);
     match state.mappings.get(&key.to_key_string()) {
@@ -561,14 +1043,18 @@ fn reconcile_workspace_created(
                 "workspace created while a closed mapping is retained".to_string(),
             ),
         ),
-        Some(_) => AppliedEvent::none(),
+        Some(_) => {
+            touch_record_sequence(state, &key, sequence);
+            AppliedEvent::none()
+        }
         None => AppliedEvent::single(ReconciliationAction::CreateWorkspaceRoot(workspace.clone())),
     }
 }
 
 fn reconcile_workspace_updated(
-    state: &BridgeState,
+    state: &mut BridgeState,
     workspace: &HerdrWorkspaceSnapshot,
+    sequence: u64,
 ) -> AppliedEvent {
     let key = state.workspace_key(&workspace.workspace_id);
     match state.mappings.get(&key.to_key_string()) {
@@ -578,10 +1064,17 @@ fn reconcile_workspace_updated(
                 "workspace updated while a closed mapping is retained".to_string(),
             ),
         ),
-        Some(_) => AppliedEvent::single(ReconciliationAction::UpdateTitle(key, workspace.label.clone())),
+        Some(_) => {
+            touch_record_sequence(state, &key, sequence);
+            AppliedEvent::single(ReconciliationAction::UpdateTitle(
+                key,
+                workspace.label.clone(),
+            ))
+        }
         None => AppliedEvent::single(ReconciliationAction::CreateWorkspaceRoot(workspace.clone())),
     }
 }
+
 
 fn close_workspace_mappings(
     state: &mut BridgeState,
@@ -613,27 +1106,37 @@ fn close_workspace_mappings(
 
 /// Rebinds a restored subthread to its current workspace and pane so
 /// subsequent per-pane events resolve without another restoration round.
+/// Destination and root checks happen before removing the old key, making a
+/// failed rebind transactional.
 fn rebind_subthread_location(
     state: &mut BridgeState,
     record: &HerdrMappingRecord,
     workspace_id: &str,
     pane_id: &str,
     sequence: u64,
-) {
-    let mut rebound = record.clone();
-    if rebound.key.workspace_id == workspace_id && rebound.key.pane_id.as_deref() == Some(pane_id)
-    {
+) -> Result<HerdrMappingRecord, String> {
+    let rebound =
+        rebind_record_for_location(&state.mappings, record, workspace_id, pane_id, sequence)?;
+    let old_key = record.key.to_key_string();
+    let new_key = rebound.key.to_key_string();
+    if old_key == new_key {
         touch_record_sequence(state, &rebound.key, sequence);
-        return;
+        return state
+            .mappings
+            .get(&new_key)
+            .cloned()
+            .ok_or_else(|| "mapped subthread disappeared during rebind".to_string());
     }
-    let old_key = rebound.key.to_key_string();
-    rebound.key.workspace_id = workspace_id.to_string();
-    rebound.key.pane_id = Some(pane_id.to_string());
-    if sequence > rebound.last_seen_sequence {
-        rebound.last_seen_sequence = sequence;
-    }
+
+    let old_record = state.mappings.get(&old_key).cloned();
     state.mappings.remove(&old_key);
-    upsert_record(&mut state.mappings, rebound);
+    if !upsert_record(&mut state.mappings, rebound.clone()) {
+        if let Some(old_record) = old_record {
+            state.mappings.insert(old_key, old_record);
+        }
+        return Err("destination mapping rejected during transactional rebind".to_string());
+    }
+    Ok(rebound)
 }
 
 fn touch_record_sequence(state: &mut BridgeState, key: &HerdrMappingKey, sequence: u64) {
@@ -736,9 +1239,12 @@ mod tests {
         let session = "alpha";
         let root = root_record(session, "w1");
         let restored = subthread_record(session, "w1", "p-old", "agent-1");
+        let mut expected = restored.clone();
+        expected.key.pane_id = Some("p-new".into());
+        expected.zed_root_thread_id = root.zed_root_thread_id;
         let mut mappings = SessionMappings::new();
         upsert_record(&mut mappings, root.clone());
-        upsert_record(&mut mappings, restored.clone());
+        upsert_record(&mut mappings, restored);
 
         let workspace = HerdrWorkspaceSnapshot {
             workspace_id: "w1".into(),
@@ -754,7 +1260,7 @@ mod tests {
             reconcile_snapshot(session, &[workspace], &mappings),
             vec![
                 ReconciliationAction::RestoreWorkspaceRoot(root),
-                ReconciliationAction::RestoreAgentSubthread(restored),
+                ReconciliationAction::RestoreAgentSubthread(expected),
             ]
         );
     }
@@ -1085,7 +1591,9 @@ mod tests {
         let session = "alpha";
         let mut state = BridgeState::new(session);
         let restored = subthread_record(session, "w1", "p-old", "agent-1");
-        let expected = restored.clone();
+        let mut expected = restored.clone();
+        expected.key.pane_id = Some("p-new".into());
+        expected.last_seen_sequence = 40;
         upsert_record(&mut state.mappings, restored);
 
         let applied = apply_event(
@@ -1125,6 +1633,8 @@ mod tests {
         let session = "alpha";
         let old = subthread_record(session, "w-old", "p-old", "agent-1");
         let old_key = old.key.clone();
+        let new_root = root_record(session, "w-new");
+        let new_root_id = new_root.zed_root_thread_id;
         let new_key = HerdrMappingKey::subthread(
             session,
             "w-new",
@@ -1132,6 +1642,7 @@ mod tests {
             HerdrAgentSessionIdentity::id("agent-1"),
         );
         let mut state = BridgeState::new(session);
+        upsert_record(&mut state.mappings, new_root);
         upsert_record(&mut state.mappings, old);
 
         let applied = apply_event(
@@ -1145,8 +1656,9 @@ mod tests {
             },
         );
         assert!(matches!(
-            applied.actions[..],
-            [ReconciliationAction::RestoreAgentSubthread(_)]
+            &applied.actions[..],
+            [ReconciliationAction::RestoreAgentSubthread(record)]
+                if record.key == new_key && record.zed_root_thread_id == new_root_id
         ));
         assert!(!state.mappings.contains_key(&old_key.to_key_string()));
         assert!(state.mappings.contains_key(&new_key.to_key_string()));
@@ -1233,6 +1745,331 @@ mod tests {
             .get(&subthread_key.to_key_string())
             .expect("descendant tombstone retained")
             .is_tombstone());
+    }
+    
+    #[test]
+    fn snapshot_rebind_returns_current_identity_and_root_association() {
+        let session = "alpha";
+        let old_root = root_record(session, "w-old");
+        let old = subthread_record(session, "w-old", "p-old", "agent-1");
+        let current_root = root_record(session, "w-new");
+        let current_root_id = current_root.zed_root_thread_id;
+        let mut mappings = SessionMappings::new();
+        upsert_record(&mut mappings, old_root);
+        upsert_record(&mut mappings, old);
+        upsert_record(&mut mappings, current_root);
+
+        let workspace = HerdrWorkspaceSnapshot {
+            workspace_id: "w-new".into(),
+            agents: vec![HerdrAgentSnapshot {
+                pane_id: "p-new".into(),
+                workspace_id: "w-new".into(),
+                session_identity: Some(HerdrAgentSessionIdentity::id("agent-1")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let actions = reconcile_snapshot(session, &[workspace], &mappings);
+        assert!(matches!(
+            &actions[..],
+            [
+                ReconciliationAction::RestoreWorkspaceRoot(_),
+                ReconciliationAction::RestoreAgentSubthread(record)
+            ] if record.key == HerdrMappingKey::subthread(
+                session,
+                "w-new",
+                "p-new",
+                HerdrAgentSessionIdentity::id("agent-1"),
+            ) && record.zed_root_thread_id == current_root_id
+        ), "expected current rebind action, got {actions:?}");
+    }
+
+    #[test]
+    fn snapshot_changed_identity_on_same_pane_is_a_conflict() {
+        let session = "alpha";
+        let root = root_record(session, "w1");
+        let existing = subthread_record(session, "w1", "p1", "agent-old");
+        let old_key = existing.key.clone();
+        let mut mappings = SessionMappings::new();
+        upsert_record(&mut mappings, root);
+        upsert_record(&mut mappings, existing);
+        let workspace = HerdrWorkspaceSnapshot {
+            workspace_id: "w1".into(),
+            agents: vec![HerdrAgentSnapshot {
+                pane_id: "p1".into(),
+                workspace_id: "w1".into(),
+                session_identity: Some(HerdrAgentSessionIdentity::id("agent-new")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let actions = reconcile_snapshot(session, &[workspace], &mappings);
+        assert!(matches!(
+            &actions[..],
+            [
+                ReconciliationAction::RestoreWorkspaceRoot(_),
+                ReconciliationAction::RecordConflict(key, _)
+            ] if key == &HerdrMappingKey::subthread(
+                session,
+                "w1",
+                "p1",
+                HerdrAgentSessionIdentity::id("agent-new"),
+            )
+        ));
+        assert!(mappings.contains_key(&old_key.to_key_string()));
+    }
+
+    #[test]
+    fn snapshot_skips_agents_below_tombstoned_workspace() {
+        let session = "alpha";
+        let root = root_record(session, "w1");
+        let mut mappings = SessionMappings::new();
+        upsert_record(&mut mappings, root);
+        tombstone_record(&mut mappings, &HerdrMappingKey::workspace(session, "w1"), 4);
+        let workspace = HerdrWorkspaceSnapshot {
+            workspace_id: "w1".into(),
+            agents: vec![HerdrAgentSnapshot {
+                pane_id: "p1".into(),
+                workspace_id: "w1".into(),
+                session_identity: Some(HerdrAgentSessionIdentity::id("agent-1")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let actions = reconcile_snapshot(session, &[workspace], &mappings);
+        assert!(matches!(
+            &actions[..],
+            [ReconciliationAction::RecordConflict(key, _)]
+                if key == &HerdrMappingKey::workspace(session, "w1")
+        ));
+    }
+
+    #[test]
+    fn snapshot_tombstoned_agent_fallback_is_a_conflict() {
+        let session = "alpha";
+        let root = root_record(session, "w1");
+        let old = subthread_record(session, "w1", "p-old", "agent-1");
+        let mut mappings = SessionMappings::new();
+        upsert_record(&mut mappings, root);
+        upsert_record(&mut mappings, old);
+        tombstone_record(
+            &mut mappings,
+            &HerdrMappingKey::subthread(
+                session,
+                "w1",
+                "p-old",
+                HerdrAgentSessionIdentity::id("agent-1"),
+            ),
+            5,
+        );
+        let workspace = HerdrWorkspaceSnapshot {
+            workspace_id: "w1".into(),
+            agents: vec![HerdrAgentSnapshot {
+                pane_id: "p-new".into(),
+                workspace_id: "w1".into(),
+                session_identity: Some(HerdrAgentSessionIdentity::id("agent-1")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let actions = reconcile_snapshot(session, &[workspace], &mappings);
+        assert!(matches!(
+            &actions[..],
+            [
+                ReconciliationAction::RestoreWorkspaceRoot(_),
+                ReconciliationAction::RecordConflict(_, _)
+            ]
+        ));
+    }
+
+    #[test]
+    fn pane_moved_rebinds_destination_before_later_events() {
+        let session = "alpha";
+        let root_old = root_record(session, "w-old");
+        let root_new = root_record(session, "w-new");
+        let old = subthread_record(session, "w-old", "p-old", "agent-1");
+        let old_key = old.key.clone();
+        let new_key = HerdrMappingKey::subthread(
+            session,
+            "w-new",
+            "p-new",
+            HerdrAgentSessionIdentity::id("agent-1"),
+        );
+        let mut state = BridgeState::new(session);
+        upsert_record(&mut state.mappings, root_old);
+        upsert_record(&mut state.mappings, root_new);
+        upsert_record(&mut state.mappings, old);
+        let pane = HerdrPaneSnapshot {
+            pane_id: "p-new".into(),
+            workspace_id: "w-new".into(),
+            session_identity: Some(HerdrAgentSessionIdentity::id("agent-1")),
+            ..Default::default()
+        };
+        let applied = apply_event(
+            &mut state,
+            &HerdrEvent::PaneMoved {
+                pane,
+                previous_pane_id: Some("p-old".into()),
+                previous_workspace_id: Some("w-old".into()),
+                previous_tab_id: None,
+                sequence: 8,
+            },
+        );
+        assert!(matches!(
+            &applied.actions[..],
+            [ReconciliationAction::RestoreAgentSubthread(record)]
+                if record.key == new_key
+        ));
+        assert!(!state.mappings.contains_key(&old_key.to_key_string()));
+        assert!(state.mappings.contains_key(&new_key.to_key_string()));
+        let applied = apply_event(
+            &mut state,
+            &HerdrEvent::PaneAgentStatusChanged {
+                pane_id: "p-new".into(),
+                status: HerdrAgentStatus::Working,
+                sequence: 9,
+            },
+        );
+        assert!(matches!(
+            &applied.actions[..],
+            [ReconciliationAction::UpdateStatus(key, _)] if key == &new_key
+        ));
+    }
+
+    #[test]
+    fn changed_identity_on_live_pane_conflicts_without_duplicate() {
+        let session = "alpha";
+        let existing = subthread_record(session, "w1", "p1", "agent-old");
+        let existing_key = existing.key.clone();
+        let mut state = BridgeState::new(session);
+        upsert_record(&mut state.mappings, existing);
+        let applied = apply_event(
+            &mut state,
+            &HerdrEvent::PaneAgentDetected {
+                pane_id: "p1".into(),
+                workspace_id: "w1".into(),
+                agent_type: None,
+                session_identity: Some(HerdrAgentSessionIdentity::id("agent-new")),
+                sequence: 10,
+            },
+        );
+        assert!(matches!(
+            &applied.actions[..],
+            [ReconciliationAction::RecordConflict(key, _)]
+                if key == &HerdrMappingKey::subthread(
+                    session,
+                    "w1",
+                    "p1",
+                    HerdrAgentSessionIdentity::id("agent-new"),
+                )
+        ));
+        assert_eq!(
+            state
+                .mappings
+                .values()
+                .filter(|record| !record.is_tombstone())
+                .count(),
+            1
+        );
+        assert!(state.mappings.contains_key(&existing_key.to_key_string()));
+    }
+
+    #[test]
+    fn delayed_reflection_of_superseded_focus_is_suppressed() {
+        let session = "alpha";
+        let mut state = BridgeState::new(session);
+        upsert_record(&mut state.mappings, root_record(session, "w1"));
+        upsert_record(&mut state.mappings, root_record(session, "w2"));
+        let first = initiate_workspace_focus(&mut state, "w1");
+        let first_id = match first {
+            OutboundRequest::FocusWorkspace { operation_id, .. } => operation_id,
+            _ => unreachable!(),
+        };
+        let second = initiate_workspace_focus(&mut state, "w2");
+        let second_id = match second {
+            OutboundRequest::FocusWorkspace { operation_id, .. } => operation_id,
+            _ => unreachable!(),
+        };
+        let applied = apply_event(&mut state, &focused_event("w1", &first_id, 1));
+        assert!(applied.actions.is_empty());
+        assert!(applied.outbound.is_empty());
+        assert_eq!(
+            state.pending_focus.as_ref().map(|pending| pending.operation_id.as_str()),
+            Some(second_id.as_str())
+        );
+    }
+
+    #[test]
+    fn persisted_mapping_sequence_rejects_older_event_after_restart() {
+        let session = "alpha";
+        let mut record = root_record(session, "w1");
+        record.last_seen_sequence = 10;
+        let key = record.key.clone();
+        let mut state = BridgeState::new(session);
+        upsert_record(&mut state.mappings, record);
+        let applied = apply_event(&mut state, &focused_event("w1", "old", 9));
+        assert!(applied.actions.is_empty());
+        assert_eq!(state.last_sequence, 0);
+        assert_eq!(
+            state.mappings[&key.to_key_string()].last_seen_sequence,
+            10
+        );
+    }
+
+    #[test]
+    fn zero_sequence_close_marks_resource_stale_without_tombstoning() {
+        let session = "alpha";
+        let record = root_record(session, "w1");
+        let key = record.key.clone();
+        let mut state = BridgeState::new(session);
+        upsert_record(&mut state.mappings, record);
+        let applied = apply_event(
+            &mut state,
+            &HerdrEvent::WorkspaceClosed {
+                workspace_id: "w1".into(),
+                sequence: 0,
+            },
+        );
+        assert!(matches!(
+            &applied.actions[..],
+            [ReconciliationAction::RecordConflict(conflict_key, message)]
+                if conflict_key == &key && message.contains("sequence")
+        ));
+        assert!(!state.mappings[&key.to_key_string()].is_tombstone());
+        assert_eq!(state.last_sequence, 0);
+    }
+
+    #[test]
+    fn rebind_without_current_root_conflicts_and_preserves_old_mapping() {
+        let session = "alpha";
+        let old = subthread_record(session, "w-old", "p-old", "agent-1");
+        let old_key = old.key.clone();
+        let mut mappings = SessionMappings::new();
+        upsert_record(&mut mappings, old);
+        let workspace = HerdrWorkspaceSnapshot {
+            workspace_id: "w-new".into(),
+            agents: vec![HerdrAgentSnapshot {
+                pane_id: "p-new".into(),
+                workspace_id: "w-new".into(),
+                session_identity: Some(HerdrAgentSessionIdentity::id("agent-1")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let actions = reconcile_snapshot(session, &[workspace], &mappings);
+        assert!(matches!(
+            &actions[..],
+            [
+                ReconciliationAction::CreateWorkspaceRoot(_),
+                ReconciliationAction::RecordConflict(key, _)
+            ] if key == &HerdrMappingKey::subthread(
+                session,
+                "w-new",
+                "p-new",
+                HerdrAgentSessionIdentity::id("agent-1"),
+            )
+        ));
+        assert!(mappings.contains_key(&old_key.to_key_string()));
     }
 
 }

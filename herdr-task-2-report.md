@@ -76,3 +76,41 @@ The focused tests defend session-qualified uniqueness, serialized-map replacemen
 Task 1's existing `HerdrApi::focus_workspace` and `focus_pane` implementations accept `operation_id` but currently omit it from their RPC payloads. Task 2 maintains the complete pure operation-ID/origin fence; Task 3 must ensure focus RPC propagation preserves the operation ID so Herdr can reflect it for end-to-end loop suppression.
 
 Unrelated untracked `.scratch`, `.superpowers`, and workspace recovery-plan files were left untouched.
+
+## Task 2 review repair evidence
+
+The review repairs are implemented in the persisted mapping and pure-state
+slice without changing Herdr transport/client behavior:
+
+- Restoration actions now carry the current workspace/pane key and current
+  root thread association; event rebinding replaces the old key transactionally
+  and leaves it intact when a destination/root tombstone, missing root, or
+  collision conflicts.
+- `PaneMoved` applies destination identity before later pane events.
+- A changed agent identity on a live pane conflicts instead of creating a
+  duplicate; tombstoned exact/fallback identities and tombstoned roots block
+  resurrection and child reconciliation.
+- Every issued Zed focus operation ID remains fenced until reflection, so a
+  delayed superseded focus cannot activate its old target.
+- Persisted per-record sequence fences reject post-restart stale events;
+  zero/missing lifecycle sequences return a refresh conflict without mutating
+  mappings.
+- Present blank payloads, noncanonical/duplicate indexes, and invalid
+  root/subthread key shapes are rejected before any replacement write.
+- Regression coverage includes current/stale rebind action and state,
+  `PaneMoved`, changed identity, tombstoned fallback/root suppression,
+  superseded focus reflection, persisted and zero sequence handling, strict
+  payload/index validation, and shape validation.
+
+### Final focused suite output
+
+```text
+$ cargo test -p agent_ui herdr_mapping_store::tests
+cargo test: 12 passed (1 suite, 494 filtered, 17 warnings, 0.01s)
+
+$ cargo test -p agent_ui herdr_state::tests
+cargo test: 35 passed (1 suite, 471 filtered, 17 warnings, 0.00s)
+```
+
+The focused commands above were run after the final source changes. No
+formatter, linter, or project-wide suite was run.

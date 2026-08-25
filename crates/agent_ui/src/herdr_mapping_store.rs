@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 
 use anyhow::Context as _;
 use db::kvp::KeyValueStore;
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, MapAccess, Visitor},
+    Deserialize, Serialize,
+};
 
 use crate::herdr_client::HerdrAgentSessionIdentity;
 use crate::thread_metadata_store::ThreadId;
@@ -143,31 +146,114 @@ impl HerdrMappingRecord {
 /// All mapping records of one Herdr session, keyed by the canonical key string.
 pub(crate) type SessionMappings = BTreeMap<String, HerdrMappingRecord>;
 
+#[derive(Clone, Debug)]
+struct StrictRecords(BTreeMap<String, HerdrMappingRecord>);
+
+impl Serialize for StrictRecords {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StrictRecords {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RecordsVisitor;
+
+        impl<'de> Visitor<'de> for RecordsVisitor {
+            type Value = StrictRecords;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a map of canonical Herdr mapping keys to records")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut records = BTreeMap::new();
+                while let Some(stored_key) = access.next_key::<String>()? {
+                    let record = access.next_value::<HerdrMappingRecord>()?;
+                    if records.insert(stored_key.clone(), record).is_some() {
+                        return Err(de::Error::custom(format!(
+                            "duplicate Herdr mapping index key {stored_key:?}"
+                        )));
+                    }
+                }
+                Ok(StrictRecords(records))
+            }
+        }
+
+        deserializer.deserialize_map(RecordsVisitor)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SerializedSessionMap {
     version: u32,
-    records: BTreeMap<String, HerdrMappingRecord>,
+    records: StrictRecords,
 }
 
+
+fn validate_key_shape(key: &HerdrMappingKey) -> anyhow::Result<()> {
+    match (&key.pane_id, &key.agent_session) {
+        (None, None) | (Some(_), Some(_)) => Ok(()),
+        (None, Some(_)) => anyhow::bail!(
+            "Herdr mapping key for workspace {:?} has an agent identity without a pane",
+            key.workspace_id
+        ),
+        (Some(_), None) => anyhow::bail!(
+            "Herdr mapping key for workspace {:?} has a pane without an agent identity",
+            key.workspace_id
+        ),
+    }
+}
+
+fn validate_record_index(stored_key: &str, record: &HerdrMappingRecord) -> anyhow::Result<()> {
+    validate_key_shape(&record.key)?;
+    let canonical = record.key.to_key_string();
+    if stored_key != canonical {
+        anyhow::bail!(
+            "Herdr mapping record is stored under noncanonical key {:?}; expected {:?}",
+            stored_key,
+            canonical
+        );
+    }
+    Ok(())
+}
+
+fn validate_records_index(mappings: &SessionMappings) -> anyhow::Result<()> {
+    for (stored_key, record) in mappings {
+        validate_record_index(stored_key, record)?;
+    }
+    Ok(())
+}
 
 /// Encodes one session's map into the value stored under
 /// `(HERDR_MAPPING_NAMESPACE, session)` in `scoped_kv_store`.
 pub(crate) fn encode_session_map(mappings: &SessionMappings) -> anyhow::Result<String> {
+    validate_records_index(mappings)?;
     let envelope = SerializedSessionMap {
         version: SESSION_MAP_FORMAT_VERSION,
-        records: mappings.clone(),
+        records: StrictRecords(mappings.clone()),
     };
     serde_json::to_string(&envelope).context("Failed to serialize Herdr session mappings")
 }
 
 /// Decodes a stored session map. A missing value decodes to an empty map;
-/// an unknown format version is rejected instead of being silently ignored.
+/// an unknown format version or corrupt record index is rejected instead of
+/// being silently ignored.
 pub(crate) fn decode_session_map(stored: Option<&str>) -> anyhow::Result<SessionMappings> {
     let Some(stored) = stored else {
         return Ok(BTreeMap::new());
     };
     if stored.trim().is_empty() {
-        return Ok(BTreeMap::new());
+        anyhow::bail!("Present Herdr session mapping payload is blank");
     }
     let envelope: SerializedSessionMap =
         serde_json::from_str(stored).context("Malformed Herdr session mapping payload")?;
@@ -178,30 +264,31 @@ pub(crate) fn decode_session_map(stored: Option<&str>) -> anyhow::Result<Session
             SESSION_MAP_FORMAT_VERSION
         );
     }
-    // Re-key by each record's own canonical key so a corrupted index entry
-    // cannot orphan or shadow a record.
+
     let mut records = BTreeMap::new();
-    for (stored_key, record) in envelope.records {
+    for (stored_key, record) in envelope.records.0 {
+        validate_record_index(&stored_key, &record)?;
         let canonical = record.key.to_key_string();
-        if stored_key != canonical {
-            log::warn!(
-                "Herdr mapping store: reindexing record stored under stale key {:?}",
-                stored_key
-            );
+        if records.insert(canonical.clone(), record).is_some() {
+            anyhow::bail!("Duplicate Herdr mapping record for canonical key {canonical:?}");
         }
-        records.insert(canonical, record);
     }
     Ok(records)
 }
 
 /// Inserts or replaces a record. An active record never implicitly overwrites
 /// a closed tombstone (that would resurrect a closed resource); callers that
-/// genuinely re-open it go through [`restore_tombstone`]. Returns whether the
-/// map changed.
+/// genuinely re-open it go through an explicit restoration. Records with an
+/// older sequence are also rejected so persistence cannot move a fence
+/// backwards. Returns whether the map changed.
 pub(crate) fn upsert_record(mappings: &mut SessionMappings, record: HerdrMappingRecord) -> bool {
+    if validate_key_shape(&record.key).is_err() {
+        return false;
+    }
     let key_string = record.key.to_key_string();
     match mappings.get(&key_string) {
         Some(existing) if existing.is_tombstone() && !record.lifecycle.is_closed() => false,
+        Some(existing) if record.last_seen_sequence < existing.last_seen_sequence => false,
         Some(existing) if existing == &record => false,
         _ => {
             mappings.insert(key_string, record);
@@ -211,23 +298,26 @@ pub(crate) fn upsert_record(mappings: &mut SessionMappings, record: HerdrMapping
 }
 
 /// Marks a record closed while keeping it in the map as a tombstone. Returns
-/// the tombstoned record, or `None` when no live record exists for the key.
+/// the tombstoned record, or `None` when no live record exists for the key or
+/// the sequence is missing/stale.
 pub(crate) fn tombstone_record(
     mappings: &mut SessionMappings,
     key: &HerdrMappingKey,
     sequence: u64,
 ) -> Option<HerdrMappingRecord> {
+    if sequence == 0 {
+        return None;
+    }
     let key_string = key.to_key_string();
     let record = mappings.get_mut(&key_string)?;
-    if record.is_tombstone() {
+    if record.is_tombstone() || sequence <= record.last_seen_sequence {
         return None;
     }
     record.lifecycle = HerdrLifecycleState::Closed;
-    if sequence > record.last_seen_sequence {
-        record.last_seen_sequence = sequence;
-    }
+    record.last_seen_sequence = sequence;
     Some(record.clone())
 }
+
 
 
 /// Live (non-tombstoned) records in insertion-stable canonical order.
@@ -274,6 +364,7 @@ impl HerdrMappingStore {
 }
 
 fn validate_session_records(session: &str, mappings: &SessionMappings) -> anyhow::Result<()> {
+    validate_records_index(mappings)?;
     for record in mappings.values() {
         if record.key.session != session {
             anyhow::bail!(
@@ -356,7 +447,7 @@ mod tests {
     #[test]
     fn missing_session_decodes_to_empty_map_and_bad_payload_is_rejected() {
         assert!(decode_session_map(None).unwrap().is_empty());
-        assert!(decode_session_map(Some("")).unwrap().is_empty());
+        assert!(decode_session_map(Some("")).is_err());
         assert!(decode_session_map(Some("not json")).is_err());
         let wrong_version = r#"{"version":9999,"records":{}}"#;
         assert!(decode_session_map(Some(wrong_version)).is_err());
@@ -433,5 +524,97 @@ mod tests {
         let mut mappings = SessionMappings::new();
         upsert_record(&mut mappings, root_mapping("beta", "w1"));
         assert!(validate_session_records("alpha", &mappings).is_err());
+    }
+    
+    #[test]
+    fn present_blank_session_payload_is_rejected() {
+        assert!(decode_session_map(Some(" \n\t")).is_err());
+    }
+
+    #[test]
+    fn noncanonical_duplicate_and_invalid_shape_records_are_rejected() {
+        let record = root_mapping("alpha", "w1");
+        let canonical = record.key.to_key_string();
+        let noncanonical = serde_json::json!({
+            "version": 1,
+            "records": {
+                "wrong-key": record,
+            }
+        });
+        assert!(decode_session_map(Some(&noncanonical.to_string())).is_err());
+
+        let duplicate = serde_json::json!({
+            "version": 1,
+            "records": {
+                canonical.clone(): record.clone(),
+                "another-key": record,
+            }
+        });
+        assert!(decode_session_map(Some(&duplicate.to_string())).is_err());
+
+        let invalid = HerdrMappingRecord {
+            key: HerdrMappingKey {
+                session: "alpha".into(),
+                workspace_id: "w1".into(),
+                pane_id: Some("p1".into()),
+                agent_session: None,
+            },
+            ..root_mapping("alpha", "w1")
+        };
+        let invalid_map = serde_json::json!({
+            "version": 1,
+            "records": {
+                invalid.key.to_key_string(): invalid,
+            }
+        });
+        assert!(decode_session_map(Some(&invalid_map.to_string())).is_err());
+        
+        let invalid_root = HerdrMappingRecord {
+            key: HerdrMappingKey {
+                session: "alpha".into(),
+                workspace_id: "w1".into(),
+                pane_id: None,
+                agent_session: Some(HerdrAgentSessionIdentity::id("agent-1")),
+            },
+            ..root_mapping("alpha", "w1")
+        };
+        let invalid_root_map = serde_json::json!({
+            "version": 1,
+            "records": {
+                invalid_root.key.to_key_string(): invalid_root,
+            }
+        });
+        assert!(decode_session_map(Some(&invalid_root_map.to_string())).is_err());
+
+        let duplicate_record = root_mapping("alpha", "w1");
+        let duplicate_key = serde_json::to_string(&duplicate_record.key.to_key_string()).unwrap();
+        let duplicate_value = serde_json::to_string(&duplicate_record).unwrap();
+        let duplicate_raw = format!(
+            r#"{{"version":1,"records":{{{duplicate_key}:{duplicate_value},{duplicate_key}:{duplicate_value}}}}}"#
+        );
+        assert!(decode_session_map(Some(&duplicate_raw)).is_err());
+    }
+
+    #[test]
+    fn upsert_rejects_a_older_sequence_without_losing_tombstone() {
+        let mut mappings = SessionMappings::new();
+        let mut current = root_mapping("alpha", "w1");
+        current.last_seen_sequence = 7;
+        assert!(upsert_record(&mut mappings, current.clone()));
+        let mut older = current.clone();
+        older.last_seen_sequence = 6;
+        older.lifecycle = HerdrLifecycleState::Archived;
+        assert!(!upsert_record(&mut mappings, older));
+        assert_eq!(
+            mappings[&current.key.to_key_string()].last_seen_sequence,
+            7
+        );
+        assert!(!mappings[&current.key.to_key_string()].is_tombstone());
+        assert!(tombstone_record(&mut mappings, &current.key, 8).is_some());
+        let mut resurrection = current;
+        resurrection.last_seen_sequence = 9;
+        assert!(!upsert_record(&mut mappings, resurrection));
+        assert!(mappings[&HerdrMappingKey::workspace("alpha", "w1").to_key_string()]
+            .is_tombstone());
     }
 }
