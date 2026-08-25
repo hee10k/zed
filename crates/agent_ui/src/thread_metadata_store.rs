@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use agent::{ThreadStore, ZED_AGENT_ID};
@@ -29,6 +29,10 @@ use util::ResultExt as _;
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
 
 use crate::DEFAULT_THREAD_TITLE;
+/// Reserved metadata identity for roots mirrored from Herdr. Herdr roots
+/// intentionally have no ACP session ID, but they are durable roots rather
+/// than disposable ACP drafts.
+pub static HERDR_AGENT_ID: LazyLock<AgentId> = LazyLock::new(|| AgentId::new("Herdr"));
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ThreadId(uuid::Uuid);
@@ -331,9 +335,10 @@ pub struct ThreadMetadata {
 
 impl ThreadMetadata {
     /// A thread is a draft until its first message is sent, at which point
-    /// it gets an ACP `session_id`.
+    /// it gets an ACP `session_id`. Herdr roots are durable metadata rows
+    /// without ACP sessions and therefore are not drafts.
     pub fn is_draft(&self) -> bool {
-        self.session_id.is_none()
+        self.session_id.is_none() && self.agent_id != HERDR_AGENT_ID.clone()
     }
 
     pub fn display_title(&self) -> SharedString {
@@ -4290,5 +4295,42 @@ mod tests {
                 "retained thread A's stored path must not be updated while the project is via collab"
             );
         });
+    }
+    #[test]
+    fn herdr_root_without_session_is_not_a_draft() {
+        let metadata = ThreadMetadata {
+            thread_id: ThreadId::new(),
+            session_id: None,
+            agent_id: HERDR_AGENT_ID.clone(),
+            title: Some("Review".into()),
+            title_override: None,
+            updated_at: Utc::now(),
+            created_at: Some(Utc::now()),
+            interacted_at: None,
+            worktree_paths: WorktreePaths::default(),
+            remote_connection: None,
+            archived: false,
+            user_order: None,
+        };
+        assert!(!metadata.is_draft());
+    }
+
+    #[test]
+    fn acp_metadata_without_session_remains_a_draft() {
+        let metadata = ThreadMetadata {
+            thread_id: ThreadId::new(),
+            session_id: None,
+            agent_id: ZED_AGENT_ID.clone(),
+            title: None,
+            title_override: None,
+            updated_at: Utc::now(),
+            created_at: Some(Utc::now()),
+            interacted_at: None,
+            worktree_paths: WorktreePaths::default(),
+            remote_connection: None,
+            archived: false,
+            user_order: None,
+        };
+        assert!(metadata.is_draft());
     }
 }

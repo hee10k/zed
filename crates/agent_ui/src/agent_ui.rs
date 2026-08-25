@@ -10,6 +10,7 @@ mod config_options;
 mod context;
 mod context_server_configuration;
 pub(crate) mod herdr_client;
+pub(crate) mod herdr_bridge;
 pub(crate) mod herdr_transport;
 pub(crate) mod herdr_mapping_store;
 pub(crate) mod herdr_state;
@@ -621,6 +622,7 @@ pub fn init(
     agent_panel::init(cx);
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
+    herdr_bridge::HerdrBridgeRegistry::init(cx);
     terminal_thread_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);

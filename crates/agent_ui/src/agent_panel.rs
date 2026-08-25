@@ -43,6 +43,9 @@ use crate::terminal_thread_metadata_store::{
     compose_terminal_thread_title, terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::herdr_bridge::{
+    HerdrBridgeEvent, HerdrBridgeRegistry, HerdrThreadBridge,
+};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
@@ -77,7 +80,7 @@ use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncApp,
     AsyncWindowContext, ClipboardItem, Entity, EventEmitter, ExternalPaths, FocusHandle,
     Focusable, KeyContext, Pixels, PlatformDisplay, Subscription, Task, TaskExt,
-    WeakEntity, WindowHandle, prelude::*, pulsating_between,
+    WeakEntity, WindowHandle, WindowId, prelude::*, pulsating_between,
 };
 use language::LanguageRegistry;
 use language_model::{
@@ -1179,6 +1182,15 @@ pub struct AgentPanel {
     context_server_registry: Entity<ContextServerRegistry>,
     focus_handle: FocusHandle,
     base_view: BaseView,
+    /// A Herdr root has no ACP ConversationView until the Herdr-backed
+    /// surface is introduced. Keep its durable thread identity separate from
+    /// the ACP base view so native behavior remains unchanged.
+    herdr_active_thread: Option<ThreadId>,
+    /// A bridge-originated focus event should activate locally without
+    /// reflecting a second focus request back to Herdr.
+    herdr_focus_suppressed: bool,
+    herdr_bridge: Option<Entity<HerdrThreadBridge>>,
+    _herdr_bridge_subscription: Option<Subscription>,
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
@@ -1516,7 +1528,7 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -1529,6 +1541,27 @@ impl AgentPanel {
             cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
 
         let thread_store = ThreadStore::global(cx);
+        let herdr_window_id = window.window_handle().window_id();
+        let herdr_bridge = if cx.try_global::<HerdrBridgeRegistry>().is_some() {
+            Some(cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                registry.for_window(
+                    herdr_window_id,
+                    Default::default(),
+                    cx,
+                )
+            }))
+        } else {
+            None
+        };
+        let herdr_bridge_subscription = herdr_bridge.as_ref().map(|bridge| {
+            cx.subscribe_in(
+                bridge,
+                window,
+                |this, _bridge, event, window, cx| {
+                    this.handle_herdr_event(event, window, cx);
+                },
+            )
+        });
 
         let base_view = BaseView::Uninitialized;
 
@@ -1593,9 +1626,24 @@ impl AgentPanel {
         })
         .detach();
 
+        if herdr_bridge.is_some() {
+            cx.on_release(move |_this, cx| {
+                if cx.try_global::<HerdrBridgeRegistry>().is_some() {
+                    cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                        registry.release_panel(herdr_window_id, cx);
+                    });
+                }
+            })
+            .detach();
+        }
+
         let panel = Self {
             workspace_id,
             base_view,
+            herdr_active_thread: None,
+            herdr_focus_suppressed: false,
+            herdr_bridge,
+            _herdr_bridge_subscription: herdr_bridge_subscription,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
             workspace,
             user_store,
@@ -1778,6 +1826,7 @@ impl AgentPanel {
 
     /// Clear the active view, retaining any running thread in the background.
     pub fn clear_base_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.herdr_active_thread = None;
         let old_view = std::mem::replace(&mut self.base_view, BaseView::Uninitialized);
         self.retain_running_thread(old_view, cx);
         self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
@@ -3450,12 +3499,12 @@ impl AgentPanel {
     }
 
     pub fn active_thread_id(&self, cx: &App) -> Option<ThreadId> {
-        match &self.base_view {
+        self.herdr_active_thread.or_else(|| match &self.base_view {
             BaseView::AgentThread { conversation_view } => {
                 Some(conversation_view.read(cx).thread_id)
             }
             _ => None,
-        }
+        })
     }
 
     /// Drops a thread — retained or the active ephemeral draft — from
@@ -3481,6 +3530,18 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(bridge) = self.herdr_bridge.clone()
+            && let Some(workspace_id) = bridge
+                .read(cx)
+                .root_mapping_for_thread(id)
+                .map(|record| record.key.workspace_id.clone())
+        {
+            let task = bridge.update(cx, |bridge, cx| {
+                bridge.request_close_workspace(&workspace_id, cx)
+            });
+            task.detach_and_log_err(cx);
+            return;
+        }
         self.retained_threads.remove(&id);
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.delete(id, cx);
@@ -4414,6 +4475,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.herdr_active_thread = None;
         let old_view = std::mem::replace(&mut self.base_view, new_view);
         self.retain_running_thread(old_view, cx);
 
@@ -4564,6 +4626,72 @@ impl AgentPanel {
         );
     }
 
+    fn handle_herdr_event(
+        &mut self,
+        event: &HerdrBridgeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            HerdrBridgeEvent::RootFocused { thread_id, .. } => {
+                self.herdr_focus_suppressed = true;
+                self.load_herdr_thread(*thread_id, true, window, cx);
+                self.herdr_focus_suppressed = false;
+            }
+            HerdrBridgeEvent::RootClosed { thread_id, .. } => {
+                if self.herdr_active_thread == Some(*thread_id) {
+                    self.herdr_active_thread = None;
+                    cx.emit(AgentPanelEvent::ActiveViewChanged);
+                    cx.notify();
+                }
+            }
+            HerdrBridgeEvent::StatusChanged(_) => cx.notify(),
+            _ => {}
+        }
+    }
+
+    /// Activate a durable Herdr root without constructing an ACP session.
+    pub fn load_herdr_thread(
+        &mut self,
+        thread_id: ThreadId,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bridge) = self.herdr_bridge.clone() else {
+            return;
+        };
+        let Some(workspace_id) = bridge
+            .read(cx)
+            .root_mapping_for_thread(thread_id)
+            .map(|record| record.key.workspace_id.clone())
+        else {
+            return;
+        };
+
+        if let Some(store) = ThreadMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| store.unarchive(thread_id, cx));
+        }
+
+        let old_view = std::mem::replace(&mut self.base_view, BaseView::Uninitialized);
+        self.retain_running_thread(old_view, cx);
+        self.herdr_active_thread = Some(thread_id);
+        self.refresh_base_view_subscriptions(window, cx);
+        if focus {
+            self.activation_focus_handle(cx).focus(window, cx);
+        }
+
+        if !self.herdr_focus_suppressed {
+            if let Some(task) = bridge.update(cx, |bridge, cx| {
+                bridge.focus_root_in_context(&workspace_id, cx)
+            }) {
+                task.detach_and_log_err(cx);
+            }
+        }
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        cx.notify();
+    }
+
     pub fn load_agent_thread(
         &mut self,
         agent: Agent,
@@ -4575,6 +4703,14 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .herdr_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.read(cx).is_root_thread(thread_id))
+        {
+            self.load_herdr_thread(thread_id, focus, window, cx);
+            return;
+        }
         if let Some(store) = ThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
                 store.unarchive(thread_id, cx);
