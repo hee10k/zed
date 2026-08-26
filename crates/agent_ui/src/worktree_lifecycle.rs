@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::Arc,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -11,12 +11,28 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use workspace::WorkspaceId;
 
+#[cfg(not(any(test, feature = "test-support")))]
+use std::sync::LazyLock;
+
 const WORKTREE_STATE_DIRECTORY: &str = "worktree-state";
+
+#[cfg(not(any(test, feature = "test-support")))]
 static GLOBAL_LIFECYCLE_OPERATION_LOCK: LazyLock<Arc<Mutex<()>>> =
     LazyLock::new(|| Arc::new(Mutex::new(())));
 
+#[cfg(not(any(test, feature = "test-support")))]
 fn global_lifecycle_operation_lock() -> Arc<Mutex<()>> {
     GLOBAL_LIFECYCLE_OPERATION_LOCK.clone()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_LIFECYCLE_OPERATION_LOCK: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn global_lifecycle_operation_lock() -> Arc<Mutex<()>> {
+    TEST_LIFECYCLE_OPERATION_LOCK.with(Arc::clone)
 }
 const LIFECYCLE_FILE_NAME: &str = "state.json";
 
@@ -639,6 +655,10 @@ mod tests {
     use gpui::TestAppContext;
     use tempfile::TempDir;
 
+    fn allow_real_filesystem_io(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+    }
+
     fn key(repository: &Path, worktree: &Path) -> WorktreeLifecycleKey {
         WorktreeLifecycleKey::new(repository, worktree, "local")
     }
@@ -675,6 +695,7 @@ mod tests {
 
     #[gpui::test]
     async fn lifecycle_store_recovers_missing_file(cx: &mut TestAppContext) {
+        allow_real_filesystem_io(cx);
         let temp = TempDir::new().expect("create temporary lifecycle root");
         let fs = Arc::new(RealFs::new(None, cx.executor()));
         let store = WorktreeLifecycleStore::with_root(fs, temp.path());
@@ -687,6 +708,7 @@ mod tests {
 
     #[gpui::test]
     async fn lifecycle_store_removal_cleans_directory(cx: &mut TestAppContext) {
+        allow_real_filesystem_io(cx);
         let temp = TempDir::new().expect("create temporary lifecycle root");
         let fs = Arc::new(RealFs::new(None, cx.executor()));
         let store = WorktreeLifecycleStore::with_root(fs.clone(), temp.path());
@@ -699,6 +721,7 @@ mod tests {
 
     #[gpui::test]
     async fn lifecycle_coordinator_preserves_explicit_terminal_states(cx: &mut TestAppContext) {
+        allow_real_filesystem_io(cx);
         let temp = TempDir::new().expect("create temporary lifecycle root");
         let fs = Arc::new(RealFs::new(None, cx.executor()));
         let store = WorktreeLifecycleStore::with_root(fs.clone(), temp.path());
@@ -714,7 +737,10 @@ mod tests {
             worktree_path.clone(),
             "local",
         );
-        let key = WorktreeLifecycleKey::new(repository_path, worktree_path, "local");
+        let key = coordinator
+            .key_for(&worktree)
+            .await
+            .expect("resolve lifecycle key");
 
         let mut closing = WorktreeLifecycleRecord::new(key.clone(), workspace_id);
         closing.state = WorktreeLifecycleState::Closing;
@@ -752,6 +778,7 @@ mod tests {
     async fn lifecycle_coordinator_marks_unavailable_and_not_seen_records(
         cx: &mut TestAppContext,
     ) {
+        allow_real_filesystem_io(cx);
         let temp = TempDir::new().expect("create temporary lifecycle root");
         let fs = Arc::new(RealFs::new(None, cx.executor()));
         let store = WorktreeLifecycleStore::with_root(fs, temp.path());
@@ -790,6 +817,7 @@ mod tests {
 
     #[gpui::test]
     async fn lifecycle_coordinator_recovers_from_corrupt_file(cx: &mut TestAppContext) {
+        allow_real_filesystem_io(cx);
         let temp = TempDir::new().expect("create temporary lifecycle root");
         let fs = Arc::new(RealFs::new(None, cx.executor()));
         let store = WorktreeLifecycleStore::with_root(fs.clone(), temp.path());
@@ -837,6 +865,7 @@ mod tests {
     }
     #[gpui::test]
     async fn lifecycle_coordinator_removes_only_requested_worktree(cx: &mut TestAppContext) {
+        allow_real_filesystem_io(cx);
         let temp = TempDir::new().expect("create temporary lifecycle root");
         let fs = Arc::new(RealFs::new(None, cx.executor()));
         let store = WorktreeLifecycleStore::with_root(fs.clone(), temp.path());
@@ -862,12 +891,18 @@ mod tests {
             "local",
         );
         coordinator
-            .reconcile_workspace(workspace_id, &[first, second])
+            .reconcile_workspace(workspace_id, &[first.clone(), second.clone()])
             .await
             .expect("reconcile multi-worktree workspace");
 
-        let first_key = WorktreeLifecycleKey::new(repository_path.clone(), first_path, "local");
-        let second_key = WorktreeLifecycleKey::new(repository_path, second_path, "local");
+        let first_key = coordinator
+            .key_for(&first)
+            .await
+            .expect("resolve first lifecycle key");
+        let second_key = coordinator
+            .key_for(&second)
+            .await
+            .expect("resolve second lifecycle key");
         coordinator
             .remove_worktree(&first_key)
             .await
@@ -892,6 +927,7 @@ mod tests {
 
     #[gpui::test]
     async fn lifecycle_reconcile_persists_workspace_id_reassignment(cx: &mut TestAppContext) {
+        allow_real_filesystem_io(cx);
         let temp = TempDir::new().expect("create temporary lifecycle root");
         let fs = Arc::new(RealFs::new(None, cx.executor()));
         let store = WorktreeLifecycleStore::with_root(fs, temp.path());
@@ -926,6 +962,7 @@ mod tests {
 
     #[gpui::test]
     async fn lifecycle_store_skips_key_file_mismatch(cx: &mut TestAppContext) {
+        allow_real_filesystem_io(cx);
         let temp = TempDir::new().expect("create temporary lifecycle root");
         let fs = Arc::new(RealFs::new(None, cx.executor()));
         let store = WorktreeLifecycleStore::with_root(fs.clone(), temp.path());
@@ -961,6 +998,7 @@ mod tests {
     async fn lifecycle_reconcile_preserves_remote_state_without_local_fs(
         cx: &mut TestAppContext,
     ) {
+        allow_real_filesystem_io(cx);
         let temp = TempDir::new().expect("create temporary lifecycle root");
         let fs = Arc::new(RealFs::new(None, cx.executor()));
         let store = WorktreeLifecycleStore::with_root(fs, temp.path());

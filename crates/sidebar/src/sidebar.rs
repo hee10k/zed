@@ -9,7 +9,7 @@ use agent_ui::terminal_thread_metadata_store::{
     TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
 use agent_ui::thread_metadata_store::{
-    ActivityStatus, ThreadMetadata, ThreadMetadataStore, WorktreePaths,
+    ActivityStatus, HERDR_AGENT_ID, ThreadMetadata, ThreadMetadataStore, WorktreePaths,
     worktree_info_from_thread_paths,
 };
 use agent_ui::thread_group::{
@@ -5132,7 +5132,7 @@ impl Sidebar {
             path,
             remote_connection,
             |thread| {
-                thread.group_id != except_group_id
+                (except_group_id.is_none() || thread.group_id != except_group_id)
                     && Self::thread_blocks_worktree_archive(thread, archive_workspaces, cx)
             },
         )
@@ -6269,11 +6269,14 @@ impl Sidebar {
         };
         match self.contents.entries.get(ix) {
             Some(ListEntry::Thread(thread)) => {
-                match thread.status {
-                    AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation => {
-                        return;
+                if thread.draft.is_none() {
+                    match thread.status {
+                        AgentThreadStatus::Running
+                        | AgentThreadStatus::WaitingForConfirmation => {
+                            return;
+                        }
+                        AgentThreadStatus::Completed | AgentThreadStatus::Error => {}
                     }
-                    AgentThreadStatus::Completed | AgentThreadStatus::Error => {}
                 }
                 if thread.draft.is_some() {
                     let workspace = thread.workspace.clone();
@@ -9478,6 +9481,12 @@ mod tests {
             remote_connection: None,
             archived: false,
             user_order: None,
+            group_id: None,
+            parent_thread_id: None,
+            worktree_id: None,
+            root_thread_id: None,
+            last_activity_at: None,
+            activity_status: ActivityStatus::Idle,
         }
     }
 

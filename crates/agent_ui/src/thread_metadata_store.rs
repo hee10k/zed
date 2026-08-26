@@ -582,6 +582,7 @@ pub struct ThreadMetadataStore {
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
     threads_by_group: HashMap<ThreadGroupId, HashSet<ThreadId>>,
+    deleted_thread_ids: HashSet<ThreadId>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
@@ -782,12 +783,14 @@ impl ThreadMetadataStore {
 
     pub fn save_all(&mut self, metadata: Vec<ThreadMetadata>, cx: &mut Context<Self>) {
         for metadata in metadata {
+            self.deleted_thread_ids.remove(&metadata.thread_id);
             self.save_internal(metadata);
         }
         cx.notify();
     }
 
     pub fn save(&mut self, metadata: ThreadMetadata, cx: &mut Context<Self>) {
+        self.deleted_thread_ids.remove(&metadata.thread_id);
         self.save_internal(metadata);
         cx.notify();
     }
@@ -865,6 +868,9 @@ impl ThreadMetadataStore {
     }
 
     fn cache_thread_metadata(&mut self, metadata: ThreadMetadata) {
+        if self.deleted_thread_ids.contains(&metadata.thread_id) {
+            return;
+        }
         // Drafts may not have a session_id yet; only index by session
         // when one is present.
         if let Some(session_id) = metadata.session_id.as_ref() {
@@ -1324,6 +1330,8 @@ impl ThreadMetadataStore {
     }
 
     pub fn delete(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        self.deleted_thread_ids.insert(thread_id);
+
         if let Some(thread) = self.threads.get(&thread_id) {
             if let Some(group_id) = thread.group_id {
                 if let Some(thread_ids) = self.threads_by_group.get_mut(&group_id) {
@@ -1524,6 +1532,7 @@ impl ThreadMetadataStore {
             threads_by_main_paths: HashMap::default(),
             threads_by_session: HashMap::default(),
             threads_by_group: HashMap::default(),
+            deleted_thread_ids: HashSet::default(),
             reload_task: None,
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
@@ -1555,6 +1564,9 @@ impl ThreadMetadataStore {
     ) {
         let view = conversation_view.read(cx);
         let thread_id = view.thread_id;
+        if self.deleted_thread_ids.contains(&thread_id) {
+            return;
+        }
         let Some(thread) = view.root_thread(cx) else {
             return;
         };
@@ -3111,6 +3123,44 @@ mod tests {
             assert_eq!(
                 store.entry(thread_id).unwrap().session_id.as_ref(),
                 Some(&session_id),
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_deleted_conversation_metadata_is_not_recreated(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None::<&Path>, cx).await;
+        let (panel, mut vcx) = setup_panel_with_project(project, cx);
+        crate::test_support::open_thread_with_connection(
+            &panel,
+            StubAgentConnection::new(),
+            &mut vcx,
+        );
+        let thread = panel.read_with(&vcx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+        let thread_id = crate::test_support::active_thread_id(&panel, &vcx);
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.delete(thread_id, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        thread.update_in(&mut vcx, |thread, _window, cx| {
+            thread.set_title("Updated Draft".into(), cx).detach();
+        });
+        vcx.run_until_parked();
+
+        cx.read(|cx| {
+            assert!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .is_none(),
+                "metadata deleted while a conversation remains live must not be recreated"
             );
         });
     }
