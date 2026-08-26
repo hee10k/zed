@@ -133,8 +133,6 @@ pub(crate) struct HerdrThreadBridge {
     outbound_requests: Vec<OutboundRequest>,
     pending_authoritative_focus: Option<String>,
     current_focus_workspace: Option<String>,
-    last_local_focus: Option<FocusTarget>,
-    superseded_focus_targets: Vec<FocusTarget>,
     metadata_dirty: HashSet<String>,
     active_subscription_id: Option<String>,
     active_subscription_ids: HashSet<String>,
@@ -170,8 +168,6 @@ impl HerdrThreadBridge {
             outbound_requests: Vec::new(),
             pending_authoritative_focus: None,
             current_focus_workspace: None,
-            last_local_focus: None,
-            superseded_focus_targets: Vec::new(),
             metadata_dirty: HashSet::default(),
             active_subscription_id: None,
             active_subscription_ids: HashSet::default(),
@@ -338,8 +334,28 @@ impl HerdrThreadBridge {
             | HerdrEvent::PaneFocused { operation_id, .. } => operation_id.as_deref(),
             _ => None,
         };
-        operation_id.is_some_and(|operation_id| {
-            self.state.issued_focus.contains_key(operation_id)
+        let Some(operation_id) = operation_id else {
+            return false;
+        };
+        if self.state.issued_focus.contains_key(operation_id) {
+            return true;
+        }
+
+        let (workspace_id, pane_id) = match event {
+            HerdrEvent::WorkspaceFocused { workspace_id, .. } => {
+                (workspace_id.as_str(), None)
+            }
+            HerdrEvent::PaneFocused {
+                pane_id,
+                workspace_id,
+                ..
+            } => (workspace_id.as_str(), Some(pane_id.as_str())),
+            _ => return false,
+        };
+        self.state.pending_focus.as_ref().is_some_and(|pending| {
+            pending.origin == HerdrOperationOrigin::Zed
+                && pending.operation_id == operation_id
+                && Self::focus_target_matches_event(&pending.target, workspace_id, pane_id)
         })
     }
     fn focus_target_matches_event(
@@ -376,10 +392,11 @@ impl HerdrThreadBridge {
             _ => return false,
         };
         if sequence == 0 {
-            return self
-                .superseded_focus_targets
-                .iter()
-                .any(|target| Self::focus_target_matches_event(target, workspace_id, pane_id));
+            // Sequence-less focus has no ordering information. Only a
+            // reflection tied to an issued/pending local operation is stale;
+            // an external event may legitimately target a superseded local
+            // focus target.
+            return self.focus_is_fenced(event);
         }
         if sequence <= self.state.last_sequence {
             return true;
@@ -1086,8 +1103,6 @@ impl HerdrThreadBridge {
         self.active_subscription_ids.clear();
         self.client = None;
         self.event_receiver = None;
-        self.last_local_focus = None;
-        self.superseded_focus_targets.clear();
         self.set_status(HerdrConnectionStatus::Unavailable);
     }
 
@@ -1115,8 +1130,6 @@ impl HerdrThreadBridge {
         self.state = BridgeState::new(session.clone());
         self.pending_authoritative_focus = None;
         self.current_focus_workspace = None;
-        self.last_local_focus = None;
-        self.superseded_focus_targets.clear();
         self.metadata_dirty.clear();
         self.root_metadata.clear();
         self.outbound_requests.clear();
@@ -1163,14 +1176,6 @@ impl HerdrThreadBridge {
     pub(crate) fn focus_root(&mut self, workspace_id: &str) -> Option<OutboundRequest> {
         if self.root_mapping(workspace_id)?.is_tombstone() {
             return None;
-        }
-        let target = FocusTarget::Workspace(workspace_id.to_string());
-        if self.last_local_focus.as_ref() != Some(&target) {
-            if let Some(previous) = self.last_local_focus.replace(target) {
-                if !self.superseded_focus_targets.contains(&previous) {
-                    self.superseded_focus_targets.push(previous);
-                }
-            }
         }
         let request = initiate_workspace_focus(&mut self.state, workspace_id);
         self.outbound_requests.push(request.clone());
@@ -1521,7 +1526,59 @@ mod tests {
             OutboundRequest::FocusWorkspace { operation_id, .. } => operation_id,
             _ => panic!("root focus must produce a workspace request"),
         };
+        bridge.apply_event(HerdrEvent::WorkspaceFocused {
+            workspace_id: "w2".to_string(),
+            operation_id: None,
+            sequence: 0,
+        });
+        bridge.apply_event(HerdrEvent::WorkspaceFocused {
+            workspace_id: "w3".to_string(),
+            operation_id: None,
+            sequence: 0,
+        });
+        assert_eq!(
+            bridge.current_focus_workspace.as_deref(),
+            Some("w3"),
+            "external sequence-less focus should become current"
+        );
+        bridge.apply_event(HerdrEvent::WorkspaceFocused {
+            workspace_id: "w1".to_string(),
+            operation_id: Some(first_operation_id.clone()),
+            sequence: 0,
+        });
+        assert!(
+            !bridge.state.issued_focus.contains_key(&first_operation_id),
+            "a delayed local reflection must consume its issued operation"
+        );
+        assert_eq!(
+            bridge.current_focus_workspace.as_deref(),
+            Some("w3"),
+            "a delayed local reflection must not activate its superseded target"
+        );
+        assert!(bridge.take_events().iter().all(|event| {
+            !matches!(
+                event,
+                HerdrBridgeEvent::RootFocused { workspace_id, .. } if workspace_id == "w1"
+            )
+        }));
+    }
+
+    #[test]
+    fn external_sequence_less_focus_on_superseded_target_applies() {
+        let mut bridge = test_bridge();
+        bridge.apply_event(workspace_created("w1", "/repo", "Review"));
+        bridge.apply_event(HerdrEvent::WorkspaceCreated {
+            workspace: HerdrWorkspaceSnapshot {
+                workspace_id: "w2".to_string(),
+                paths: vec!["/repo-2".to_string()],
+                label: "Other".to_string(),
+                ..Default::default()
+            },
+            sequence: 2,
+        });
+        bridge.focus_root("w1").expect("first root focus");
         bridge.focus_root("w2").expect("second root focus");
+
         bridge.apply_event(HerdrEvent::WorkspaceFocused {
             workspace_id: "w2".to_string(),
             operation_id: None,
@@ -1532,32 +1589,14 @@ mod tests {
             operation_id: None,
             sequence: 0,
         });
+
         assert_eq!(
             bridge.current_focus_workspace.as_deref(),
-            Some("w2"),
-            "a delayed sequence-less reflection must not replace newer local focus"
+            Some("w1"),
+            "external sequence-less focus must not be suppressed by target history"
         );
-        bridge.apply_event(HerdrEvent::WorkspaceFocused {
-            workspace_id: "w1".to_string(),
-            operation_id: Some(first_operation_id.clone()),
-            sequence: 0,
-        });
-        assert!(
-            !bridge.state.issued_focus.contains_key(&first_operation_id),
-            "a suppressed local reflection still consumes its issued operation"
-        );
-        bridge.apply_event(HerdrEvent::WorkspaceFocused {
-            workspace_id: "w3".to_string(),
-            operation_id: None,
-            sequence: 0,
-        });
-        assert_eq!(
-            bridge.current_focus_workspace.as_deref(),
-            Some("w3"),
-            "an unrelated external sequence-less focus remains valid"
-        );
-        assert!(bridge.take_events().iter().all(|event| {
-            !matches!(
+        assert!(bridge.take_events().iter().any(|event| {
+            matches!(
                 event,
                 HerdrBridgeEvent::RootFocused { workspace_id, .. } if workspace_id == "w1"
             )

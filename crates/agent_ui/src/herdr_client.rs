@@ -66,13 +66,19 @@ impl SubscriptionFence {
     }
 }
 
+#[derive(Clone)]
+struct HerdrLifecycleEvent {
+    generation: u64,
+    event: HerdrEvent,
+}
+
 /// A generation fence is checked while holding the publish lock, so a
 /// cancellation boundary either precedes an event entirely or follows it.
 fn publish_event(
     fence: &SubscriptionFence,
     event: HerdrEvent,
     event_cursor_tx: &Sender<HerdrEventCursor>,
-    lifecycle_tx: &Sender<HerdrEvent>,
+    lifecycle_tx: &Sender<HerdrLifecycleEvent>,
     event_log: &Arc<Mutex<Vec<HerdrEvent>>>,
 ) -> Result<bool, HerdrClientError> {
     let _publish_guard = match fence.publish_lock.lock() {
@@ -83,7 +89,7 @@ fn publish_event(
         return Ok(false);
     }
     let cursor = record_event(event_log, event.clone());
-    forward_lifecycle(lifecycle_tx, &event);
+    forward_lifecycle(lifecycle_tx, fence.expected_generation, &event);
     futures::executor::block_on(event_cursor_tx.send(cursor))
         .map_err(|_| HerdrClientError::Disconnected)?;
     Ok(true)
@@ -943,8 +949,8 @@ pub(crate) struct HerdrClientHandle {
     event_cursor_tx: Sender<HerdrEventCursor>,
     event_cursor_rx: Receiver<HerdrEventCursor>,
     event_log: Arc<Mutex<Vec<HerdrEvent>>>,
-    lifecycle_tx: Sender<HerdrEvent>,
-    lifecycle_rx: Receiver<HerdrEvent>,
+    lifecycle_tx: Sender<HerdrLifecycleEvent>,
+    lifecycle_rx: Receiver<HerdrLifecycleEvent>,
     watched_panes: WatchedPanes,
     subscription_kills: Arc<Mutex<Vec<ConnectionKillSwitch>>>,
     subscription_generation: Arc<AtomicU64>,
@@ -1102,13 +1108,28 @@ impl HerdrClientHandle {
         retain_kill_switch: bool,
         cancellation: Arc<AtomicBool>,
     ) -> Task<Result<(String, usize, ConnectionKillSwitch, u64), HerdrClientError>> {
+        let generation = self.subscription_generation.load(Ordering::SeqCst);
+        self.start_subscription_with_cancellation_at_generation(
+            params,
+            retain_kill_switch,
+            cancellation,
+            generation,
+        )
+    }
+
+    fn start_subscription_with_cancellation_at_generation(
+        &self,
+        params: Value,
+        retain_kill_switch: bool,
+        cancellation: Arc<AtomicBool>,
+        generation: u64,
+    ) -> Task<Result<(String, usize, ConnectionKillSwitch, u64), HerdrClientError>> {
         let request_id = format!("req-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let request = HerdrRequest {
             id: request_id.clone(),
             method: "events.subscribe".to_string(),
             params,
         };
-        let generation = self.subscription_generation.load(Ordering::SeqCst);
         let fence = SubscriptionFence::with_cancellation(
             self.subscription_generation.clone(),
             generation,
@@ -1206,19 +1227,21 @@ impl HerdrClientHandle {
         }
         Ok(())
     }
-
     /// Track a pane created mid-session: per-pane filters plus a continuous
     /// output watcher. No-op if the pane is already watched.
-    fn watch_pane(&self, pane_id: String) {
-        let Some((cancel, generation)) = self.ensure_watched_with_generation(&pane_id) else {
+    fn watch_pane_at_generation(&self, pane_id: String, expected_generation: u64) {
+        let Some((cancel, generation)) =
+            self.ensure_watched_at_generation(&pane_id, Some(expected_generation))
+        else {
             return;
         };
 
         let filter_cancel = cancel.clone();
-        let filters = self.start_subscription_with_cancellation(
+        let filters = self.start_subscription_with_cancellation_at_generation(
             pane_filter_subscription_params(&[pane_id.clone()]),
             false,
             filter_cancel.clone(),
+            expected_generation,
         );
         let registrar = self.clone();
         let filter_pane_id = pane_id.clone();
@@ -1263,11 +1286,23 @@ impl HerdrClientHandle {
         &self,
         pane_id: &str,
     ) -> Option<(Arc<AtomicBool>, u64)> {
+        self.ensure_watched_at_generation(pane_id, None)
+    }
+
+    fn ensure_watched_at_generation(
+        &self,
+        pane_id: &str,
+        expected_generation: Option<u64>,
+    ) -> Option<(Arc<AtomicBool>, u64)> {
         let generation_guard = match self.publish_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         let generation = self.subscription_generation.load(Ordering::SeqCst);
+        if expected_generation.is_some_and(|expected| expected != generation) {
+            drop(generation_guard);
+            return None;
+        }
         let mut watched = watched_lock(&self.watched_panes);
         if watched.contains_key(pane_id) {
             drop(generation_guard);
@@ -1334,6 +1369,22 @@ impl HerdrClientHandle {
             }
             Some(_) | None => drop(kill.trigger()),
         }
+        drop(generation_guard);
+    }
+    /// Retire a pane only when the lifecycle event still belongs to the
+    /// current generation. The generation check is fenced by the same lock
+    /// used by cancellation, so a late old event cannot remove or replace a
+    /// new-generation watch.
+    fn retire_pane_at_generation(&self, pane_id: &str, expected_generation: u64) {
+        let generation_guard = match self.publish_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.subscription_generation.load(Ordering::SeqCst) != expected_generation {
+            drop(generation_guard);
+            return;
+        }
+        self.retire_pane(pane_id);
         drop(generation_guard);
     }
 
@@ -1491,6 +1542,37 @@ impl HerdrClientHandle {
             .detach();
     }
 
+    /// Apply a lifecycle event only when it belongs to the current
+    /// subscription generation. The generation-aware watch/retire methods
+    /// repeat the check under the publish lock to fence cancellation races
+    /// between receive and action.
+    fn handle_lifecycle_event(&self, lifecycle: HerdrLifecycleEvent) {
+        if self.subscription_generation.load(Ordering::SeqCst) != lifecycle.generation {
+            return;
+        }
+        match lifecycle.event {
+            HerdrEvent::PaneCreated { pane, .. } => {
+                self.watch_pane_at_generation(pane.pane_id, lifecycle.generation);
+            }
+            HerdrEvent::PaneMoved {
+                pane,
+                previous_pane_id,
+                ..
+            } => {
+                if let Some(previous) = previous_pane_id {
+                    if previous != pane.pane_id {
+                        self.retire_pane_at_generation(&previous, lifecycle.generation);
+                    }
+                }
+                self.watch_pane_at_generation(pane.pane_id, lifecycle.generation);
+            }
+            HerdrEvent::PaneClosed { pane_id, .. } | HerdrEvent::PaneExited { pane_id, .. } => {
+                self.retire_pane_at_generation(&pane_id, lifecycle.generation);
+            }
+            _ => {}
+        }
+    }
+
     /// Maintain per-pane watches as lifecycle events create, move, or close
     /// panes so filtered subscriptions never cover only the bootstrap set.
     fn start_watch_supervisor(&self) {
@@ -1503,28 +1585,7 @@ impl HerdrClientHandle {
             .clone()
             .spawn(async move {
                 while let Ok(event) = lifecycle_rx.recv().await {
-                    match event {
-                        HerdrEvent::PaneCreated { ref pane, .. } => {
-                            client.watch_pane(pane.pane_id.clone());
-                        }
-                        HerdrEvent::PaneMoved {
-                            ref pane,
-                            ref previous_pane_id,
-                            ..
-                        } => {
-                            if let Some(previous) = previous_pane_id {
-                                if previous != &pane.pane_id {
-                                    client.retire_pane(previous);
-                                }
-                            }
-                            client.watch_pane(pane.pane_id.clone());
-                        }
-                        HerdrEvent::PaneClosed { ref pane_id, .. }
-                        | HerdrEvent::PaneExited { ref pane_id, .. } => {
-                            client.retire_pane(pane_id);
-                        }
-                        _ => {}
-                    }
+                    client.handle_lifecycle_event(event);
                 }
             })
             .detach();
@@ -1646,7 +1707,11 @@ fn read_error_to_client_error(error: anyhow::Error) -> HerdrClientError {
     HerdrClientError::Io(error.to_string())
 }
 
-fn forward_lifecycle(lifecycle_tx: &Sender<HerdrEvent>, event: &HerdrEvent) {
+fn forward_lifecycle(
+    lifecycle_tx: &Sender<HerdrLifecycleEvent>,
+    generation: u64,
+    event: &HerdrEvent,
+) {
     if matches!(
         event,
         HerdrEvent::PaneCreated { .. }
@@ -1654,7 +1719,10 @@ fn forward_lifecycle(lifecycle_tx: &Sender<HerdrEvent>, event: &HerdrEvent) {
             | HerdrEvent::PaneClosed { .. }
             | HerdrEvent::PaneExited { .. }
     ) {
-        let _ = lifecycle_tx.try_send(event.clone());
+        let _ = lifecycle_tx.try_send(HerdrLifecycleEvent {
+            generation,
+            event: event.clone(),
+        });
     }
 }
 
@@ -1680,7 +1748,7 @@ fn run_request_once(
     pending: PendingRequests,
     _event_tx: Sender<HerdrEvent>,
     event_cursor_tx: Sender<HerdrEventCursor>,
-    lifecycle_tx: Sender<HerdrEvent>,
+    lifecycle_tx: Sender<HerdrLifecycleEvent>,
     event_log: Arc<Mutex<Vec<HerdrEvent>>>,
     fence: SubscriptionFence,
 ) -> PendingResult {
@@ -1763,7 +1831,7 @@ fn run_subscription_connection(
     ready_tx: oneshot::Sender<Result<(String, usize, ConnectionKillSwitch), HerdrClientError>>,
     _event_tx: Sender<HerdrEvent>,
     event_cursor_tx: Sender<HerdrEventCursor>,
-    lifecycle_tx: Sender<HerdrEvent>,
+    lifecycle_tx: Sender<HerdrLifecycleEvent>,
     event_log: Arc<Mutex<Vec<HerdrEvent>>>,
     fence: SubscriptionFence,
 ) {
@@ -1953,7 +2021,7 @@ fn run_subscription_connection(
 fn pump_subscription_events(
     reader: &mut HerdrLineReader,
     event_cursor_tx: &Sender<HerdrEventCursor>,
-    lifecycle_tx: &Sender<HerdrEvent>,
+    lifecycle_tx: &Sender<HerdrLifecycleEvent>,
     event_log: &Arc<Mutex<Vec<HerdrEvent>>>,
     fence: &SubscriptionFence,
 ) -> Result<(), HerdrClientError> {
@@ -2998,16 +3066,17 @@ mod tests {
             },
             sequence: 0,
         };
-        forward_lifecycle(&lifecycle_tx, &created);
+        forward_lifecycle(&lifecycle_tx, 7, &created);
         let seen = lifecycle_rx.try_recv().expect("lifecycle event forwarded");
-        assert_eq!(seen.pane_id(), Some("w1:p2"));
+        assert_eq!(seen.generation, 7);
+        assert_eq!(seen.event.pane_id(), Some("w1:p2"));
 
         let closed = HerdrEvent::PaneClosed {
             pane_id: "w1:p2".to_string(),
             workspace_id: "w1".to_string(),
             sequence: 0,
         };
-        forward_lifecycle(&lifecycle_tx, &closed);
+        forward_lifecycle(&lifecycle_tx, 7, &closed);
         lifecycle_rx.try_recv().expect("closed forwarded");
 
         let focused = HerdrEvent::WorkspaceFocused {
@@ -3015,8 +3084,59 @@ mod tests {
             operation_id: None,
             sequence: 0,
         };
-        forward_lifecycle(&lifecycle_tx, &focused);
+        forward_lifecycle(&lifecycle_tx, 7, &focused);
         assert!(lifecycle_rx.try_recv().is_err(), "non-lifecycle event filtered");
+    }
+
+    #[test]
+    fn watch_supervisor_discards_queued_lifecycle_events_from_retired_generation() {
+        let dispatcher = Arc::new(gpui::TestDispatcher::new(0));
+        let executor = gpui::BackgroundExecutor::new(dispatcher);
+        let handle = HerdrClientHandle::new_with_executor(HerdrEndpoint::Default, executor);
+        let retired_generation = handle.subscription_generation.load(Ordering::SeqCst);
+
+        handle.cancel_subscription_generation();
+        assert_eq!(
+            handle.subscription_generation.load(Ordering::SeqCst),
+            retired_generation + 1
+        );
+
+        let created = HerdrEvent::PaneCreated {
+            pane: HerdrPaneSnapshot {
+                pane_id: "w1:p2".to_string(),
+                workspace_id: "w1".to_string(),
+                ..Default::default()
+            },
+            sequence: 0,
+        };
+        let moved = HerdrEvent::PaneMoved {
+            pane: HerdrPaneSnapshot {
+                pane_id: "w1:p3".to_string(),
+                workspace_id: "w1".to_string(),
+                ..Default::default()
+            },
+            previous_pane_id: Some("w1:p2".to_string()),
+            previous_workspace_id: None,
+            previous_tab_id: None,
+            sequence: 0,
+        };
+        for event in [created, moved] {
+            handle
+                .lifecycle_tx
+                .try_send(HerdrLifecycleEvent {
+                    generation: retired_generation,
+                    event,
+                })
+                .expect("queue stale lifecycle event");
+        }
+
+        while let Ok(event) = handle.lifecycle_rx.try_recv() {
+            handle.handle_lifecycle_event(event);
+        }
+        assert!(
+            watched_lock(&handle.watched_panes).is_empty(),
+            "queued events from a retired generation must not register new watches"
+        );
     }
 
     /// Finding 4 (deterministic): watch state is added once per pane and

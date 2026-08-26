@@ -199,3 +199,39 @@ cargo test: ok (1 suite, 534 filtered, 0.00s)
 cargo test -p agent_ui herdr_client::tests
 cargo test: 36 passed (1 suite, 498 filtered, 0.15s)
 ```
+
+## Review-5 repairs
+
+- Tagged every persistent lifecycle supervisor publication with its subscription generation. The supervisor rejects retired generations, and generation-aware watch/retire and filter-subscription fences close the receive-to-cancellation race for queued `PaneCreated` and `PaneMoved` events.
+- Replaced sequence-less target-history suppression with issued/pending local-operation fencing. A delayed local reflection is consumed by its operation record without activation, while an external sequence-less focus can apply even when it targets a previously superseded local target.
+- Added deterministic regressions for retired-generation lifecycle events and both external and delayed local sequence-less focus.
+
+## Review-5 verification
+
+Commands were run from the repository root without formatters, linters, or project-wide suites:
+
+```text
+cargo test -p agent_ui herdr_bridge::tests
+cargo test: 16 passed (1 suite, 520 filtered, 0.00s)
+
+cargo test -p agent_ui herdr_client::tests
+cargo test: 37 passed (1 suite, 499 filtered, 0.16s)
+
+cargo test -p agent_ui thread_metadata_store::tests
+cargo test: 52 passed (1 suite, 484 filtered, 0.66s)
+
+cargo test -p agent_ui herdr_ --no-default-features
+cargo test: 109 passed (1 suite, 427 filtered, 0.16s)
+
+cargo test -p agent_ui agent_panel::tests -- --exact
+cargo test: ok (1 suite, 536 filtered, 0.00s)
+
+cargo test -p agent_ui herdr_client::tests::watch_supervisor_discards_queued_lifecycle_events_from_retired_generation -- --exact
+cargo test: 1 passed (1 suite, 535 filtered, 0.00s)
+
+cargo test -p agent_ui herdr_bridge::tests::external_sequence_less_focus_on_superseded_target_applies -- --exact
+cargo test: 1 passed (1 suite, 535 filtered, 0.00s)
+
+cargo test -p agent_ui herdr_bridge::tests::stale_sequence_less_focus_does_not_replace_newer_focus -- --exact
+cargo test: 1 passed (1 suite, 535 filtered, 0.00s)
+```
