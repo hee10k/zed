@@ -36,6 +36,7 @@ mod model_selector_popover;
 mod profile_selector;
 mod terminal_codegen;
 mod terminal_inline_assistant;
+pub mod terminal_resume;
 pub mod terminal_thread_metadata_store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -43,9 +44,11 @@ mod thread_import;
 pub mod thread_metadata_store;
 pub mod thread_worktree_archive;
 
+pub mod thread_group;
 pub mod threads_archive_view;
 mod ui;
 mod unicode_confusables;
+pub mod worktree_lifecycle;
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -87,6 +90,11 @@ pub use crate::agent_panel::{
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
+pub use crate::thread_group::{
+    MoveOrClonePayload, MoveOrCloneResult, MoveOrCloneThread, RebaseResult, ThreadGroupId,
+    ThreadGroupTransfer, ThreadGroupTransferPreview,
+    execute_move_or_clone_payload, unsupported_rebase_executor, validate_transfer,
+};
 pub use crate::thread_metadata_store::ThreadId;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use conversation_view::open_markdown_in_workspace;
@@ -1018,6 +1026,7 @@ mod tests {
             expand_edit_card: true,
             expand_terminal_card: true,
             terminal_init_command: None,
+            terminal_resume_commands: Default::default(),
             cancel_generation_on_terminal_stop: true,
             use_modifier_to_send: true,
             message_editor_min_lines: 1,

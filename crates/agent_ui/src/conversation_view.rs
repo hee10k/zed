@@ -34,7 +34,7 @@ use gpui::{
     linear_gradient, list, pulsating_between,
 };
 use language::{Buffer, Language, Rope};
-use language_model::LanguageModelCompletionError;
+use language_model::{LanguageModelCompletionError, ProviderErrorCategory};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle,
 };
@@ -88,7 +88,7 @@ use crate::entry_view_state::{EntryViewEvent, ViewEvent};
 use crate::message_editor::{InputAttempt, MessageEditor, MessageEditorEvent};
 use crate::profile_selector::{ProfileProvider, ProfileSelector};
 
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore};
+use crate::thread_metadata_store::{ActivityStatus, ThreadId, ThreadMetadataStore};
 use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
@@ -146,7 +146,9 @@ pub(crate) enum ThreadError {
         provider: SharedString,
         message: Option<SharedString>,
     },
-    RequestFailed,
+    ProviderRejection {
+        message: SharedString,
+    },
     MaxOutputTokens,
     NoModelSelected,
     ApiError {
@@ -171,16 +173,39 @@ impl From<anyhow::Error> for ThreadError {
         } else if let Some(lm_error) = error.downcast_ref::<LanguageModelCompletionError>() {
             use LanguageModelCompletionError::*;
             match lm_error {
-                RateLimitExceeded { provider, .. } => Self::RateLimitExceeded {
-                    provider: provider.to_string().into(),
-                },
-                ServerOverloaded { provider, .. } | ApiInternalServerError { provider, .. } => {
-                    Self::ServerOverloaded {
+                ProviderRejection {
+                    provider,
+                    message,
+                    category,
+                    ..
+                } => match category {
+                    ProviderErrorCategory::RateLimit => Self::RateLimitExceeded {
                         provider: provider.to_string().into(),
-                    }
-                }
-                PromptTooLarge { .. } => Self::PromptTooLarge,
-                PaymentRequired => Self::PaymentRequired,
+                    },
+                    ProviderErrorCategory::Overloaded => Self::ServerOverloaded {
+                        provider: provider.to_string().into(),
+                    },
+                    ProviderErrorCategory::PromptTooLarge { .. } => Self::PromptTooLarge,
+                    ProviderErrorCategory::PaymentRequired => Self::PaymentRequired,
+                    ProviderErrorCategory::Authentication => Self::AuthenticationFailed {
+                        provider: provider.to_string().into(),
+                    },
+                    ProviderErrorCategory::Permission => Self::PermissionDenied {
+                        provider: provider.to_string().into(),
+                        message: Some(message.clone().into()),
+                    },
+                    ProviderErrorCategory::EndpointNotFound => Self::ApiError {
+                        provider: provider.to_string().into(),
+                    },
+                    ProviderErrorCategory::InvalidEncryptedContent
+                    | ProviderErrorCategory::InvalidRequest
+                    | ProviderErrorCategory::Conflict
+                    | ProviderErrorCategory::Timeout
+                    | ProviderErrorCategory::InternalServer
+                    | ProviderErrorCategory::Other => Self::ProviderRejection {
+                        message: message.clone().into(),
+                    },
+                },
                 NoApiKey { provider } => Self::NoCredentials {
                     provider: provider.to_string().into(),
                 },
@@ -190,20 +215,7 @@ impl From<anyhow::Error> for ThreadError {
                 | HttpSend { provider, .. } => Self::StreamError {
                     provider: provider.to_string().into(),
                 },
-                AuthenticationError { provider, .. } => Self::AuthenticationFailed {
-                    provider: provider.to_string().into(),
-                },
-                PermissionError { provider, message } => Self::PermissionDenied {
-                    provider: provider.to_string().into(),
-                    message: Some(message.clone().into()),
-                },
-                UpstreamProviderError { .. } => Self::RequestFailed,
                 DataRetentionConsentRequired { .. } => Self::DataRetentionConsentRequired,
-                BadRequestFormat { provider, .. }
-                | HttpResponseError { provider, .. }
-                | ApiEndpointNotFound { provider } => Self::ApiError {
-                    provider: provider.to_string().into(),
-                },
                 _ => {
                     let message: SharedString = format!("{:#}", error).into();
                     Self::Other {
@@ -1578,6 +1590,50 @@ impl ConversationView {
             return;
         };
         let is_subagent = thread.read(cx).parent_session_id().is_some();
+        if !is_subagent {
+            let activity_status = match event {
+                AcpThreadEvent::StatusChanged => Some(if matches!(
+                    thread.read(cx).status(),
+                    ThreadStatus::Generating
+                ) {
+                    ActivityStatus::Running
+                } else {
+                    ActivityStatus::Idle
+                }),
+                AcpThreadEvent::NewEntry
+                | AcpThreadEvent::EntryUpdated(_)
+                | AcpThreadEvent::EntriesRemoved(_) => Some(if matches!(
+                    thread.read(cx).status(),
+                    ThreadStatus::Generating
+                ) {
+                    ActivityStatus::Running
+                } else {
+                    ActivityStatus::Completed
+                }),
+                AcpThreadEvent::ToolAuthorizationRequested(_)
+                | AcpThreadEvent::ElicitationRequested(_) => {
+                    Some(ActivityStatus::WaitingForUser)
+                }
+                AcpThreadEvent::Stopped(_) => Some(ActivityStatus::Completed),
+                AcpThreadEvent::Refusal
+                | AcpThreadEvent::Error
+                | AcpThreadEvent::LoadError(_) => Some(ActivityStatus::Error),
+                _ => None,
+            };
+            if let Some(activity_status) = activity_status
+                && let Some(store) = ThreadMetadataStore::try_global(cx)
+            {
+                store.update(cx, |store, cx| {
+                    store.record_activity(
+                        self.thread_id,
+                        activity_status,
+                        chrono::Utc::now(),
+                        cx,
+                    );
+                });
+            }
+        }
+
         if !is_subagent && affects_thread_metadata(event) {
             cx.emit(RootThreadUpdated);
         }
@@ -3707,6 +3763,26 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn test_provider_rejection_preserves_provider_message() {
+        let provider_error = LanguageModelCompletionError::from_provider_response(
+            language_model::OPEN_AI_PROVIDER_NAME,
+            None,
+            Some("cyber_policy".to_string()),
+            "This content was flagged as potentially violating our terms of use.".to_string(),
+            None,
+            ProviderErrorCategory::Other,
+        );
+
+        let error = ThreadError::from(anyhow!(provider_error));
+
+        assert!(matches!(
+            error,
+            ThreadError::ProviderRejection { message }
+                if message == "This content was flagged as potentially violating our terms of use."
+        ));
+    }
+
     #[gpui::test]
     async fn test_drop(cx: &mut TestAppContext) {
         init_test(cx);
@@ -4659,20 +4735,22 @@ pub(crate) mod tests {
         cx.update(|_window, cx| {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(
-                    ThreadMetadata {
-                        thread_id: ThreadId::new(),
-                        session_id: Some(resume_session_id.clone()),
-                        agent_id: ProjectAgentId::new("Flaky"),
-                        title: Some(stored_title.clone()),
-                        title_override: None,
-                        updated_at: Utc::now(),
-                        created_at: Some(Utc::now()),
-                        interacted_at: None,
-                        worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
-                        remote_connection: None,
-                        archived: false,
-                        user_order: None,
-                    },
+                    ThreadMetadata { thread_id: ThreadId::new(),
+                    session_id: Some(resume_session_id.clone()),
+                    agent_id: ProjectAgentId::new("Flaky"),
+                    title: Some(stored_title.clone()),
+                    title_override: None,
+                    updated_at: Utc::now(),
+                    created_at: Some(Utc::now()),
+                    interacted_at: None,
+                    worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
+                    remote_connection: None,
+                    archived: false,
+                    user_order: None,
+                    group_id: None,
+                    parent_thread_id: None,
+                    worktree_id: None,
+                    root_thread_id: None, last_activity_at: None, activity_status: Default::default() },
                     cx,
                 );
             });

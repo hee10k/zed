@@ -1559,6 +1559,11 @@ const FIND_HYPERLINK_THROTTLE: Duration = Duration::from_millis(100);
 const SELECTION_DRAG_THRESHOLD: f64 = 2.0;
 
 impl Terminal {
+    /// Returns the shell syntax used by this terminal for programmatic commands.
+    pub fn shell_kind(&self) -> ShellKind {
+        self.template.shell.shell_kind(self.path_style.is_windows())
+    }
+
     fn process_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {
         match event {
             PtyEvent::Event(event) => self.process_event(event, cx),

@@ -48,6 +48,7 @@ pub struct ThreadItem {
     timestamp: SharedString,
     notified: bool,
     status: AgentThreadStatus,
+    activity_mark: Option<SharedString>,
     selected: bool,
     focused: bool,
     hovered: bool,
@@ -82,6 +83,7 @@ impl ThreadItem {
             highlight_positions: Vec::new(),
             timestamp: "".into(),
             notified: false,
+            activity_mark: None,
             status: AgentThreadStatus::default(),
             selected: false,
             focused: false,
@@ -143,6 +145,11 @@ impl ThreadItem {
         self.status = status;
         self
     }
+    pub fn activity_mark(mut self, mark: impl Into<SharedString>) -> Self {
+        self.activity_mark = Some(mark.into());
+        self
+    }
+
 
     pub fn title_generating(mut self, generating: bool) -> Self {
         self.title_generating = generating;
@@ -402,6 +409,7 @@ impl RenderOnce for ThreadItem {
         let has_project_name = self.project_name.is_some();
         let has_project_paths = project_paths.is_some();
         let has_timestamp = !self.timestamp.is_empty();
+        let activity_mark = self.activity_mark.clone();
         let timestamp = self.timestamp;
 
         let show_tooltip = matches!(
@@ -422,7 +430,8 @@ impl RenderOnce for ThreadItem {
             || has_project_paths
             || has_worktree
             || has_diff_stats
-            || has_timestamp;
+            || has_timestamp
+            || activity_mark.is_some();
 
         v_flex()
             .id(self.id.clone())
@@ -455,6 +464,9 @@ impl RenderOnce for ThreadItem {
                             .flex_1()
                             .gap_1p5()
                             .child(icon)
+                            .when_some(activity_mark, |this, mark| {
+                                this.child(Label::new(mark).size(LabelSize::Small).color(Color::Muted))
+                            })
                             .child(title_label),
                     )
                     .when(self.is_truncated && opaque_window, |this| {

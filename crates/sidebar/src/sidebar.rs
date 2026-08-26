@@ -9,8 +9,12 @@ use agent_ui::terminal_thread_metadata_store::{
     TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
 use agent_ui::thread_metadata_store::{
-    HERDR_AGENT_ID, ThreadMetadata, ThreadMetadataStore, WorktreePaths,
+    ActivityStatus, ThreadMetadata, ThreadMetadataStore, WorktreePaths,
     worktree_info_from_thread_paths,
+};
+use agent_ui::thread_group::{
+    MoveOrClonePayload, MoveOrCloneResult, MoveOrCloneThread, RebaseResult, ThreadGroupId,
+    group_id_for_worktree_paths, stable_worktree_id,
 };
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
@@ -354,6 +358,16 @@ enum DraftKind {
     WithContent,
     Empty,
 }
+fn activity_status_mark(status: ActivityStatus) -> &'static str {
+    match status {
+        ActivityStatus::Idle => "I",
+        ActivityStatus::Running => "R",
+        ActivityStatus::WaitingForUser => "W",
+        ActivityStatus::Completed => "D",
+        ActivityStatus::Error => "!",
+    }
+}
+
 
 #[derive(Clone)]
 struct ThreadEntry {
@@ -494,6 +508,46 @@ struct SidebarContents {
     project_header_indices: Vec<usize>,
     has_open_projects: bool,
 }
+/// Drop boundary for a sidebar row. `Before` and `After` are kept explicit so
+/// hit testing and persistence do not depend on an implicit row convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropPosition {
+    Before,
+    After,
+}
+
+fn insertion_index(row_index: usize, position: DropPosition, row_count: usize) -> Option<usize> {
+    let index = match position {
+        DropPosition::Before => row_index,
+        DropPosition::After => row_index.saturating_add(1),
+    };
+    (index <= row_count).then_some(index)
+}
+
+#[cfg(test)]
+mod drag_position_tests {
+    use super::{DropPosition, insertion_index};
+
+    #[test]
+    fn computes_before_and_after_boundaries() {
+        assert_eq!(insertion_index(0, DropPosition::Before, 3), Some(0));
+        assert_eq!(insertion_index(0, DropPosition::After, 3), Some(1));
+        assert_eq!(insertion_index(2, DropPosition::After, 3), Some(3));
+        assert_eq!(insertion_index(3, DropPosition::After, 3), None);
+    }
+}
+#[derive(Clone)]
+struct PendingGroupTransfer {
+    source_thread_id: ThreadId,
+    target_thread_id: ThreadId,
+    target_group_id: ThreadGroupId,
+    target_root_thread_id: ThreadId,
+    target_worktree_id: Option<SharedString>,
+    source_is_dirty: bool,
+    source_has_active_session: bool,
+    source_workspace: ThreadEntryWorkspace,
+}
+
 
 /// Payload carried on a drag of a sidebar row, used to reorder entries within
 /// a project group. Retains the entry identity plus its group so a drop into
@@ -877,6 +931,7 @@ pub struct Sidebar {
     /// Tracks which sidebar entry is currently active (highlighted).
     active_entry: Option<ActiveEntry>,
     hovered_thread_index: Option<usize>,
+    pending_group_transfer: Option<PendingGroupTransfer>,
     renaming_thread_id: Option<ThreadId>,
     /// Threads in the database-backed regeneration path need their own loading
     /// state because they do not have a live `agent::Thread` to report it.
@@ -1027,6 +1082,7 @@ impl Sidebar {
             contents: SidebarContents::default(),
             selection: None,
             active_entry: None,
+            pending_group_transfer: None,
             hovered_thread_index: None,
             renaming_thread_id: None,
             regenerating_titles: HashSet::new(),
@@ -1590,13 +1646,30 @@ impl Sidebar {
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
                     let has_notification =
                         live_notified_terminal_ids.contains(&metadata.terminal_id);
+                    let live_status = live_terminal_statuses.get(&metadata.terminal_id).copied();
+                    let status = match (live_status, metadata.activity_status) {
+                        (Some(status), _)
+                            if matches!(
+                                status,
+                                TerminalAgentStatus::Running
+                                    | TerminalAgentStatus::WaitingForUserInput
+                            ) =>
+                        {
+                            status
+                        }
+                        (_, ActivityStatus::WaitingForUser) => {
+                            TerminalAgentStatus::WaitingForUserInput
+                        }
+                        (Some(status), _) => status,
+                        (None, ActivityStatus::Running | ActivityStatus::Idle) => {
+                            TerminalAgentStatus::Idle
+                        }
+                        (None, ActivityStatus::Completed | ActivityStatus::Error) => {
+                            TerminalAgentStatus::Completed
+                        }
+                    };
                     TerminalEntry {
-                        status: live_terminal_statuses
-                            .get(&metadata.terminal_id)
-                            .copied()
-                            .unwrap_or_else(|| {
-                                TerminalAgentStatus::derive(metadata.display_title().as_ref())
-                            }),
+                        status,
                         metadata,
                         workspace,
                         worktrees,
@@ -1704,12 +1777,21 @@ impl Sidebar {
                         // pass below downgrades them to `Empty` if no draft
                         // label can be derived.
                         let draft = row.is_draft().then_some(DraftKind::WithContent);
+                        let status = match row.activity_status {
+                            ActivityStatus::Running => AgentThreadStatus::Running,
+                            ActivityStatus::WaitingForUser => {
+                                AgentThreadStatus::WaitingForConfirmation
+                            }
+                            ActivityStatus::Completed => AgentThreadStatus::Completed,
+                            ActivityStatus::Error => AgentThreadStatus::Error,
+                            ActivityStatus::Idle => AgentThreadStatus::Completed,
+                        };
                         Arc::new(ThreadEntry {
                             metadata: row,
                             display_title: None,
                             icon,
                             icon_from_external_svg,
-                            status: AgentThreadStatus::default(),
+                            status,
                             workspace,
                             is_live: false,
                             is_background: false,
@@ -1921,9 +2003,26 @@ impl Sidebar {
                 }
 
                 threads.sort_by(|a, b| {
-                    let a_time = Self::thread_display_time(&a.metadata);
-                    let b_time = Self::thread_display_time(&b.metadata);
-                    b_time.cmp(&a_time)
+                    let group_order = match (&a.metadata.group_id, &b.metadata.group_id) {
+                        (Some(a), Some(b)) => a.to_key_string().cmp(&b.to_key_string()),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    };
+                    if group_order != std::cmp::Ordering::Equal {
+                        return group_order;
+                    }
+
+                    let a_is_root = a.metadata.parent_thread_id.is_none();
+                    let b_is_root = b.metadata.parent_thread_id.is_none();
+                    match b_is_root.cmp(&a_is_root) {
+                        std::cmp::Ordering::Equal => {
+                            let a_time = Self::thread_display_time(&a.metadata);
+                            let b_time = Self::thread_display_time(&b.metadata);
+                            b_time.cmp(&a_time)
+                        }
+                        order => order,
+                    }
                 });
             } else {
                 for info in live_infos {
@@ -2389,6 +2488,49 @@ impl Sidebar {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
         };
+        let pending_transfer_target = matches!(
+            entry,
+            ListEntry::Thread(thread)
+                if self
+                    .pending_group_transfer
+                    .as_ref()
+                    .is_some_and(|pending| pending.target_thread_id == thread.metadata.thread_id)
+        );
+        let rendered = if pending_transfer_target {
+            v_flex()
+                .child(rendered)
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .px_2()
+                        .child(
+                            Button::new(("group-transfer-move", ix), "Move")
+                                .style(ButtonStyle::Outlined)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.apply_pending_group_transfer(
+                                        MoveOrCloneThread::Move,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new(("group-transfer-clone", ix), "Clone")
+                                .style(ButtonStyle::Outlined)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.apply_pending_group_transfer(
+                                        MoveOrCloneThread::Clone,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            rendered
+        };
+
 
         // Wrap re-orderable rows (threads/terminals) so they can be dragged to
         // reposition within their project group.
@@ -2433,7 +2575,10 @@ impl Sidebar {
                             .as_ref()
                             .is_some_and(|target| target.project_group_key() == dragged.project_group_key());
                         if same_group {
-                            style.bg(cx.theme().colors().ghost_element_hover)
+                            style
+                                .bg(cx.theme().colors().ghost_element_hover)
+                                .border_b_1()
+                                .border_color(cx.theme().colors().border)
                         } else {
                             style
                         }
@@ -2441,7 +2586,7 @@ impl Sidebar {
                 })
                 .on_drop(
                     cx.listener(move |this, dragged: &DraggedSidebarEntry, _window, cx| {
-                        this.reorder_entries(dragged, ix, cx);
+                        this.reorder_entries(dragged, ix, DropPosition::After, cx);
                     }),
                 )
                 .child(rendered)
@@ -4979,11 +5124,17 @@ impl Sidebar {
         archive_workspaces: &[Entity<Workspace>],
         cx: &App,
     ) -> bool {
+        let except_group_id = except_thread_id
+            .and_then(|thread_id| thread_store.entry(thread_id))
+            .and_then(|thread| thread.group_id);
         thread_store.path_is_referenced_by_unarchived_threads_matching(
             except_thread_id,
             path,
             remote_connection,
-            |thread| Self::thread_blocks_worktree_archive(thread, archive_workspaces, cx),
+            |thread| {
+                thread.group_id != except_group_id
+                    && Self::thread_blocks_worktree_archive(thread, archive_workspaces, cx)
+            },
         )
     }
 
@@ -6176,7 +6327,10 @@ impl Sidebar {
     }
 
     fn thread_display_time(metadata: &ThreadMetadata) -> DateTime<Utc> {
-        metadata.interacted_at.unwrap_or(metadata.updated_at)
+        metadata
+            .last_activity_at
+            .or(metadata.interacted_at)
+            .unwrap_or(metadata.updated_at)
     }
 
     /// Resolves the project group key that owns an entry's workspace.
@@ -6203,7 +6357,9 @@ impl Sidebar {
                     DateTime::<Utc>::MAX_UTC
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
-                ListEntry::Terminal(terminal) => terminal.metadata.created_at,
+                ListEntry::Terminal(terminal) => {
+                    terminal.metadata.last_activity_at.unwrap_or(terminal.metadata.created_at)
+                }
                 ListEntry::ProjectHeader { .. } => unreachable!(),
             }
         }
@@ -6229,6 +6385,7 @@ impl Sidebar {
                 match (is_empty_draft(left), is_empty_draft(right)) {
                     (true, false) => return std::cmp::Ordering::Less,
                     (false, true) => return std::cmp::Ordering::Greater,
+
                     (true, true) => return std::cmp::Ordering::Equal,
                     (false, false) => {}
                 }
@@ -6258,6 +6415,270 @@ impl Sidebar {
         }
     }
 
+    fn begin_group_transfer(
+        &mut self,
+        dragged: &DraggedSidebarEntry,
+        drop_row_ix: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let DraggedSidebarEntry::Thread { thread_id, .. } = dragged else {
+            return;
+        };
+        let Some(ListEntry::Thread(target)) = self.contents.entries.get(drop_row_ix) else {
+            return;
+        };
+        let Some(source) = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(*thread_id)
+            .cloned()
+        else {
+            return;
+        };
+        let source_group_id = source
+            .group_id
+            .or_else(|| group_id_for_worktree_paths(&source.worktree_paths));
+        let target_group_id = target
+            .metadata
+            .group_id
+            .or_else(|| group_id_for_worktree_paths(&target.metadata.worktree_paths));
+        let (Some(source_group_id), Some(target_group_id)) = (source_group_id, target_group_id)
+        else {
+            return;
+        };
+        if source_group_id == target_group_id {
+            return;
+        }
+        let source_is_dirty = self
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread) if thread.metadata.thread_id == *thread_id => {
+                    Some(thread.diff_stats.lines_added > 0 || thread.diff_stats.lines_removed > 0)
+                }
+                _ => None,
+            })
+            .unwrap_or(false);
+        let source_has_active_session = source.activity_status.is_live();
+        let Some(source_workspace) = self.contents.entries.iter().find_map(|entry| match entry {
+            ListEntry::Thread(thread) if thread.metadata.thread_id == *thread_id => {
+                Some(thread.workspace.clone())
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+
+        self.pending_group_transfer = Some(PendingGroupTransfer {
+            source_thread_id: *thread_id,
+            target_thread_id: target.metadata.thread_id,
+            target_group_id,
+            target_root_thread_id: target
+                .metadata
+                .root_thread_id
+                .unwrap_or(target.metadata.thread_id),
+            target_worktree_id: target.metadata.worktree_id.clone(),
+            source_is_dirty,
+            source_has_active_session,
+            source_workspace,
+        });
+        cx.notify();
+    }
+
+    fn apply_pending_group_transfer(
+        &mut self,
+        operation: MoveOrCloneThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending_group_transfer.take() else {
+            return;
+        };
+        let payload = MoveOrClonePayload {
+            operation,
+            source_thread_id: pending.source_thread_id,
+            target_group_id: pending.target_group_id,
+            target_root_thread_id: pending.target_root_thread_id,
+            source_is_dirty: pending.source_is_dirty,
+            source_has_active_session: pending.source_has_active_session,
+            confirmed: true,
+        };
+        let workspace = match pending.source_workspace.clone() {
+            ThreadEntryWorkspace::Open(workspace) => workspace,
+            ThreadEntryWorkspace::Closed { .. } => return,
+        };
+        let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+            return;
+        };
+
+        if operation == MoveOrCloneThread::Move {
+            let thread_store = ThreadMetadataStore::global(cx);
+            let source_path = thread_store
+                .read(cx)
+                .entry(pending.source_thread_id)
+                .and_then(|metadata| metadata.folder_paths().paths().first().cloned());
+            let target_path = thread_store
+                .read(cx)
+                .entry(pending.target_root_thread_id)
+                .and_then(|metadata| metadata.folder_paths().paths().first().cloned());
+            let project = workspace.read(cx).project().clone();
+            let repository = source_path.as_ref().and_then(|source_path| {
+                target_path.as_ref().and_then(|target_path| {
+                    project.read_with(cx, |project, cx| {
+                        project.repositories(cx).values().find_map(|repository| {
+                            let snapshot = repository.read(cx).snapshot();
+                            let source_matches =
+                                snapshot.work_directory_abs_path.as_ref() == source_path
+                                    || snapshot
+                                        .linked_worktrees()
+                                        .iter()
+                                        .any(|worktree| &worktree.path == source_path);
+                            if !source_matches {
+                                return None;
+                            }
+                            let upstream = if snapshot.work_directory_abs_path.as_ref()
+                                == target_path
+                            {
+                                snapshot
+                                    .branch
+                                    .as_ref()
+                                    .map(|branch| branch.name().to_string())
+                            } else {
+                                snapshot
+                                    .linked_worktrees()
+                                    .iter()
+                                    .find(|worktree| &worktree.path == target_path)
+                                    .and_then(|worktree| {
+                                        worktree.branch_name().map(ToString::to_string)
+                                    })
+                            };
+                            upstream.map(|upstream| (repository.clone(), upstream))
+                        })
+                    })
+                })
+            });
+            let Some((repository, upstream)) = repository else {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_error(
+                        anyhow::anyhow!("could not resolve the target group's Git branch"),
+                        cx,
+                    );
+                });
+                return;
+            };
+            let rebase_task = repository.update(cx, |repository, cx| {
+                repository.rebase(upstream, cx)
+            });
+            let workspace_for_task = workspace.clone();
+            cx.spawn(async move |this, cx| {
+                let rebase_result = match rebase_task.await {
+                    Ok(Ok(())) => RebaseResult::Success,
+                    Ok(Err(error)) => RebaseResult::Error {
+                        details: error.to_string(),
+                    },
+                    Err(error) => RebaseResult::Error {
+                        details: error.to_string(),
+                    },
+                };
+                let result = panel.update(cx, |panel, cx| {
+                    panel.execute_thread_group_transfer(
+                        payload,
+                        pending.target_worktree_id,
+                        || rebase_result.clone(),
+                        || Err("derived worktree creation is only used by Clone".to_string()),
+                        cx,
+                    )
+                });
+                if let MoveOrCloneResult::MoveFailed {
+                    reason,
+                    rebase_result,
+                } = result
+                {
+                    let details = rebase_result
+                        .map(|result| format!("{result:?}"))
+                        .unwrap_or_default();
+                    workspace_for_task.update(cx, |workspace, cx| {
+                        workspace.show_error(
+                            anyhow::anyhow!("{reason} {details}"),
+                            cx,
+                        );
+                    });
+                }
+                this.update(cx, |this, cx| {
+                    this.schedule_update_entries(false, cx);
+                })
+                .ok();
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+            return;
+        }
+
+        let action = zed_actions::CreateWorktree {
+            worktree_name: Some(format!("clone-{}", pending.source_thread_id.to_key_string())),
+            branch_target: zed_actions::NewWorktreeBranchTarget::CurrentBranch,
+        };
+        let mut async_window_cx = window.to_async(cx);
+        let create_task = match workspace.update_in(&mut async_window_cx, |workspace, window, cx| {
+            git_ui_core::worktree_service::create_worktree_workspace(
+                workspace,
+                &action,
+                window,
+                None,
+                workspace::OpenMode::Add,
+                cx,
+            )
+        }) {
+            Ok(task) => task,
+            Err(error) => {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_error(error, cx);
+                });
+                return;
+            }
+        };
+        let workspace_for_task = workspace.clone();
+        cx.spawn(async move |this, cx| {
+            let created = create_task.await?;
+            let paths = created
+                .workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace.project().read(cx).worktree_paths(cx)
+                });
+            let Some(folder_path) = paths.folder_path_list().paths().first().cloned() else {
+                anyhow::bail!("cloned worktree has no folder path");
+            };
+            let main_path = paths
+                .main_worktree_path_list()
+                .paths()
+                .first()
+                .cloned()
+                .unwrap_or_else(|| folder_path.clone());
+            let worktree_id = stable_worktree_id(&main_path, &folder_path, "local");
+            let clone_paths = paths.clone();
+            let clone_id = worktree_id.clone();
+            let result = panel.update(cx, |panel, cx| {
+                panel.execute_thread_group_transfer(
+                    payload,
+                    Some(worktree_id),
+                    || RebaseResult::Success,
+                    move || Ok((clone_paths, clone_id)),
+                    cx,
+                )
+            });
+            if let MoveOrCloneResult::CloneFailed { reason } = result {
+                workspace_for_task.update(cx, |workspace, cx| {
+                    workspace.show_error(anyhow::anyhow!(reason), cx);
+                });
+            }
+            this.update(cx, |this, cx| {
+                this.schedule_update_entries(false, cx);
+            })
+            .ok();
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
     /// Reorders a sidebar entry to a new position within its project group and
     /// persists the resulting order to the thread/terminal metadata stores.
     ///
@@ -6269,8 +6690,10 @@ impl Sidebar {
         &mut self,
         dragged: &DraggedSidebarEntry,
         drop_row_ix: usize,
+        position: DropPosition,
         cx: &mut Context<Self>,
     ) {
+        self.pending_group_transfer = None;
         let project_group_key = match dragged {
             DraggedSidebarEntry::Thread {
                 project_group_key, ..
@@ -6292,6 +6715,13 @@ impl Sidebar {
         let Some(header_ix) = group_header_ix else {
             return;
         };
+        if matches!(self.contents.entries.get(drop_row_ix), Some(ListEntry::Thread(_))) {
+            self.pending_group_transfer = None;
+            self.begin_group_transfer(dragged, drop_row_ix, cx);
+            if self.pending_group_transfer.is_some() {
+                return;
+            }
+        }
         if !self
             .contents
             .entries
@@ -6319,11 +6749,11 @@ impl Sidebar {
             .enumerate()
             .collect();
 
-        // Compute the target position within the group (0-based row index).
-        let normalized_drop = drop_row_ix - header_ix - 1;
-        if normalized_drop >= rows.len() {
+        // Compute the target boundary within the group (0-based).
+        let row_index = drop_row_ix - header_ix - 1;
+        let Some(normalized_drop) = insertion_index(row_index, position, rows.len()) else {
             return;
-        }
+        };
 
         // Keep only the rows that are still present (drop target must be a row).
         let mut ordered = rows
@@ -6357,8 +6787,20 @@ impl Sidebar {
         let Some(dragged_ix) = dragged_ix else {
             return;
         };
+        let is_self_drop = match position {
+            DropPosition::Before => normalized_drop == dragged_ix,
+            DropPosition::After => normalized_drop == dragged_ix.saturating_add(1),
+        };
+        if is_self_drop {
+            return;
+        }
         let dragged = ordered.remove(dragged_ix);
-        let insert_at = normalized_drop.min(ordered.len());
+        let insert_at = if dragged_ix < normalized_drop {
+            normalized_drop.saturating_sub(1)
+        } else {
+            normalized_drop
+        }
+        .min(ordered.len());
         ordered.insert(insert_at, dragged);
 
         // Renumber the group and persist to the stores.
@@ -6836,6 +7278,7 @@ impl Sidebar {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
             })
             .status(thread.status)
+            .activity_mark(activity_status_mark(thread.metadata.activity_status))
             .is_remote(is_remote)
             .when_some(icon_svg, |this, svg| {
                 this.custom_icon_from_external_svg(svg)
@@ -7186,7 +7629,12 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = ElementId::from(format!("terminal-{}", terminal.metadata.terminal_id));
-        let timestamp = format_history_entry_timestamp(terminal.metadata.created_at);
+        let timestamp = format_history_entry_timestamp(
+            terminal
+                .metadata
+                .last_activity_at
+                .unwrap_or(terminal.metadata.created_at),
+        );
         let is_hovered = self.hovered_thread_index == Some(ix);
         let color = cx.theme().colors();
         let sidebar_bg = color
@@ -7207,22 +7655,25 @@ impl Sidebar {
                 Some((icon_char, title, positions)) => (Some(icon_char), title, positions),
                 None => (None, display_title, terminal.highlight_positions.clone()),
             };
-
-        let thread_item = ThreadItem::new(id, title)
-            .base_bg(sidebar_bg)
-            .icon(IconName::Terminal)
-            .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
-            .status(match terminal.status {
+        let thread_status = if terminal.metadata.activity_status == ActivityStatus::Error {
+            AgentThreadStatus::Error
+        } else {
+            match terminal.status {
                 TerminalAgentStatus::Running => AgentThreadStatus::Running,
-                // Waiting-for-input reuses the existing monotone warning
-                // badge (ADR 0005); Idle and Completed carry no badge.
                 TerminalAgentStatus::WaitingForUserInput => {
                     AgentThreadStatus::WaitingForConfirmation
                 }
                 TerminalAgentStatus::Idle | TerminalAgentStatus::Completed => {
                     AgentThreadStatus::Completed
                 }
-            })
+            }
+        };
+        let thread_item = ThreadItem::new(id, title)
+            .base_bg(sidebar_bg)
+            .icon(IconName::Terminal)
+            .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
+            .status(thread_status)
+            .activity_mark(activity_status_mark(terminal.metadata.activity_status))
             .is_remote(is_remote)
             .worktrees(worktrees)
             .timestamp(timestamp)

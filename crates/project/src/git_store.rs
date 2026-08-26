@@ -7559,6 +7559,25 @@ impl Repository {
         });
         self.finish_graph_mutation(receiver, cx)
     }
+    pub fn rebase(
+        &mut self,
+        upstream: String,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<()>> {
+        let receiver = self.send_job("rebase", None, move |git_repo, _| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState {
+                    backend,
+                    environment,
+                    ..
+                }) => backend.rebase(upstream, environment).await,
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("rebase is not supported for remote project repositories")
+                }
+            }
+        });
+        self.finish_graph_mutation(receiver, cx)
+    }
 
     pub fn operation_state(
         &mut self,

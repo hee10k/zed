@@ -31,7 +31,8 @@ use crate::{
     },
     herdr_transport::HerdrEndpoint,
     thread_metadata_store::{
-        HERDR_AGENT_ID, ThreadId, ThreadMetadata, ThreadMetadataStore, WorktreePaths,
+        ActivityStatus, HERDR_AGENT_ID, ThreadId, ThreadMetadata, ThreadMetadataStore,
+        WorktreePaths,
     },
 };
 
@@ -1395,6 +1396,12 @@ impl HerdrThreadBridge {
             remote_connection: None,
             archived: false,
             user_order: None,
+            group_id: None,
+            parent_thread_id: None,
+            worktree_id: None,
+            root_thread_id: None,
+            last_activity_at: None,
+            activity_status: ActivityStatus::Idle,
         };
         if let Some(existing) = self.root_metadata.get(&workspace.workspace_id) {
             metadata.created_at = existing.created_at;
