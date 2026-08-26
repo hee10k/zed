@@ -2,51 +2,61 @@
 
 ## Scope executed
 - `crates/sidebar/src/sidebar.rs`
-  - `load_agent_thread_in_workspace` now inspects the backend marker (`HERDR_AGENT_ID`) before choosing a path: Herdr roots activate via `AgentPanel::load_herdr_thread`, which routes through the window bridge and issues exactly one outbound `workspace.focus` per activation; ACP-native threads keep the existing `load_agent_thread` path and never call Herdr. This single cutover covers local activation, cross-window activation, archive-restore activation, and thread-switcher preview/confirm (all funnel through this function).
-  - `apply_thread_rename` routes Herdr-root renames through `bridge.request_rename_workspace` (falling back to a title override when disconnected); ACP renames unchanged.
-  - Row close action is backend-aware: Herdr rows call the new `Sidebar::close_herdr_entry` → `bridge.request_close_workspace`; no `agent.cancel`/`agent.close` is emitted for Herdr roots. Tooltip reads "Close Herdr Root".
-  - New "New Herdr Thread" entries in the project-header new-thread menu call `Sidebar::new_herdr_entry` → `AgentPanel::create_herdr_root`: `workspace.create` is sent, and the Zed row activates only after the returned identity is persisted as a root mapping (`RootCreated`), with focus suppressed to avoid a reflected second focus.
-  - Rebuild persistence: Herdr rows already flow from `ThreadMetadataStore` via their stored worktree/cwd identity, are not drafts (`is_draft()` excludes them), and remain visible while disconnected. Added a session-label pass that appends ` · {session}` to bridge-mapped roots only when a project holds multiple Herdr rows (ambiguity with historical sessions).
-  - New `#[cfg(test)] mod tests` with three behavior tests (below).
-- `crates/sidebar/src/thread_switcher.rs`: no functional change required — switcher selection flows through `load_agent_thread_in_workspace`, so Herdr routing applies automatically; entries inherit non-draft classification.
+  - Herdr rows continue through `load_agent_thread_in_workspace` using their persisted root mapping and never enter ACP loading. Local activation, cross-window activation, archive restore, and thread-switcher selection preserve the existing ACP path while Herdr roots route through the window bridge.
+  - `ArchiveSelectedThread` now recognizes Herdr metadata (`HERDR_AGENT_ID`) when `session_id` is absent and routes the row to `workspace.close` instead of silently returning. The row action uses the same Herdr close path.
+  - `apply_thread_rename` returns immediately after the first panel successfully routes a Herdr rename, preventing duplicate `workspace.rename` requests when panels share one bridge.
+  - `close_herdr_entry` now loads `AgentPanel` asynchronously for the matching workspace when no panel is present, then issues `workspace.close` through the loaded bridge. Loaded-panel behavior is unchanged.
+  - `new_herdr_entry` now loads/adds the lazy `AgentPanel` before issuing `workspace.create`; the old missing-panel path was a silent no-op.
+  - Thread-switcher preview still activates the Zed workspace and reveals the panel, but Herdr `workspace.focus` is sent only by committed activation (`focus=true`). Preview followed by confirm therefore emits one focus request, not two.
+  - Herdr metadata rebuild behavior remains persisted by worktree/cwd identity, visible while disconnected, and excluded from ACP draft classification.
+  - Added deterministic regressions for archive routing, shared-panel rename routing, lazy create-panel loading, lazy close-panel loading, and switcher preview focus suppression.
+- `crates/sidebar/src/thread_switcher.rs`: no functional change required; both preview and confirm already funnel through the sidebar loading helper.
 - `crates/agent_ui/src/agent_panel.rs`
-  - Public routing API: `rename_herdr_thread`, `close_herdr_thread`, `create_herdr_root`, `herdr_root_thread_id`, `herdr_mapped_root_thread_ids`, `herdr_session_name`.
-  - Status surface: `herdr_status_label` returns `Ready` / `Synchronizing` / `Reconnecting` / `Unavailable` / `Conflict`; rendered next to the Herdr root title in the panel header bar. `Conflict` is raised by `HerdrBridgeEvent::Conflict` and cleared when a fresh synchronization run starts.
-  - Explicit rebind UI: new `ConnectHerdrSession` action (declared in `agent_ui.rs`, registered on Workspace in `agent_panel::init` and on the panel). It opens a one-line session-name editor overlay; rebinding happens only on explicit confirm, going through the new `HerdrBridgeRegistry::rebind_window_session` (falls back to direct `bridge.rebind_selection` when unregistered), after which the stale Herdr surface resets to a draft.
-  - Test-support helpers under `#[cfg(any(test, feature = "test-support"))]`: `install_test_herdr_root` (recording-API-backed bridge seeded with one workspace) and `take_test_herdr_api_calls`, so dependent-crate tests can assert outbound calls without a real server.
-  - Two new tests in `agent_panel::tests::herdr`.
-- `crates/agent_ui/src/herdr_bridge.rs` (minimal accessors only)
-  - New `pub(crate) fn rebind_window_session(window_id, selection, cx)` on `HerdrBridgeRegistry` (required by the explicit-rebind flow).
-  - New `pub(crate) fn root_thread_ids()` on `HerdrThreadBridge` (sidebar labeling + creation flow).
-  - Widened existing test-only cfg gates (`RecordingHerdrApi`, `for_test_with_api`) from `cfg(test)` to `cfg(any(test, feature = "test-support"))` so the sidebar crate's dev-dependency feature can use them. No production code paths changed.
-- `crates/agent_ui/src/agent_ui.rs`: declared the `ConnectHerdrSession` action.
+  - Session-editor blur now dismisses with `commit=false`; only Confirm/Newline commits a selected session.
+  - Successful `workspace.create` responses are reconciled directly into the bridge mapping and `ThreadMetadataStore` before the returned root is activated. Activation no longer depends on a separate `WorkspaceCreated` event.
+  - Added `SessionRebound` bridge-event handling so every AgentPanel subscribed to a shared window bridge clears stale Herdr state and returns to a draft after explicit rebinding.
+  - Herdr loading sends `workspace.focus` only when the caller requested focus; background/switcher preview loads do not focus Herdr.
+  - `has_terminal` is crate-private again. Cross-crate sidebar tests use the existing public `terminals` accessor instead of widening the API.
+  - Test support includes a configurable create response and a shared-bridge helper for deterministic dependent-crate regressions.
+- `crates/agent_ui/src/herdr_bridge.rs`
+  - Added the minimal create-response reconciliation seam, which persists the root mapping/metadata without requiring a pushed create event.
+  - `rebind_selection` emits the explicit `SessionRebound` event to the bridge's subscribers before starting the new synchronization worker; shared-panel subscribers can reset together.
+  - Existing test-only `RecordingHerdrApi` now accepts one controlled create response.
+- `crates/agent_ui/src/agent_ui.rs`: existing `ConnectHerdrSession` action remains registered from `agent_panel::init`.
 
 ## Verification commands and results
 
 | Command | Result |
 |---|---|
-| `cargo test -p sidebar sidebar::tests::activating_herdr_root_requests_herdr_workspace_focus -- --exact` | ok, **0 matched** — see naming note below |
-| `cargo test -p sidebar tests::activating_herdr_root_requests_herdr_workspace_focus -- --exact` | ok, 1 passed |
-| `cargo test -p sidebar sidebar::tests::activating_acp_root_does_not_request_herdr_focus -- --exact` | ok, **0 matched** — same naming note |
-| `cargo test -p sidebar tests::activating_acp_root_does_not_request_herdr_focus -- --exact` | ok, 1 passed |
-| `cargo test -p sidebar tests::` | ok, **148 passed; 0 failed** (full suite incl. 3 new) |
-| `cargo test -p agent_ui agent_panel::tests::herdr` | ok, **5 passed; 0 failed** (3 pre-existing + 2 new) |
-| `cargo test -p agent_ui herdr_bridge` | ok, **21 passed; 0 failed** |
-| `cargo check -p agent_ui --lib`, `cargo check -p sidebar --lib` | clean |
+| `cargo test -p agent_ui agent_panel::tests::herdr::herdr_session_editor_blur_dismisses_without_rebinding -- --exact` | **1 passed; 0 failed** |
+| `cargo test -p agent_ui agent_panel::tests::herdr::herdr_create_response_persists_mapping_and_activates_without_event -- --exact` | **1 passed; 0 failed** |
+| `cargo test -p agent_ui agent_panel::tests::herdr::session_rebind_resets_active_herdr_surface -- --exact` | **1 passed; 0 failed** |
+| `cargo test -p sidebar tests::activating_herdr_root_requests_herdr_workspace_focus -- --exact` | **1 passed; 0 failed** |
+| `cargo test -p sidebar tests::activating_acp_root_does_not_request_herdr_focus -- --exact` | **1 passed; 0 failed** |
+| `cargo test -p sidebar tests::archiving_herdr_root_routes_to_workspace_close -- --exact` | **1 passed; 0 failed** |
+| `cargo test -p sidebar tests::switcher_preview_does_not_focus_herdr_root_until_confirm -- --exact` | **1 passed; 0 failed** |
+| `cargo test -p sidebar tests::new_herdr_thread_loads_lazy_panel_before_create -- --exact` | **1 passed; 0 failed** |
+| `cargo test -p sidebar tests::closing_herdr_root_loads_bridge_when_panel_is_lazy -- --exact` | **1 passed; 0 failed** |
+| `cargo test -p sidebar tests::herdr_rename_routes_once_when_multiple_panels_share_bridge -- --exact` | **1 passed; 0 failed** |
+| `cargo test -p sidebar tests::` | **153 passed; 0 failed** |
+| `cargo test -p agent_ui agent_panel::tests::herdr` | **8 passed; 0 failed** |
+| `cargo test -p agent_ui herdr_bridge::tests` | **21 passed; 0 failed** |
 
-**Naming note:** the brief's literal filter `sidebar::tests::…` matches nothing because unit tests in a lib target are named without the crate prefix; the module path here is `tests::*`. The identical assertions run green under `tests::<name> -- --exact`. If strict textual parity with the checklist is required, the module would need to move into an integration-test target (a new file outside Task 5's allowed file list).
+The brief's literal `sidebar::tests::…` filter is not a matching unit-test path for this lib target; the same tests run under `tests::<name> -- --exact` as shown above.
 
-**Pre-existing breakage fixed en route:** at parent commit `8150878310` a clean-worktree `cargo test -p sidebar --lib --no-run` failed with 6 errors: `sidebar_tests.rs` calls `AgentPanel::has_terminal`, which was `pub(crate)` (invisible cross-crate). Verified against HEAD in a temporary worktree. Fixed minimally by widening `has_terminal` to `pub` (agent_panel.rs is in Task 5 scope); without it none of the required sidebar commands could compile.
-
-## Test coverage added
-1. `activating_herdr_root_requests_herdr_workspace_focus` — activating a Herdr row records exactly `focus_workspace:w1` on the recording API.
-2. `activating_acp_root_does_not_request_herdr_focus` — with a bound recording bridge, activating an ACP-native row records zero Herdr calls.
-3. `herdr_rows_persist_through_rebuilds_while_disconnected` — a disconnected Herdr row survives rebuilds, stays visible, and is never draft-classified.
-4. `herdr_rename_and_close_route_through_the_bridge` — rename/close of a Herdr root produce `rename_workspace:w1:*` / `close_workspace:w1`; unknown ids are not routed.
-5. `herdr_status_label_tracks_conflict_and_connection_states` — Unavailable → Conflict on a conflict event → cleared on a new sync run; session name exposed.
+## Regression coverage added
+1. `herdr_session_editor_blur_dismisses_without_rebinding` — changing the session name then emitting editor blur dismisses the editor while retaining the original bridge session.
+2. `herdr_create_response_persists_mapping_and_activates_without_event` — a controlled create response with no pushed create event persists mapping and metadata, then activates the returned Herdr root.
+3. `session_rebind_resets_active_herdr_surface` — a rebound bridge event clears the active Herdr surface and leaves the panel on a draft.
+4. `archiving_herdr_root_routes_to_workspace_close` — the selected Herdr row with no ACP session ID emits exactly `close_workspace:w1`.
+5. `switcher_preview_does_not_focus_herdr_root_until_confirm` — preview emits no focus request; confirm emits exactly one.
+6. `new_herdr_thread_loads_lazy_panel_before_create` — the New Herdr Thread path installs the lazy panel before attempting creation.
+7. `closing_herdr_root_loads_bridge_when_panel_is_lazy` — close loads the missing AgentPanel/bridge for the owning workspace.
+8. `herdr_rename_routes_once_when_multiple_panels_share_bridge` — two panels sharing one bridge still produce one rename request.
+9. Existing ACP/sidebar terminal assertions now use `AgentPanel::terminals`, proving `has_terminal` remains crate-private while preserving coverage.
 
 ## Concerns / notes for review
-- `create_herdr_root` relies on the server broadcasting `WorkspaceCreated` (which reconciliation persists) and activates on `RootCreated`; a race window is covered by checking the mapping again after the create response resolves.
-- The synthetic status test drives `StatusChanged` through the panel handler, so the label falls back to the bridge's real status rather than the synthetic one; asserted accordingly.
-- Session labels appear only under multi-Herdr-row ambiguity, per the brief's "only when needed"; single historical rows render their stored titles untouched.
-- Task 6 items (fake NDJSON server fixture, transport/socket coverage, real smoke scenarios) were intentionally not started.
+- Herdr bridge mapping persistence remains asynchronous through the existing `HerdrMappingStore::save_session` background task; metadata is cached/persisted through `ThreadMetadataStore` before activation, matching the bridge's existing persistence model.
+- A Herdr close requested for a row whose persisted paths do not match any currently open workspace is logged and not sent; there is no owning workspace/bridge to target in that state.
+- The shared-panel reset is delivered by the explicit `SessionRebound` event emitted by `rebind_selection`; ordinary reconnect/bootstrap status events do not clear active Herdr surfaces.
+- Task 6 items (fake NDJSON server fixture, transport/socket coverage, and real Herdr smoke scenarios) were intentionally not started.

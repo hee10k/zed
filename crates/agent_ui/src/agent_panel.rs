@@ -1222,9 +1222,6 @@ pub struct AgentPanel {
     /// named Herdr session via `Connect to Herdr Session`.
     herdr_connect_editor: Option<Entity<Editor>>,
     _herdr_connect_editor_subscription: Option<Subscription>,
-    /// Herdr workspace whose returned identity is persisted by the bridge;
-    /// the Zed row activates once `RootCreated` confirms the mapping.
-    pending_herdr_root_activation: Option<String>,
     /// Recorded outbound Herdr API calls for UI tests in dependent crates.
     #[cfg(any(test, feature = "test-support"))]
     test_herdr_recording: Option<Arc<RecordingHerdrApi>>,
@@ -1707,7 +1704,6 @@ impl AgentPanel {
             test_herdr_recording: None,
             herdr_connect_editor: None,
             _herdr_connect_editor_subscription: None,
-            pending_herdr_root_activation: None,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
             workspace,
             user_store,
@@ -3660,7 +3656,7 @@ impl AgentPanel {
             _ => None,
         }
     }
-    pub fn has_terminal(&self, terminal_id: TerminalId) -> bool {
+    pub(crate) fn has_terminal(&self, terminal_id: TerminalId) -> bool {
         self.terminals.contains_key(&terminal_id)
     }
 
@@ -4832,19 +4828,13 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         match event {
-            HerdrBridgeEvent::RootCreated {
-                workspace_id,
-                thread_id,
-            } => {
-                // A locally initiated `workspace.create` activates its new
-                // Zed row only after the bridge persisted the returned
-                // identity as a root mapping.
-                if self.pending_herdr_root_activation.as_deref() == Some(workspace_id) {
-                    self.pending_herdr_root_activation = None;
-                    self.herdr_focus_suppressed = true;
-                    self.load_herdr_thread(*thread_id, true, window, cx);
-                    self.herdr_focus_suppressed = false;
-                }
+            HerdrBridgeEvent::RootCreated { .. } => {
+                // The bridge persists root metadata before publishing this
+                // event. External roots must refresh the sidebar but must not
+                // steal the current panel surface; locally initiated roots
+                // activate directly from their create response.
+                cx.emit(AgentPanelEvent::EntryChanged);
+                cx.notify();
             }
             HerdrBridgeEvent::RootFocused {
                 workspace_id,
@@ -4926,6 +4916,9 @@ impl AgentPanel {
                         cx,
                     );
                 }
+            }
+            HerdrBridgeEvent::SessionRebound => {
+                self.reset_herdr_surface_after_rebind(window, cx);
             }
             HerdrBridgeEvent::StatusChanged(status) => {
                 // A fresh synchronization run supersedes conflicts reported
@@ -5015,7 +5008,7 @@ impl AgentPanel {
             self.activation_focus_handle(cx).focus(window, cx);
         }
 
-        if !self.herdr_focus_suppressed {
+        if focus && !self.herdr_focus_suppressed {
             if let Some(task) = bridge.update(cx, |bridge, cx| {
                 bridge.focus_root_in_context(&workspace_id, cx)
             }) {
@@ -5097,10 +5090,10 @@ impl AgentPanel {
         true
     }
 
-    /// Creates a new Herdr-backed root via `workspace.create`. The Zed row
-    /// becomes active only after the returned workspace identity has been
-    /// persisted as a root mapping (`RootCreated`). Returns `false` when no
-    /// bridge is bound.
+    /// Creates a new Herdr-backed root via `workspace.create`. The response
+    /// itself is reconciled and persisted before the Zed row becomes active;
+    /// a separate `RootCreated` event is not required. Returns `false` when
+    /// no bridge is bound.
     pub fn create_herdr_root(
         &mut self,
         label: impl Into<String>,
@@ -5117,20 +5110,22 @@ impl AgentPanel {
             match task.await {
                 Ok(snapshot) => {
                     this.update_in(cx, |panel, window, cx| {
-                        panel.pending_herdr_root_activation = Some(snapshot.workspace_id.clone());
-                        // The bridge may already have applied the
-                        // `WorkspaceCreated` event while the create response
-                        // was in flight.
-                        if let Some(thread_id) =
-                            panel.herdr_bridge.as_ref().and_then(|bridge| {
-                                bridge.read(cx).root_thread_id(&snapshot.workspace_id)
+                        let thread_id = panel.herdr_bridge.as_ref().and_then(|bridge| {
+                            bridge.update(cx, |bridge, cx| {
+                                bridge.apply_create_response(snapshot.clone(), cx)
                             })
-                        {
-                            panel.pending_herdr_root_activation = None;
-                            panel.herdr_focus_suppressed = true;
-                            panel.load_herdr_thread(thread_id, true, window, cx);
-                            panel.herdr_focus_suppressed = false;
-                        }
+                        });
+                        let Some(thread_id) = thread_id else {
+                            Self::show_herdr_toast(
+                                &panel.workspace,
+                                "Herdr create returned no workspace identity",
+                                cx,
+                            );
+                            return;
+                        };
+                        panel.herdr_focus_suppressed = true;
+                        panel.load_herdr_thread(thread_id, true, window, cx);
+                        panel.herdr_focus_suppressed = false;
                     })
                     .ok();
                 }
@@ -5205,7 +5200,7 @@ impl AgentPanel {
             window,
             |this, _editor, event: &editor::EditorEvent, window, cx| {
                 if matches!(event, editor::EditorEvent::Blurred) {
-                    this.stop_connecting_to_herdr_session(true, window, cx);
+                    this.stop_connecting_to_herdr_session(false, window, cx);
                 }
             },
         );
@@ -5272,8 +5267,9 @@ impl AgentPanel {
 
     fn reset_herdr_surface_after_rebind(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.herdr_conflict_active = false;
-        self.pending_herdr_root_activation = None;
-        if self.herdr_active_thread.take().is_some() {
+        let had_herdr_surface = self.herdr_active_thread.take().is_some()
+            || matches!(&self.base_view, BaseView::HerdrConversation { .. });
+        if had_herdr_surface {
             // Mappings from the previous session are gone; fall back to a
             // draft instead of showing stale conversation state.
             let old_view = std::mem::replace(&mut self.base_view, BaseView::Uninitialized);
@@ -7698,6 +7694,13 @@ impl AgentPanel {
             });
         });
         self.test_herdr_recording = Some(api);
+    }
+
+    /// Shares a test bridge with another panel without exposing the bridge
+    /// type to dependent crates.
+    pub fn share_test_herdr_bridge(&mut self, source: &Entity<AgentPanel>, cx: &App) {
+        self.herdr_bridge = source.read(cx).herdr_bridge.clone();
+        self._herdr_bridge_subscription = None;
     }
 
     /// Outbound Herdr API calls recorded since installation. Calls are
@@ -15032,6 +15035,122 @@ mod tests {
                 panel.read_with(&cx, |panel, cx| panel.herdr_session_name(cx)),
                 Some(SharedString::from("alpha"))
             );
+        }
+        #[gpui::test]
+        async fn herdr_session_editor_blur_dismisses_without_rebinding(
+            cx: &mut TestAppContext,
+        ) {
+            let (panel, mut cx) = setup_panel(cx).await;
+            panel.update_in(&mut cx, |panel, _window, cx| {
+                panel.install_test_herdr_root("w1", "/project", "Review", cx);
+            });
+            let initial_session = panel.read_with(&cx, |panel, cx| {
+                panel
+                    .herdr_bridge
+                    .as_ref()
+                    .map(|bridge| bridge.read(cx).session_name().to_string())
+            });
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.connect_to_herdr_session(window, cx);
+                let editor = panel
+                    .herdr_connect_editor
+                    .clone()
+                    .expect("session editor should be open");
+                editor.update(cx, |editor, cx| {
+                    editor.set_text("beta", window, cx);
+                    cx.emit(editor::EditorEvent::Blurred);
+                });
+            });
+            cx.run_until_parked();
+
+            panel.read_with(&cx, |panel, cx| {
+                assert!(
+                    panel.herdr_connect_editor.is_none(),
+                    "blur should dismiss the session editor"
+                );
+                assert_eq!(
+                    panel
+                        .herdr_bridge
+                        .as_ref()
+                        .map(|bridge| bridge.read(cx).session_name().to_string()),
+                    initial_session,
+                    "blur must not commit a session rebind"
+                );
+            });
+        }
+
+        #[gpui::test]
+        async fn herdr_create_response_persists_mapping_and_activates_without_event(
+            cx: &mut TestAppContext,
+        ) {
+            let (panel, mut cx) = setup_panel(cx).await;
+            cx.update(|_window, cx| ThreadMetadataStore::init_global(cx));
+            let api = RecordingHerdrApi::new();
+            api.set_create_response(crate::herdr_client::HerdrWorkspaceSnapshot {
+                workspace_id: "created-workspace".to_string(),
+                label: "Created Root".to_string(),
+                paths: vec!["/project".to_string()],
+                ..Default::default()
+            });
+            panel.update_in(&mut cx, |panel, _window, cx| {
+                let bridge = cx.new(|_| HerdrThreadBridge::for_test_with_api(api.clone()));
+                panel.herdr_bridge = Some(bridge);
+                panel._herdr_bridge_subscription = None;
+            });
+
+            let started = panel.update_in(&mut cx, |panel, window, cx| {
+                panel.create_herdr_root(
+                    "Created Root",
+                    vec!["/project".to_string()],
+                    window,
+                    cx,
+                )
+            });
+            assert!(started);
+            cx.run_until_parked();
+            let (thread_id, metadata) = panel.read_with(&cx, |panel, cx| {
+                let thread_id = panel
+                    .herdr_root_thread_id("created-workspace", cx)
+                    .expect("create response should establish a root mapping");
+                let metadata = ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .cloned()
+                    .expect("create response should persist root metadata");
+                assert_eq!(panel.herdr_active_thread, Some(thread_id));
+                assert!(matches!(
+                    panel.base_view,
+                    BaseView::HerdrConversation { .. }
+                ));
+                (thread_id, metadata)
+            });
+            assert_eq!(metadata.title().map(|title| title.to_string()), Some("Created Root".to_string()));
+            assert_eq!(metadata.folder_paths().paths().len(), 1);
+            assert_eq!(
+                metadata.folder_paths().paths()[0].as_path(),
+                std::path::Path::new("/project")
+            );
+        }
+
+        #[gpui::test]
+        async fn session_rebind_resets_active_herdr_surface(
+            cx: &mut TestAppContext,
+        ) {
+            let (panel, _bridge, mut cx) = setup_herdr_panel(cx).await;
+            let thread_id = root_thread_id(&panel, &cx);
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.load_herdr_thread(thread_id, true, window, cx);
+            });
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.handle_herdr_event(&HerdrBridgeEvent::SessionRebound, window, cx);
+            });
+            panel.read_with(&cx, |panel, _| {
+                assert_eq!(panel.herdr_active_thread, None);
+                assert!(!matches!(
+                    panel.base_view,
+                    BaseView::HerdrConversation { .. }
+                ));
+            });
         }
     }
 }

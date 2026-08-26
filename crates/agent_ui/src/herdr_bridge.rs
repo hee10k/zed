@@ -84,6 +84,9 @@ pub(crate) enum HerdrConnectionStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HerdrBridgeEvent {
     StatusChanged(HerdrConnectionStatus),
+    /// A user explicitly rebound this bridge; all panels sharing it must drop
+    /// surfaces that belong to the previous session.
+    SessionRebound,
     RootCreated {
         workspace_id: String,
         thread_id: ThreadId,
@@ -1479,6 +1482,7 @@ impl HerdrThreadBridge {
         cx: &mut Context<Self>,
     ) -> Result<()> {
         let session_name = selection.session_name();
+        let event_start = self.events.len();
         self.rebind_session(session_name.clone())?;
         self.selection = selection.clone();
         self.state.mappings =
@@ -1501,6 +1505,8 @@ impl HerdrThreadBridge {
                 None
             }
         };
+        self.events.push(HerdrBridgeEvent::SessionRebound);
+        self.emit_new_events(event_start, cx);
         self.sync_started = true;
         self.start_sync(cx);
         Ok(())
@@ -1550,6 +1556,26 @@ impl HerdrThreadBridge {
             Some(client) => client.create_workspace(label, paths, cx),
             None => Task::ready(Err(HerdrClientError::Disconnected)),
         }
+    }
+
+    /// Reconciles a successful `workspace.create` response directly into the
+    /// durable root mapping and metadata. Herdr may not emit a corresponding
+    /// `workspace.created` event, so callers must not wait for one before
+    /// activating the returned root.
+    pub(crate) fn apply_create_response(
+        &mut self,
+        workspace: HerdrWorkspaceSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Option<ThreadId> {
+        if workspace.workspace_id.is_empty() {
+            return None;
+        }
+        let previous_mappings = self.state.mappings.clone();
+        let thread_id = self.create_or_restore_root(&workspace, true);
+        self.persist_metadata_changes(&previous_mappings, cx);
+        self.persist_dirty_metadata(cx);
+        self.persist_mappings(cx);
+        Some(thread_id)
     }
 
     pub(crate) fn request_rename_workspace(
@@ -1789,6 +1815,7 @@ impl HerdrBridgeRegistry {
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) struct RecordingHerdrApi {
     calls: parking_lot::Mutex<Vec<String>>,
+    create_response: parking_lot::Mutex<Option<HerdrWorkspaceSnapshot>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1796,7 +1823,12 @@ impl RecordingHerdrApi {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             calls: parking_lot::Mutex::new(Vec::new()),
+            create_response: parking_lot::Mutex::new(None),
         })
+    }
+
+    pub(crate) fn set_create_response(&self, snapshot: HerdrWorkspaceSnapshot) {
+        *self.create_response.lock() = Some(snapshot);
     }
 
     pub(crate) fn calls(&self) -> Vec<String> {
@@ -1838,7 +1870,12 @@ impl HerdrApi for RecordingHerdrApi {
         _paths: Vec<String>,
         _cx: &App,
     ) -> Task<Result<HerdrWorkspaceSnapshot, HerdrClientError>> {
-        Task::ready(Err(HerdrClientError::Disconnected))
+        Task::ready(
+            self.create_response
+                .lock()
+                .take()
+                .ok_or(HerdrClientError::Disconnected),
+        )
     }
     fn rename_workspace(
         &self,

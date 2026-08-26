@@ -3677,19 +3677,17 @@ impl Sidebar {
             .entry(thread_id)
             .is_some_and(|metadata| thread_is_herdr_backed(metadata));
         if is_herdr {
-            let mut routed = false;
             if let Some(multi_workspace) = self.multi_workspace.upgrade() {
                 let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
                 for workspace in workspaces {
-                    if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                        routed |= agent_panel.update(cx, |panel, cx| {
+                    if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx)
+                        && agent_panel.update(cx, |panel, cx| {
                             panel.rename_herdr_thread(thread_id, &title, cx)
-                        });
+                        })
+                    {
+                        return;
                     }
                 }
-            }
-            if routed {
-                return;
             }
             // Disconnected root: persist the override so the rename is not
             // lost until Herdr confirms a new title.
@@ -5597,13 +5595,19 @@ impl Sidebar {
 
     /// Closes a Herdr-backed root through the owning window's bridge. The
     /// row stays visible (as a disconnected historical session) until Herdr
-    /// confirms the close.
-    fn close_herdr_entry(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+    /// confirms the close. A workspace without an open AgentPanel is loaded
+    /// first so the request always reaches its per-window bridge.
+    fn close_herdr_entry(
+        &mut self,
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
         let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
-        for workspace in workspaces {
+        for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
                 let closed = agent_panel.update(cx, |panel, cx| {
                     panel.close_herdr_thread(thread_id, cx)
@@ -5613,6 +5617,43 @@ impl Sidebar {
                 }
             }
         }
+
+        let metadata = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(thread_id)
+            .cloned();
+        let Some(workspace) = workspaces.into_iter().find(|workspace| {
+            let Some(metadata) = metadata.as_ref() else {
+                return false;
+            };
+            let herdr_paths = metadata.folder_paths().paths();
+            let roots = workspace.read(cx).root_paths(cx);
+            roots.iter().any(|root| {
+                herdr_paths
+                    .iter()
+                    .any(|herdr_path| herdr_path.as_path() == root.as_ref())
+            })
+        }) else {
+            log::warn!("cannot find workspace to close Herdr thread {thread_id:?}");
+            return;
+        };
+
+        let workspace_weak = workspace.downgrade();
+        let mut async_window_cx = window.to_async(cx);
+        cx.spawn(async move |_this, _cx| {
+            let panel = AgentPanel::load(workspace_weak, async_window_cx.clone()).await?;
+            workspace.update_in(&mut async_window_cx, |workspace, window, cx| {
+                let panel = workspace.panel::<AgentPanel>(cx).unwrap_or_else(|| {
+                    workspace.add_panel(panel.clone(), window, cx);
+                    panel.clone()
+                });
+                if !panel.update(cx, |panel, cx| panel.close_herdr_thread(thread_id, cx)) {
+                    log::warn!("loaded workspace has no Herdr mapping for thread {thread_id:?}");
+                }
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     /// Creates a new Herdr-backed root for `workspace` via
@@ -5640,14 +5681,37 @@ impl Sidebar {
             .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "Herdr".to_string());
 
-        workspace.update(cx, |workspace, cx| {
-            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+        if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.create_herdr_root(label, paths, window, cx);
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.focus_panel::<AgentPanel>(window, cx);
+            });
+            return;
+        }
+
+        // The menu is available even when the AgentPanel has never been
+        // opened. Load it before issuing `workspace.create`; otherwise this
+        // action would silently do nothing.
+        let workspace = workspace.clone();
+        let workspace_weak = workspace.downgrade();
+        let mut async_window_cx = window.to_async(cx);
+        cx.spawn(async move |_this, _cx| {
+            let panel = AgentPanel::load(workspace_weak, async_window_cx.clone()).await?;
+            workspace.update_in(&mut async_window_cx, |workspace, window, cx| {
+                let panel = workspace.panel::<AgentPanel>(cx).unwrap_or_else(|| {
+                    workspace.add_panel(panel.clone(), window, cx);
+                    panel.clone()
+                });
                 panel.update(cx, |panel, cx| {
                     panel.create_herdr_root(label, paths, window, cx);
                 });
-            }
-            workspace.focus_panel::<AgentPanel>(window, cx);
-        });
+                workspace.focus_panel::<AgentPanel>(window, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn archive_thread(
@@ -6060,6 +6124,8 @@ impl Sidebar {
                     let workspace = thread.workspace.clone();
                     let draft_id = thread.metadata.thread_id;
                     self.remove_draft(draft_id, &workspace, window, cx);
+                } else if thread_is_herdr_backed(&thread.metadata) {
+                    self.close_herdr_entry(thread.metadata.thread_id, window, cx);
                 } else if let Some(session_id) = thread.metadata.session_id.clone() {
                     self.archive_thread(&session_id, window, cx);
                 }
@@ -6930,7 +6996,7 @@ impl Sidebar {
                                         // close through the bridge, ACP
                                         // sessions through the archive flow.
                                         if let Some(thread_id) = herdr_thread_id {
-                                            this.close_herdr_entry(thread_id, cx);
+                                            this.close_herdr_entry(thread_id, window, cx);
                                         } else if let Some(session_id) = &session_id {
                                             this.archive_thread(session_id, window, cx);
                                         }
@@ -9106,5 +9172,206 @@ mod tests {
                 .expect("Herdr row should be present after rebuild");
             assert!(row.draft.is_none(), "Herdr rows are never ACP drafts");
         });
+    }
+
+    #[gpui::test]
+    async fn archiving_herdr_root_routes_to_workspace_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_navigation_test(cx);
+        let project = init_project("/repo", cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let fixture = build_fixture(&multi_workspace, cx);
+        seed_herdr_root(&fixture, "w1", "/repo", "alpha-root", "Alpha Root", cx);
+
+        let row_index = fixture.sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .position(|entry| {
+                    matches!(
+                        entry,
+                        ListEntry::Thread(thread)
+                            if thread.metadata.title.as_deref() == Some("Alpha Root")
+                    )
+                })
+                .expect("Herdr root row should be visible")
+        });
+        fixture.panel.read_with(cx, |panel, _| {
+            assert!(panel.take_test_herdr_api_calls().is_empty());
+        });
+        fixture.sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.selection = Some(row_index);
+            sidebar.archive_selected_thread(&ArchiveSelectedThread, window, cx);
+        });
+        cx.run_until_parked();
+
+        let calls = fixture
+            .panel
+            .read_with(cx, |panel, _| panel.take_test_herdr_api_calls());
+        assert_eq!(calls, vec!["close_workspace:w1".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn switcher_preview_does_not_focus_herdr_root_until_confirm(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_navigation_test(cx);
+        let project = init_project("/repo", cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let fixture = build_fixture(&multi_workspace, cx);
+        seed_herdr_root(&fixture, "w1", "/repo", "alpha-root", "Alpha Root", cx);
+        let metadata = fixture.sidebar.update(cx, |_, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entries()
+                .find(|entry| entry.title.as_deref() == Some("Alpha Root"))
+                .cloned()
+                .expect("Herdr row should be persisted")
+        });
+        let selection = ThreadSwitcherSelection::Thread {
+            metadata,
+            workspace: fixture.workspace.clone(),
+        };
+
+        fixture.sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.preview_switcher_selection(&selection, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            fixture
+                .panel
+                .read_with(cx, |panel, _| panel.take_test_herdr_api_calls())
+                .is_empty(),
+            "preview must not issue workspace.focus"
+        );
+
+        fixture.sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.confirm_switcher_selection(&selection, window, cx);
+        });
+        cx.run_until_parked();
+        let calls = fixture
+            .panel
+            .read_with(cx, |panel, _| panel.take_test_herdr_api_calls());
+        assert_eq!(calls, vec!["focus_workspace:w1".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn new_herdr_thread_loads_lazy_panel_before_create(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_navigation_test(cx);
+        let project = init_project("/repo", cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let fixture = build_fixture(&multi_workspace, cx);
+        fixture.workspace.update_in(cx, |workspace, window, cx| {
+            workspace.remove_panel(&fixture.panel, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            fixture
+                .workspace
+                .read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))
+                .is_none(),
+            "fixture must start this regression with a lazy panel"
+        );
+
+        fixture.sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.new_herdr_entry(&fixture.workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            fixture
+                .workspace
+                .read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))
+                .is_some(),
+            "New Herdr Thread must load the panel before creating a root"
+        );
+    }
+
+    #[gpui::test]
+    async fn closing_herdr_root_loads_bridge_when_panel_is_lazy(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_navigation_test(cx);
+        let project = init_project("/repo", cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let fixture = build_fixture(&multi_workspace, cx);
+        seed_herdr_root(&fixture, "w1", "/repo", "alpha-root", "Alpha Root", cx);
+        let thread_id = fixture
+            .panel
+            .read_with(cx, |panel, cx| panel.herdr_root_thread_id("w1", cx))
+            .expect("seeded root should have an id");
+        fixture.workspace.update_in(cx, |workspace, window, cx| {
+            workspace.remove_panel(&fixture.panel, window, cx);
+        });
+        cx.run_until_parked();
+
+        fixture.sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.close_herdr_entry(thread_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            fixture
+                .workspace
+                .read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))
+                .is_some(),
+            "closing a lazy Herdr root must load its AgentPanel/bridge first"
+        );
+    }
+
+    #[gpui::test]
+    async fn herdr_rename_routes_once_when_multiple_panels_share_bridge(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_navigation_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/repo", serde_json::json!({ "src": {} })).await;
+        fs.insert_tree("/repo-b", serde_json::json!({ "src": {} })).await;
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        let project =
+            project::Project::test(fs.clone(), [std::path::Path::new("/repo")], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let fixture = build_fixture(&multi_workspace, cx);
+        let project_b =
+            project::Project::test(fs.clone(), [std::path::Path::new("/repo-b")], cx).await;
+        let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
+            mw.test_add_workspace(project_b, window, cx)
+        });
+        let panel_b = workspace_b.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::test_new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        seed_herdr_root(&fixture, "w1", "/repo", "alpha-root", "Alpha Root", cx);
+        panel_b.update(cx, |panel, cx| {
+            panel.share_test_herdr_bridge(&fixture.panel, cx);
+        });
+        let thread_id = fixture
+            .panel
+            .read_with(cx, |panel, cx| panel.herdr_root_thread_id("w1", cx))
+            .expect("seeded root should have an id");
+
+        fixture.sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.apply_thread_rename(thread_id, "Renamed".into(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let calls = fixture
+            .panel
+            .read_with(cx, |panel, _| panel.take_test_herdr_api_calls());
+        assert_eq!(
+            calls,
+            vec!["rename_workspace:w1:Renamed".to_string()],
+            "one user rename must produce one Herdr request"
+        );
     }
 }

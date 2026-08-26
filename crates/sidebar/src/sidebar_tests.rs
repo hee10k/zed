@@ -1868,7 +1868,7 @@ async fn test_closing_last_agent_panel_terminal_restores_empty_header(cx: &mut T
     cx.run_until_parked();
 
     panel.read_with(cx, |panel, cx| {
-        assert!(!panel.has_terminal(terminal_id));
+        assert!(!panel.terminals(cx).iter().any(|terminal| terminal.id == terminal_id));
         assert!(
             panel.active_view_is_new_draft(cx),
             "closing the active terminal should leave the panel on its empty draft"
@@ -2990,8 +2990,8 @@ async fn test_terminal_close_event_closes_sidebar_terminal(cx: &mut TestAppConte
     });
     cx.run_until_parked();
 
-    panel.read_with(cx, |panel, _cx| {
-        assert!(!panel.has_terminal(terminal_id));
+    panel.read_with(cx, |panel, cx| {
+        assert!(!panel.terminals(cx).iter().any(|terminal| terminal.id == terminal_id));
     });
     sidebar.read_with(cx, |sidebar, _cx| {
         assert!(sidebar.contents.entries.iter().all(|entry| {
@@ -3032,8 +3032,8 @@ async fn test_terminal_close_event_activates_neighbor(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    panel.read_with(cx, |panel, _cx| {
-        assert!(!panel.has_terminal(server_terminal_id));
+    panel.read_with(cx, |panel, cx| {
+        assert!(!panel.terminals(cx).iter().any(|terminal| terminal.id == server_terminal_id));
         assert_eq!(panel.active_terminal_id(), Some(build_terminal_id));
     });
     sidebar.read_with(cx, |sidebar, _cx| {
@@ -3897,8 +3897,8 @@ async fn test_archive_selected_thread_closes_selected_agent_panel_terminal(
     cx.dispatch_action(ArchiveSelectedThread);
     cx.run_until_parked();
 
-    panel.read_with(cx, |panel, _cx| {
-        assert!(!panel.has_terminal(terminal_id));
+    panel.read_with(cx, |panel, cx| {
+        assert!(!panel.terminals(cx).iter().any(|terminal| terminal.id == terminal_id));
     });
     sidebar.read_with(cx, |sidebar, _cx| {
         assert!(sidebar.contents.entries.iter().all(|entry| {
@@ -3952,8 +3952,8 @@ async fn test_closing_active_agent_panel_terminal_activates_neighbor(cx: &mut Te
     });
     cx.run_until_parked();
 
-    panel.read_with(cx, |panel, _cx| {
-        assert!(!panel.has_terminal(server_terminal_id));
+    panel.read_with(cx, |panel, cx| {
+        assert!(!panel.terminals(cx).iter().any(|terminal| terminal.id == server_terminal_id));
         assert_eq!(panel.active_terminal_id(), Some(build_terminal_id));
     });
     sidebar.read_with(cx, |sidebar, _cx| {
