@@ -24,6 +24,71 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// the server's own timeout plus this margin.
 const EVENTS_WAIT_DEADLINE_MARGIN_MS: u64 = 5_000;
 
+#[derive(Clone)]
+struct SubscriptionFence {
+    generation: Arc<AtomicU64>,
+    expected_generation: u64,
+    cancellation: Arc<AtomicBool>,
+    publish_lock: Arc<Mutex<()>>,
+}
+
+impl SubscriptionFence {
+    fn new(
+        generation: Arc<AtomicU64>,
+        expected_generation: u64,
+        publish_lock: Arc<Mutex<()>>,
+    ) -> Self {
+        Self::with_cancellation(
+            generation,
+            expected_generation,
+            publish_lock,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn with_cancellation(
+        generation: Arc<AtomicU64>,
+        expected_generation: u64,
+        publish_lock: Arc<Mutex<()>>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            generation,
+            expected_generation,
+            cancellation,
+            publish_lock,
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        !self.cancellation.load(Ordering::SeqCst)
+            && self.generation.load(Ordering::SeqCst) == self.expected_generation
+    }
+}
+
+/// A generation fence is checked while holding the publish lock, so a
+/// cancellation boundary either precedes an event entirely or follows it.
+fn publish_event(
+    fence: &SubscriptionFence,
+    event: HerdrEvent,
+    event_cursor_tx: &Sender<HerdrEventCursor>,
+    lifecycle_tx: &Sender<HerdrEvent>,
+    event_log: &Arc<Mutex<Vec<HerdrEvent>>>,
+) -> Result<bool, HerdrClientError> {
+    let _publish_guard = match fence.publish_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !fence.is_current() {
+        return Ok(false);
+    }
+    let cursor = record_event(event_log, event.clone());
+    forward_lifecycle(lifecycle_tx, &event);
+    futures::executor::block_on(event_cursor_tx.send(cursor))
+        .map_err(|_| HerdrClientError::Disconnected)?;
+    Ok(true)
+}
+
 type PendingResult = Result<Box<RawValue>, HerdrClientError>;
 type PendingRequests = Arc<Mutex<HashMap<String, oneshot::Sender<PendingResult>>>>;
 
@@ -808,6 +873,65 @@ fn bootstrap_primary_subscription_ended(
     })
 }
 
+fn bootstrap_subscription_ended(events: &[HerdrEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            HerdrEvent::Unknown { event, .. } if event == "subscription_ended"
+        )
+    })
+}
+
+/// Keeps cancellation active while an established subscription is blocked in
+/// a read. A one-shot Windows `CancelIoEx` can miss a read that starts just
+/// after the cancellation call; repeated triggers close that race while the
+/// generation fence rejects any late publisher.
+struct SubscriptionKillGuard {
+    stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SubscriptionKillGuard {
+    fn new(kill: ConnectionKillSwitch, fence: SubscriptionFence) -> Self {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("herdr-subscription-cancel".to_string())
+            .spawn(move || {
+                while fence.is_current() {
+                    match stop_rx.recv_timeout(Duration::from_millis(25)) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            return;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+                loop {
+                    kill.trigger();
+                    match stop_rx.recv_timeout(Duration::from_millis(25)) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            })
+            .ok();
+        Self {
+            stop_tx: Some(stop_tx),
+            worker,
+        }
+    }
+}
+
+impl Drop for SubscriptionKillGuard {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 
 #[derive(Clone)]
 pub(crate) struct HerdrClientHandle {
@@ -824,6 +948,7 @@ pub(crate) struct HerdrClientHandle {
     watched_panes: WatchedPanes,
     subscription_kills: Arc<Mutex<Vec<ConnectionKillSwitch>>>,
     subscription_generation: Arc<AtomicU64>,
+    publish_lock: Arc<Mutex<()>>,
     supervisor_started: Arc<AtomicBool>,
     executor: BackgroundExecutor,
 }
@@ -855,6 +980,7 @@ impl HerdrClientHandle {
             watched_panes: Arc::new(Mutex::new(HashMap::new())),
             subscription_kills: Arc::new(Mutex::new(Vec::new())),
             subscription_generation: Arc::new(AtomicU64::new(0)),
+            publish_lock: Arc::new(Mutex::new(())),
             supervisor_started: Arc::new(AtomicBool::new(false)),
             executor,
         }
@@ -915,6 +1041,12 @@ impl HerdrClientHandle {
         let event_cursor_tx = self.event_cursor_tx.clone();
         let lifecycle_tx = self.lifecycle_tx.clone();
         let event_log = self.event_log.clone();
+        let generation = self.subscription_generation.load(Ordering::SeqCst);
+        let fence = SubscriptionFence::new(
+            self.subscription_generation.clone(),
+            generation,
+            self.publish_lock.clone(),
+        );
         let spawned = std::thread::Builder::new()
             .name("herdr-request".to_string())
             .spawn(move || {
@@ -927,6 +1059,7 @@ impl HerdrClientHandle {
                     event_cursor_tx,
                     lifecycle_tx,
                     event_log,
+                    fence,
                 );
             });
         if spawned.is_err() {
@@ -955,7 +1088,20 @@ impl HerdrClientHandle {
         &self,
         params: Value,
         retain_kill_switch: bool,
-    ) -> Task<Result<(String, usize, ConnectionKillSwitch), HerdrClientError>> {
+    ) -> Task<Result<(String, usize, ConnectionKillSwitch, u64), HerdrClientError>> {
+        self.start_subscription_with_cancellation(
+            params,
+            retain_kill_switch,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn start_subscription_with_cancellation(
+        &self,
+        params: Value,
+        retain_kill_switch: bool,
+        cancellation: Arc<AtomicBool>,
+    ) -> Task<Result<(String, usize, ConnectionKillSwitch, u64), HerdrClientError>> {
         let request_id = format!("req-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let request = HerdrRequest {
             id: request_id.clone(),
@@ -963,6 +1109,12 @@ impl HerdrClientHandle {
             params,
         };
         let generation = self.subscription_generation.load(Ordering::SeqCst);
+        let fence = SubscriptionFence::with_cancellation(
+            self.subscription_generation.clone(),
+            generation,
+            self.publish_lock.clone(),
+            cancellation,
+        );
         let endpoint = self.endpoint.clone();
         let event_tx = self.event_tx.clone();
         let event_cursor_tx = self.event_cursor_tx.clone();
@@ -983,6 +1135,7 @@ impl HerdrClientHandle {
                     event_cursor_tx,
                     lifecycle_tx,
                     event_log,
+                    fence,
                 );
             });
         if let Err(error) = spawned {
@@ -995,29 +1148,28 @@ impl HerdrClientHandle {
                 .unwrap_or_else(|_| Err(HerdrClientError::Disconnected));
             let (subscription_id, boundary, kill) = result?;
             registrar.accept_subscription_kill(generation, &kill, retain_kill_switch)?;
-            Ok((subscription_id, boundary, kill))
+            Ok((subscription_id, boundary, kill, generation))
         })
     }
     fn cancel_subscription_generation(&self) {
-        let kills = match self.subscription_kills.lock() {
-            Ok(mut kills) => {
-                self.subscription_generation.fetch_add(1, Ordering::SeqCst);
-                std::mem::take(&mut *kills)
-            }
-            Err(poisoned) => {
-                let mut kills = poisoned.into_inner();
-                self.subscription_generation.fetch_add(1, Ordering::SeqCst);
-                std::mem::take(&mut *kills)
-            }
+        let generation_guard = match self.publish_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
         };
-        for kill in kills {
-            kill.trigger();
-        }
-
+        self.subscription_generation.fetch_add(1, Ordering::SeqCst);
+        let kills = match self.subscription_kills.lock() {
+            Ok(mut kills) => std::mem::take(&mut *kills),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
         let watches = {
             let mut watched = watched_lock(&self.watched_panes);
             std::mem::take(&mut *watched)
         };
+        drop(generation_guard);
+
+        for kill in kills {
+            kill.trigger();
+        }
         for (_, watch) in watches {
             watch.watcher_cancel.store(true, Ordering::SeqCst);
             if let Some(kill) = watch.filter_kill {
@@ -1058,13 +1210,15 @@ impl HerdrClientHandle {
     /// Track a pane created mid-session: per-pane filters plus a continuous
     /// output watcher. No-op if the pane is already watched.
     fn watch_pane(&self, pane_id: String) {
-        let Some(cancel) = self.ensure_watched(&pane_id) else {
+        let Some((cancel, generation)) = self.ensure_watched_with_generation(&pane_id) else {
             return;
         };
 
-        let filters = self.start_subscription(
+        let filter_cancel = cancel.clone();
+        let filters = self.start_subscription_with_cancellation(
             pane_filter_subscription_params(&[pane_id.clone()]),
             false,
+            filter_cancel.clone(),
         );
         let registrar = self.clone();
         let filter_pane_id = pane_id.clone();
@@ -1072,8 +1226,13 @@ impl HerdrClientHandle {
             .clone()
             .spawn(async move {
                 match filters.await {
-                    Ok((_, _, kill)) => {
-                        registrar.store_filter_kill_switch(&filter_pane_id, kill);
+                    Ok((_, _, kill, filter_generation)) => {
+                        registrar.store_filter_kill_switch_at_generation(
+                            &filter_pane_id,
+                            filter_generation,
+                            filter_cancel,
+                            kill,
+                        );
                     }
                     Err(error) => {
                         log::error!(
@@ -1083,32 +1242,48 @@ impl HerdrClientHandle {
                 }
             })
             .detach();
-        self.spawn_output_watcher(pane_id, cancel);
+        self.spawn_output_watcher(pane_id, cancel, generation);
     }
 
     /// Begin output watching for a pane whose per-pane filters were already
     /// registered by the bootstrap subscription batch.
     fn track_pane_output(&self, pane_id: String) {
-        let Some(cancel) = self.ensure_watched(&pane_id) else {
+        let Some((cancel, generation)) = self.ensure_watched_with_generation(&pane_id) else {
             return;
         };
-        self.spawn_output_watcher(pane_id, cancel);
+        self.spawn_output_watcher(pane_id, cancel, generation);
     }
 
     fn ensure_watched(&self, pane_id: &str) -> Option<Arc<AtomicBool>> {
+        self.ensure_watched_with_generation(pane_id)
+            .map(|(cancel, _generation)| cancel)
+    }
+
+    fn ensure_watched_with_generation(
+        &self,
+        pane_id: &str,
+    ) -> Option<(Arc<AtomicBool>, u64)> {
+        let generation_guard = match self.publish_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let generation = self.subscription_generation.load(Ordering::SeqCst);
         let mut watched = watched_lock(&self.watched_panes);
         if watched.contains_key(pane_id) {
+            drop(generation_guard);
             return None;
         }
         let cancel = Arc::new(AtomicBool::new(false));
         watched.insert(
             pane_id.to_string(),
             PaneWatch {
+                generation,
                 watcher_cancel: cancel.clone(),
                 filter_kill: None,
             },
         );
-        Some(cancel)
+        drop(generation_guard);
+        Some((cancel, generation))
     }
 
 
@@ -1120,16 +1295,46 @@ impl HerdrClientHandle {
     /// it replaces, or that connection would leak and its pump would keep
     /// running against a pane id it no longer owns.
     fn store_filter_kill_switch(&self, pane_id: &str, kill: ConnectionKillSwitch) {
+        let generation = self.subscription_generation.load(Ordering::SeqCst);
+        let cancellation = watched_lock(&self.watched_panes)
+            .get(pane_id)
+            .map(|watch| watch.watcher_cancel.clone())
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
+        self.store_filter_kill_switch_at_generation(pane_id, generation, cancellation, kill);
+    }
+
+    fn store_filter_kill_switch_at_generation(
+        &self,
+        pane_id: &str,
+        generation: u64,
+        cancellation: Arc<AtomicBool>,
+        kill: ConnectionKillSwitch,
+    ) {
+        let generation_guard = match self.publish_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.subscription_generation.load(Ordering::SeqCst) != generation
+            || cancellation.load(Ordering::SeqCst)
+        {
+            drop(generation_guard);
+            kill.trigger();
+            return;
+        }
         let mut watched = watched_lock(&self.watched_panes);
         match watched.get_mut(pane_id) {
-            Some(watch) => {
+            Some(watch)
+                if watch.generation == generation
+                    && Arc::ptr_eq(&watch.watcher_cancel, &cancellation) =>
+            {
                 if let Some(previous) = watch.filter_kill.replace(kill) {
                     log::debug!("Replacing stale Herdr filter subscription for {pane_id}");
                     previous.trigger();
                 }
             }
-            None => drop(kill.trigger()),
+            Some(_) | None => drop(kill.trigger()),
         }
+        drop(generation_guard);
     }
 
     /// Retire a pane: cancel its output watcher and terminate its dedicated
@@ -1140,6 +1345,7 @@ impl HerdrClientHandle {
         if let Some(PaneWatch {
             watcher_cancel,
             filter_kill,
+            ..
         }) = retired
         {
             watcher_cancel.store(true, Ordering::SeqCst);
@@ -1154,15 +1360,27 @@ impl HerdrClientHandle {
     /// fire on non-matching -> matching transitions, so instead repeatedly
     /// block in `events.wait` for `pane_output_changed` and fetch the changed
     /// buffer with a revision-aware `pane.read`.
-    fn spawn_output_watcher(&self, pane_id: String, cancel: Arc<AtomicBool>) {
+    fn spawn_output_watcher(
+        &self,
+        pane_id: String,
+        cancel: Arc<AtomicBool>,
+        generation: u64,
+    ) {
         let client = self.clone();
         let event_cursor_tx = self.event_cursor_tx.clone();
+        let fence = SubscriptionFence::with_cancellation(
+            self.subscription_generation.clone(),
+            generation,
+            self.publish_lock.clone(),
+            cancel.clone(),
+        );
         self.executor
             .clone()
             .spawn(async move {
                 let mut last_revision: u64 = 0;
+                let retry_delay = Duration::from_millis(100);
                 loop {
-                    if cancel.load(Ordering::SeqCst) {
+                    if !fence.is_current() {
                         return;
                     }
                     let wait = client
@@ -1172,7 +1390,7 @@ impl HerdrClientHandle {
                             events_wait_deadline(),
                         )
                         .await;
-                    if cancel.load(Ordering::SeqCst) {
+                    if !fence.is_current() {
                         return;
                     }
                     let notified_revision = match wait {
@@ -1182,21 +1400,35 @@ impl HerdrClientHandle {
                                 continue;
                             }
                             log::warn!(
-                                "Herdr output watcher stopped for {pane_id}: protocol error ({code}): {message}"
+                                "Herdr output watcher retrying for {pane_id}: protocol error ({code}): {message}"
                             );
-                            return;
+                            if !fence.is_current() {
+                                return;
+                            }
+                            client.executor.clone().timer(retry_delay).await;
+                            continue;
                         }
                         Err(error) => {
-                            log::warn!("Herdr output watcher stopped for {pane_id}: {error}");
-                            return;
+                            log::warn!(
+                                "Herdr output watcher retrying for {pane_id}: {error}"
+                            );
+                            if !fence.is_current() {
+                                return;
+                            }
+                            client.executor.clone().timer(retry_delay).await;
+                            continue;
                         }
                         Ok(result) => match wait_matched_revision(&result) {
                             Some(revision) => revision,
                             None => {
                                 log::warn!(
-                                    "Herdr output watcher stopped for {pane_id}: unexpected events.wait result"
+                                    "Herdr output watcher retrying for {pane_id}: unexpected events.wait result"
                                 );
-                                return;
+                                if !fence.is_current() {
+                                    return;
+                                }
+                                client.executor.clone().timer(retry_delay).await;
+                                continue;
                             }
                         },
                     };
@@ -1214,7 +1446,7 @@ impl HerdrClientHandle {
                             }),
                         )
                         .await;
-                    if cancel.load(Ordering::SeqCst) {
+                    if !fence.is_current() {
                         return;
                     }
                     match read
@@ -1231,14 +1463,27 @@ impl HerdrClientHandle {
                                     delta: text,
                                     sequence: 0,
                                 };
-                                let cursor = record_event(&client.event_log, event.clone());
-                                if event_cursor_tx.send(cursor).await.is_err() {
+                                if !publish_event(
+                                    &fence,
+                                    event,
+                                    &event_cursor_tx,
+                                    &client.lifecycle_tx,
+                                    &client.event_log,
+                                )
+                                .unwrap_or(false)
+                                {
                                     return;
                                 }
                             }
                         }
                         Err(error) => {
-                            log::warn!("Herdr pane.read failed for {pane_id}: {error}");
+                            log::warn!(
+                                "Herdr output watcher retrying for {pane_id}: pane.read failed: {error}"
+                            );
+                            if !fence.is_current() {
+                                return;
+                            }
+                            client.executor.clone().timer(retry_delay).await;
                         }
                     }
                 }
@@ -1300,9 +1545,10 @@ impl HerdrClientHandle {
                 // Subscribe before pane discovery. A pane.created event that
                 // arrives while either snapshot is in flight is then captured
                 // by the primary stream instead of falling into a gap.
-                let (subscription_id, boundary, _) = client
+                let (subscription_id, boundary, _, _) = client
                     .start_subscription(subscription_params(), true)
                     .await?;
+                let mut subscription_ids = vec![subscription_id.clone()];
 
                 // First snapshot is only used to learn pane IDs so every
                 // per-pane filter can register its baseline before the
@@ -1321,12 +1567,13 @@ impl HerdrClientHandle {
                     .collect();
 
                 if !pane_ids.is_empty() {
-                    client
+                    let (filter_subscription_id, _, _, _) = client
                         .start_subscription(
                             pane_filter_subscription_params(&pane_ids),
                             true,
                         )
                         .await?;
+                    subscription_ids.push(filter_subscription_id);
                     for pane_id in &pane_ids {
                         client.track_pane_output(pane_id.clone());
                     }
@@ -1341,12 +1588,13 @@ impl HerdrClientHandle {
                 )?;
                 let (events, replay_until) =
                     events_since_with_boundary(&event_log, boundary);
-                if bootstrap_primary_subscription_ended(&events, &subscription_id) {
+                if bootstrap_subscription_ended(&events) {
                     return Err(HerdrClientError::Disconnected);
                 }
                 Ok(HerdrBootstrap {
                     snapshot,
                     subscription_id,
+                    subscription_ids,
                     events,
                     replay_until,
                 })
@@ -1365,6 +1613,7 @@ type WatchedPanes = Arc<Mutex<HashMap<String, PaneWatch>>>;
 /// kill switch for the pane's dedicated filter-subscription connection, so
 /// retiring the pane terminates both loops.
 struct PaneWatch {
+    generation: u64,
     watcher_cancel: Arc<AtomicBool>,
     filter_kill: Option<ConnectionKillSwitch>,
 }
@@ -1433,6 +1682,7 @@ fn run_request_once(
     event_cursor_tx: Sender<HerdrEventCursor>,
     lifecycle_tx: Sender<HerdrEvent>,
     event_log: Arc<Mutex<Vec<HerdrEvent>>>,
+    fence: SubscriptionFence,
 ) -> PendingResult {
     let request_id = request.id.clone();
     let attempt = (|| -> PendingResult {
@@ -1478,10 +1728,16 @@ fn run_request_once(
                     Ok(event) => event,
                     Err(error) => break Err(error),
                 };
-                let cursor = record_event(&event_log, event.clone());
-                forward_lifecycle(&lifecycle_tx, &event);
-                if futures::executor::block_on(event_cursor_tx.send(cursor)).is_err() {
-                    break Err(HerdrClientError::Disconnected);
+                match publish_event(
+                    &fence,
+                    event,
+                    &event_cursor_tx,
+                    &lifecycle_tx,
+                    &event_log,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => break Err(error),
                 }
             } else {
                 break Err(HerdrClientError::Codec(
@@ -1505,11 +1761,16 @@ fn run_subscription_connection(
     request: HerdrRequest,
     handshake_deadline: Duration,
     ready_tx: oneshot::Sender<Result<(String, usize, ConnectionKillSwitch), HerdrClientError>>,
-    event_tx: Sender<HerdrEvent>,
+    _event_tx: Sender<HerdrEvent>,
     event_cursor_tx: Sender<HerdrEventCursor>,
     lifecycle_tx: Sender<HerdrEvent>,
     event_log: Arc<Mutex<Vec<HerdrEvent>>>,
+    fence: SubscriptionFence,
 ) {
+    if !fence.is_current() {
+        let _ = ready_tx.send(Err(HerdrClientError::Disconnected));
+        return;
+    }
     let mut stream = match HerdrStream::connect_with_deadline(&endpoint, handshake_deadline) {
         Ok(stream) => stream,
         Err(error) => {
@@ -1518,7 +1779,8 @@ fn run_subscription_connection(
         }
     };
     // The kill switch lets the pane owner terminate this connection later;
-    // the handshake watchdog bounds a silent peer during setup.
+    // the handshake watchdog bounds a silent peer during setup. The
+    // generation guard keeps cancellation active after a Windows read starts.
     let kill_switch = match stream.kill_switch() {
         Ok(kill) => kill,
         Err(error) => {
@@ -1526,7 +1788,12 @@ fn run_subscription_connection(
             return;
         }
     };
+    let _cancellation_guard = SubscriptionKillGuard::new(kill_switch.clone(), fence.clone());
     let handshake_watchdog = stream.arm_io_deadline(handshake_deadline).ok();
+    if !fence.is_current() {
+        let _ = ready_tx.send(Err(HerdrClientError::Disconnected));
+        return;
+    }
     let encoded = match serde_json::to_string(&request) {
         Ok(encoded) => encoded,
         Err(error) => {
@@ -1542,6 +1809,10 @@ fn run_subscription_connection(
     let mut reader = HerdrLineReader::new(stream);
     let subscription_id: String;
     loop {
+        if !fence.is_current() {
+            let _ = ready_tx.send(Err(HerdrClientError::Disconnected));
+            return;
+        }
         let line = match reader.read_line() {
             Ok(Some(line)) => line,
             Ok(None) => {
@@ -1567,14 +1838,23 @@ fn run_subscription_connection(
             // Pushed events may arrive before the acknowledgement; buffer them.
             if value.get("event").is_some() {
                 match decode_event(&line) {
-                    Ok(event) => {
-                        let cursor = record_event(&event_log, event.clone());
-                        forward_lifecycle(&lifecycle_tx, &event);
-                        if futures::executor::block_on(event_cursor_tx.send(cursor)).is_err() {
+                    Ok(event) => match publish_event(
+                        &fence,
+                        event,
+                        &event_cursor_tx,
+                        &lifecycle_tx,
+                        &event_log,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
                             let _ = ready_tx.send(Err(HerdrClientError::Disconnected));
                             return;
                         }
-                    }
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
+                            return;
+                        }
+                    },
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
                         return;
@@ -1619,6 +1899,10 @@ fn run_subscription_connection(
             .unwrap_or("default")
             .to_string();
         let boundary = event_log_len(&event_log);
+        if !fence.is_current() {
+            let _ = ready_tx.send(Err(HerdrClientError::Disconnected));
+            return;
+        }
         if ready_tx.send(Ok((subscription_id.clone(), boundary, kill_switch))).is_err() {
             return;
         }
@@ -1636,37 +1920,47 @@ fn run_subscription_connection(
     }
     if let Err(error) = pump_subscription_events(
         &mut reader,
-        &event_tx,
         &event_cursor_tx,
         &lifecycle_tx,
         &event_log,
+        &fence,
     ) {
-        log::error!("Herdr subscription terminated: {error}");
-        let data = serde_json::from_str::<Box<RawValue>>(
-            &serde_json::json!({
-                "subscription_id": subscription_id,
-                "error": error.to_string()
-            })
-            .to_string(),
-        )
-        .expect("subscription-ended payload is valid JSON");
-        let event = HerdrEvent::Unknown {
-            event: "subscription_ended".to_string(),
-            data,
-        };
-        let cursor = record_event(&event_log, event.clone());
-        let _ = futures::executor::block_on(event_cursor_tx.send(cursor));
+        if fence.is_current() {
+            log::error!("Herdr subscription terminated: {error}");
+            let data = serde_json::from_str::<Box<RawValue>>(
+                &serde_json::json!({
+                    "subscription_id": subscription_id,
+                    "error": error.to_string()
+                })
+                .to_string(),
+            )
+            .expect("subscription-ended payload is valid JSON");
+            let event = HerdrEvent::Unknown {
+                event: "subscription_ended".to_string(),
+                data,
+            };
+            let _ = publish_event(
+                &fence,
+                event,
+                &event_cursor_tx,
+                &lifecycle_tx,
+                &event_log,
+            );
+        }
     }
 }
 
 fn pump_subscription_events(
     reader: &mut HerdrLineReader,
-    _event_tx: &Sender<HerdrEvent>,
     event_cursor_tx: &Sender<HerdrEventCursor>,
     lifecycle_tx: &Sender<HerdrEvent>,
     event_log: &Arc<Mutex<Vec<HerdrEvent>>>,
+    fence: &SubscriptionFence,
 ) -> Result<(), HerdrClientError> {
     loop {
+        if !fence.is_current() {
+            return Err(HerdrClientError::Disconnected);
+        }
         let line = match reader.read_line() {
             Ok(Some(line)) => line,
             Ok(None) => return Err(HerdrClientError::Disconnected),
@@ -1683,10 +1977,11 @@ fn pump_subscription_events(
             )));
         }
         let event = decode_event(&line)?;
-        let cursor = record_event(event_log, event.clone());
-        forward_lifecycle(lifecycle_tx, &event);
-        futures::executor::block_on(event_cursor_tx.send(cursor))
-            .map_err(|_| HerdrClientError::Disconnected)?;
+        match publish_event(fence, event, event_cursor_tx, lifecycle_tx, event_log) {
+            Ok(true) => {}
+            Ok(false) => return Err(HerdrClientError::Disconnected),
+            Err(error) => return Err(error),
+        }
     }
 }
 fn take_pending(
@@ -1713,6 +2008,7 @@ fn remove_pending(pending: &PendingRequests, request_id: &str) {
 pub(crate) struct HerdrBootstrap {
     pub snapshot: HerdrSnapshot,
     pub subscription_id: String,
+    pub subscription_ids: Vec<String>,
     pub events: Vec<HerdrEvent>,
     /// Exclusive event-log index covered by `events`. Cursors below this
     /// boundary are either replayed here or superseded by the snapshot.
@@ -1890,7 +2186,7 @@ impl HerdrApi for HerdrClientHandle {
         let task = self.start_subscription(subscription_params(), true);
         self.executor
             .clone()
-            .spawn(async move { task.await.map(|(subscription_id, _, _)| subscription_id) })
+            .spawn(async move { task.await.map(|(subscription_id, _, _, _)| subscription_id) })
     }
 
     fn bootstrap(&self, _cx: &App) -> Task<Result<HerdrBootstrap, HerdrClientError>> {
@@ -2058,6 +2354,11 @@ impl HerdrApi for HerdrClientHandle {
 mod tests {
     use super::*;
 
+
+    fn test_fence() -> SubscriptionFence {
+        let generation = Arc::new(AtomicU64::new(0));
+        SubscriptionFence::new(generation, 0, Arc::new(Mutex::new(())))
+    }
     #[test]
     fn decodes_success_response_by_request_id() {
         let response = decode_response(r#"{"id":"req-1","result":{"type":"pong"}}"#)
@@ -2511,6 +2812,7 @@ mod tests {
             event_cursor_tx,
             lifecycle_tx,
             event_log,
+            test_fence(),
         );
 
         assert!(matches!(result, Err(HerdrClientError::Timeout)));
@@ -2540,6 +2842,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn bootstrap_rejects_bulk_filter_subscription_end_event() {
+        let data: Box<RawValue> =
+            serde_json::from_str(r#"{"subscription_id":"bulk-filter","error":"closed"}"#)
+                .expect("subscription-ended data");
+        let ended = HerdrEvent::Unknown {
+            event: "subscription_ended".to_string(),
+            data,
+        };
+        assert!(
+            bootstrap_subscription_ended(std::slice::from_ref(&ended)),
+            "any terminated bootstrap subscription must force a reconnect"
+        );
+    }
+
     /// Finding 6: a well-formed frame without an `event` field terminates the
     /// subscription visibly instead of being discarded.
     #[cfg(unix)]
@@ -2563,16 +2880,16 @@ mod tests {
         // forever, so the pump must terminate from the stray frame itself.
         let mut reader = HerdrLineReader::new(HerdrStream::Unix(client_side));
         let event_log = Arc::new(Mutex::new(Vec::new()));
-        let (event_tx, event_rx) = async_channel::unbounded();
+        let (_event_tx, event_rx) = async_channel::unbounded::<HerdrEvent>();
         let (event_cursor_tx, event_cursor_rx) = async_channel::unbounded();
         let (lifecycle_tx, _lifecycle_rx) = async_channel::unbounded();
 
         let result = pump_subscription_events(
             &mut reader,
-            &event_tx,
             &event_cursor_tx,
             &lifecycle_tx,
             &event_log,
+            &test_fence(),
         );
 
         match result {
@@ -2590,6 +2907,81 @@ mod tests {
             .expect("delivered cursor");
         assert_eq!(delivered.index, 0);
         assert!(matches!(delivered.event, HerdrEvent::PaneFocused { .. }));
+    }
+
+    /// Review 4 finding 1: an established pump must discard events after its
+    /// subscription generation is cancelled, including events already queued
+    /// by the socket.
+    #[cfg(unix)]
+    #[test]
+    fn established_subscription_pump_discards_events_after_generation_cancellation() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let (mut server_side, client_side) = UnixStream::pair().expect("socket pair");
+        server_side
+            .write_all(
+                br#"{"event":"pane.focused","data":{"type":"pane_focused","pane_id":"p1","workspace_id":"w1"}}"#,
+            )
+            .expect("write queued event");
+        server_side.write_all(b"\n").expect("write event newline");
+        drop(server_side);
+
+        let generation = Arc::new(AtomicU64::new(0));
+        generation.store(1, Ordering::SeqCst);
+        let fence = SubscriptionFence::new(
+            generation,
+            0,
+            Arc::new(Mutex::new(())),
+        );
+        let mut reader = HerdrLineReader::new(HerdrStream::Unix(client_side));
+        let event_log = Arc::new(Mutex::new(Vec::new()));
+        let (event_cursor_tx, event_cursor_rx) = async_channel::unbounded();
+        let (lifecycle_tx, lifecycle_rx) = async_channel::unbounded();
+        let result = pump_subscription_events(
+            &mut reader,
+            &event_cursor_tx,
+            &lifecycle_tx,
+            &event_log,
+            &fence,
+        );
+
+        assert!(matches!(result, Err(HerdrClientError::Disconnected)));
+        assert_eq!(event_log_len(&event_log), 0);
+        assert!(event_cursor_rx.try_recv().is_err());
+        assert!(lifecycle_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancelled_generation_drops_watcher_output_publication() {
+        let generation = Arc::new(AtomicU64::new(0));
+        let fence = SubscriptionFence::new(
+            generation.clone(),
+            0,
+            Arc::new(Mutex::new(())),
+        );
+        generation.store(1, Ordering::SeqCst);
+        let event_log = Arc::new(Mutex::new(Vec::new()));
+        let (event_cursor_tx, event_cursor_rx) = async_channel::unbounded();
+        let (lifecycle_tx, lifecycle_rx) = async_channel::unbounded();
+        let published = publish_event(
+            &fence,
+            HerdrEvent::PaneOutput {
+                pane_id: "w1:p1".to_string(),
+                revision: 2,
+                delta: "stale".to_string(),
+                sequence: 0,
+            },
+            &event_cursor_tx,
+            &lifecycle_tx,
+            &event_log,
+        )
+        .expect("stale publication check");
+
+        assert!(!published);
+        assert_eq!(event_log_len(&event_log), 0);
+        assert!(event_cursor_rx.try_recv().is_err());
+        assert!(lifecycle_rx.try_recv().is_err());
     }
 
     /// Finding 4 (deterministic): pane lifecycle events are forwarded to the
@@ -2833,6 +3225,7 @@ mod tests {
                         event_cursor_tx,
                         lifecycle_tx,
                         event_log,
+                        test_fence(),
                     );
                 }
             })
