@@ -5,7 +5,7 @@ use gpui::{
 };
 use crate::herdr_bridge::{HerdrBridgeEvent, HerdrConnectionStatus, HerdrThreadBridge};
 use crate::herdr_client::{HerdrAgentSessionIdentity, HerdrAgentStatus, HerdrClientError};
-use ui::{Button, ButtonStyle, Label, prelude::*};
+use ui::{Button, ButtonStyle, Label, Tooltip, prelude::*};
 use crate::herdr_thread_view::HerdrThreadView;
 use crate::thread_metadata_store::ThreadId;
 
@@ -204,6 +204,7 @@ pub(crate) struct HerdrConversationView {
     bridge: WeakEntity<HerdrThreadBridge>,
     state: HerdrConversationState,
     title: SharedString,
+    title_override: Option<SharedString>,
     connection_status: HerdrConnectionStatus,
 }
 
@@ -217,6 +218,11 @@ impl HerdrConversationView {
         cx: &mut Context<Self>,
     ) -> Self {
         let workspace_id = workspace_id.into();
+        let bridge_ref = bridge.read(cx);
+        let title_override = bridge_ref
+            .root_metadata(&workspace_id)
+            .and_then(|metadata| metadata.title_override.clone());
+        let connection_status = bridge_ref.status();
         Self {
             thread_id,
             state: HerdrConversationState::new(workspace_id.clone(), thread_id),
@@ -226,7 +232,8 @@ impl HerdrConversationView {
             focus_handle: cx.focus_handle(),
             bridge: bridge.downgrade(),
             title: title.into(),
-            connection_status: bridge.read(cx).status(),
+            title_override,
+            connection_status,
         }
     }
 
@@ -237,6 +244,14 @@ impl HerdrConversationView {
     pub(crate) fn connection_status(&self) -> HerdrConnectionStatus {
         self.connection_status
     }
+    pub(crate) fn controls_enabled(&self) -> bool {
+        self.connection_status.allows_actions()
+    }
+
+    pub(crate) fn controls_disabled_reason(&self) -> Option<&'static str> {
+        self.connection_status.disabled_reason()
+    }
+
 
     pub(crate) fn state(&self) -> &HerdrConversationState {
         &self.state
@@ -280,8 +295,18 @@ impl HerdrConversationView {
                 title,
                 ..
             } if workspace_id == &self.workspace_id => {
-                self.title = title.clone().into();
-                cx.notify();
+                if self.title_override.is_none() {
+                    self.title_override = self.bridge.upgrade().and_then(|bridge| {
+                        bridge
+                            .read(cx)
+                            .root_metadata(workspace_id)
+                            .and_then(|metadata| metadata.title_override.clone())
+                    });
+                }
+                if self.title_override.is_none() {
+                    self.title = title.clone().into();
+                    cx.notify();
+                }
             }
             HerdrBridgeEvent::SubthreadCreated {
                 key,
@@ -479,6 +504,9 @@ impl HerdrConversationView {
         pane_id: &str,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<(), HerdrClientError>>> {
+        if !self.controls_enabled() {
+            return None;
+        }
         let child = self.subthreads.get(pane_id)?;
         Some(child.update(cx, |child, cx| child.request_focus(cx)))
     }
@@ -526,6 +554,8 @@ impl Render for HerdrConversationView {
             .as_ref()
             .and_then(|pane_id| self.subthreads.get(pane_id))
             .cloned();
+        let controls_enabled = self.controls_enabled();
+        let controls_reason = self.controls_disabled_reason();
         let root = cx.entity().downgrade();
         let cards = self.subthreads.iter().map(|(pane_id, child)| {
             let pane_id_for_click = pane_id.clone();
@@ -540,6 +570,10 @@ impl Render for HerdrConversationView {
                 ButtonStyle::Tinted(ui::TintColor::Accent)
             } else {
                 ButtonStyle::Outlined
+            })
+            .disabled(!controls_enabled)
+            .when_some(controls_reason, |button, reason| {
+                button.tooltip(Tooltip::text(reason))
             })
             .on_click(move |_, _window, cx| {
                 if let Some(root) = root_for_click.upgrade() {
@@ -562,12 +596,26 @@ impl Render for HerdrConversationView {
                 h_flex()
                     .justify_between()
                     .child(Label::new(self.title.clone()).size(LabelSize::Large))
-                    .child(Label::new(format!("Herdr: {:?}", self.connection_status)).color(Color::Muted)),
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Label::new(format!("Herdr: {:?}", self.connection_status))
+                                    .color(Color::Muted),
+                            )
+                            .when_some(controls_reason, |this, reason| {
+                                this.child(Label::new(reason).color(Color::Muted))
+                            }),
+                    ),
             )
             .child(v_flex().gap_1().children(cards).children(status_only))
             .child(
                 active_child.map_or_else(
-                    || div().child(Label::new("Select an agent pane to continue").color(Color::Muted)).into_any_element(),
+                    || {
+                        div()
+                            .child(Label::new("Select an agent pane to continue").color(Color::Muted))
+                            .into_any_element()
+                    },
                     |child| child.into_any_element(),
                 ),
             )
@@ -762,5 +810,50 @@ mod tests {
             assert_eq!(child.output_revision, 4);
             assert_eq!(child.output, "preserve this output");
         }).expect("child metadata assertions");
+    }
+    #[test]
+    fn herdr_controls_are_enabled_only_when_ready() {
+        assert!(!HerdrConnectionStatus::Unavailable.allows_actions());
+        assert!(!HerdrConnectionStatus::Reconnecting.allows_actions());
+        assert!(!HerdrConnectionStatus::Synchronizing.allows_actions());
+        assert!(HerdrConnectionStatus::Ready.allows_actions());
+        assert!(HerdrConnectionStatus::Unavailable
+            .disabled_reason()
+            .is_some());
+    }
+
+    #[gpui::test]
+    fn root_rename_does_not_clobber_an_explicit_title_override(
+        cx: &mut TestAppContext,
+    ) {
+        crate::test_support::init_test(cx);
+        let conversation = cx.add_window(|window, cx| {
+            let bridge = cx.new(|_| HerdrThreadBridge::for_test("alpha"));
+            HerdrConversationView::new(
+                ThreadId::new(),
+                "w1",
+                "Generated title",
+                bridge,
+                window,
+                cx,
+            )
+        });
+        let mut cx = VisualTestContext::from_window(conversation.clone().into(), cx);
+        conversation.update(&mut cx, |view, window, cx| {
+            view.title = "User title".into();
+            view.title_override = Some("User title".into());
+            view.apply_bridge_event(
+                &HerdrBridgeEvent::RootRenamed {
+                    workspace_id: "w1".to_string(),
+                    thread_id: view.thread_id,
+                    title: "Generated rename".to_string(),
+                },
+                window,
+                cx,
+            );
+        });
+        conversation.read_with(&cx, |view, _| {
+            assert_eq!(view.title(), "User title");
+        });
     }
 }

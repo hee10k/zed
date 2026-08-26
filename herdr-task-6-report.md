@@ -507,3 +507,99 @@ unknown-method assertion; the exact test and the complete fixture suite passed
 on immediate reruns. The sidebar run emitted existing warning diagnostics from
 unrelated workspace code. No formatter, linter, or project-wide suite was run.
 Windows named-pipe coverage remains CI-gated on this macOS host.
+
+## Final Integration Residual Repairs
+
+Findings file: `.superpowers/sdd/final-review-residual-7.md`. All eight
+integration residuals were fixed with deterministic regressions:
+
+1. Bridge publication now distinguishes accepted reconciliation actions,
+   rejected/conflicting events, and explicitly safe sequence-less status/output
+   notifications. Stale or zero-sequence lifecycle events no longer publish
+   status, output, or close effects; identity-less zero-sequence detections do
+   not mutate the status-only cache.
+2. Workspace-close status-only cleanup runs only after reconciliation accepts
+   the close. A rejected zero-sequence close retains the cached pane state.
+3. Accepted `PaneMoved` reconciliation publishes a source
+   `SubthreadClosed` and destination `SubthreadCreated` using the current
+   mapping key and carried-forward pane snapshot, so both root views rebind.
+4. Bridge sync cancellation is generation-owned. Rebind closes the old
+   generation channel and replaces its cancellation flag/channel, waking every
+   old receiver without allowing the new worker to consume the old token.
+5. Herdr thread and conversation controls are disabled unless the bridge is
+   `Ready`, with a visible status/reason and tooltip while unavailable,
+   reconnecting, or synchronizing.
+6. A `RootRenamed` event updates generated metadata while preserving an
+   explicit `title_override` in metadata and in the visible conversation.
+7. Conflict state is marked only after workspace ownership routing succeeds;
+   a foreign-workspace conflict cannot contaminate another panel.
+8. The client event log is an absolute-indexed, bounded replay window. It
+   prunes superseded entries at bootstrap boundaries and preserves cursor
+   indices for events arriving during replay.
+
+New regressions include:
+`rejected_stale_status_and_output_do_not_publish`,
+`rejected_zero_sequence_workspace_close_preserves_status_only_cache`,
+`identityless_zero_sequence_detection_does_not_mutate_status_only_cache`,
+`accepted_pane_move_publishes_close_and_create_for_current_mapping`,
+`rebind_wakes_old_worker_and_replaces_cancellation_generation`,
+`herdr_controls_are_enabled_only_when_ready`,
+`root_rename_does_not_clobber_an_explicit_title_override`,
+`workspace_rename_updates_generated_title_without_clobbering_override`,
+`event_log_is_bounded_and_consumed_replay_keeps_absolute_cursors`, and the
+foreign-workspace assertion in
+`herdr_status_label_tracks_conflict_and_connection_states`.
+
+### Focused host verification
+
+Commands were run from the repository root on macOS:
+
+```text
+$ cargo test -p agent_ui herdr_client
+cargo test: 38 passed (1 suite, 557 filtered, 0.15s)
+
+$ cargo test -p agent_ui herdr_transport
+cargo test: 6 passed (1 suite, 589 filtered, 0.16s)
+
+$ cargo test -p agent_ui herdr_mapping_store
+cargo test: 12 passed (1 suite, 583 filtered, 0.00s)
+
+$ cargo test -p agent_ui herdr_state
+cargo test: 37 passed (1 suite, 558 filtered, 0.00s)
+
+$ cargo test -p agent_ui herdr_bridge
+cargo test: 41 passed (1 suite, 554 filtered, 0.01s)
+
+$ cargo test -p agent_ui herdr_conversation_view
+cargo test: 10 passed (1 suite, 585 filtered, 0.27s)
+
+$ cargo test -p agent_ui herdr_thread_view
+cargo test: 2 passed (1 suite, 593 filtered, 0.00s)
+
+$ cargo test -p agent_ui agent_panel::tests::herdr
+cargo test: 12 passed (1 suite, 583 filtered, 1.15s)
+
+$ cargo test -p agent_ui herdr_test_support
+cargo test: 9 passed (1 suite, 586 filtered, 0.02s)
+
+$ cargo test -p sidebar tests::
+cargo test: 153 passed (1 suite, 41 warnings, 23.80s)
+
+$ cargo test -p sidebar tests::activating_herdr_root_requests_herdr_workspace_focus -- --exact
+cargo test: 1 passed (1 suite, 152 filtered, 41 warnings, 0.25s)
+```
+
+The sidebar runs emitted warning diagnostics from existing workspace code and
+test-only Herdr support symbols; no test failed. No formatter, linter, or
+project-wide suite was run. Windows named-pipe behavior remains compile/CI
+gated on this macOS host.
+
+Post-amend verification for the final commit:
+
+```text
+$ cargo test -p agent_ui herdr_bridge
+cargo test: 41 passed (1 suite, 554 filtered, 0.00s)
+
+$ cargo test -p agent_ui herdr_bridge::tests::accepted_pane_move_publishes_close_and_create_for_current_mapping -- --exact
+cargo test: 1 passed (1 suite, 594 filtered, 0.00s)
+```

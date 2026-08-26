@@ -4,10 +4,10 @@ use gpui::{
     WeakEntity, Window, prelude::*,
 };
 use language::Buffer;
-use ui::{Button, ButtonStyle, Label, prelude::*};
+use ui::{Button, ButtonStyle, Label, Tooltip, prelude::*};
 
 
-use crate::herdr_bridge::HerdrThreadBridge;
+use crate::herdr_bridge::{HerdrConnectionStatus, HerdrThreadBridge};
 use crate::herdr_client::{
     HerdrAgentSessionIdentity, HerdrAgentSnapshot, HerdrAgentStatus, HerdrClientError,
 };
@@ -71,6 +71,21 @@ impl HerdrThreadView {
             error: None,
         }
     }
+    fn connection_status(&self, cx: &App) -> HerdrConnectionStatus {
+        self.bridge
+            .upgrade()
+            .map(|bridge| bridge.read(cx).status())
+            .unwrap_or(HerdrConnectionStatus::Unavailable)
+    }
+
+    pub(crate) fn controls_enabled(&self, cx: &App) -> bool {
+        self.connection_status(cx).allows_actions()
+    }
+
+    pub(crate) fn controls_disabled_reason(&self, cx: &App) -> Option<&'static str> {
+        self.connection_status(cx).disabled_reason()
+    }
+
 
     pub(crate) fn activation_focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -201,8 +216,12 @@ impl HerdrThreadView {
             }
         });
     }
-
     fn send_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reason) = self.controls_disabled_reason(cx) {
+            self.error = Some(reason.into());
+            cx.notify();
+            return;
+        }
         let prompt = self.prompt_editor.read(cx).text(cx);
         if prompt.trim().is_empty() {
             return;
@@ -231,6 +250,11 @@ impl HerdrThreadView {
     }
 
     fn send_cancel(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.controls_disabled_reason(cx) {
+            self.error = Some(reason.into());
+            cx.notify();
+            return;
+        }
         let task = self.request_cancel(cx);
         cx.spawn(async move |this, cx| {
             if let Err(error) = task.await {
@@ -244,6 +268,11 @@ impl HerdrThreadView {
         .detach();
     }
     fn send_close(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.controls_disabled_reason(cx) {
+            self.error = Some(reason.into());
+            cx.notify();
+            return;
+        }
         let task = self.request_close(cx);
         cx.spawn(async move |this, cx| {
             if let Err(error) = task.await {
@@ -268,6 +297,9 @@ impl Render for HerdrThreadView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane_id = self.pane_id.clone();
         let session = format!("{}:{}", self.session.kind, self.session.value);
+        let connection_status = self.connection_status(cx);
+        let controls_enabled = connection_status.allows_actions();
+        let controls_reason = connection_status.disabled_reason();
         v_flex()
             .id(format!("herdr-thread-{pane_id}"))
             .flex_1()
@@ -283,6 +315,14 @@ impl Render for HerdrThreadView {
                     .child(Label::new(self.title.clone()))
                     .child(Label::new(format!("{:?}", self.status)).color(Color::Muted)),
             )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Label::new(format!("Herdr: {:?}", connection_status)).color(Color::Muted))
+                    .when_some(controls_reason, |this, reason| {
+                        this.child(Label::new(reason).color(Color::Muted))
+                    }),
+            )
             .child(Label::new(format!("Pane {pane_id} · {session}")).color(Color::Muted))
             .child(
                 div()
@@ -290,11 +330,15 @@ impl Render for HerdrThreadView {
                     .min_h_0()
                     .child(Label::new(self.output.clone())),
             )
-                    .child(
-                        Button::new("herdr-close", "Close")
-                            .style(ButtonStyle::Outlined)
-                            .on_click(cx.listener(|this, _, _, cx| this.send_close(cx))),
-                    )
+            .child(
+                Button::new("herdr-close", "Close")
+                    .style(ButtonStyle::Outlined)
+                    .disabled(!controls_enabled)
+                    .when_some(controls_reason, |button, reason| {
+                        button.tooltip(Tooltip::text(reason))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.send_close(cx))),
+            )
             .child(self.prompt_editor.clone())
             .child(
                 h_flex()
@@ -303,12 +347,22 @@ impl Render for HerdrThreadView {
                     .child(
                         Button::new("herdr-cancel", "Cancel")
                             .style(ButtonStyle::Outlined)
+                            .disabled(!controls_enabled)
+                            .when_some(controls_reason, |button, reason| {
+                                button.tooltip(Tooltip::text(reason))
+                            })
                             .on_click(cx.listener(|this, _, _, cx| this.send_cancel(cx))),
                     )
                     .child(
                         Button::new("herdr-send", "Send")
                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                            .on_click(cx.listener(|this, _, window, cx| this.send_prompt(window, cx))),
+                            .disabled(!controls_enabled)
+                            .when_some(controls_reason, |button, reason| {
+                                button.tooltip(Tooltip::text(reason))
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.send_prompt(window, cx)
+                            })),
                     ),
             )
             .when_some(self.error.clone(), |this, error| {

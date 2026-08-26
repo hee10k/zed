@@ -17,6 +17,11 @@ use crate::herdr_transport::{
 
 const HERDR_PROTOCOL: u64 = 20;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// The replay log only needs to cover events waiting for the next bootstrap.
+/// Once a bootstrap boundary is consumed, older entries are superseded by its
+/// authoritative snapshot and can be discarded.
+const MAX_EVENT_LOG: usize = 256;
+
 
 /// Margin added on top of the server-side `events.wait` hold time so the
 /// request deadline always exceeds the server wait by a bounded amount: a
@@ -79,7 +84,7 @@ fn publish_event(
     event: HerdrEvent,
     event_cursor_tx: &Sender<HerdrEventCursor>,
     lifecycle_tx: &Sender<HerdrLifecycleEvent>,
-    event_log: &Arc<Mutex<Vec<HerdrEvent>>>,
+    event_log: &SharedEventLog,
 ) -> Result<bool, HerdrClientError> {
     let _publish_guard = match fence.publish_lock.lock() {
         Ok(guard) => guard,
@@ -362,6 +367,15 @@ pub(crate) enum HerdrEvent {
 /// Event-log position paired with the event delivered to the bridge. The
 /// cursor lets bootstrap replay partition the shared stream without applying
 /// the same event again after discovery completes.
+#[derive(Default)]
+struct HerdrEventLog {
+    base_index: usize,
+    events: Vec<HerdrEvent>,
+    replay_boundary: Option<usize>,
+}
+type SharedEventLog = Arc<Mutex<HerdrEventLog>>;
+
+
 #[derive(Clone, Debug)]
 pub(crate) struct HerdrEventCursor {
     pub(crate) index: usize,
@@ -812,47 +826,108 @@ fn response_result(response: HerdrResponse) -> PendingResult {
     }
 }
 
+fn prune_event_log(log: &mut HerdrEventLog) {
+    if log.replay_boundary.is_some() || log.events.len() <= MAX_EVENT_LOG {
+        return;
+    }
+    let remove = log.events.len() - MAX_EVENT_LOG;
+    log.events.drain(..remove);
+    log.base_index += remove;
+}
+
 fn record_event(
-    event_log: &Arc<Mutex<Vec<HerdrEvent>>>,
+    event_log: &SharedEventLog,
     event: HerdrEvent,
 ) -> HerdrEventCursor {
     match event_log.lock() {
-        Ok(mut events) => {
-            let index = events.len();
-            events.push(event.clone());
+        Ok(mut log) => {
+            let index = log.base_index + log.events.len();
+            log.events.push(event.clone());
+            prune_event_log(&mut log);
             HerdrEventCursor { index, event }
         }
         Err(poisoned) => {
-            let mut events = poisoned.into_inner();
-            let index = events.len();
-            events.push(event.clone());
+            let mut log = poisoned.into_inner();
+            let index = log.base_index + log.events.len();
+            log.events.push(event.clone());
+            prune_event_log(&mut log);
             HerdrEventCursor { index, event }
         }
     }
 }
-fn event_log_len(event_log: &Arc<Mutex<Vec<HerdrEvent>>>) -> usize {
+
+fn event_log_len(event_log: &SharedEventLog) -> usize {
     match event_log.lock() {
-        Ok(events) => events.len(),
-        Err(poisoned) => poisoned.into_inner().len(),
+        Ok(log) => log.events.len(),
+        Err(poisoned) => poisoned.into_inner().events.len(),
     }
 }
 
+fn event_log_end(event_log: &SharedEventLog) -> usize {
+    match event_log.lock() {
+        Ok(log) => log.base_index + log.events.len(),
+        Err(poisoned) => {
+            let log = poisoned.into_inner();
+            log.base_index + log.events.len()
+        }
+    }
+}
+
+fn mark_event_log_replay_boundary(event_log: &SharedEventLog, boundary: usize) {
+    let mut log = match event_log.lock() {
+        Ok(log) => log,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let remove = boundary.saturating_sub(log.base_index).min(log.events.len());
+    if remove > 0 {
+        log.events.drain(..remove);
+        log.base_index += remove;
+    }
+    log.replay_boundary = Some(boundary.max(log.base_index));
+}
+
+fn finish_event_log_replay(event_log: &SharedEventLog, replay_until: usize) {
+    let mut log = match event_log.lock() {
+        Ok(log) => log,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let remove = replay_until
+        .saturating_sub(log.base_index)
+        .min(log.events.len());
+    if remove > 0 {
+        log.events.drain(..remove);
+        log.base_index += remove;
+    }
+    log.replay_boundary = None;
+    prune_event_log(&mut log);
+}
+
 fn events_since(
-    event_log: &Arc<Mutex<Vec<HerdrEvent>>>,
+    event_log: &SharedEventLog,
     start: usize,
 ) -> Vec<HerdrEvent> {
     events_since_with_boundary(event_log, start).0
 }
 
 fn events_since_with_boundary(
-    event_log: &Arc<Mutex<Vec<HerdrEvent>>>,
+    event_log: &SharedEventLog,
     start: usize,
 ) -> (Vec<HerdrEvent>, usize) {
     match event_log.lock() {
-        Ok(events) => (events[start..].to_vec(), events.len()),
+        Ok(log) => {
+            let offset = start.saturating_sub(log.base_index).min(log.events.len());
+            (
+                log.events[offset..].to_vec(),
+                log.base_index + log.events.len(),
+            )
+        }
         Err(poisoned) => {
-            let events = poisoned.into_inner();
-            (events[start..].to_vec(), events.len())
+            let log = poisoned.into_inner();
+            let offset = start.saturating_sub(log.base_index).min(log.events.len());
+            (
+                log.events[offset..].to_vec(),
+                log.base_index + log.events.len(),
+            )
         }
     }
 }
@@ -948,7 +1023,7 @@ pub(crate) struct HerdrClientHandle {
     event_rx: Receiver<HerdrEvent>,
     event_cursor_tx: Sender<HerdrEventCursor>,
     event_cursor_rx: Receiver<HerdrEventCursor>,
-    event_log: Arc<Mutex<Vec<HerdrEvent>>>,
+    event_log: SharedEventLog,
     lifecycle_tx: Sender<HerdrLifecycleEvent>,
     lifecycle_rx: Receiver<HerdrLifecycleEvent>,
     watched_panes: WatchedPanes,
@@ -980,7 +1055,7 @@ impl HerdrClientHandle {
             event_rx,
             event_cursor_tx,
             event_cursor_rx,
-            event_log: Arc::new(Mutex::new(Vec::new())),
+            event_log: Arc::new(Mutex::new(HerdrEventLog::default())),
             lifecycle_tx,
             lifecycle_rx,
             watched_panes: Arc::new(Mutex::new(HashMap::new())),
@@ -1609,6 +1684,9 @@ impl HerdrClientHandle {
                 let (subscription_id, boundary, _, _) = client
                     .start_subscription(subscription_params(), true)
                     .await?;
+                // Events before this boundary are superseded by the snapshot.
+                // Retain the new-generation window until replay is consumed.
+                mark_event_log_replay_boundary(&event_log, boundary);
                 let mut subscription_ids = vec![subscription_id.clone()];
 
                 // First snapshot is only used to learn pane IDs so every
@@ -1650,8 +1728,10 @@ impl HerdrClientHandle {
                 let (events, replay_until) =
                     events_since_with_boundary(&event_log, boundary);
                 if bootstrap_subscription_ended(&events) {
+                    finish_event_log_replay(&event_log, replay_until);
                     return Err(HerdrClientError::Disconnected);
                 }
+                finish_event_log_replay(&event_log, replay_until);
                 Ok(HerdrBootstrap {
                     snapshot,
                     subscription_id,
@@ -1662,6 +1742,7 @@ impl HerdrClientHandle {
             }
             .await;
             if result.is_err() {
+                finish_event_log_replay(&event_log, event_log_end(&event_log));
                 client.cancel_subscription_generation();
             }
             result
@@ -1749,7 +1830,7 @@ fn run_request_once(
     _event_tx: Sender<HerdrEvent>,
     event_cursor_tx: Sender<HerdrEventCursor>,
     lifecycle_tx: Sender<HerdrLifecycleEvent>,
-    event_log: Arc<Mutex<Vec<HerdrEvent>>>,
+    event_log: SharedEventLog,
     fence: SubscriptionFence,
 ) -> PendingResult {
     let request_id = request.id.clone();
@@ -1832,7 +1913,7 @@ fn run_subscription_connection(
     _event_tx: Sender<HerdrEvent>,
     event_cursor_tx: Sender<HerdrEventCursor>,
     lifecycle_tx: Sender<HerdrLifecycleEvent>,
-    event_log: Arc<Mutex<Vec<HerdrEvent>>>,
+    event_log: SharedEventLog,
     fence: SubscriptionFence,
 ) {
     if !fence.is_current() {
@@ -1966,7 +2047,7 @@ fn run_subscription_connection(
             .and_then(Value::as_str)
             .unwrap_or("default")
             .to_string();
-        let boundary = event_log_len(&event_log);
+        let boundary = event_log_end(&event_log);
         if !fence.is_current() {
             let _ = ready_tx.send(Err(HerdrClientError::Disconnected));
             return;
@@ -2022,7 +2103,7 @@ fn pump_subscription_events(
     reader: &mut HerdrLineReader,
     event_cursor_tx: &Sender<HerdrEventCursor>,
     lifecycle_tx: &Sender<HerdrLifecycleEvent>,
-    event_log: &Arc<Mutex<Vec<HerdrEvent>>>,
+    event_log: &SharedEventLog,
     fence: &SubscriptionFence,
 ) -> Result<(), HerdrClientError> {
     loop {
@@ -2524,7 +2605,7 @@ mod tests {
 
     #[test]
     fn replays_buffered_events_in_arrival_order_without_sequences() {
-        let event_log = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::new(Mutex::new(HerdrEventLog::default()));
         let start = event_log_len(&event_log);
         record_event(
             &event_log,
@@ -2550,7 +2631,7 @@ mod tests {
 
     #[test]
     fn bootstrap_event_boundary_excludes_pre_subscription_events() {
-        let event_log = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::new(Mutex::new(HerdrEventLog::default()));
         let before = record_event(
             &event_log,
             HerdrEvent::WorkspaceFocused {
@@ -2577,6 +2658,53 @@ mod tests {
             [HerdrEvent::WorkspaceFocused { workspace_id, .. }] if workspace_id == "new"
         ));
     }
+    #[test]
+    fn event_log_is_bounded_and_consumed_replay_keeps_absolute_cursors() {
+        let event_log = Arc::new(Mutex::new(HerdrEventLog::default()));
+        for sequence in 0..(MAX_EVENT_LOG + 8) {
+            record_event(
+                &event_log,
+                HerdrEvent::WorkspaceFocused {
+                    workspace_id: format!("w{sequence}"),
+                    operation_id: None,
+                    sequence: sequence as u64,
+                },
+            );
+        }
+        assert_eq!(event_log_len(&event_log), MAX_EVENT_LOG);
+
+        let boundary = event_log_end(&event_log);
+        mark_event_log_replay_boundary(&event_log, boundary);
+        let cursor = record_event(
+            &event_log,
+            HerdrEvent::PaneScrollChanged {
+                pane_id: "w1:p1".to_string(),
+                sequence: 0,
+            },
+        );
+        let (events, replay_until) = events_since_with_boundary(&event_log, boundary);
+        assert_eq!(cursor.index, boundary);
+        assert_eq!(replay_until, boundary + 1);
+        assert!(matches!(
+            events.as_slice(),
+            [HerdrEvent::PaneScrollChanged { pane_id, .. }] if pane_id == "w1:p1"
+        ));
+
+        finish_event_log_replay(&event_log, replay_until);
+        assert_eq!(event_log_len(&event_log), 0);
+        let next = record_event(
+            &event_log,
+            HerdrEvent::PaneScrollChanged {
+                pane_id: "w1:p2".to_string(),
+                sequence: 0,
+            },
+        );
+        assert_eq!(
+            next.index, replay_until,
+            "pruning must not reset cursor indices for the live stream"
+        );
+    }
+
 
     #[test]
     fn cancelling_subscription_generation_retires_output_watchers() {
@@ -2863,7 +2991,7 @@ mod tests {
         let (event_tx, _event_rx) = async_channel::unbounded();
         let (event_cursor_tx, _event_cursor_rx) = async_channel::unbounded();
         let (lifecycle_tx, _lifecycle_rx) = async_channel::unbounded();
-        let event_log = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::new(Mutex::new(HerdrEventLog::default()));
         let request = HerdrRequest {
             id: "req-timeout".to_string(),
             method: "ping".to_string(),
@@ -2947,7 +3075,7 @@ mod tests {
         // Keep `server_side` alive on purpose: any further read would block
         // forever, so the pump must terminate from the stray frame itself.
         let mut reader = HerdrLineReader::new(HerdrStream::Unix(client_side));
-        let event_log = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::new(Mutex::new(HerdrEventLog::default()));
         let (_event_tx, event_rx) = async_channel::unbounded::<HerdrEvent>();
         let (event_cursor_tx, event_cursor_rx) = async_channel::unbounded();
         let (lifecycle_tx, _lifecycle_rx) = async_channel::unbounded();
@@ -3003,7 +3131,7 @@ mod tests {
             Arc::new(Mutex::new(())),
         );
         let mut reader = HerdrLineReader::new(HerdrStream::Unix(client_side));
-        let event_log = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::new(Mutex::new(HerdrEventLog::default()));
         let (event_cursor_tx, event_cursor_rx) = async_channel::unbounded();
         let (lifecycle_tx, lifecycle_rx) = async_channel::unbounded();
         let result = pump_subscription_events(
@@ -3029,7 +3157,7 @@ mod tests {
             Arc::new(Mutex::new(())),
         );
         generation.store(1, Ordering::SeqCst);
-        let event_log = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::new(Mutex::new(HerdrEventLog::default()));
         let (event_cursor_tx, event_cursor_rx) = async_channel::unbounded();
         let (lifecycle_tx, lifecycle_rx) = async_channel::unbounded();
         let published = publish_event(
@@ -3317,7 +3445,7 @@ mod tests {
         let (event_tx, _event_rx) = async_channel::unbounded();
         let (event_cursor_tx, _event_cursor_rx) = async_channel::unbounded();
         let (lifecycle_tx, _lifecycle_rx) = async_channel::unbounded();
-        let event_log = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::new(Mutex::new(HerdrEventLog::default()));
         handle.ensure_watched("w1:p1").expect("register watch");
 
         // Drive the connection thread directly: awaiting a GPUI-executor

@@ -5081,8 +5081,9 @@ impl AgentPanel {
                 self.handle_herdr_subthread_event(event, key, *thread_id, window, cx, route);
             }
             HerdrBridgeEvent::Conflict { key, message } => {
-                self.herdr_conflict_active = true;
-                if !route || self.route_herdr_workspace(&key.workspace_id, event, window, cx) {
+                let owns = !route || self.route_herdr_workspace(&key.workspace_id, event, window, cx);
+                if owns {
+                    self.herdr_conflict_active = true;
                     Self::show_herdr_toast(
                         &self.workspace,
                         format!("Herdr conflict: {message}"),
@@ -6672,6 +6673,7 @@ impl AgentPanel {
                 }
             }
             VisibleSurface::HerdrConversation(conversation_view) => {
+                let herdr_controls_enabled = conversation_view.read(cx).controls_enabled();
                 if let Some(title_editor) = self.herdr_title_editor.clone() {
                     div()
                         .flex_1()
@@ -6694,7 +6696,9 @@ impl AgentPanel {
                         .min_w_0()
                         .cursor_text()
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.edit_herdr_title(window, cx);
+                            if herdr_controls_enabled {
+                                this.edit_herdr_title(window, cx);
+                            }
                         }))
                         .child(
                             h_flex()
@@ -6760,6 +6764,13 @@ impl AgentPanel {
 
             VisibleSurface::Uninitialized => Label::new("Agent").truncate().into_any_element(),
         };
+        let herdr_controls_enabled = !matches!(
+            self.visible_surface(),
+            VisibleSurface::HerdrConversation(_)
+        ) || self
+            .herdr_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.read(cx).status().allows_actions());
 
         let toolbar_bg = cx.theme().colors().tab_bar_background;
         let gradient_overlay = GradientFade::new(toolbar_bg, toolbar_bg, toolbar_bg)
@@ -6792,6 +6803,7 @@ impl AgentPanel {
                             .child(
                                 IconButton::new("edit_tile", IconName::Pencil)
                                     .icon_size(IconSize::Small)
+                                    .disabled(!herdr_controls_enabled)
                                     .tooltip(Tooltip::text("Edit Thread Title"))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         if matches!(
@@ -15287,6 +15299,23 @@ mod tests {
                     Some(SharedString::from("Unavailable"))
                 );
             });
+            // A conflict for a workspace this panel does not own must not
+            // contaminate its status.
+            handle_event(
+                &panel,
+                &mut cx,
+                &HerdrBridgeEvent::Conflict {
+                    key: HerdrMappingKey::workspace("alpha", "foreign"),
+                    message: "foreign workspace".to_string(),
+                },
+            );
+            panel.read_with(&cx, |panel, cx| {
+                assert_eq!(
+                    panel.herdr_status_label(cx),
+                    Some(SharedString::from("Unavailable"))
+                );
+            });
+
 
             // A reconciliation conflict surfaces as `Conflict`.
             handle_event(
