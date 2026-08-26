@@ -271,3 +271,60 @@ cargo test: 153 passed (1 suite, 24.09s)
 
 The Windows named-pipe branch was not executable on this macOS host; Windows
 compilation and the named-pipe regression remain CI-gated.
+
+## Residual Gate 2 Repairs (HEAD a358be1b80 → this commit)
+
+Findings file: `.superpowers/sdd/final-review-residual-2.md`. All four
+findings fixed with deterministic regressions.
+
+1. **Stale agent snapshot on identity loss (P2)** — `herdr_bridge.rs`
+   `apply_snapshot` and the live `PaneAgentDetected { session_identity: None }`
+   path now drop the pane's stale `agent_snapshots` record and
+   `published_subthreads` entry before inserting the status-only snapshot, so
+   `subthread_snapshots` returns exactly one record. `herdr_conversation_view.rs`
+   demotes a previously selectable pane back to status-only (dropping its child
+   view and active selection) when an identity-less `AgentDetected` replays.
+   Regressions: `snapshot_identity_loss_replaces_the_agent_snapshot_with_status_only`,
+   `live_identity_loss_replaces_the_agent_snapshot_with_status_only`,
+   `identity_loss_demotes_a_selectable_pane_to_status_only`.
+2. **Status-preserving identity upgrade (P2)** — `create_agent_mapping` carries
+   a retained status-only status into the inserted agent snapshot, and the
+   `PaneAgentDetected` emission reuses it (falling back to the mapping
+   snapshot's status) for both the snapshot and the `SubthreadCreated` event.
+   Regression: `identity_upgrade_preserves_the_retained_status_only_status`.
+3. **Lazy-owner forwarding claim (P3)** — `agent_panel.rs` adds a GPUI global
+   `HerdrLazyOwnerForwards` in-flight claim; only the first non-owner panel that
+   observes the owner absent loads and forwards, later observers in the same
+   synchronous fanout skip, and the claim is released on load success or
+   failure. Regressions:
+   `lazy_owner_forward_claim_is_exclusive_until_released`,
+   `concurrent_non_owner_panels_claim_the_lazy_owner_once` (two synchronous
+   non-owner observations of a lazy owner produce exactly one claim and one
+   panel load).
+4. **Status-only cache cleared on workspace close (P3)** — `archive_mapping`
+   now retains no `status_only_snapshots` rows for the archived workspace.
+   Regression: `workspace_close_clears_the_status_only_cache`.
+
+### Verification evidence
+
+```text
+$ cargo test -p agent_ui herdr_bridge
+test result: ok. 31 passed; 0 failed (includes 4 new regressions)
+
+$ cargo test -p agent_ui herdr_conversation_view
+test result: ok. 7 passed; 0 failed (includes 1 new regression)
+
+$ cargo test -p agent_ui agent_panel::tests::herdr
+test result: ok. 11 passed; 0 failed (includes 2 new regressions)
+
+$ cargo test -p agent_ui herdr_test_support
+test result: ok. 9 passed; 0 failed
+
+$ cargo test -p sidebar tests::
+test result: ok. 153 passed; 0 failed
+```
+
+Concerns: the lazy-owner claim is keyed by Herdr workspace id per process; if a
+forward task fails to load the owner panel the event is not redelivered by the
+skipping observers (the next bridge event retries the load). Windows named-pipe
+coverage remains CI-gated as before.

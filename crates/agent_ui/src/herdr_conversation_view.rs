@@ -119,6 +119,13 @@ impl HerdrConversationState {
                     state.status = status;
                     self.status_only.remove(&pane_id);
                 } else {
+                    // Reverse identity transition: a previously selectable
+                    // pane falls back to status-only so only one record
+                    // remains.
+                    self.subthreads.shift_remove(&pane_id);
+                    if self.active_pane_id.as_deref() == Some(pane_id.as_str()) {
+                        self.active_pane_id = None;
+                    }
                     self.status_only.insert(pane_id, status);
                 }
             }
@@ -426,7 +433,10 @@ impl HerdrConversationView {
                     child.update(cx, |child, cx| child.hydrate_output(window, cx));
                 }
             }
-            HerdrConversationEvent::AgentDetected { session: None, .. } => {}
+            HerdrConversationEvent::AgentDetected { session: None, .. } => {
+                // The state demoted this pane; release its child view too.
+                self.subthreads.shift_remove(&pane_id);
+            }
             HerdrConversationEvent::StatusChanged { status, .. } => {
                 if let Some(child) = self.subthreads.get(&pane_id) {
                     child.update(cx, |child, cx| child.apply_status(status, cx));
@@ -596,6 +606,31 @@ mod tests {
         assert!(view.is_selectable("p1"));
         assert_eq!(view.status_only("p1"), None);
     }
+
+    #[test]
+    fn identity_loss_demotes_a_selectable_pane_to_status_only() {
+        let mut view = HerdrConversationState::new("w1", ThreadId::new());
+        view.apply(agent_detected("p1", "session-1"));
+        view.apply(HerdrConversationEvent::PaneFocused {
+            pane_id: "p1".to_string(),
+        });
+        assert!(view.is_selectable("p1"));
+        assert_eq!(view.active_pane_id(), Some("p1"));
+
+        // The pane loses its identity; exactly one record (status-only)
+        // must remain and the pane must no longer be selectable.
+        view.apply(HerdrConversationEvent::AgentDetected {
+            pane_id: "p1".to_string(),
+            session: None,
+            title: None,
+            status: HerdrAgentStatus::Blocked,
+        });
+        assert!(!view.is_selectable("p1"));
+        assert_eq!(view.subthreads().len(), 0);
+        assert_eq!(view.status_only("p1"), Some(&HerdrAgentStatus::Blocked));
+        assert_eq!(view.active_pane_id(), None);
+    }
+
     #[test]
     fn agent_session_identity_creates_a_selectable_subthread() {
         let mut view = HerdrConversationState::new("w1", ThreadId::new());

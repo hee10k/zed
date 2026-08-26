@@ -170,6 +170,37 @@ impl MaxIdleRetainedThreads {
         cx.try_global::<Self>().map_or(5, |g| g.0)
     }
 }
+/// Deduplicates lazy-owner loads for Herdr bridge events. When several
+/// non-owner panels observe the owning workspace's panel absent during the
+/// same synchronous event fanout, exactly one claim wins and performs the
+/// load/forward; the rest skip so the lazy owner receives the event once.
+#[derive(Default)]
+struct HerdrLazyOwnerForwards {
+    in_flight: HashSet<String>,
+    total_claims: usize,
+}
+impl gpui::Global for HerdrLazyOwnerForwards {}
+
+fn claim_lazy_owner_forward(cx: &mut App, workspace_id: &str) -> bool {
+    let claims = cx.default_global::<HerdrLazyOwnerForwards>();
+    if claims.in_flight.insert(workspace_id.to_string()) {
+        claims.total_claims += 1;
+        true
+    } else {
+        false
+    }
+}
+
+fn release_lazy_owner_forward(cx: &mut App, workspace_id: &str) {
+    cx.default_global::<HerdrLazyOwnerForwards>()
+        .in_flight
+        .remove(workspace_id);
+}
+#[cfg(test)]
+pub(crate) fn herdr_lazy_forward_total_claims(cx: &App) -> usize {
+    cx.try_global::<HerdrLazyOwnerForwards>()
+        .map_or(0, |claims| claims.total_claims)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TerminalId(uuid::Uuid);
@@ -4808,21 +4839,36 @@ impl AgentPanel {
         // subscription. Forward only when it is not loaded yet; forwarding
         // to an already-subscribed owner would deliver the same event twice.
         if owner.read(cx).panel::<AgentPanel>(cx).is_none() {
+            // Multiple non-owner panels can observe the owner absent within
+            // one synchronous fanout; only the first claim may load and
+            // forward so exactly-once delivery holds for lazy convergence.
+            if !claim_lazy_owner_forward(cx, herdr_workspace_id) {
+                return false;
+            }
             let owner_weak = owner.downgrade();
+            let workspace_id = herdr_workspace_id.to_string();
             let event = event.clone();
             let mut async_window_cx = window.to_async(cx);
-            cx.spawn(async move |_this, _cx| {
-                let panel = AgentPanel::load(owner_weak.clone(), async_window_cx.clone()).await?;
-                owner.update_in(&mut async_window_cx, |owner, window, cx| {
-                    let panel = owner.panel::<AgentPanel>(cx).unwrap_or_else(|| {
-                        owner.add_panel(panel.clone(), window, cx);
-                        panel.clone()
-                    });
-                    panel.update(cx, |panel, cx| {
-                        panel.handle_herdr_event(&event, window, cx);
-                    });
-                })?;
-                anyhow::Ok(())
+            cx.spawn(async move |_this, cx| {
+                let forwarded = async {
+                    let panel =
+                        AgentPanel::load(owner_weak.clone(), async_window_cx.clone()).await?;
+                    owner.update_in(&mut async_window_cx, |owner, window, cx| {
+                        let panel = owner.panel::<AgentPanel>(cx).unwrap_or_else(|| {
+                            owner.add_panel(panel.clone(), window, cx);
+                            panel.clone()
+                        });
+                        panel.update(cx, |panel, cx| {
+                            panel.handle_herdr_event(&event, window, cx);
+                        });
+                    })?;
+                    anyhow::Ok(())
+                }
+                .await;
+                // Release the claim on success and failure alike so a later
+                // event can retry the load.
+                let _ = cx.update(|cx| release_lazy_owner_forward(cx, &workspace_id));
+                forwarded
             })
             .detach_and_log_err(cx);
         }
@@ -15296,6 +15342,110 @@ mod tests {
                     panel.base_view,
                     BaseView::HerdrConversation { .. }
                 ));
+            });
+        }
+
+        #[gpui::test]
+        async fn lazy_owner_forward_claim_is_exclusive_until_released(
+            cx: &mut TestAppContext,
+        ) {
+            cx.update(|cx| {
+                assert!(claim_lazy_owner_forward(cx, "w1"));
+                // A second observer in the same fanout must not claim.
+                assert!(!claim_lazy_owner_forward(cx, "w1"));
+                assert!(claim_lazy_owner_forward(cx, "w2"));
+                release_lazy_owner_forward(cx, "w1");
+                assert!(claim_lazy_owner_forward(cx, "w1"));
+            });
+        }
+
+        #[gpui::test]
+        async fn concurrent_non_owner_panels_claim_the_lazy_owner_once(
+            cx: &mut TestAppContext,
+        ) {
+            init_test(cx);
+            cx.update(|cx| {
+                agent::ThreadStore::init_global(cx);
+                language_model::LanguageModelRegistry::test(cx);
+            });
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree("/project_a", json!({ "file.txt": "" }))
+                .await;
+            let project_a = Project::test(fs.clone(), [Path::new("/project_a")], cx).await;
+            let project_b = Project::test(fs, [], cx).await;
+
+            let multi_workspace =
+                cx.add_window(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+            let workspace_a = multi_workspace
+                .read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone())
+                .unwrap();
+            let workspace_b = multi_workspace
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.test_add_workspace(project_b.clone(), window, cx)
+                })
+                .unwrap();
+            let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+            // The non-owner panel owns the Herdr bridge for workspace "w1"
+            // whose mirrored folder paths belong to workspace_a; workspace_a
+            // has no panel yet, so the owner is lazy.
+            let panel_b = workspace_b.update_in(cx, |workspace, window, cx| {
+                cx.new(|cx| AgentPanel::new(workspace, window, cx))
+            });
+            let bridge = panel_b.update_in(cx, |panel, _window, cx| {
+                let bridge = cx.new(|_| HerdrThreadBridge::for_test("alpha"));
+                panel.herdr_bridge = Some(bridge.clone());
+                panel._herdr_bridge_subscription = None;
+                bridge
+            });
+            bridge.update(cx, |bridge, _| {
+                bridge.apply_event(crate::herdr_client::HerdrEvent::WorkspaceCreated {
+                    workspace: crate::herdr_client::HerdrWorkspaceSnapshot {
+                        workspace_id: "w1".to_string(),
+                        label: "Review".to_string(),
+                        paths: vec!["/project_a".to_string()],
+                        ..Default::default()
+                    },
+                    sequence: 1,
+                });
+            });
+
+            workspace_a.read_with(cx, |workspace, cx| {
+                assert!(
+                    workspace.panel::<AgentPanel>(cx).is_none(),
+                    "the owning workspace must start without a loaded panel"
+                );
+            });
+
+            // Two non-owner subscription callbacks observe the owner absent
+            // within the same synchronous fanout; exactly one may load and
+            // forward so the event reaches the lazy owner once.
+            for _ in 0..2 {
+                panel_b.update_in(cx, |panel, window, cx| {
+                    panel.handle_herdr_event(
+                        &HerdrBridgeEvent::RootRenamed {
+                            workspace_id: "w1".to_string(),
+                            thread_id: ThreadId::new(),
+                            title: "Renamed".to_string(),
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            }
+            cx.update(|_window, cx| {
+                assert_eq!(
+                    herdr_lazy_forward_total_claims(cx),
+                    1,
+                    "exactly one lazy-owner load must be claimed per fanout"
+                );
+            });
+            cx.run_until_parked();
+            workspace_a.read_with(cx, |workspace, cx| {
+                assert!(
+                    workspace.panel::<AgentPanel>(cx).is_some(),
+                    "the lazy owner should be loaded exactly once"
+                );
             });
         }
     }
