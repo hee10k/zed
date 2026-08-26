@@ -15,6 +15,8 @@ pub(crate) mod herdr_transport;
 pub(crate) mod herdr_mapping_store;
 pub(crate) mod herdr_state;
 pub(crate) mod conversation_view;
+mod herdr_conversation_view;
+mod herdr_thread_view;
 
 mod diagnostics;
 pub mod draft_prompt_store;

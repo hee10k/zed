@@ -42,10 +42,13 @@ use crate::terminal_thread_metadata_store::{
     TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore,
     compose_terminal_thread_title, terminal_title_without_prefix,
 };
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::thread_metadata_store::{
+    HERDR_AGENT_ID, ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent,
+};
 use crate::herdr_bridge::{
     HerdrBridgeEvent, HerdrBridgeRegistry, HerdrThreadBridge,
 };
+use crate::herdr_conversation_view::HerdrConversationView;
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
@@ -1136,6 +1139,9 @@ enum BaseView {
     AgentThread {
         conversation_view: Entity<ConversationView>,
     },
+    HerdrConversation {
+        conversation_view: Entity<HerdrConversationView>,
+    },
     Terminal {
         terminal_id: TerminalId,
     },
@@ -1152,6 +1158,7 @@ impl From<AgentThread> for BaseView {
 enum VisibleSurface<'a> {
     Uninitialized,
     AgentThread(&'a Entity<ConversationView>),
+    HerdrConversation(&'a Entity<HerdrConversationView>),
     Terminal(&'a Entity<TerminalView>),
 }
 
@@ -1163,7 +1170,9 @@ enum WhichFontSize {
 impl BaseView {
     pub fn which_font_size_used(&self) -> WhichFontSize {
         match self {
-            BaseView::AgentThread { .. } => WhichFontSize::AgentFont,
+            BaseView::AgentThread { .. } | BaseView::HerdrConversation { .. } => {
+                WhichFontSize::AgentFont
+            }
             BaseView::Terminal { .. } | BaseView::Uninitialized => WhichFontSize::None,
         }
     }
@@ -1237,6 +1246,19 @@ impl AgentPanel {
 
         let last_active_thread = if last_active_terminal_id.is_some() {
             None
+        } else if let Some(thread_id) = self.herdr_active_thread {
+            let metadata = ThreadMetadataStore::try_global(cx)
+                .and_then(|store| store.read(cx).entry(thread_id).cloned());
+            Some(SerializedActiveThread {
+                session_id: None,
+                thread_id: Some(thread_id),
+                agent_type: Agent::from(HERDR_AGENT_ID.clone()),
+                title: metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.title.as_ref())
+                    .map(|title| title.to_string()),
+                work_dirs: metadata.map(|metadata| metadata.folder_paths().serialize()),
+            })
         } else {
             let is_draft_active = self.active_thread_is_draft(cx);
             let active_thread_id = self.active_thread_id(cx);
@@ -4534,6 +4556,20 @@ impl AgentPanel {
                     cx.notify();
                 }))
             }
+            BaseView::HerdrConversation { conversation_view } => {
+                self._thread_view_subscription = None;
+                let focus_handle = conversation_view.focus_handle(cx);
+                self._active_thread_focus_subscription =
+                    Some(cx.on_focus_in(&focus_handle, window, |_this, _window, cx| {
+                        cx.emit(AgentPanelEvent::ActiveViewFocused);
+                        cx.notify();
+                    }));
+                let view = conversation_view.clone();
+                Some(cx.observe_in(&view, window, |_this, _view, _window, cx| {
+                    cx.emit(AgentPanelEvent::ActiveViewChanged);
+                    cx.notify();
+                }))
+            }
             BaseView::Terminal { terminal_id } => {
                 self._thread_view_subscription = None;
                 if let Some(terminal) = self.terminals.get(terminal_id) {
@@ -4560,7 +4596,6 @@ impl AgentPanel {
                 None
             }
         };
-        self.serialize(cx);
     }
 
     fn visible_surface(&self) -> VisibleSurface<'_> {
@@ -4568,6 +4603,9 @@ impl AgentPanel {
             BaseView::Uninitialized => VisibleSurface::Uninitialized,
             BaseView::AgentThread { conversation_view } => {
                 VisibleSurface::AgentThread(conversation_view)
+            }
+            BaseView::HerdrConversation { conversation_view } => {
+                VisibleSurface::HerdrConversation(conversation_view)
             }
             BaseView::Terminal { terminal_id } => self
                 .terminals
@@ -4721,6 +4759,27 @@ impl AgentPanel {
         true
     }
 
+    fn handle_herdr_subthread_event(
+        &mut self,
+        event: &HerdrBridgeEvent,
+        key: &crate::herdr_mapping_store::HerdrMappingKey,
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.route_herdr_workspace(&key.workspace_id, window, cx) {
+            return;
+        }
+        if self.herdr_active_thread != Some(thread_id) {
+            self.herdr_focus_suppressed = true;
+            self.load_herdr_thread(thread_id, true, window, cx);
+            self.herdr_focus_suppressed = false;
+        }
+        if let BaseView::HerdrConversation { conversation_view } = &self.base_view {
+            conversation_view.update(cx, |view, cx| view.apply_bridge_event(event, window, cx));
+        }
+    }
+
     fn handle_herdr_event(
         &mut self,
         event: &HerdrBridgeEvent,
@@ -4763,6 +4822,21 @@ impl AgentPanel {
                     // this event, so the sidebar observes the durable title.
                     cx.notify();
                 }
+            }
+            HerdrBridgeEvent::SubthreadCreated {
+                key, thread_id, ..
+            }
+            | HerdrBridgeEvent::SubthreadUpdated {
+                key, thread_id, ..
+            }
+            | HerdrBridgeEvent::SubthreadOutput {
+                key, thread_id, ..
+            }
+            | HerdrBridgeEvent::SubthreadClosed {
+                key, thread_id, ..
+            }
+            | HerdrBridgeEvent::SubthreadFocused { key, thread_id } => {
+                self.handle_herdr_subthread_event(event, key, *thread_id, window, cx);
             }
             HerdrBridgeEvent::Conflict { key, message } => {
                 if self.route_herdr_workspace(&key.workspace_id, window, cx) {
@@ -4817,9 +4891,49 @@ impl AgentPanel {
             store.update(cx, |store, cx| store.unarchive(thread_id, cx));
         }
 
-        let old_view = std::mem::replace(&mut self.base_view, BaseView::Uninitialized);
-        self.retain_running_thread(old_view, cx);
+        let title = bridge
+            .read(cx)
+            .root_title(&workspace_id)
+            .or_else(|| {
+                ThreadMetadataStore::try_global(cx)
+                    .and_then(|store| {
+                        store
+                            .read(cx)
+                            .entry(thread_id)
+                            .and_then(|metadata| metadata.title().map(|title| title.to_string()))
+                    })
+            })
+            .unwrap_or_else(|| workspace_id.clone());
+        let herdr_view = match &self.base_view {
+            BaseView::HerdrConversation { conversation_view }
+                if conversation_view.read(cx).thread_id == thread_id =>
+            {
+                conversation_view.clone()
+            }
+            _ => cx.new(|cx| {
+                HerdrConversationView::new(
+                    thread_id,
+                    workspace_id.clone(),
+                    title,
+                    bridge.clone(),
+                    window,
+                    cx,
+                )
+            }),
+        };
+        if !matches!(
+            &self.base_view,
+            BaseView::HerdrConversation { conversation_view }
+                if conversation_view.entity_id() == herdr_view.entity_id()
+        ) {
+            let old_view = std::mem::replace(&mut self.base_view, BaseView::Uninitialized);
+            self.retain_running_thread(old_view, cx);
+            self.base_view = BaseView::HerdrConversation {
+                conversation_view: herdr_view.clone(),
+            };
+        }
         self.herdr_active_thread = Some(thread_id);
+        herdr_view.update(cx, |view, cx| view.refresh_from_bridge(window, cx));
         self.refresh_base_view_subscriptions(window, cx);
         if focus {
             self.activation_focus_handle(cx).focus(window, cx);
@@ -5446,6 +5560,9 @@ impl Panel for AgentPanel {
             VisibleSurface::AgentThread(conversation_view) => {
                 conversation_view.read(cx).activation_focus_handle(cx)
             }
+            VisibleSurface::HerdrConversation(conversation_view) => {
+                conversation_view.read(cx).activation_focus_handle(cx)
+            }
             VisibleSurface::Terminal(terminal_view) => terminal_view.focus_handle(cx),
         }
     }
@@ -5664,6 +5781,9 @@ impl AgentPanel {
         match &self.base_view {
             BaseView::Uninitialized => false,
             BaseView::Terminal { .. } => true,
+            BaseView::HerdrConversation { conversation_view } => {
+                !conversation_view.read(cx).subthreads.is_empty()
+            }
             BaseView::AgentThread { conversation_view } => {
                 let has_entries = conversation_view
                     .read(cx)
@@ -5809,7 +5929,9 @@ impl AgentPanel {
     fn should_show_title_edit(&self, window: &Window, cx: &Context<Self>) -> bool {
         matches!(
             self.visible_surface(),
-            VisibleSurface::AgentThread(_) | VisibleSurface::Terminal(_)
+            VisibleSurface::AgentThread(_) 
+            | VisibleSurface::HerdrConversation(_)
+            | VisibleSurface::Terminal(_)
         ) && self.has_open_project(cx)
             && !self.is_title_editor_focused(window, cx)
     }
@@ -5910,6 +6032,12 @@ impl AgentPanel {
                         .into_any_element()
                 }
             }
+            VisibleSurface::HerdrConversation(conversation_view) => Label::new(
+                conversation_view.read(cx).title(),
+            )
+            .color(Color::Muted)
+            .truncate()
+            .into_any_element(),
             VisibleSurface::Terminal(_) => {
                 if let Some((terminal_id, title_editor, title)) =
                     self.active_terminal_id().and_then(|terminal_id| {
@@ -6655,7 +6783,9 @@ impl AgentPanel {
                     return false;
                 }
             }
-            BaseView::Terminal { .. } | BaseView::Uninitialized => {
+            BaseView::HerdrConversation { .. }
+            | BaseView::Terminal { .. }
+            | BaseView::Uninitialized => {
                 return false;
             }
         }
@@ -6704,10 +6834,12 @@ impl AgentPanel {
             .any(|provider| {
                 provider.is_authenticated(cx)
                     && provider.id() != language_model::ZED_CLOUD_PROVIDER_ID
-            });
-
+            })
+            ;
         match &self.base_view {
-            BaseView::Uninitialized | BaseView::Terminal { .. } => false,
+            BaseView::Uninitialized
+            | BaseView::Terminal { .. }
+            | BaseView::HerdrConversation { .. } => false,
             BaseView::AgentThread { conversation_view } => {
                 if conversation_view.read(cx).as_native_thread(cx).is_some() {
                     let history_is_empty = ThreadStore::global(cx).read(cx).is_empty();
@@ -6883,6 +7015,7 @@ impl AgentPanel {
                     conversation_view.insert_dragged_files(paths, added_worktrees, window, cx);
                 });
             }
+            BaseView::HerdrConversation { .. } => {}
             BaseView::Terminal { terminal_id } => {
                 let paths = {
                     let project = self.project.read(cx);
@@ -7007,6 +7140,8 @@ impl Render for AgentPanel {
                         .child(terminal_content)
                         .child(self.render_drag_target(cx))
                 }
+                VisibleSurface::HerdrConversation(conversation_view) => parent
+                    .child(conversation_view.clone()),
             })
             .children(self.render_trial_end_upsell(window, cx));
 
