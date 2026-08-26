@@ -420,3 +420,44 @@ cargo test: 153 passed (1 suite, 40 warnings, 23.77s)
 The sidebar run emitted warning diagnostics from existing unrelated workspace
 code. No formatter, linter, or project-wide suite was run. Windows named-pipe
 coverage remains CI-gated on this macOS host.
+
+## Final Residual Gate 5 Repairs (HEAD 902601f073 → this commit)
+
+Findings file: `.superpowers/sdd/final-review-residual-5.md`. Stale metadata
+on an already selectable child was fixed. `AgentDetected(Some)` now updates
+the existing `HerdrThreadView` session, title, and status instead of leaving
+the child entity stale or creating a duplicate. The update does not touch the
+child's revisioned output. The `SubthreadCreated` bridge path is covered by
+the regression `duplicate_agent_detection_refreshes_existing_child_metadata`,
+which asserts that reconnect metadata refreshes the same child entity while
+preserving output revision and text.
+
+### Verification evidence
+
+```text
+$ cargo test -p agent_ui herdr_conversation_view
+cargo test: 8 passed (1 suite, 578 filtered, 0.14s)
+
+$ cargo test -p agent_ui herdr_thread_view
+cargo test: 2 passed (1 suite, 584 filtered, 0.00s)
+
+$ cargo test -p agent_ui herdr_bridge
+cargo test: 35 passed (1 suite, 551 filtered, 0.00s)
+
+$ cargo test -p agent_ui agent_panel::tests::herdr
+cargo test: 12 passed (1 suite, 574 filtered, 1.09s)
+
+$ cargo test -p sidebar tests::
+cargo test: 153 passed (1 suite, 40 warnings, 23.92s)
+```
+
+The regression was also run directly:
+
+```text
+$ cargo test -p agent_ui herdr_conversation_view::tests::duplicate_agent_detection_refreshes_existing_child_metadata -- --exact
+cargo test: 1 passed (1 suite, 585 filtered, 0.18s)
+```
+
+The sidebar run emitted warning diagnostics from existing unrelated workspace
+code. No formatter, linter, or project-wide suite was run. Windows named-pipe
+coverage remains CI-gated on this macOS host.

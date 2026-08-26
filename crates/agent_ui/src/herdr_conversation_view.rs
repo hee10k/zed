@@ -431,6 +431,10 @@ impl HerdrConversationView {
                     });
                     self.subthreads.insert(pane_id.clone(), child.clone());
                     child.update(cx, |child, cx| child.hydrate_output(window, cx));
+                } else if let Some(child) = self.subthreads.get(&pane_id) {
+                    child.update(cx, |child, cx| {
+                        child.apply_metadata(session, title, status, cx);
+                    });
                 }
             }
             HerdrConversationEvent::AgentDetected { session: None, .. } => {
@@ -573,6 +577,8 @@ impl Render for HerdrConversationView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+    use crate::herdr_mapping_store::HerdrMappingKey;
 
     fn agent_detected(pane_id: &str, session: &str) -> HerdrConversationEvent {
         HerdrConversationEvent::AgentDetected {
@@ -687,5 +693,74 @@ mod tests {
             status: HerdrAgentStatus::Blocked,
         });
         assert_eq!(view.status("p1"), Some(&HerdrAgentStatus::Blocked));
+    }
+
+    #[gpui::test]
+    fn duplicate_agent_detection_refreshes_existing_child_metadata(
+        cx: &mut TestAppContext,
+    ) {
+        crate::test_support::init_test(cx);
+        let conversation = cx.add_window(|window, cx| {
+            let bridge = cx.new(|_| HerdrThreadBridge::for_test("alpha"));
+            HerdrConversationView::new(
+                ThreadId::new(),
+                "w1",
+                "Root",
+                bridge,
+                window,
+                cx,
+            )
+        });
+        let mut cx = VisualTestContext::from_window(conversation.clone().into(), cx);
+
+        let initial_child_id = conversation.update(&mut cx, |view, window, cx| {
+            view.apply_event(
+                HerdrConversationEvent::AgentDetected {
+                    pane_id: "p1".to_string(),
+                    session: Some(HerdrAgentSessionIdentity::id("session-old")),
+                    title: Some("Old title".to_string()),
+                    status: HerdrAgentStatus::Idle,
+                },
+                window,
+                cx,
+            );
+            let child = view.subthreads.get("p1").expect("initial child").clone();
+            child.update(cx, |child, cx| {
+                child.apply_output(4, "preserve this output".to_string(), cx);
+            });
+            child.entity_id()
+        }).expect("initial child setup");
+
+        conversation.update(&mut cx, |view, window, cx| {
+            view.apply_bridge_event(
+                &HerdrBridgeEvent::SubthreadCreated {
+                    key: HerdrMappingKey::subthread(
+                        "alpha",
+                        "w1",
+                        "p1",
+                        HerdrAgentSessionIdentity::id("session-new"),
+                    ),
+                    thread_id: ThreadId::new(),
+                    pane_id: "p1".to_string(),
+                    session: HerdrAgentSessionIdentity::id("session-new"),
+                    title: "New title".to_string(),
+                    status: HerdrAgentStatus::Blocked,
+                },
+                window,
+                cx,
+            );
+        }).expect("duplicate child refresh");
+
+        conversation.read_with(&cx, |view, cx| {
+            assert_eq!(view.subthreads.len(), 1);
+            let child = view.subthreads.get("p1").expect("refreshed child");
+            assert_eq!(child.entity_id(), initial_child_id);
+            let child = child.read(cx);
+            assert_eq!(child.session, HerdrAgentSessionIdentity::id("session-new"));
+            assert_eq!(child.title, "New title");
+            assert_eq!(child.status, HerdrAgentStatus::Blocked);
+            assert_eq!(child.output_revision, 4);
+            assert_eq!(child.output, "preserve this output");
+        }).expect("child metadata assertions");
     }
 }

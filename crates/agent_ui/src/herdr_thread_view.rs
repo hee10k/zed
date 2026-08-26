@@ -88,6 +88,21 @@ impl HerdrThreadView {
         }
     }
 
+    pub(crate) fn apply_metadata(
+        &mut self,
+        session: HerdrAgentSessionIdentity,
+        title: Option<String>,
+        status: HerdrAgentStatus,
+        cx: &mut Context<Self>,
+    ) {
+        self.session = session;
+        if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
+            self.title = title.into();
+        }
+        self.status = status;
+        cx.notify();
+    }
+
     pub(crate) fn apply_output(&mut self, revision: u64, output: String, cx: &mut Context<Self>) {
         if revision > self.output_revision {
             self.output_revision = revision;
