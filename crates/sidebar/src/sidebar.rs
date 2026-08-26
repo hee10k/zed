@@ -358,6 +358,9 @@ enum DraftKind {
 #[derive(Clone)]
 struct ThreadEntry {
     metadata: ThreadMetadata,
+    /// Optional presentation-only title. In particular, the Herdr session
+    /// disambiguator must never be written back into durable metadata.
+    display_title: Option<SharedString>,
     icon: IconName,
     icon_from_external_svg: Option<SharedString>,
     status: AgentThreadStatus,
@@ -1303,9 +1306,7 @@ impl Sidebar {
         let panel = agent_panel.read(cx);
 
         if let Some(pending_thread_id) = self.pending_thread_activation {
-            let panel_thread_id = panel
-                .active_conversation_view()
-                .map(|cv| cv.read(cx).parent_id());
+            let panel_thread_id = panel.active_thread_id(cx);
 
             if panel_thread_id == Some(pending_thread_id) {
                 let session_id = panel
@@ -1705,6 +1706,7 @@ impl Sidebar {
                         let draft = row.is_draft().then_some(DraftKind::WithContent);
                         Arc::new(ThreadEntry {
                             metadata: row,
+                            display_title: None,
                             icon,
                             icon_from_external_svg,
                             status: AgentThreadStatus::default(),
@@ -1910,9 +1912,8 @@ impl Sidebar {
                             if thread_is_herdr_backed(&thread.metadata)
                                 && mapped_ids.contains(&thread.metadata.thread_id)
                             {
-                                let title =
-                                    thread.metadata.title.clone().unwrap_or_default().to_string();
-                                Arc::make_mut(thread).metadata.title =
+                                let title = thread.metadata.display_title().to_string();
+                                Arc::make_mut(thread).display_title =
                                     Some(format!("{title} · {session}").into());
                             }
                         }
@@ -5617,6 +5618,9 @@ impl Sidebar {
                 }
             }
         }
+        if AgentPanel::close_herdr_thread_in_window(thread_id, window, cx) {
+            return;
+        }
 
         let metadata = ThreadMetadataStore::global(cx)
             .read(cx)
@@ -6768,7 +6772,11 @@ impl Sidebar {
     ) -> AnyElement {
         let has_notification = self.contents.is_thread_notified(&thread.metadata.thread_id);
 
-        let title: SharedString = thread.metadata.display_title();
+        let title: SharedString = thread
+            .display_title
+            .clone()
+            .unwrap_or_else(|| thread.metadata.display_title());
+        let rename_title = thread.metadata.display_title();
         let metadata = thread.metadata.clone();
         let thread_workspace = thread.workspace.clone();
 
@@ -6891,12 +6899,12 @@ impl Sidebar {
                         }
                     })
                     .on_click({
-                        let title = title.clone();
+                        let rename_title = rename_title.clone();
                         cx.listener(move |this, _, window, cx| {
                             this.start_renaming_thread(
                                 ix,
                                 thread_id_for_actions,
-                                title.clone(),
+                                rename_title.clone(),
                                 window,
                                 cx,
                             );
@@ -7065,7 +7073,7 @@ impl Sidebar {
             .menu({
                 let thread_id = thread.metadata.thread_id;
                 let markdown_title = Some(thread.metadata.display_title());
-                let rename_title = title;
+                let rename_title = thread.metadata.display_title();
                 move |_window, cx| {
                     let session_id = session_id.clone();
                     let sidebar = sidebar.clone();

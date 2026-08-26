@@ -85,7 +85,7 @@ use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncApp,
     AsyncWindowContext, ClipboardItem, Entity, EventEmitter, ExternalPaths, FocusHandle,
     Focusable, KeyContext, Pixels, PlatformDisplay, Subscription, Task, TaskExt,
-    WeakEntity, WindowHandle, WindowId, prelude::*, pulsating_between,
+    WeakEntity, WindowHandle, prelude::*, pulsating_between,
 };
 use language::LanguageRegistry;
 use language_model::{
@@ -4546,6 +4546,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.herdr_title_editor.is_some() {
+            self.stop_editing_herdr_title(false, window, cx);
+        }
         self.herdr_active_thread = None;
         let old_view = std::mem::replace(&mut self.base_view, new_view);
         self.retain_running_thread(old_view, cx);
@@ -4741,8 +4744,9 @@ impl AgentPanel {
     /// roots own the mirrored Herdr metadata. A MultiWorkspace activation is
     /// performed before panel focus so only the owning panel handles it.
     fn route_herdr_workspace(
-        &self,
+        &mut self,
         herdr_workspace_id: &str,
+        event: &HerdrBridgeEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -4782,14 +4786,57 @@ impl AgentPanel {
         let Some(owner) = owner.cloned() else {
             return false;
         };
-        if current_workspace.as_ref() != Some(&owner) {
+        let owner_is_current = current_workspace.as_ref() == Some(&owner);
+        let owner_is_source = self.workspace.upgrade().as_ref() == Some(&owner);
+        if owner_is_current && owner_is_source {
+            return true;
+        }
+
+        if !owner_is_current {
             let source = current_workspace.as_ref().map(Entity::downgrade);
             multi_workspace.update(cx, |multi_workspace, cx| {
-                multi_workspace.activate(owner, source, window, cx);
+                multi_workspace.activate(owner.clone(), source, window, cx);
             });
-            return false;
         }
-        true
+        if owner_is_source {
+            // The event already arrived through the owning panel; after
+            // activation it can be handled by this invocation.
+            return true;
+        }
+
+
+
+        // Bridge events are emitted to every panel sharing a window bridge.
+        // If the event arrived through a non-owning panel, forward it to the
+        // owning panel rather than dropping it after activation. A lazy owner
+        // is loaded before replaying the event, so focus and lifecycle events
+        // retain their original semantics.
+        let owner_panel = owner.read(cx).panel::<AgentPanel>(cx);
+        if let Some(owner_panel) = owner_panel {
+            let event = event.clone();
+            owner_panel.update(cx, |panel, cx| {
+                panel.handle_herdr_event(&event, window, cx);
+            });
+        } else {
+            let owner_weak = owner.downgrade();
+            let event = event.clone();
+            let mut async_window_cx = window.to_async(cx);
+            cx.spawn(async move |_this, _cx| {
+                let panel = AgentPanel::load(owner_weak.clone(), async_window_cx.clone()).await?;
+                owner.update_in(&mut async_window_cx, |owner, window, cx| {
+                    let panel = owner.panel::<AgentPanel>(cx).unwrap_or_else(|| {
+                        owner.add_panel(panel.clone(), window, cx);
+                        panel.clone()
+                    });
+                    panel.update(cx, |panel, cx| {
+                        panel.handle_herdr_event(&event, window, cx);
+                    });
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        }
+        false
     }
 
     fn handle_herdr_subthread_event(
@@ -4800,7 +4847,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.route_herdr_workspace(&key.workspace_id, window, cx) {
+        if !self.route_herdr_workspace(&key.workspace_id, event, window, cx) {
             return;
         }
         // Only an explicit focus event may activate the Herdr surface. All
@@ -4840,7 +4887,7 @@ impl AgentPanel {
                 workspace_id,
                 thread_id,
             } => {
-                if !self.route_herdr_workspace(workspace_id, window, cx) {
+                if !self.route_herdr_workspace(workspace_id, event, window, cx) {
                     return;
                 }
                 self.herdr_focus_suppressed = true;
@@ -4851,10 +4898,13 @@ impl AgentPanel {
                 workspace_id,
                 thread_id,
             } => {
-                if !self.route_herdr_workspace(workspace_id, window, cx) {
+                if !self.route_herdr_workspace(workspace_id, event, window, cx) {
                     return;
                 }
                 if self.herdr_active_thread == Some(*thread_id) {
+                    if self.herdr_title_editor.is_some() {
+                        self.stop_editing_herdr_title(false, window, cx);
+                    }
                     self.herdr_active_thread = None;
                     let old_view =
                         std::mem::replace(&mut self.base_view, BaseView::Uninitialized);
@@ -4866,7 +4916,7 @@ impl AgentPanel {
                 }
             }
             HerdrBridgeEvent::RootRenamed { workspace_id, .. } => {
-                if self.route_herdr_workspace(workspace_id, window, cx) {
+                if self.route_herdr_workspace(workspace_id, event, window, cx) {
                     // ThreadMetadataStore was updated by the bridge before
                     // this event, so the sidebar observes the durable title.
                     if let BaseView::HerdrConversation { conversation_view } = &self.base_view {
@@ -4874,6 +4924,14 @@ impl AgentPanel {
                             .update(cx, |view, cx| view.apply_bridge_event(event, window, cx));
                     }
                     cx.notify();
+                }
+            }
+            HerdrBridgeEvent::SubthreadStatusOnly { workspace_id, .. } => {
+                if self.route_herdr_workspace(workspace_id, event, window, cx) {
+                    if let BaseView::HerdrConversation { conversation_view } = &self.base_view {
+                        conversation_view
+                            .update(cx, |view, cx| view.apply_bridge_event(event, window, cx));
+                    }
                 }
             }
             HerdrBridgeEvent::SubthreadCreated {
@@ -4893,7 +4951,7 @@ impl AgentPanel {
             }
             HerdrBridgeEvent::Conflict { key, message } => {
                 self.herdr_conflict_active = true;
-                if self.route_herdr_workspace(&key.workspace_id, window, cx) {
+                if self.route_herdr_workspace(&key.workspace_id, event, window, cx) {
                     Self::show_herdr_toast(
                         &self.workspace,
                         format!("Herdr conflict: {message}"),
@@ -4908,7 +4966,7 @@ impl AgentPanel {
             } => {
                 let owns = workspace_id
                     .as_deref()
-                    .map_or(true, |id| self.route_herdr_workspace(id, window, cx));
+                    .map_or(true, |id| self.route_herdr_workspace(id, event, window, cx));
                 if owns {
                     Self::show_herdr_toast(
                         &self.workspace,
@@ -4995,6 +5053,9 @@ impl AgentPanel {
             BaseView::HerdrConversation { conversation_view }
                 if conversation_view.entity_id() == herdr_view.entity_id()
         ) {
+            if self.herdr_title_editor.is_some() {
+                self.stop_editing_herdr_title(false, window, cx);
+            }
             let old_view = std::mem::replace(&mut self.base_view, BaseView::Uninitialized);
             self.retain_running_thread(old_view, cx);
             self.base_view = BaseView::HerdrConversation {
@@ -5090,6 +5151,39 @@ impl AgentPanel {
         true
     }
 
+    /// Closes a Herdr root through this window's bridge even when the owning
+    /// workspace has no loaded AgentPanel (for example, a historical row).
+    pub fn close_herdr_thread_in_window(
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let window_id = window.window_handle().window_id();
+        let Some(bridge) = cx
+            .try_global::<HerdrBridgeRegistry>()
+            .and_then(|registry| registry.bridge_for_window(window_id, cx))
+        else {
+            return false;
+        };
+        let Some(workspace_id) = bridge
+            .read(cx)
+            .root_mapping_for_thread(thread_id)
+            .map(|record| record.key.workspace_id.clone())
+        else {
+            return false;
+        };
+        let task =
+            bridge.update(cx, |bridge, cx| bridge.request_close_workspace(&workspace_id, cx));
+        cx.spawn(async move |_cx| {
+            if let Err(error) = task.await {
+                log::warn!("Herdr close failed for historical root: {error}");
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+        true
+    }
+
     /// Creates a new Herdr-backed root via `workspace.create`. The response
     /// itself is reconciled and persisted before the Zed row becomes active;
     /// a separate `RootCreated` event is not required. Returns `false` when
@@ -5104,7 +5198,9 @@ impl AgentPanel {
         let Some(bridge) = self.herdr_bridge.clone() else {
             return false;
         };
-        let task = bridge.read(cx).request_create_workspace(&label.into(), paths, cx);
+        let (session, generation) = bridge.read(cx).create_request_fence();
+        let label = label.into();
+        let task = bridge.read(cx).request_create_workspace(&label, paths, cx);
         let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |this, cx| {
             match task.await {
@@ -5112,7 +5208,12 @@ impl AgentPanel {
                     this.update_in(cx, |panel, window, cx| {
                         let thread_id = panel.herdr_bridge.as_ref().and_then(|bridge| {
                             bridge.update(cx, |bridge, cx| {
-                                bridge.apply_create_response(snapshot.clone(), cx)
+                                bridge.apply_create_response(
+                                    snapshot.clone(),
+                                    &session,
+                                    generation,
+                                    cx,
+                                )
                             })
                         });
                         let Some(thread_id) = thread_id else {
@@ -7115,7 +7216,9 @@ impl AgentPanel {
 
         let mode = if matches!(self.base_view, BaseView::Terminal { .. }) {
             ToolbarMode::Terminal
-        } else if self.active_thread_has_messages(cx) {
+        } else if matches!(self.base_view, BaseView::HerdrConversation { .. })
+            || self.active_thread_has_messages(cx)
+        {
             ToolbarMode::ActiveThread
         } else {
             ToolbarMode::EmptyThread

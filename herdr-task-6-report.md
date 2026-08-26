@@ -136,3 +136,92 @@ named sessions. Repeat the launcher/Zed flow on macOS, Linux, and Windows.
 The `herdr --session alpha` line is the expected installed-Herdr CLI shape; if a
 packaged installation uses another launcher, substitute that launcher while
 preserving the named session and local endpoint.
+
+## Final whole-branch review repairs
+
+All nineteen findings in `.superpowers/sdd/final-review-findings.md` were
+reproduced against the active implementation and fixed:
+
+1. Agent restoration now atomically removes the prior live mapping and its
+   derived snapshot/publication state.
+2. Snapshot reconciliation merges nested agents with protocol-level
+   `snapshot.agents` and `snapshot.panes` without duplicate identity entries.
+3. Unsequenced watcher reads replace the complete pane buffer; sequenced
+   deltas retain append behavior and revision fencing.
+4. Snapshot-reported session names no longer overwrite the stable
+   selection/endpoint mapping key.
+5. Status and output forwarding use live-only mapping lookup after tombstones.
+6. Identity-less agent detection emits a status-only bridge/view entry and
+   identity arrival upgrades it to a selectable subthread.
+7. Context action batches emit lifecycle events once, after all actions are
+   applied.
+8. Added an end-to-end fake-server focus round trip asserting one encoded
+   request for workspace focus and one for pane focus, with operation IDs and
+   `zed` origins.
+9. Windows named-pipe setup accepts the `ERROR_PIPE_CONNECTED` success race.
+10. Fixture subscription IDs are allocated while holding the registration
+    lock.
+11. Unknown fixture methods return top-level protocol errors, surfaced by the
+    client as `HerdrClientError::ProtocolError`.
+12. Unix fixture accept retries `Interrupted` and `ConnectionAborted` errors.
+13. Session disambiguation is stored as presentation-only row state, leaving
+    durable Herdr titles unchanged for rename persistence.
+14. Pending activation resolves through `AgentPanel::active_thread_id`, which
+    includes Herdr roots.
+15. Event routing activates and forwards to the owning panel, loading a lazy
+    panel before replaying the event.
+16. Leaving or replacing a Herdr surface clears its title editor without
+    committing stale text.
+17. Herdr roots use the title/editor toolbar path even when they have no ACP
+    messages.
+18. Create responses carry the selection session and bridge generation fence;
+    stale responses are discarded after rebind.
+19. Closed-workspace rows route close through the owning window bridge before
+    attempting workspace loading.
+
+## Final host verification
+
+Commands were run from the repository root on macOS:
+
+```text
+$ cargo test -p agent_ui herdr_client
+cargo test: 37 passed (1 suite, 534 filtered, 0.16s)
+
+$ cargo test -p agent_ui herdr_transport
+cargo test: 6 passed (1 suite, 565 filtered, 0.16s)
+
+$ cargo test -p agent_ui herdr_mapping_store
+cargo test: 12 passed (1 suite, 559 filtered, 0.01s)
+
+$ cargo test -p agent_ui herdr_state
+cargo test: 37 passed (1 suite, 534 filtered, 0.00s)
+
+$ cargo test -p agent_ui herdr_bridge
+cargo test: 26 passed (1 suite, 545 filtered, 0.00s)
+
+$ cargo test -p agent_ui herdr_conversation_view
+cargo test: 6 passed (1 suite, 565 filtered, 0.00s)
+
+$ cargo test -p agent_ui herdr_thread_view
+cargo test: 2 passed (1 suite, 569 filtered, 0.00s)
+
+$ cargo test -p agent_ui agent_panel::tests::herdr
+cargo test: 8 passed (1 suite, 563 filtered, 0.88s)
+
+$ cargo test -p agent_ui herdr_test_support
+cargo test: 9 passed (1 suite, 562 filtered, 0.02s)
+
+$ cargo test -p sidebar tests::
+cargo test: 153 passed (1 suite, 23.99s)
+```
+
+No formatter, linter, or project-wide suite was run. Windows named-pipe
+behavior remains compile/CI-gated on this macOS host; the fixture-specific
+`ERROR_PIPE_CONNECTED` branch is covered by the Windows implementation.
+
+The exact activation regression was also rerun:
+
+```text
+$ cargo test -p sidebar tests::activating_herdr_root_requests_herdr_workspace_focus -- --exact
+cargo test: 1 passed (1 suite, 152 filtered, 0.25s)
+```

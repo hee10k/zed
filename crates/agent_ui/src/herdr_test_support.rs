@@ -20,9 +20,9 @@ use crate::herdr_bridge::{HerdrBridgeEvent, HerdrConnectionStatus, HerdrThreadBr
 use crate::herdr_client::HerdrSnapshot;
 #[cfg(test)]
 use crate::herdr_client::{
-    HerdrAgentSessionIdentity, HerdrAgentSnapshot, HerdrAgentStatus, HerdrApi, HerdrClientHandle,
-    HerdrEvent, HerdrWorkspaceSnapshot, decode_pane_read_result, empty_params, subscription_params,
-    validate_ping_result,
+    HerdrAgentSessionIdentity, HerdrAgentSnapshot, HerdrAgentStatus, HerdrApi, HerdrClientError,
+    HerdrClientHandle, HerdrEvent, HerdrWorkspaceSnapshot, decode_pane_read_result, empty_params,
+    subscription_params, validate_ping_result,
 };
 #[cfg(test)]
 use crate::herdr_mapping_store::{HerdrMappingKey, HerdrMappingRecord, SessionMappings};
@@ -106,18 +106,24 @@ impl ServerState {
             .expect("fixture snapshot lock")
             .clone()
     }
-    fn response_for(&self, request: &RecordedHerdrRequest) -> Value {
+    fn response_for(
+        &self,
+        request: &RecordedHerdrRequest,
+        subscription_id: Option<&str>,
+    ) -> Result<Value, (String, String)> {
         if let Some(result) = self.response_override(&request.method) {
-            return result;
+            return Ok(result);
         }
         match request.method.as_str() {
-            "ping" => json!({"type": "pong", "version": "0.20.0", "protocol": 20}),
+            "ping" => Ok(json!({"type": "pong", "version": "0.20.0", "protocol": 20})),
             "events.subscribe" => {
-                let id = self
-                    .next_subscription
-                    .load(Ordering::SeqCst)
-                    .saturating_sub(1);
-                json!({"type": "subscription_started", "subscription_id": format!("fixture-sub-{id}")})
+                let Some(subscription_id) = subscription_id else {
+                    return Err((
+                        "internal_error".to_string(),
+                        "fixture subscription response missing allocated ID".to_string(),
+                    ));
+                };
+                Ok(json!({"type": "subscription_started", "subscription_id": subscription_id}))
             }
             "session.snapshot" => {
                 let snapshot = self
@@ -126,9 +132,9 @@ impl ServerState {
                     .expect("fixture snapshot sequence lock")
                     .pop_front()
                     .unwrap_or_else(|| self.snapshot());
-                json!({"type": "session_snapshot", "snapshot": snapshot})
+                Ok(json!({"type": "session_snapshot", "snapshot": snapshot}))
             }
-            "pane.read" => self.pane_read_response(request),
+            "pane.read" => Ok(self.pane_read_response(request)),
             "workspace.create" => {
                 let params = &request.params;
                 let label = params
@@ -139,7 +145,7 @@ impl ServerState {
                     .get("cwd")
                     .and_then(Value::as_str)
                     .unwrap_or("/fixture");
-                json!({
+                Ok(json!({
                     "type": "workspace_created",
                     "workspace": {
                         "workspace_id": "fixture-workspace-created",
@@ -152,8 +158,19 @@ impl ServerState {
                         "active_tab_id": null,
                         "agent_status": "idle"
                     }
-                })
+                }))
             }
+            "workspace.focus"
+            | "workspace.rename"
+            | "workspace.close"
+            | "pane.focus"
+            | "pane.close"
+            | "pane.send_keys"
+            | "pane.send_text"
+            | "pane.send_input"
+            | "pane.split"
+            | "agent.prompt"
+            | "agent.send_keys" => Ok(json!({})),
             "agent.rename" | "agent.start" => {
                 let pane_id = request
                     .params
@@ -161,7 +178,7 @@ impl ServerState {
                     .or_else(|| request.params.get("pane_id"))
                     .and_then(Value::as_str)
                     .unwrap_or("fixture-pane");
-                json!({
+                Ok(json!({
                     "agent": {
                         "pane_id": pane_id,
                         "workspace_id": "fixture-workspace",
@@ -170,9 +187,12 @@ impl ServerState {
                         "agent_status": "idle",
                         "title": "Fixture Agent"
                     }
-                })
+                }))
             }
-            _ => json!({}),
+            _ => Err((
+                "method_not_found".to_string(),
+                format!("fixture does not implement Herdr method {:?}", request.method),
+            )),
         }
     }
 
@@ -511,6 +531,19 @@ fn write_frame<S: Write>(stream: &mut S, frame: &str) -> Result<()> {
     Ok(())
 }
 
+fn response_frame(
+    id: &str,
+    result: Result<Value, (String, String)>,
+) -> Value {
+    match result {
+        Ok(result) => json!({"id": id, "result": result}),
+        Err((code, message)) => json!({
+            "id": id,
+            "error": {"code": code, "message": message}
+        }),
+    }
+}
+
 fn handle_connection<S: Read + Write + Send + 'static>(
     stream: S,
     inner: Arc<ServerState>,
@@ -543,8 +576,7 @@ fn handle_connection<S: Read + Write + Send + 'static>(
         return;
     }
 
-    let result = inner.response_for(&request);
-    let response = json!({"id": request.id, "result": result});
+    let response = response_frame(&request.id, inner.response_for(&request, None));
     let _ = write_frame(reader.get_mut(), &response.to_string());
 }
 
@@ -553,18 +585,23 @@ fn handle_subscription<S: Read + Write + Send + 'static>(
     inner: Arc<ServerState>,
     request: RecordedHerdrRequest,
 ) {
-    let subscription_number = inner.next_subscription.fetch_add(1, Ordering::SeqCst);
-    let subscription_id = format!("fixture-sub-{subscription_number}");
-    let (tx, rx) = std::sync::mpsc::channel();
-    inner
-        .subscriptions
-        .lock()
-        .expect("fixture subscription lock")
-        .push(Subscription {
+    let (subscription_id, rx) = {
+        // Allocate the ID while holding the same lock that registers the
+        // channel. The response cannot observe a different subscription's
+        // counter value under concurrent handshakes.
+        let mut subscriptions = inner
+            .subscriptions
+            .lock()
+            .expect("fixture subscription lock");
+        let subscription_number = inner.next_subscription.fetch_add(1, Ordering::SeqCst);
+        let subscription_id = format!("fixture-sub-{subscription_number}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        subscriptions.push(Subscription {
             id: subscription_id.clone(),
             tx,
         });
-
+        (subscription_id, rx)
+    };
     // Deliberately send buffered events before the acknowledgement. The real
     // client must retain them while completing the subscription handshake.
     let buffered = std::mem::take(
@@ -580,8 +617,10 @@ fn handle_subscription<S: Read + Write + Send + 'static>(
         }
     }
 
-    let result = inner.response_for(&request);
-    let response = json!({"id": request.id, "result": result});
+    let response = response_frame(
+        &request.id,
+        inner.response_for(&request, Some(&subscription_id)),
+    );
     if write_frame(reader.get_mut(), &response.to_string()).is_err() {
         inner.remove_subscription(&subscription_id);
         return;
@@ -620,9 +659,17 @@ fn unix_accept_loop(
                     .name("herdr-fixture-connection".to_string())
                     .spawn(move || handle_connection(stream, thread_inner));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(2));
-            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::ConnectionAborted
+                ) => {
+                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                },
             Err(_) => break,
         }
     }
@@ -640,7 +687,7 @@ fn windows_accept_loop(
     stop: Arc<AtomicBool>,
 ) {
     use windows::core::HSTRING;
-    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED};
     use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -662,7 +709,13 @@ fn windows_accept_loop(
         if pipe.is_invalid() {
             break;
         }
-        if unsafe { ConnectNamedPipe(pipe, None) }.is_err() {
+        let connected = unsafe { ConnectNamedPipe(pipe, None) }
+            .map(|_| true)
+            .or_else(|error| {
+                (error.code() == ERROR_PIPE_CONNECTED.to_hresult()).then_some(true)
+            })
+            .unwrap_or(false);
+        if !connected {
             let _ = unsafe { CloseHandle(pipe) };
             continue;
         }
@@ -818,6 +871,51 @@ mod tests {
         ] {
             assert!(recorded_methods.iter().any(|recorded| recorded == method), "fixture did not record {method}");
         }
+    }
+
+    #[gpui::test]
+    async fn fake_server_surfaces_unknown_method_as_protocol_error(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let server =
+            FakeHerdrServer::new(snapshot("alpha", vec![workspace("w1", "Alpha", "/repo")]))
+                .expect("fixture server");
+        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor().clone());
+        let result = client
+            .request_on_executor("unsupported.fixture.method", json!({}))
+            .await;
+        assert!(matches!(
+            result,
+            Err(HerdrClientError::ProtocolError { code, message })
+                if code == "method_not_found" && message.contains("unsupported.fixture.method")
+        ));
+    }
+
+    #[gpui::test]
+    async fn concurrent_subscriptions_receive_their_atomically_allocated_ids(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let server =
+            FakeHerdrServer::new(snapshot("alpha", vec![workspace("w1", "Alpha", "/repo")]))
+                .expect("fixture server");
+        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor().clone());
+        let results = join_all((0..8).map(|_| {
+            client.start_subscription(subscription_params(), false)
+        }))
+        .await;
+        let mut ids = results
+            .into_iter()
+            .map(|result| result.expect("subscription").0)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(
+            ids,
+            (1..=8)
+                .map(|id| format!("fixture-sub-{id}"))
+                .collect::<Vec<_>>()
+        );
+        client.cancel_subscriptions();
+        server.disconnect_subscriptions();
     }
 
     #[gpui::test]
@@ -980,6 +1078,86 @@ mod tests {
             .take_events()
             .iter()
             .all(|event| !matches!(event, HerdrBridgeEvent::SubthreadFocused { .. })));
+    }
+
+    #[gpui::test]
+    async fn focus_round_trip_reaches_fake_server_once_per_direction(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let server =
+            FakeHerdrServer::new(snapshot("alpha", vec![workspace("w1", "Alpha", "/repo")]))
+                .expect("fixture server");
+        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor().clone());
+        let mut bridge = HerdrThreadBridge::for_test("alpha");
+        bridge.apply_event(HerdrEvent::WorkspaceCreated {
+            workspace: workspace("w1", "Alpha", "/repo"),
+            sequence: 1,
+        });
+        bridge.apply_event(HerdrEvent::PaneAgentDetected {
+            pane_id: "p1".to_string(),
+            workspace_id: "w1".to_string(),
+            agent_type: Some("omp".to_string()),
+            session_identity: Some(HerdrAgentSessionIdentity::id("agent-1")),
+            sequence: 2,
+        });
+        bridge.take_events();
+
+        let root_operation = match bridge.focus_root("w1").expect("root focus") {
+            OutboundRequest::FocusWorkspace { operation_id, origin, .. } => {
+                assert_eq!(origin, crate::herdr_state::HerdrOperationOrigin::Zed);
+                operation_id
+            }
+            other => panic!("unexpected root request: {other:?}"),
+        };
+        client
+            .request_on_executor(
+                "workspace.focus",
+                json!({"workspace_id":"w1","operation_id":root_operation,"origin":"zed"}),
+            )
+            .await
+            .expect("workspace focus request");
+        bridge.apply_event(HerdrEvent::WorkspaceFocused {
+            workspace_id: "w1".to_string(),
+            operation_id: Some(root_operation.clone()),
+            sequence: 3,
+        });
+
+        let pane_operation = match bridge.focus_pane("w1", "p1").expect("pane focus") {
+            OutboundRequest::FocusPane { operation_id, origin, .. } => {
+                assert_eq!(origin, crate::herdr_state::HerdrOperationOrigin::Zed);
+                operation_id
+            }
+            other => panic!("unexpected pane request: {other:?}"),
+        };
+        client
+            .request_on_executor(
+                "pane.focus",
+                json!({"pane_id":"p1","operation_id":pane_operation,"origin":"zed"}),
+            )
+            .await
+            .expect("pane focus request");
+        bridge.apply_event(HerdrEvent::PaneFocused {
+            pane_id: "p1".to_string(),
+            workspace_id: "w1".to_string(),
+            operation_id: Some(pane_operation.clone()),
+            sequence: 4,
+        });
+        assert!(bridge.take_outbound_requests().len() == 2);
+
+        let requests = server.requests();
+        let root_requests = requests
+            .iter()
+            .filter(|request| request.method == "workspace.focus")
+            .collect::<Vec<_>>();
+        let pane_requests = requests
+            .iter()
+            .filter(|request| request.method == "pane.focus")
+            .collect::<Vec<_>>();
+        assert_eq!(root_requests.len(), 1);
+        assert_eq!(pane_requests.len(), 1);
+        assert_eq!(root_requests[0].params["origin"], "zed");
+        assert_eq!(pane_requests[0].params["origin"], "zed");
+        assert_eq!(root_requests[0].params["operation_id"], root_operation);
+        assert_eq!(pane_requests[0].params["operation_id"], pane_operation);
     }
 
     #[test]

@@ -252,6 +252,22 @@ impl HerdrConversationView {
             HerdrBridgeEvent::StatusChanged(status) => {
                 self.apply_connection_status(*status, cx);
             }
+            HerdrBridgeEvent::SubthreadStatusOnly {
+                workspace_id,
+                pane_id,
+                status,
+            } if workspace_id == &self.workspace_id => {
+                self.apply_event(
+                    HerdrConversationEvent::AgentDetected {
+                        pane_id: pane_id.clone(),
+                        session: None,
+                        title: None,
+                        status: status.clone(),
+                    },
+                    window,
+                    cx,
+                );
+            }
             HerdrBridgeEvent::RootRenamed {
                 workspace_id,
                 title,
@@ -520,6 +536,11 @@ impl Render for HerdrConversationView {
                 }
             })
         });
+        let status_only = self.state.status_only.iter().map(|(pane_id, status)| {
+            Label::new(format!("{pane_id} · {:?}", status))
+                .color(Color::Muted)
+                .into_any_element()
+        });
 
         v_flex()
             .size_full()
@@ -532,7 +553,7 @@ impl Render for HerdrConversationView {
                     .child(Label::new(self.title.clone()).size(LabelSize::Large))
                     .child(Label::new(format!("Herdr: {:?}", self.connection_status)).color(Color::Muted)),
             )
-            .child(v_flex().gap_1().children(cards))
+            .child(v_flex().gap_1().children(cards).children(status_only))
             .child(
                 active_child.map_or_else(
                     || div().child(Label::new("Select an agent pane to continue").color(Color::Muted)).into_any_element(),
@@ -563,6 +584,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn panes_without_identity_upgrade_when_identity_arrives() {
+        let mut view = HerdrConversationState::new("w1", ThreadId::new());
+        view.apply(HerdrConversationEvent::AgentDetected {
+            pane_id: "p1".to_string(),
+            session: None,
+            title: None,
+            status: HerdrAgentStatus::Working,
+        });
+        assert_eq!(view.status_only("p1"), Some(&HerdrAgentStatus::Working));
+
+        view.apply(agent_detected("p1", "session-1"));
+        assert!(view.is_selectable("p1"));
+        assert_eq!(view.status_only("p1"), None);
+    }
     #[test]
     fn agent_session_identity_creates_a_selectable_subthread() {
         let mut view = HerdrConversationState::new("w1", ThreadId::new());
