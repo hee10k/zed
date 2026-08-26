@@ -192,7 +192,7 @@ pub(crate) struct HerdrThreadBridge {
     status: HerdrConnectionStatus,
     events: Vec<HerdrBridgeEvent>,
     outbound_requests: Vec<OutboundRequest>,
-    pending_authoritative_focus: Option<String>,
+    pending_authoritative_focus: Option<PendingAuthoritativeFocus>,
     current_focus_workspace: Option<String>,
     metadata_dirty: HashSet<String>,
     active_subscription_id: Option<String>,
@@ -209,6 +209,19 @@ struct PaneMoveSource {
     record: HerdrMappingRecord,
     snapshot: Option<HerdrAgentSnapshot>,
     published: bool,
+}
+
+#[derive(Clone)]
+struct PendingAuthoritativeFocus {
+    target: FocusTarget,
+    pane_identity: Option<PendingAuthoritativePaneIdentity>,
+}
+
+#[derive(Clone)]
+enum PendingAuthoritativePaneIdentity {
+    Exact(HerdrAgentSessionIdentity),
+    AwaitReplay,
+    RootFallback,
 }
 
 impl HerdrThreadBridge {
@@ -679,6 +692,7 @@ impl HerdrThreadBridge {
         );
         self.note_focus_event(&event, &applied, fenced, stale);
         self.apply_actions(applied);
+        self.update_pending_authoritative_focus_from_replay(&event, accepted);
         if accepted {
             self.clear_status_only_for_workspace_close(&event);
             if matches!(event, HerdrEvent::PaneMoved { .. }) {
@@ -708,6 +722,7 @@ impl HerdrThreadBridge {
         );
         self.note_focus_event(&event, &applied, fenced, stale);
         self.apply_actions_in_context(applied, cx);
+        self.update_pending_authoritative_focus_from_replay(&event, accepted);
         if accepted {
             self.clear_status_only_for_workspace_close(&event);
             if matches!(event, HerdrEvent::PaneMoved { .. }) {
@@ -1563,6 +1578,54 @@ impl HerdrThreadBridge {
     }
 
 
+    fn pending_authoritative_focus_for_snapshot(
+        snapshot: &HerdrSnapshot,
+        workspaces: &[HerdrWorkspaceSnapshot],
+        agents: &[HerdrAgentSnapshot],
+    ) -> Option<PendingAuthoritativeFocus> {
+        let workspace_id = snapshot.active_workspace_id.clone()?;
+        let active_pane_id = snapshot.active_pane_id.clone().or_else(|| {
+            workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+                .and_then(|workspace| workspace.active_pane_id.clone())
+        });
+        let target = match active_pane_id {
+            Some(pane_id) => FocusTarget::Pane {
+                workspace_id: workspace_id.clone(),
+                pane_id,
+            },
+            None => FocusTarget::Workspace(workspace_id),
+        };
+        let pane_identity = match &target {
+            FocusTarget::Workspace(_) => None,
+            FocusTarget::Pane {
+                workspace_id,
+                pane_id,
+            } => {
+                let matching_agents = agents
+                    .iter()
+                    .filter(|agent| {
+                        agent.workspace_id == *workspace_id && agent.pane_id == *pane_id
+                    })
+                    .collect::<Vec<_>>();
+                Some(match matching_agents.as_slice() {
+                    [agent] => agent
+                        .session_identity
+                        .clone()
+                        .map(PendingAuthoritativePaneIdentity::Exact)
+                        .unwrap_or(PendingAuthoritativePaneIdentity::AwaitReplay),
+                    [] => PendingAuthoritativePaneIdentity::AwaitReplay,
+                    _ => PendingAuthoritativePaneIdentity::RootFallback,
+                })
+            }
+        };
+        Some(PendingAuthoritativeFocus {
+            target,
+            pane_identity,
+        })
+    }
+
     fn apply_snapshot(&mut self, snapshot: HerdrSnapshot) {
         // The server can expose pane identities either nested under each
         // workspace or in the protocol-level `agents`/`panes` collections.
@@ -1577,7 +1640,8 @@ impl HerdrThreadBridge {
                     && agent.pane_id == *pane_id
             })
         });
-        self.pending_authoritative_focus = snapshot.active_workspace_id;
+        self.pending_authoritative_focus =
+            Self::pending_authoritative_focus_for_snapshot(&snapshot, &workspaces, &agents);
         let actions = reconcile_snapshot(
             &self.state.session,
             &workspaces,
@@ -1725,6 +1789,7 @@ impl HerdrThreadBridge {
             );
             self.note_focus_event(&event, &applied, fenced, stale);
             self.apply_actions(applied);
+            self.update_pending_authoritative_focus_from_replay(&event, accepted);
             if accepted {
                 self.clear_status_only_for_workspace_close(&event);
                 if matches!(event, HerdrEvent::PaneMoved { .. }) {
@@ -1736,6 +1801,114 @@ impl HerdrThreadBridge {
         }
     }
 
+    fn unique_live_subthread_at(
+        &self,
+        workspace_id: &str,
+        pane_id: &str,
+    ) -> Option<HerdrMappingKey> {
+        let mut candidates = self.state.mappings.values().filter(|record| {
+            !record.is_tombstone()
+                && record.key.session == self.state.session
+                && record.key.workspace_id == workspace_id
+                && record.key.pane_id.as_deref() == Some(pane_id)
+        });
+        let candidate = candidates.next()?.key.clone();
+        if candidates.next().is_some() {
+            None
+        } else {
+            Some(candidate)
+        }
+    }
+
+    fn update_pending_authoritative_focus_from_replay(
+        &mut self,
+        event: &HerdrEvent,
+        accepted: bool,
+    ) {
+        if !accepted {
+            return;
+        }
+        let Some(PendingAuthoritativeFocus {
+            target:
+                FocusTarget::Pane {
+                    workspace_id,
+                    pane_id,
+                },
+            pane_identity: Some(PendingAuthoritativePaneIdentity::AwaitReplay),
+        }) = self.pending_authoritative_focus.as_ref()
+        else {
+            return;
+        };
+        let (event_workspace_id, event_pane_id) = match event {
+            HerdrEvent::PaneMoved { pane, .. } | HerdrEvent::PaneUpdated { pane, .. } => {
+                (&pane.workspace_id, &pane.pane_id)
+            }
+            HerdrEvent::PaneAgentDetected {
+                workspace_id,
+                pane_id,
+                ..
+            } => (workspace_id, pane_id),
+            _ => return,
+        };
+        if event_workspace_id != workspace_id || event_pane_id != pane_id {
+            return;
+        }
+        let identity = self
+            .unique_live_subthread_at(workspace_id, pane_id)
+            .and_then(|key| key.agent_session);
+        if let Some(PendingAuthoritativeFocus {
+            pane_identity: Some(pane_identity),
+            ..
+        }) = self.pending_authoritative_focus.as_mut()
+        {
+            *pane_identity = identity
+                .map(PendingAuthoritativePaneIdentity::Exact)
+                .unwrap_or(PendingAuthoritativePaneIdentity::RootFallback);
+        }
+    }
+
+    fn active_authoritative_subthread(
+        &self,
+        workspace_id: &str,
+        pane_id: &str,
+        agent_session: &HerdrAgentSessionIdentity,
+    ) -> Option<HerdrMappingKey> {
+        let key = self.unique_live_subthread_at(workspace_id, pane_id)?;
+        if key.agent_session.as_ref() != Some(agent_session) {
+            return None;
+        }
+        self.agent_snapshots
+            .get(&key.to_key_string())
+            .filter(|snapshot| {
+                snapshot.workspace_id == workspace_id
+                    && snapshot.pane_id == pane_id
+                    && snapshot.session_identity.as_ref() == Some(agent_session)
+            })?;
+        Some(key)
+    }
+
+    fn activate_pending_authoritative_focus(&mut self) {
+        let Some(focus) = self.pending_authoritative_focus.take() else {
+            return;
+        };
+        let key = match focus.target {
+            FocusTarget::Workspace(workspace_id) => self.state.workspace_key(&workspace_id),
+            FocusTarget::Pane {
+                workspace_id,
+                pane_id,
+            } => focus
+                .pane_identity
+                .and_then(|identity| match identity {
+                    PendingAuthoritativePaneIdentity::Exact(agent_session) => self
+                        .active_authoritative_subthread(&workspace_id, &pane_id, &agent_session),
+                    PendingAuthoritativePaneIdentity::AwaitReplay
+                    | PendingAuthoritativePaneIdentity::RootFallback => None,
+                })
+                .unwrap_or_else(|| self.state.workspace_key(&workspace_id)),
+        };
+        self.activate_mapping(&key);
+    }
+
     fn apply_bootstrap(&mut self, bootstrap: HerdrBootstrap, cx: &mut Context<Self>) {
         let start = self.events.len();
         self.set_status(HerdrConnectionStatus::Synchronizing);
@@ -1743,10 +1916,7 @@ impl HerdrThreadBridge {
         self.merge_existing_metadata(&bootstrap.snapshot.workspaces, cx);
         self.apply_replay_events(bootstrap.events);
         if self.current_focus_workspace.is_none() {
-            if let Some(workspace_id) = self.pending_authoritative_focus.take() {
-                let key = self.state.workspace_key(&workspace_id);
-                self.activate_mapping(&key);
-            }
+            self.activate_pending_authoritative_focus();
         } else {
             self.pending_authoritative_focus = None;
         }
@@ -3992,5 +4162,215 @@ mod tests {
                 .and_then(|snapshot| snapshot.session_identity.clone()),
             Some(HerdrAgentSessionIdentity::id("session-1"))
         );
+    }
+    #[test]
+    fn snapshot_active_pane_focuses_the_matching_subthread() {
+        let mut bridge = test_bridge();
+        bridge.apply_snapshot(HerdrSnapshot {
+            session: "alpha".to_string(),
+            active_workspace_id: Some("w1".to_string()),
+            active_pane_id: Some("p1".to_string()),
+            workspaces: vec![HerdrWorkspaceSnapshot {
+                workspace_id: "w1".to_string(),
+                label: "Review".to_string(),
+                paths: vec!["/repo".to_string()],
+                agents: vec![HerdrAgentSnapshot {
+                    pane_id: "p1".to_string(),
+                    workspace_id: "w1".to_string(),
+                    agent_type: Some("omp".to_string()),
+                    session_identity: Some(HerdrAgentSessionIdentity::id("session-1")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        bridge.take_events();
+
+        bridge.activate_pending_authoritative_focus();
+
+        assert!(bridge.take_events().iter().any(|event| matches!(
+            event,
+            HerdrBridgeEvent::SubthreadFocused { key, .. }
+                if key.workspace_id == "w1" && key.pane_id.as_deref() == Some("p1")
+        )));
+    }
+
+    #[test]
+    fn snapshot_active_pane_without_identity_falls_back_to_the_root() {
+        let mut bridge = test_bridge();
+        bridge.apply_snapshot(HerdrSnapshot {
+            session: "alpha".to_string(),
+            active_workspace_id: Some("w1".to_string()),
+            active_pane_id: Some("p1".to_string()),
+            workspaces: vec![HerdrWorkspaceSnapshot {
+                workspace_id: "w1".to_string(),
+                label: "Review".to_string(),
+                paths: vec!["/repo".to_string()],
+                agents: vec![HerdrAgentSnapshot {
+                    pane_id: "p1".to_string(),
+                    workspace_id: "w1".to_string(),
+                    agent_type: Some("omp".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        bridge.take_events();
+
+        bridge.activate_pending_authoritative_focus();
+
+        let events = bridge.take_events();
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            HerdrBridgeEvent::SubthreadFocused { .. }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HerdrBridgeEvent::RootFocused { workspace_id, .. } if workspace_id == "w1"
+        )));
+    }
+
+    #[test]
+    fn snapshot_active_duplicate_pane_mappings_fall_back_to_the_root() {
+        let mut bridge = test_bridge();
+        bridge.apply_event(workspace_created("w1", "/repo", "Review"));
+        let root_thread_id = bridge.root_thread_id("w1").expect("root thread");
+        for session in ["session-1", "session-2"] {
+            let record = HerdrMappingRecord {
+                key: HerdrMappingKey::subthread(
+                    "alpha",
+                    "w1",
+                    "p1",
+                    HerdrAgentSessionIdentity::id(session),
+                ),
+                zed_root_thread_id: root_thread_id,
+                zed_subthread_session_id: Some(session.to_string()),
+                worktree_or_cwd_identity: None,
+                last_seen_sequence: 2,
+                lifecycle: HerdrLifecycleState::Active,
+            };
+            bridge.state.mappings.insert(record.key.to_key_string(), record);
+        }
+        bridge.apply_snapshot(HerdrSnapshot {
+            session: "alpha".to_string(),
+            active_workspace_id: Some("w1".to_string()),
+            active_pane_id: Some("p1".to_string()),
+            workspaces: vec![HerdrWorkspaceSnapshot {
+                workspace_id: "w1".to_string(),
+                label: "Review".to_string(),
+                paths: vec!["/repo".to_string()],
+                agents: vec![HerdrAgentSnapshot {
+                    pane_id: "p1".to_string(),
+                    workspace_id: "w1".to_string(),
+                    agent_type: Some("omp".to_string()),
+                    session_identity: Some(HerdrAgentSessionIdentity::id("session-2")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        bridge.take_events();
+
+        bridge.activate_pending_authoritative_focus();
+
+        let events = bridge.take_events();
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            HerdrBridgeEvent::SubthreadFocused { .. }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HerdrBridgeEvent::RootFocused { workspace_id, .. } if workspace_id == "w1"
+        )));
+    }
+
+    #[test]
+    fn replayed_identity_for_active_status_only_pane_focuses_the_subthread() {
+        let mut bridge = test_bridge();
+        bridge.apply_snapshot(HerdrSnapshot {
+            session: "alpha".to_string(),
+            active_workspace_id: Some("w1".to_string()),
+            active_pane_id: Some("p1".to_string()),
+            workspaces: vec![HerdrWorkspaceSnapshot {
+                workspace_id: "w1".to_string(),
+                label: "Review".to_string(),
+                paths: vec!["/repo".to_string()],
+                agents: vec![HerdrAgentSnapshot {
+                    pane_id: "p1".to_string(),
+                    workspace_id: "w1".to_string(),
+                    agent_type: Some("omp".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        bridge.take_events();
+        bridge.apply_replay_events([HerdrEvent::PaneAgentDetected {
+            pane_id: "p1".to_string(),
+            workspace_id: "w1".to_string(),
+            agent_type: Some("omp".to_string()),
+            session_identity: Some(HerdrAgentSessionIdentity::id("session-1")),
+            sequence: 1,
+        }]);
+        bridge.take_events();
+
+        bridge.activate_pending_authoritative_focus();
+
+        assert!(bridge.take_events().iter().any(|event| matches!(
+            event,
+            HerdrBridgeEvent::SubthreadFocused { key, .. }
+                if key.workspace_id == "w1" && key.pane_id.as_deref() == Some("p1")
+        )));
+    }
+
+    #[test]
+    fn replayed_identityless_pane_move_focuses_the_rebound_active_subthread() {
+        let mut bridge = test_bridge();
+        bridge.apply_event(workspace_created("w1", "/repo", "Review"));
+        bridge.apply_event(HerdrEvent::PaneAgentDetected {
+            pane_id: "p0".to_string(),
+            workspace_id: "w1".to_string(),
+            agent_type: Some("omp".to_string()),
+            session_identity: Some(HerdrAgentSessionIdentity::id("session-1")),
+            sequence: 2,
+        });
+        bridge.take_events();
+        bridge.apply_snapshot(HerdrSnapshot {
+            session: "alpha".to_string(),
+            active_workspace_id: Some("w1".to_string()),
+            active_pane_id: Some("p1".to_string()),
+            workspaces: vec![HerdrWorkspaceSnapshot {
+                workspace_id: "w1".to_string(),
+                label: "Review".to_string(),
+                paths: vec!["/repo".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        bridge.take_events();
+        bridge.apply_replay_events([HerdrEvent::PaneMoved {
+            pane: HerdrPaneSnapshot {
+                pane_id: "p1".to_string(),
+                workspace_id: "w1".to_string(),
+                ..Default::default()
+            },
+            previous_pane_id: Some("p0".to_string()),
+            previous_workspace_id: Some("w1".to_string()),
+            previous_tab_id: None,
+            sequence: 3,
+        }]);
+        bridge.take_events();
+
+        bridge.activate_pending_authoritative_focus();
+
+        assert!(bridge.take_events().iter().any(|event| matches!(
+            event,
+            HerdrBridgeEvent::SubthreadFocused { key, .. }
+                if key.workspace_id == "w1" && key.pane_id.as_deref() == Some("p1")
+        )));
     }
 }
