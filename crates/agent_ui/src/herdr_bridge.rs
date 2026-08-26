@@ -542,6 +542,25 @@ impl HerdrThreadBridge {
         }
     }
 
+    fn accepted_subthread_reconciliation(
+        event: &HerdrEvent,
+        applied: &AppliedEvent,
+    ) -> bool {
+        let identity_bearing = match event {
+            HerdrEvent::PaneAgentDetected { session_identity, .. } => session_identity.is_some(),
+            HerdrEvent::PaneUpdated { pane, .. } => pane.session_identity.is_some(),
+            _ => false,
+        };
+        !identity_bearing
+            || applied.actions.iter().any(|action| {
+                matches!(
+                    action,
+                    ReconciliationAction::CreateAgentSubthread(_)
+                        | ReconciliationAction::RestoreAgentSubthread(_)
+                )
+            })
+    }
+
     /// Apply one pushed Herdr event without requiring a GPUI context. This is
     /// intentionally also used by deterministic bridge tests.
     pub(crate) fn apply_event(&mut self, event: HerdrEvent) {
@@ -554,9 +573,12 @@ impl HerdrThreadBridge {
         let retained_status = self.retained_status_for_pane_updated(&event);
         let state_event = self.event_for_state(&event);
         let applied = self.reconcile_state_event(&state_event);
+        let accepted = Self::accepted_subthread_reconciliation(&event, &applied);
         self.note_focus_event(&event, &applied, fenced, stale);
         self.apply_actions(applied);
-        self.emit_subthread_event(&event, retained_status);
+        if accepted {
+            self.emit_subthread_event(&event, retained_status);
+        }
     }
     fn apply_event_in_context(&mut self, event: HerdrEvent, cx: &mut Context<Self>) {
         let start = self.events.len();
@@ -569,9 +591,12 @@ impl HerdrThreadBridge {
         let retained_status = self.retained_status_for_pane_updated(&event);
         let state_event = self.event_for_state(&event);
         let applied = self.reconcile_state_event(&state_event);
+        let accepted = Self::accepted_subthread_reconciliation(&event, &applied);
         self.note_focus_event(&event, &applied, fenced, stale);
         self.apply_actions_in_context(applied, cx);
-        self.emit_subthread_event(&event, retained_status);
+        if accepted {
+            self.emit_subthread_event(&event, retained_status);
+        }
         self.emit_new_events(start, cx);
         self.persist_mappings(cx);
     }
@@ -1471,9 +1496,12 @@ impl HerdrThreadBridge {
             let retained_status = self.retained_status_for_pane_updated(&event);
             let state_event = self.event_for_state(&event);
             let applied = self.reconcile_state_event(&state_event);
+            let accepted = Self::accepted_subthread_reconciliation(&event, &applied);
             self.note_focus_event(&event, &applied, fenced, stale);
             self.apply_actions(applied);
-            self.emit_subthread_event(&event, retained_status);
+            if accepted {
+                self.emit_subthread_event(&event, retained_status);
+            }
         }
     }
 
@@ -3357,6 +3385,52 @@ mod tests {
             snapshots[0].session_identity,
             Some(HerdrAgentSessionIdentity::id("session-1"))
         );
+    }
+
+    #[test]
+    fn rejected_zero_sequence_detection_does_not_refresh_existing_subthread_metadata() {
+        let mut bridge = test_bridge();
+        bridge.apply_event(workspace_created("w1", "/repo", "Review"));
+        bridge.take_events();
+        bridge.apply_event(HerdrEvent::PaneAgentDetected {
+            pane_id: "p1".to_string(),
+            workspace_id: "w1".to_string(),
+            agent_type: Some("original-agent".to_string()),
+            session_identity: Some(HerdrAgentSessionIdentity::id("session-1")),
+            sequence: 2,
+        });
+        bridge.take_events();
+        let before = bridge
+            .subthread_snapshots("w1")
+            .into_iter()
+            .next()
+            .expect("initial subthread snapshot");
+
+        bridge.apply_event(HerdrEvent::PaneAgentDetected {
+            pane_id: "p1".to_string(),
+            workspace_id: "w1".to_string(),
+            agent_type: Some("stale-agent".to_string()),
+            session_identity: Some(HerdrAgentSessionIdentity::id("session-1")),
+            sequence: 0,
+        });
+        let events = bridge.take_events();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, HerdrBridgeEvent::Conflict { .. })));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            HerdrBridgeEvent::SubthreadCreated { .. } | HerdrBridgeEvent::SubthreadUpdated { .. }
+        )));
+
+        let after = bridge
+            .subthread_snapshots("w1")
+            .into_iter()
+            .next()
+            .expect("retained subthread snapshot");
+        assert_eq!(after.agent_type, before.agent_type);
+        assert_eq!(after.session_identity, before.session_identity);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.title, before.title);
     }
 
     #[test]

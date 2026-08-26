@@ -461,3 +461,49 @@ cargo test: 1 passed (1 suite, 585 filtered, 0.18s)
 The sidebar run emitted warning diagnostics from existing unrelated workspace
 code. No formatter, linter, or project-wide suite was run. Windows named-pipe
 coverage remains CI-gated on this macOS host.
+
+## Final Residual Gate 6 Repairs (HEAD 01d30c7679 → this commit)
+
+Findings file: `.superpowers/sdd/final-review-residual-6.md`. Rejected
+identity-bearing detections are no longer allowed to publish child metadata.
+`HerdrThreadBridge` now emits `SubthreadCreated`/`SubthreadUpdated` for
+identity-bearing `PaneAgentDetected` and `PaneUpdated` events only when Task
+2 reconciliation accepted a `CreateAgentSubthread` or
+`RestoreAgentSubthread` action. Zero-sequence and stale/conflicting
+detections still publish their `Conflict` event, but cannot mutate the
+existing agent snapshot or the corresponding `HerdrThreadView`.
+The regression `rejected_zero_sequence_detection_does_not_refresh_existing_subthread_metadata`
+asserts that the conflict remains visible while the existing session,
+agent type, status, title, and child publication remain unchanged.
+
+### Verification evidence
+
+```text
+$ cargo test -p agent_ui herdr_bridge
+cargo test: 36 passed (1 suite, 551 filtered, 0.00s)
+
+$ cargo test -p agent_ui herdr_conversation_view
+cargo test: 8 passed (1 suite, 579 filtered, 0.16s)
+
+$ cargo test -p agent_ui agent_panel::tests::herdr
+cargo test: 12 passed (1 suite, 575 filtered, 1.11s)
+
+$ cargo test -p agent_ui herdr_test_support
+cargo test: 9 passed (1 suite, 578 filtered, 0.02s)
+
+$ cargo test -p sidebar tests::
+cargo test: 153 passed (1 suite, 40 warnings, 23.88s)
+```
+
+The rejected-event regression was also run directly:
+
+```text
+$ cargo test -p agent_ui herdr_bridge::tests::rejected_zero_sequence_detection_does_not_refresh_existing_subthread_metadata -- --exact
+cargo test: 1 passed (1 suite, 586 filtered, 0.11s)
+```
+
+The fixture suite's first parallel run transiently failed its existing
+unknown-method assertion; the exact test and the complete fixture suite passed
+on immediate reruns. The sidebar run emitted existing warning diagnostics from
+unrelated workspace code. No formatter, linter, or project-wide suite was run.
+Windows named-pipe coverage remains CI-gated on this macOS host.
