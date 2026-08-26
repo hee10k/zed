@@ -378,3 +378,45 @@ cargo test: 153 passed (1 suite, 40 warnings, 23.56s)
 The sidebar run emitted only existing warning diagnostics from unrelated
 workspace crates. No formatter, linter, or project-wide suite was run.
 Windows named-pipe coverage remains CI-gated on this macOS host.
+
+## Final Residual Gate 4 Repairs (HEAD dab5f4e941 → this commit)
+
+Findings file: `.superpowers/sdd/final-review-residual-4.md`. Both findings
+were fixed with deterministic regressions.
+
+1. **Lazy-owner queue fanout deduplication (P2)** — `queue_lazy_owner_forward`
+   claims the scoped forwarding key before queueing and suppresses a duplicate
+   event already at the pending queue tail, while retaining later distinct
+   events in arrival order. Failed loads still release the scoped claim without
+   dropping pending events, so a later event retries the complete queue.
+   Regressions: `lazy_owner_forward_queue_deduplicates_same_event_across_callbacks`
+   and the strengthened
+   `concurrent_non_owner_panels_claim_the_lazy_owner_once`.
+2. **PaneUpdated status-preserving identity promotion (P2)** — status-only
+   status is captured before `PaneUpdated` identity reconciliation and carried
+   into the created or updated subthread snapshot/event, preventing the pane's
+   default status from replacing retained Working/Blocked state. Regression:
+   `pane_updated_identity_upgrade_preserves_the_retained_status_only_status`.
+
+### Verification evidence
+
+```text
+$ cargo test -p agent_ui herdr_bridge
+cargo test: 35 passed (1 suite, 550 filtered, 0.00s)
+
+$ cargo test -p agent_ui herdr_conversation_view
+cargo test: 7 passed (1 suite, 578 filtered, 0.00s)
+
+$ cargo test -p agent_ui agent_panel::tests::herdr
+cargo test: 12 passed (1 suite, 573 filtered, 1.15s)
+
+$ cargo test -p agent_ui herdr_test_support
+cargo test: 9 passed (1 suite, 576 filtered, 0.02s)
+
+$ cargo test -p sidebar tests::
+cargo test: 153 passed (1 suite, 40 warnings, 23.77s)
+```
+
+The sidebar run emitted warning diagnostics from existing unrelated workspace
+code. No formatter, linter, or project-wide suite was run. Windows named-pipe
+coverage remains CI-gated on this macOS host.

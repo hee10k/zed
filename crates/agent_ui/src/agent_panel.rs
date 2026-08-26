@@ -194,13 +194,15 @@ fn queue_lazy_owner_forward(
     event: HerdrBridgeEvent,
 ) -> bool {
     let claims = cx.default_global::<HerdrLazyOwnerForwards>();
-    claims.pending.entry(key.clone()).or_default().push(event);
-    if claims.in_flight.insert(key) {
-        claims.total_claims += 1;
-        true
-    } else {
-        false
+    let newly_claimed = claims.in_flight.insert(key.clone());
+    let pending = claims.pending.entry(key).or_default();
+    if pending.last() != Some(&event) {
+        pending.push(event);
     }
+    if newly_claimed {
+        claims.total_claims += 1;
+    }
+    newly_claimed
 }
 
 fn pending_lazy_owner_forward(
@@ -15506,6 +15508,51 @@ mod tests {
                 assert_eq!(pending_lazy_owner_forward(cx, &beta_window_one).len(), 2);
             });
         }
+        #[gpui::test]
+        async fn lazy_owner_forward_queue_deduplicates_same_event_across_callbacks(
+            cx: &mut TestAppContext,
+        ) {
+            let key = HerdrLazyOwnerForwardKey {
+                window_id: WindowId::from(1),
+                session: "alpha".to_string(),
+                workspace_id: "w1".to_string(),
+            };
+            let event = HerdrBridgeEvent::RootRenamed {
+                workspace_id: "w1".to_string(),
+                thread_id: ThreadId::new(),
+                title: "Renamed".to_string(),
+            };
+            let next_event = HerdrBridgeEvent::RootRenamed {
+                workspace_id: "w1".to_string(),
+                thread_id: ThreadId::new(),
+                title: "Next".to_string(),
+            };
+
+            cx.update(|cx| {
+                assert!(queue_lazy_owner_forward(
+                    cx,
+                    key.clone(),
+                    event.clone()
+                ));
+                assert!(!queue_lazy_owner_forward(
+                    cx,
+                    key.clone(),
+                    event.clone()
+                ));
+                assert_eq!(pending_lazy_owner_forward(cx, &key), vec![event.clone()]);
+
+                assert!(!queue_lazy_owner_forward(
+                    cx,
+                    key.clone(),
+                    next_event.clone()
+                ));
+                assert_eq!(
+                    pending_lazy_owner_forward(cx, &key),
+                    vec![event, next_event]
+                );
+            });
+        }
+
 
         #[gpui::test]
         async fn concurrent_non_owner_panels_claim_the_lazy_owner_once(
@@ -15568,27 +15615,34 @@ mod tests {
             // Two non-owner subscription callbacks observe the owner absent
             // within the same synchronous fanout; exactly one may load and
             // forward so the event reaches the lazy owner once.
+            let event = HerdrBridgeEvent::RootRenamed {
+                workspace_id: "w1".to_string(),
+                thread_id: ThreadId::new(),
+                title: "Renamed".to_string(),
+            };
             for _ in 0..2 {
                 panel_b.update_in(cx, |panel, window, cx| {
-                    panel.handle_herdr_event(
-                        &HerdrBridgeEvent::RootRenamed {
-                            workspace_id: "w1".to_string(),
-                            thread_id: ThreadId::new(),
-                            title: "Renamed".to_string(),
-                        },
-                        window,
-                        cx,
-                    );
+                    panel.handle_herdr_event(&event, window, cx);
                 });
             }
+            let window_id = cx.update(|window, _cx| window.window_handle().window_id());
             cx.update(|_window, cx| {
                 assert_eq!(
                     herdr_lazy_forward_total_claims(cx),
                     1,
                     "exactly one lazy-owner load must be claimed per fanout"
                 );
+                let key = HerdrLazyOwnerForwardKey {
+                    window_id,
+                    session: "alpha".to_string(),
+                    workspace_id: "w1".to_string(),
+                };
+                assert_eq!(
+                    pending_lazy_owner_forward(cx, &key).len(),
+                    1,
+                    "one bridge event must be queued despite duplicate callbacks"
+                );
             });
-            let window_id = cx.update(|window, _cx| window.window_handle().window_id());
             cx.run_until_parked();
             workspace_a.read_with(cx, |workspace, cx| {
                 assert!(

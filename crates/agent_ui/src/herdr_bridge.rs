@@ -551,11 +551,12 @@ impl HerdrThreadBridge {
         if stale && !fenced {
             return;
         }
+        let retained_status = self.retained_status_for_pane_updated(&event);
         let state_event = self.event_for_state(&event);
         let applied = self.reconcile_state_event(&state_event);
         self.note_focus_event(&event, &applied, fenced, stale);
         self.apply_actions(applied);
-        self.emit_subthread_event(&event);
+        self.emit_subthread_event(&event, retained_status);
     }
     fn apply_event_in_context(&mut self, event: HerdrEvent, cx: &mut Context<Self>) {
         let start = self.events.len();
@@ -565,11 +566,12 @@ impl HerdrThreadBridge {
         if stale && !fenced {
             return;
         }
+        let retained_status = self.retained_status_for_pane_updated(&event);
         let state_event = self.event_for_state(&event);
         let applied = self.reconcile_state_event(&state_event);
         self.note_focus_event(&event, &applied, fenced, stale);
         self.apply_actions_in_context(applied, cx);
-        self.emit_subthread_event(&event);
+        self.emit_subthread_event(&event, retained_status);
         self.emit_new_events(start, cx);
         self.persist_mappings(cx);
     }
@@ -578,6 +580,15 @@ impl HerdrThreadBridge {
             self.status_only_snapshots
                 .retain(|(existing_workspace_id, _), _| existing_workspace_id != workspace_id);
         }
+    }
+    fn retained_status_for_pane_updated(&self, event: &HerdrEvent) -> Option<HerdrAgentStatus> {
+        let HerdrEvent::PaneUpdated { pane, .. } = event else {
+            return None;
+        };
+        pane.session_identity.as_ref()?;
+        self.status_only_snapshots
+            .get(&(pane.workspace_id.clone(), pane.pane_id.clone()))
+            .map(|snapshot| snapshot.status.clone())
     }
 
 
@@ -747,7 +758,11 @@ impl HerdrThreadBridge {
             .cloned()
     }
 
-    fn emit_subthread_event(&mut self, event: &HerdrEvent) {
+    fn emit_subthread_event(
+        &mut self,
+        event: &HerdrEvent,
+        retained_status: Option<HerdrAgentStatus>,
+    ) {
         match event {
             HerdrEvent::PaneAgentDetected {
                 pane_id,
@@ -863,6 +878,7 @@ impl HerdrThreadBridge {
                 if record.key.agent_session.as_ref() != Some(&session) {
                     return;
                 }
+                let status = retained_status.unwrap_or_else(|| pane.status.clone());
                 self.status_only_snapshots
                     .remove(&(pane.workspace_id.clone(), pane.pane_id.clone()));
                 self.agent_snapshots.insert(
@@ -872,7 +888,7 @@ impl HerdrThreadBridge {
                         workspace_id: pane.workspace_id.clone(),
                         agent_type: pane.agent_type.clone(),
                         session_identity: Some(session),
-                        status: pane.status.clone(),
+                        status: status.clone(),
                         title: pane.title.clone(),
                         cwd: pane.cwd.clone(),
                         ..Default::default()
@@ -890,7 +906,7 @@ impl HerdrThreadBridge {
                             HerdrAgentSessionIdentity::id(pane.pane_id.clone())
                         }),
                         title: pane.title.clone().unwrap_or_else(|| pane.pane_id.clone()),
-                        status: pane.status.clone(),
+                        status: status.clone(),
                     });
                 } else {
                     self.events.push(HerdrBridgeEvent::SubthreadUpdated {
@@ -898,7 +914,7 @@ impl HerdrThreadBridge {
                         thread_id: record.zed_root_thread_id,
                         pane_id: pane.pane_id.clone(),
                         title: pane.title.clone(),
-                        status: Some(pane.status.clone()),
+                        status: Some(status),
                     });
                 }
             }
@@ -1452,11 +1468,12 @@ impl HerdrThreadBridge {
             if stale && !fenced {
                 continue;
             }
+            let retained_status = self.retained_status_for_pane_updated(&event);
             let state_event = self.event_for_state(&event);
             let applied = self.reconcile_state_event(&state_event);
             self.note_focus_event(&event, &applied, fenced, stale);
             self.apply_actions(applied);
-            self.emit_subthread_event(&event);
+            self.emit_subthread_event(&event, retained_status);
         }
     }
 
@@ -2710,6 +2727,50 @@ mod tests {
             } if pane_id == "p1"
         )));
     }
+    #[test]
+    fn pane_updated_identity_upgrade_preserves_the_retained_status_only_status() {
+        let mut bridge = test_bridge();
+        bridge.apply_event(workspace_created("w1", "/repo", "Review"));
+        bridge.apply_event(HerdrEvent::PaneAgentDetected {
+            pane_id: "p1".to_string(),
+            workspace_id: "w1".to_string(),
+            agent_type: Some("omp".to_string()),
+            session_identity: None,
+            sequence: 2,
+        });
+        bridge.apply_event(HerdrEvent::PaneAgentStatusChanged {
+            pane_id: "p1".to_string(),
+            status: HerdrAgentStatus::Working,
+            sequence: 3,
+        });
+        bridge.take_events();
+
+        bridge.apply_event(HerdrEvent::PaneUpdated {
+            pane: crate::herdr_client::HerdrPaneSnapshot {
+                pane_id: "p1".to_string(),
+                workspace_id: "w1".to_string(),
+                agent_type: Some("omp".to_string()),
+                session_identity: Some(HerdrAgentSessionIdentity::id("session-1")),
+                status: HerdrAgentStatus::default(),
+                title: Some("live title".to_string()),
+                ..Default::default()
+            },
+            sequence: 4,
+        });
+
+        let snapshots = bridge.subthread_snapshots("w1");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].status, HerdrAgentStatus::Working);
+        assert!(bridge.take_events().iter().any(|event| matches!(
+            event,
+            HerdrBridgeEvent::SubthreadCreated {
+                pane_id,
+                status: HerdrAgentStatus::Working,
+                ..
+            } if pane_id == "p1"
+        )));
+    }
+
     #[test]
     fn live_identity_transition_preserves_status_through_reupgrade() {
         let mut bridge = test_bridge();
