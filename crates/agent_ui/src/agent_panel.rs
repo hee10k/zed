@@ -4804,20 +4804,10 @@ impl AgentPanel {
             return true;
         }
 
-
-
-        // Bridge events are emitted to every panel sharing a window bridge.
-        // If the event arrived through a non-owning panel, forward it to the
-        // owning panel rather than dropping it after activation. A lazy owner
-        // is loaded before replaying the event, so focus and lifecycle events
-        // retain their original semantics.
-        let owner_panel = owner.read(cx).panel::<AgentPanel>(cx);
-        if let Some(owner_panel) = owner_panel {
-            let event = event.clone();
-            owner_panel.update(cx, |panel, cx| {
-                panel.handle_herdr_event(&event, window, cx);
-            });
-        } else {
+        // The owning panel also receives this bridge event through its own
+        // subscription. Forward only when it is not loaded yet; forwarding
+        // to an already-subscribed owner would deliver the same event twice.
+        if owner.read(cx).panel::<AgentPanel>(cx).is_none() {
             let owner_weak = owner.downgrade();
             let event = event.clone();
             let mut async_window_cx = window.to_async(cx);
@@ -14965,6 +14955,59 @@ mod tests {
                     panel.base_view,
                     BaseView::HerdrConversation { .. }
                 ));
+            });
+        }
+
+        #[gpui::test]
+        async fn refresh_replays_identityless_pane_until_identity_arrives(
+            cx: &mut TestAppContext,
+        ) {
+            let (panel, bridge, mut cx) = setup_herdr_panel(cx).await;
+            bridge.update(&mut cx, |bridge, _| {
+                bridge.apply_event(crate::herdr_client::HerdrEvent::PaneAgentDetected {
+                    pane_id: "p1".to_string(),
+                    workspace_id: "w1".to_string(),
+                    agent_type: Some("omp".to_string()),
+                    session_identity: None,
+                    sequence: 2,
+                });
+            });
+            let thread_id = root_thread_id(&panel, &cx);
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.load_herdr_thread(thread_id, false, window, cx);
+            });
+            panel.read_with(&cx, |panel, cx| {
+                let BaseView::HerdrConversation { conversation_view } = &panel.base_view else {
+                    panic!("refresh should create the Herdr conversation view");
+                };
+                assert_eq!(
+                    conversation_view.read(cx).state().status_only("p1"),
+                    Some(&crate::herdr_client::HerdrAgentStatus::Unknown(
+                        "unknown".to_string()
+                    ))
+                );
+                assert!(!conversation_view.read(cx).state().is_selectable("p1"));
+            });
+
+            let events = bridge.update(&mut cx, |bridge, _| {
+                bridge.apply_event(crate::herdr_client::HerdrEvent::PaneAgentDetected {
+                    pane_id: "p1".to_string(),
+                    workspace_id: "w1".to_string(),
+                    agent_type: Some("omp".to_string()),
+                    session_identity: Some(HerdrAgentSessionIdentity::id("session-1")),
+                    sequence: 3,
+                });
+                bridge.take_events()
+            });
+            for event in &events {
+                handle_event(&panel, &mut cx, event);
+            }
+            panel.read_with(&cx, |panel, cx| {
+                let BaseView::HerdrConversation { conversation_view } = &panel.base_view else {
+                    panic!("Herdr conversation view should remain open");
+                };
+                assert!(conversation_view.read(cx).state().is_selectable("p1"));
+                assert_eq!(conversation_view.read(cx).state().status_only("p1"), None);
             });
         }
 

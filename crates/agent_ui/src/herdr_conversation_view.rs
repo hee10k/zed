@@ -373,13 +373,10 @@ impl HerdrConversationView {
             .map(|bridge| bridge.read(cx).subthread_snapshots(&self.workspace_id))
             .unwrap_or_default();
         for snapshot in snapshots {
-            let Some(session) = snapshot.session_identity else {
-                continue;
-            };
             self.apply_event(
                 HerdrConversationEvent::AgentDetected {
                     pane_id: snapshot.pane_id,
-                    session: Some(session),
+                    session: snapshot.session_identity,
                     title: snapshot.title,
                     status: snapshot.status,
                 },

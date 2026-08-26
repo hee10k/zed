@@ -225,3 +225,49 @@ The exact activation regression was also rerun:
 $ cargo test -p sidebar tests::activating_herdr_root_requests_herdr_workspace_focus -- --exact
 cargo test: 1 passed (1 suite, 152 filtered, 0.25s)
 ```
+
+## Residual gate repairs
+
+The final-gate residuals were repaired:
+
+1. The Windows `ERROR_PIPE_CONNECTED` race now returns `Ok(true)` and returns
+   other `ConnectNamedPipe` errors through the `Result` chain instead of
+   constructing an `Option<bool>`. This code is `cfg(windows)` and remains
+   compile-gated on the macOS host.
+2. The fixture focus round trip now constructs a real
+   `HerdrThreadBridge` entity backed by `HerdrClientHandle` and calls
+   `focus_root_in_context` and `focus_pane_in_context`. It asserts one
+   fixture request per direction, encoded operation IDs/origins, and no
+   outbound request after each reflected focus event.
+3. Identity-less pane snapshots are retained in bridge state, replayed by
+   `refresh_from_bridge`, and removed when the pane receives an identity.
+4. Multi-workspace event routing no longer forwards an event to an already
+   subscribed owning panel. Lazy owner loading still forwards when no owner
+   panel is loaded.
+
+The new regressions cover status-only snapshot retention/upgrading and the
+panel refresh path.
+
+## Residual repair verification
+
+Commands were run from the repository root on macOS:
+
+```text
+$ cargo test -p agent_ui herdr_test_support
+cargo test: 9 passed (1 suite, 564 filtered, 0.02s)
+
+$ cargo test -p agent_ui herdr_bridge
+cargo test: 27 passed (1 suite, 546 filtered, 0.00s)
+
+$ cargo test -p agent_ui herdr_conversation_view
+cargo test: 6 passed (1 suite, 567 filtered, 0.00s)
+
+$ cargo test -p agent_ui agent_panel::tests::herdr
+cargo test: 9 passed (1 suite, 564 filtered, 1.11s)
+
+$ cargo test -p sidebar tests::
+cargo test: 153 passed (1 suite, 24.09s)
+```
+
+The Windows named-pipe branch was not executable on this macOS host; Windows
+compilation and the named-pipe regression remain CI-gated.

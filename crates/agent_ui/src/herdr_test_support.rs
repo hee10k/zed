@@ -33,7 +33,7 @@ use crate::herdr_transport::HerdrEndpoint;
 use crate::herdr_transport::{HerdrLineReader, HerdrStream};
 
 #[cfg(test)]
-use gpui::TestAppContext;
+use gpui::{AppContext as _, TestAppContext};
 
 #[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
@@ -712,7 +712,11 @@ fn windows_accept_loop(
         let connected = unsafe { ConnectNamedPipe(pipe, None) }
             .map(|_| true)
             .or_else(|error| {
-                (error.code() == ERROR_PIPE_CONNECTED.to_hresult()).then_some(true)
+                if error.code() == ERROR_PIPE_CONNECTED.to_hresult() {
+                    Ok(true)
+                } else {
+                    Err(error)
+                }
             })
             .unwrap_or(false);
         if !connected {
@@ -1086,62 +1090,94 @@ mod tests {
         let server =
             FakeHerdrServer::new(snapshot("alpha", vec![workspace("w1", "Alpha", "/repo")]))
                 .expect("fixture server");
-        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor().clone());
-        let mut bridge = HerdrThreadBridge::for_test("alpha");
-        bridge.apply_event(HerdrEvent::WorkspaceCreated {
-            workspace: workspace("w1", "Alpha", "/repo"),
-            sequence: 1,
+        let client = Arc::new(HerdrClientHandle::new_with_executor(
+            server.endpoint(),
+            cx.executor().clone(),
+        ));
+        let bridge = cx.new(|_| HerdrThreadBridge::for_test_with_api(client));
+        bridge.update(cx, |bridge, _| {
+            bridge.apply_event(HerdrEvent::WorkspaceCreated {
+                workspace: workspace("w1", "Alpha", "/repo"),
+                sequence: 1,
+            });
+            bridge.apply_event(HerdrEvent::PaneAgentDetected {
+                pane_id: "p1".to_string(),
+                workspace_id: "w1".to_string(),
+                agent_type: Some("omp".to_string()),
+                session_identity: Some(HerdrAgentSessionIdentity::id("agent-1")),
+                sequence: 2,
+            });
+            bridge.take_events();
         });
-        bridge.apply_event(HerdrEvent::PaneAgentDetected {
-            pane_id: "p1".to_string(),
-            workspace_id: "w1".to_string(),
-            agent_type: Some("omp".to_string()),
-            session_identity: Some(HerdrAgentSessionIdentity::id("agent-1")),
-            sequence: 2,
-        });
-        bridge.take_events();
 
-        let root_operation = match bridge.focus_root("w1").expect("root focus") {
-            OutboundRequest::FocusWorkspace { operation_id, origin, .. } => {
+        let root_task = bridge.update(cx, |bridge, cx| {
+            bridge
+                .focus_root_in_context("w1", cx)
+                .expect("root focus task")
+        });
+        root_task.await.expect("workspace focus request");
+        let root_request = bridge.update(cx, |bridge, _| {
+            let requests = bridge.take_outbound_requests();
+            assert_eq!(requests.len(), 1, "root focus should issue one bridge request");
+            requests.into_iter().next().expect("root request")
+        });
+        let root_operation = match root_request {
+            OutboundRequest::FocusWorkspace {
+                operation_id,
+                origin,
+                ..
+            } => {
                 assert_eq!(origin, crate::herdr_state::HerdrOperationOrigin::Zed);
                 operation_id
             }
             other => panic!("unexpected root request: {other:?}"),
         };
-        client
-            .request_on_executor(
-                "workspace.focus",
-                json!({"workspace_id":"w1","operation_id":root_operation,"origin":"zed"}),
-            )
-            .await
-            .expect("workspace focus request");
-        bridge.apply_event(HerdrEvent::WorkspaceFocused {
-            workspace_id: "w1".to_string(),
-            operation_id: Some(root_operation.clone()),
-            sequence: 3,
+        bridge.update(cx, |bridge, _| {
+            bridge.apply_event(HerdrEvent::WorkspaceFocused {
+                workspace_id: "w1".to_string(),
+                operation_id: Some(root_operation.clone()),
+                sequence: 3,
+            });
+            assert!(
+                bridge.take_outbound_requests().is_empty(),
+                "reflected root focus must not issue another request"
+            );
         });
 
-        let pane_operation = match bridge.focus_pane("w1", "p1").expect("pane focus") {
-            OutboundRequest::FocusPane { operation_id, origin, .. } => {
+        let pane_task = bridge.update(cx, |bridge, cx| {
+            bridge
+                .focus_pane_in_context("w1", "p1", cx)
+                .expect("pane focus task")
+        });
+        pane_task.await.expect("pane focus request");
+        let pane_request = bridge.update(cx, |bridge, _| {
+            let requests = bridge.take_outbound_requests();
+            assert_eq!(requests.len(), 1, "pane focus should issue one bridge request");
+            requests.into_iter().next().expect("pane request")
+        });
+        let pane_operation = match pane_request {
+            OutboundRequest::FocusPane {
+                operation_id,
+                origin,
+                ..
+            } => {
                 assert_eq!(origin, crate::herdr_state::HerdrOperationOrigin::Zed);
                 operation_id
             }
             other => panic!("unexpected pane request: {other:?}"),
         };
-        client
-            .request_on_executor(
-                "pane.focus",
-                json!({"pane_id":"p1","operation_id":pane_operation,"origin":"zed"}),
-            )
-            .await
-            .expect("pane focus request");
-        bridge.apply_event(HerdrEvent::PaneFocused {
-            pane_id: "p1".to_string(),
-            workspace_id: "w1".to_string(),
-            operation_id: Some(pane_operation.clone()),
-            sequence: 4,
+        bridge.update(cx, |bridge, _| {
+            bridge.apply_event(HerdrEvent::PaneFocused {
+                pane_id: "p1".to_string(),
+                workspace_id: "w1".to_string(),
+                operation_id: Some(pane_operation.clone()),
+                sequence: 4,
+            });
+            assert!(
+                bridge.take_outbound_requests().is_empty(),
+                "reflected pane focus must not issue another request"
+            );
         });
-        assert!(bridge.take_outbound_requests().len() == 2);
 
         let requests = server.requests();
         let root_requests = requests
@@ -1159,6 +1195,7 @@ mod tests {
         assert_eq!(root_requests[0].params["operation_id"], root_operation);
         assert_eq!(pane_requests[0].params["operation_id"], pane_operation);
     }
+
 
     #[test]
     fn lifecycle_reconnect_preserves_threads_rejects_stale_events_and_conflicts_ambiguity() {
