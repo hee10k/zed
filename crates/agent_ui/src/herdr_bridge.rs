@@ -313,41 +313,80 @@ impl HerdrThreadBridge {
         })
     }
 
+    fn focus_event_is_stale(&self, event: &HerdrEvent) -> bool {
+        let sequence = event.sequence();
+        let (workspace_id, pane_id) = match event {
+            HerdrEvent::WorkspaceFocused { workspace_id, .. } => {
+                (workspace_id.as_str(), None)
+            }
+            HerdrEvent::PaneFocused {
+                pane_id,
+                workspace_id,
+                ..
+            } => (workspace_id.as_str(), Some(pane_id.as_str())),
+            _ => return false,
+        };
+        if sequence == 0 {
+            return false;
+        }
+        if sequence <= self.state.last_sequence {
+            return true;
+        }
+
+        self.state
+            .mappings
+            .values()
+            .filter(|record| {
+                record.key.session == self.state.session
+                    && record.key.workspace_id == workspace_id
+                    && pane_id.map_or(true, |pane| {
+                        record.key.pane_id.as_deref() == Some(pane)
+                    })
+            })
+            .any(|record| sequence <= record.last_seen_sequence)
+    }
+
     fn note_focus_event(
         &mut self,
         event: &HerdrEvent,
         applied: &AppliedEvent,
         fenced: bool,
+        stale: bool,
     ) {
-        if fenced
-            || applied
-                .actions
-                .iter()
-                .any(|action| matches!(action, ReconciliationAction::Activate(_)))
+        if !stale
+            && (fenced
+                || applied
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action, ReconciliationAction::Activate(_))))
         {
             self.current_focus_workspace = event.workspace_id().map(ToOwned::to_owned);
         }
     }
 
     /// Apply one pushed Herdr event without requiring a GPUI context. This is
+    /// intentionally also used by deterministic bridge tests.
     pub(crate) fn apply_event(&mut self, event: HerdrEvent) {
         let fenced = self.focus_is_fenced(&event);
+        let stale = self.focus_event_is_stale(&event);
         let state_event = self.event_for_state(&event);
         let applied = apply_event(&mut self.state, &state_event);
-        self.note_focus_event(&event, &applied, fenced);
+        self.note_focus_event(&event, &applied, fenced, stale);
         self.apply_actions(applied);
     }
 
     fn apply_event_in_context(&mut self, event: HerdrEvent, cx: &mut Context<Self>) {
         let start = self.events.len();
         let fenced = self.focus_is_fenced(&event);
+        let stale = self.focus_event_is_stale(&event);
         let state_event = self.event_for_state(&event);
         let applied = apply_event(&mut self.state, &state_event);
-        self.note_focus_event(&event, &applied, fenced);
+        self.note_focus_event(&event, &applied, fenced, stale);
         self.apply_actions_in_context(applied, cx);
         self.emit_new_events(start, cx);
         self.persist_mappings(cx);
     }
+
 
     fn apply_actions(&mut self, applied: AppliedEvent) {
         for outbound in applied.outbound {
@@ -731,9 +770,10 @@ impl HerdrThreadBridge {
     fn apply_replay_events(&mut self, events: impl IntoIterator<Item = HerdrEvent>) {
         for event in events {
             let fenced = self.focus_is_fenced(&event);
+            let stale = self.focus_event_is_stale(&event);
             let state_event = self.event_for_state(&event);
             let applied = apply_event(&mut self.state, &state_event);
-            self.note_focus_event(&event, &applied, fenced);
+            self.note_focus_event(&event, &applied, fenced, stale);
             self.apply_actions(applied);
         }
     }
@@ -1348,6 +1388,53 @@ mod tests {
         assert_eq!(metadata.agent_id, HERDR_AGENT_ID.clone());
         assert!(!metadata.is_draft());
         assert_eq!(metadata.folder_paths().paths(), &[PathBuf::from("/repo")]);
+    }
+
+    #[test]
+    fn stale_fenced_focus_does_not_replace_newer_current_focus() {
+        let mut bridge = test_bridge();
+        bridge.apply_event(workspace_created("w1", "/repo", "Review"));
+        bridge.apply_event(HerdrEvent::WorkspaceCreated {
+            workspace: HerdrWorkspaceSnapshot {
+                workspace_id: "w2".to_string(),
+                paths: vec!["/repo-2".to_string()],
+                label: "Other".to_string(),
+                ..Default::default()
+            },
+            sequence: 2,
+        });
+        let first = bridge.focus_root("w1").expect("first root focus");
+        let second = bridge.focus_root("w2").expect("second root focus");
+        let first_operation_id = match first {
+            OutboundRequest::FocusWorkspace { operation_id, .. } => operation_id,
+            _ => panic!("root focus must produce a workspace request"),
+        };
+        let second_operation_id = match second {
+            OutboundRequest::FocusWorkspace { operation_id, .. } => operation_id,
+            _ => panic!("root focus must produce a workspace request"),
+        };
+
+        bridge.apply_event(HerdrEvent::WorkspaceFocused {
+            workspace_id: "w2".to_string(),
+            operation_id: Some(second_operation_id),
+            sequence: 4,
+        });
+        assert_eq!(
+            bridge.current_focus_workspace.as_deref(),
+            Some("w2"),
+            "newer fenced focus should become current"
+        );
+
+        bridge.apply_replay_events([HerdrEvent::WorkspaceFocused {
+            workspace_id: "w1".to_string(),
+            operation_id: Some(first_operation_id),
+            sequence: 3,
+        }]);
+        assert_eq!(
+            bridge.current_focus_workspace.as_deref(),
+            Some("w2"),
+            "a delayed older fenced focus must not replace newer focus"
+        );
     }
 
     #[test]

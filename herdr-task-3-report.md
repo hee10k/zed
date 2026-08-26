@@ -44,3 +44,57 @@ cargo test: 1 passed (1 suite, 525 filtered, 0.18s)
 ## Notes
 
 Task 4's Herdr conversation/subthread rendering remains intentionally out of scope. Herdr roots are represented as durable metadata and routed without fabricating ACP sessions until that surface is added.
+
+## Review-3 repairs
+
+- Retained bootstrap bulk pane-filter kill switches in the generation-owned subscription list, fenced late handshakes, and cancelled every retained stream on failure, reconnect, rebind, or stop.
+- Rejected a primary `subscription_ended` sentinel observed during bootstrap so the generation fails and the bridge reconnects instead of publishing Ready without a live primary stream.
+- Stopped forwarding cursor-mode events to the unused legacy event channel; cursor delivery remains the sole live bridge stream and the legacy receiver no longer grows.
+- Applied focus fencing only after accepting global/resource sequence order, so a delayed older fenced reflection cannot replace newer current focus.
+- Added deterministic regressions for bulk filter teardown/late handshakes, primary bootstrap termination detection, legacy queue non-growth, and stale fenced focus ordering.
+
+## Review-3 verification
+
+Commands were run from the repository root without formatters, linters, or project-wide suites:
+
+```text
+cargo test -p agent_ui herdr_bridge::tests
+cargo test: 13 passed (1 suite, 516 filtered, 0.01s)
+
+cargo test -p agent_ui thread_metadata_store::tests
+cargo test: 52 passed (1 suite, 477 filtered, 0.66s)
+
+cargo test -p agent_ui herdr_ --no-default-features
+cargo test: 102 passed (1 suite, 427 filtered, 0.16s)
+
+cargo test -p agent_ui agent_panel::tests -- --exact
+cargo test: ok (1 suite, 529 filtered, 0.00s)
+
+cargo test -p agent_ui herdr_client::tests
+cargo test: 33 passed (1 suite, 496 filtered, 0.15s)
+
+cargo test -p agent_ui herdr_bridge::tests::stale_fenced_focus_does_not_replace_newer_current_focus -- --exact
+cargo test: 1 passed (1 suite, 528 filtered, 0.01s)
+
+cargo test -p agent_ui herdr_client::tests::bootstrap_bulk_filter_kill_is_retained_and_cancelled -- --exact
+cargo test: 1 passed (1 suite, 528 filtered, 0.00s)
+```
+
+## Final focused rerun
+
+```text
+cargo test -p agent_ui herdr_bridge::tests
+cargo test: 13 passed (1 suite, 516 filtered, 0.00s)
+
+cargo test -p agent_ui herdr_client::tests
+cargo test: 33 passed (1 suite, 496 filtered, 0.16s)
+
+cargo test -p agent_ui thread_metadata_store::tests
+cargo test: 52 passed (1 suite, 477 filtered, 0.65s)
+
+cargo test -p agent_ui herdr_ --no-default-features
+cargo test: 102 passed (1 suite, 427 filtered, 0.16s)
+
+cargo test -p agent_ui agent_panel::tests -- --exact
+cargo test: ok (1 suite, 529 filtered, 0.00s)
+```
