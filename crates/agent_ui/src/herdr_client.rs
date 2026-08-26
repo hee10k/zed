@@ -967,7 +967,7 @@ impl HerdrClientHandle {
         ))
     }
 
-    fn new_with_executor(endpoint: HerdrEndpoint, executor: BackgroundExecutor) -> Self {
+    pub(crate) fn new_with_executor(endpoint: HerdrEndpoint, executor: BackgroundExecutor) -> Self {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, event_rx) = async_channel::unbounded();
         let (event_cursor_tx, event_cursor_rx) = async_channel::unbounded();
@@ -1015,7 +1015,7 @@ impl HerdrClientHandle {
     /// deadline (socket timeouts on Unix, an I/O-cancelling watchdog on
     /// Windows), so a server that accepts and never responds resolves the
     /// caller's task with `Timeout` instead of hanging forever.
-    fn request_on_executor(&self, method: &str, params: Value) -> Task<PendingResult> {
+    pub(crate) fn request_on_executor(&self, method: &str, params: Value) -> Task<PendingResult> {
         self.request_on_executor_with_deadline(method, params, REQUEST_TIMEOUT)
     }
 
@@ -1090,7 +1090,7 @@ impl HerdrClientHandle {
     /// Start the long-lived subscription connection. Resolves once
     /// `subscription_started` is acknowledged; pushed events then flow through
     /// the shared cursor channel until the connection terminates.
-    fn start_subscription(
+    pub(crate) fn start_subscription(
         &self,
         params: Value,
         retain_kill_switch: bool,
@@ -2117,10 +2117,10 @@ pub(crate) trait HerdrApi: Send + Sync {
     fn read_pane_output(&self, pane_id: &str, since_revision: Option<u64>, cx: &App) -> Task<Result<(u64, String), HerdrClientError>>;
 }
 
-fn empty_params() -> Value {
+pub(crate) fn empty_params() -> Value {
     serde_json::Map::new().into()
 }
-fn subscription_params() -> Value {
+pub(crate) fn subscription_params() -> Value {
     serde_json::json!({
         "subscriptions": [
             {"type": "workspace.created"},

@@ -17,6 +17,8 @@ pub(crate) mod herdr_state;
 pub(crate) mod conversation_view;
 mod herdr_conversation_view;
 mod herdr_thread_view;
+#[cfg(any(test, feature = "test-support"))]
+pub mod herdr_test_support;
 
 mod diagnostics;
 pub mod draft_prompt_store;
