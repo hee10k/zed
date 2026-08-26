@@ -334,6 +334,8 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Explicitly rebinds the window's Herdr bridge to a named session.
+        ConnectHerdrSession,
     ]
 );
 

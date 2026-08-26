@@ -239,7 +239,7 @@ impl HerdrThreadBridge {
     }
 
     /// Constructor used by UI tests that must observe outbound API calls.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn for_test_with_api(client: Arc<dyn HerdrApi>) -> Self {
         Self::new(
             None,
@@ -303,6 +303,15 @@ impl HerdrThreadBridge {
     pub(crate) fn is_root_thread(&self, thread_id: ThreadId) -> bool {
         self.root_mapping_for_thread(thread_id)
             .is_some_and(|record| !record.is_tombstone())
+    }
+
+    pub(crate) fn root_thread_ids(&self) -> Vec<ThreadId> {
+        self.state
+            .mappings
+            .values()
+            .filter(|record| record.key.pane_id.is_none() && !record.is_tombstone())
+            .map(|record| record.zed_root_thread_id)
+            .collect()
     }
 
     pub(crate) fn root_title(&self, workspace_id: &str) -> Option<String> {
@@ -1743,6 +1752,23 @@ impl HerdrBridgeRegistry {
         self.bridges.get(&window_id).cloned()
     }
 
+    /// Explicitly rebinds the bridge bound to `window_id` to `selection`
+    /// after a user picks a Herdr session. The fresh snapshot is loaded by
+    /// the resulting sync run.
+    pub(crate) fn rebind_window_session(
+        &mut self,
+        window_id: WindowId,
+        selection: HerdrSessionSelection,
+        cx: &mut App,
+    ) -> Result<()> {
+        let bridge = self
+            .bridges
+            .get(&window_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("no Herdr bridge is bound to this window"))?;
+        bridge.update(cx, |bridge, cx| bridge.rebind_selection(selection, cx))
+    }
+
     pub(crate) fn release_panel(&mut self, window_id: WindowId, cx: &mut App) {
         let Some(count) = self.panel_counts.get_mut(&window_id) else {
             return;
@@ -1760,12 +1786,12 @@ impl HerdrBridgeRegistry {
 
 /// Records outbound API calls so UI tests can assert side effects without a
 /// real Herdr server.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct RecordingHerdrApi {
     calls: parking_lot::Mutex<Vec<String>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl RecordingHerdrApi {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -1782,7 +1808,7 @@ impl RecordingHerdrApi {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl HerdrApi for RecordingHerdrApi {
     fn ping(&self, _cx: &App) -> Task<Result<(), HerdrClientError>> {
         Task::ready(Ok(()))

@@ -9,7 +9,8 @@ use agent_ui::terminal_thread_metadata_store::{
     TerminalAgentStatus, TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
 use agent_ui::thread_metadata_store::{
-    ThreadMetadata, ThreadMetadataStore, WorktreePaths, worktree_info_from_thread_paths,
+    HERDR_AGENT_ID, ThreadMetadata, ThreadMetadataStore, WorktreePaths,
+    worktree_info_from_thread_paths,
 };
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
@@ -339,6 +340,13 @@ fn thread_metadata_would_render_sidebar_row(
     }
 
     draft_display_label_for_thread_metadata(metadata, workspace, cx).is_some()
+}
+
+/// Whether this row is a Herdr-backed root rather than an ACP session or a
+/// draft. Herdr rows persist through rebuilds via their stored worktree/cwd
+/// identity and are never ACP drafts.
+fn thread_is_herdr_backed(metadata: &ThreadMetadata) -> bool {
+    metadata.agent_id.as_ref() == HERDR_AGENT_ID.as_ref()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1876,6 +1884,41 @@ impl Sidebar {
                     }
                 }
 
+                // A session label is added only when needed to distinguish
+                // disconnected historical Herdr sessions: when a project
+                // holds multiple Herdr roots, the rows still mapped by an
+                // open bridge are marked with that bridge's session name.
+                if threads
+                    .iter()
+                    .filter(|thread| thread_is_herdr_backed(&thread.metadata))
+                    .count()
+                    > 1
+                {
+                    let mut mapped_ids: HashSet<agent_ui::ThreadId> = HashSet::default();
+                    let mut session_name = None;
+                    for ws in group_workspaces {
+                        if let Some(panel) = ws.read(cx).panel::<AgentPanel>(cx) {
+                            let panel = panel.read(cx);
+                            mapped_ids.extend(panel.herdr_mapped_root_thread_ids(cx));
+                            session_name = session_name.or_else(|| panel.herdr_session_name(cx));
+                        }
+                    }
+                    if let Some(session) = session_name
+                        && !mapped_ids.is_empty()
+                    {
+                        for thread in &mut threads {
+                            if thread_is_herdr_backed(&thread.metadata)
+                                && mapped_ids.contains(&thread.metadata.thread_id)
+                            {
+                                let title =
+                                    thread.metadata.title.clone().unwrap_or_default().to_string();
+                                Arc::make_mut(thread).metadata.title =
+                                    Some(format!("{title} · {session}").into());
+                            }
+                        }
+                    }
+                }
+
                 threads.sort_by(|a, b| {
                     let a_time = Self::thread_display_time(&a.metadata);
                     let b_time = Self::thread_display_time(&b.metadata);
@@ -2806,6 +2849,22 @@ impl Sidebar {
                         );
                     }
 
+                    // New Herdr-backed roots: creation goes through the
+                    // bridge's `workspace.create` and the new row becomes
+                    // active only after its identity is persisted.
+                    for workspace in open_workspaces.iter().cloned() {
+                        let this = this.clone();
+                        let key = key.clone();
+                        menu = menu.entry("New Herdr Thread", None, move |window, cx| {
+                            this.update(cx, |sidebar, cx| {
+                                sidebar.set_group_expanded(&key, true, cx);
+                                sidebar.selection = None;
+                                sidebar.new_herdr_entry(&workspace, window, cx);
+                            })
+                            .ok();
+                        });
+                    }
+
                     let base_workspace = active_workspace
                         .as_ref()
                         .filter(|workspace| open_workspaces.contains(workspace))
@@ -3610,6 +3669,36 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Inspect the backend before choosing a path: Herdr-backed roots
+        // rename through the window bridge, never through an ACP thread
+        // view.
+        let is_herdr = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(thread_id)
+            .is_some_and(|metadata| thread_is_herdr_backed(metadata));
+        if is_herdr {
+            let mut routed = false;
+            if let Some(multi_workspace) = self.multi_workspace.upgrade() {
+                let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
+                for workspace in workspaces {
+                    if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                        routed |= agent_panel.update(cx, |panel, cx| {
+                            panel.rename_herdr_thread(thread_id, &title, cx)
+                        });
+                    }
+                }
+            }
+            if routed {
+                return;
+            }
+            // Disconnected root: persist the override so the rename is not
+            // lost until Herdr confirms a new title.
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_title_override(thread_id, title, cx);
+            });
+            return;
+        }
+
         let mut found = false;
         if let Some(multi_workspace) = self.multi_workspace.upgrade() {
             let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
@@ -3810,16 +3899,23 @@ impl Sidebar {
                            window: &mut Window,
                            cx: &mut App| {
             agent_panel.update(cx, |panel, cx| {
-                panel.load_agent_thread(
-                    Agent::from(metadata.agent_id.clone()),
-                    metadata.thread_id,
-                    Some(metadata.folder_paths().clone()),
-                    metadata.title.clone(),
-                    focus,
-                    AgentThreadSource::Sidebar,
-                    window,
-                    cx,
-                );
+                // Herdr-backed roots route through the window bridge
+                // (`workspace.focus`); ACP-native threads keep the existing
+                // load path and never call Herdr.
+                if thread_is_herdr_backed(metadata) {
+                    panel.load_herdr_thread(metadata.thread_id, focus, window, cx);
+                } else {
+                    panel.load_agent_thread(
+                        Agent::from(metadata.agent_id.clone()),
+                        metadata.thread_id,
+                        Some(metadata.folder_paths().clone()),
+                        metadata.title.clone(),
+                        focus,
+                        AgentThreadSource::Sidebar,
+                        window,
+                        cx,
+                    );
+                }
             });
         };
 
@@ -5499,6 +5595,61 @@ impl Sidebar {
         close_item_tasks
     }
 
+    /// Closes a Herdr-backed root through the owning window's bridge. The
+    /// row stays visible (as a disconnected historical session) until Herdr
+    /// confirms the close.
+    fn close_herdr_entry(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
+        for workspace in workspaces {
+            if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                let closed = agent_panel.update(cx, |panel, cx| {
+                    panel.close_herdr_thread(thread_id, cx)
+                });
+                if closed {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Creates a new Herdr-backed root for `workspace` via
+    /// `workspace.create`. The bridge persists the returned identity before
+    /// the new Zed row becomes active.
+    fn new_herdr_entry(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths: Vec<String> = workspace
+            .read(cx)
+            .root_paths(cx)
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let label = workspace
+            .read(cx)
+            .root_paths(cx)
+            .first()
+            .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "Herdr".to_string());
+
+        workspace.update(cx, |workspace, cx| {
+            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.create_herdr_root(label, paths, window, cx);
+                });
+            }
+            workspace.focus_panel::<AgentPanel>(window, cx);
+        });
+    }
+
     fn archive_thread(
         &mut self,
         session_id: &acp::SessionId,
@@ -6755,19 +6906,32 @@ impl Sidebar {
                                 .icon_size(IconSize::Small)
                                 .tooltip({
                                     let focus_handle = focus_handle.clone();
+                                    let is_herdr = thread_is_herdr_backed(&thread.metadata);
                                     move |_window, cx| {
-                                        Tooltip::for_action_in(
-                                            "Archive Thread",
-                                            &ArchiveSelectedThread,
-                                            &focus_handle,
-                                            cx,
-                                        )
+                                        if is_herdr {
+                                            Tooltip::text("Close Herdr Root")(_window, cx)
+                                        } else {
+                                            Tooltip::for_action_in(
+                                                "Archive Thread",
+                                                &ArchiveSelectedThread,
+                                                &focus_handle,
+                                                cx,
+                                            )
+                                        }
                                     }
                                 })
                                 .on_click({
                                     let session_id = session_id_for_delete.clone();
+                                    let herdr_thread_id = thread_is_herdr_backed(&thread.metadata)
+                                        .then_some(thread_id_for_actions);
                                     cx.listener(move |this, _, window, cx| {
-                                        if let Some(ref session_id) = session_id {
+                                        // Inspect the backend marker before
+                                        // choosing the close path: Herdr roots
+                                        // close through the bridge, ACP
+                                        // sessions through the archive flow.
+                                        if let Some(thread_id) = herdr_thread_id {
+                                            this.close_herdr_entry(thread_id, cx);
+                                        } else if let Some(session_id) = &session_id {
                                             this.archive_thread(session_id, window, cx);
                                         }
                                     })
@@ -8716,4 +8880,231 @@ fn dump_single_workspace(workspace: &Workspace, output: &mut String, cx: &gpui::
     }
 
     writeln!(output).ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+
+    fn init_navigation_test(cx: &mut gpui::TestAppContext) {
+        agent_ui::test_support::init_test(cx);
+        cx.update(|cx| {
+            cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+            ThreadStore::init_global(cx);
+            ThreadMetadataStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            prompt_store::init(cx);
+        });
+    }
+
+    async fn init_project(
+        root: &'static str,
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<project::Project> {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(root, serde_json::json!({ "src": {} })).await;
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        project::Project::test(fs, [std::path::Path::new(root)], cx).await
+    }
+
+    struct NavigationFixture {
+        sidebar: Entity<Sidebar>,
+        workspace: Entity<Workspace>,
+        panel: Entity<AgentPanel>,
+    }
+
+    fn build_fixture(
+        multi_workspace: &Entity<MultiWorkspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> NavigationFixture {
+        let multi_workspace_for_sidebar = multi_workspace.clone();
+        let sidebar = cx
+            .update(|window, cx| cx.new(|cx| Sidebar::new(multi_workspace_for_sidebar, window, cx)));
+        multi_workspace.update(cx, |mw, cx| mw.register_sidebar(sidebar.clone(), cx));
+        multi_workspace.update_in(cx, |mw, window, cx| mw.toggle_sidebar(window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let panel = workspace.update_in(cx, |ws, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::test_new(ws, window, cx));
+            ws.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        cx.run_until_parked();
+        NavigationFixture {
+            sidebar,
+            workspace,
+            panel,
+        }
+    }
+
+    fn herdr_metadata(thread_id: ThreadId, title: &str, root: &str) -> ThreadMetadata {
+        ThreadMetadata {
+            thread_id,
+            session_id: None,
+            agent_id: HERDR_AGENT_ID.clone(),
+            title: Some(title.into()),
+            title_override: None,
+            updated_at: chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+            created_at: None,
+            interacted_at: None,
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[
+                std::path::Path::new(root),
+            ])),
+            remote_connection: None,
+            archived: false,
+            user_order: None,
+        }
+    }
+
+    fn seed_metadata(
+        fixture: &NavigationFixture,
+        metadata: ThreadMetadata,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        fixture.sidebar.update(cx, |_, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
+        });
+        cx.run_until_parked();
+    }
+
+    fn seed_herdr_root(
+        fixture: &NavigationFixture,
+        workspace_id: &str,
+        root: &str,
+        label: &str,
+        title: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        fixture.panel.update_in(cx, |panel, _window, cx| {
+            panel.install_test_herdr_root(workspace_id, root, label, cx);
+        });
+        let thread_id = fixture
+            .panel
+            .read_with(cx, |panel, cx| panel.herdr_root_thread_id(workspace_id, cx))
+            .expect("seeded Herdr workspace should map a root thread");
+        seed_metadata(fixture, herdr_metadata(thread_id, title, root), cx);
+    }
+
+    #[gpui::test]
+    async fn activating_herdr_root_requests_herdr_workspace_focus(cx: &mut gpui::TestAppContext) {
+        init_navigation_test(cx);
+        let project = init_project("/repo", cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let fixture = build_fixture(&multi_workspace, cx);
+        seed_herdr_root(&fixture, "w1", "/repo", "alpha-root", "Alpha Root", cx);
+
+        let metadata = fixture.sidebar.update(cx, |_, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entries()
+                .find(|entry| entry.title.as_deref() == Some("Alpha Root"))
+                .cloned()
+                .expect("Herdr row should be persisted")
+        });
+        let workspace = fixture.workspace.clone();
+        fixture.sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.activate_thread(metadata, &workspace, false, window, cx);
+        });
+        cx.run_until_parked();
+
+        let calls = fixture
+            .panel
+            .read_with(cx, |panel, _| panel.take_test_herdr_api_calls());
+        assert_eq!(calls, vec!["focus_workspace:w1".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn activating_acp_root_does_not_request_herdr_focus(cx: &mut gpui::TestAppContext) {
+        init_navigation_test(cx);
+        let project = init_project("/repo", cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let fixture = build_fixture(&multi_workspace, cx);
+        // A recording bridge is bound, so any Herdr routing mistake would be
+        // captured.
+        fixture.panel.update_in(cx, |panel, _window, cx| {
+            panel.install_test_herdr_root("w1", "/repo", "alpha-root", cx);
+        });
+        seed_metadata(
+            &fixture,
+            ThreadMetadata {
+                session_id: Some(acp::SessionId::new(std::sync::Arc::from("acp-session"))),
+                agent_id: agent::ZED_AGENT_ID.clone(),
+                ..herdr_metadata(ThreadId::new(), "ACP Thread", "/repo")
+            },
+            cx,
+        );
+        let metadata = fixture.sidebar.update(cx, |_, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entries()
+                .find(|entry| entry.title.as_deref() == Some("ACP Thread"))
+                .cloned()
+                .expect("ACP row should be persisted")
+        });
+
+        let workspace = fixture.workspace.clone();
+        fixture.sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.activate_thread(metadata, &workspace, false, window, cx);
+        });
+        cx.run_until_parked();
+
+        let calls = fixture
+            .panel
+            .read_with(cx, |panel, _| panel.take_test_herdr_api_calls());
+        assert!(calls.is_empty(), "ACP activation must never call Herdr");
+    }
+
+    #[gpui::test]
+    async fn herdr_rows_persist_through_rebuilds_while_disconnected(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_navigation_test(cx);
+        let project = init_project("/repo", cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let fixture = build_fixture(&multi_workspace, cx);
+        // No bridge is installed: the row is a disconnected historical
+        // session. It must survive rebuilds via its stored worktree identity
+        // and must not be classified as an ACP draft.
+        seed_metadata(
+            &fixture,
+            herdr_metadata(ThreadId::new(), "Historical Root", "/repo"),
+            cx,
+        );
+
+        fixture.sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+        cx.run_until_parked();
+
+        fixture.sidebar.read_with(cx, |sidebar, _| {
+            let titles: Vec<SharedString> = sidebar
+                .contents
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    ListEntry::Thread(thread) => Some(thread.metadata.display_title()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                titles.iter().any(|title| title.contains("Historical Root")),
+                "disconnected Herdr row must stay visible, got {titles:?}"
+            );
+            let row = sidebar
+                .contents
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    ListEntry::Thread(thread)
+                        if thread.metadata.title.as_deref() == Some("Historical Root") =>
+                    {
+                        Some(thread)
+                    }
+                    _ => None,
+                })
+                .expect("Herdr row should be present after rebuild");
+            assert!(row.draft.is_none(), "Herdr rows are never ACP drafts");
+        });
+    }
 }
