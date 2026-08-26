@@ -159,6 +159,12 @@ pub(crate) struct HerdrThreadBridge {
     root_metadata: HashMap<String, ThreadMetadata>,
     agent_snapshots: HashMap<String, HerdrAgentSnapshot>,
     pane_outputs: HashMap<String, (u64, String)>,
+    /// Subthreads already published to UI consumers, keyed by
+    /// `(workspace_id, pane_id)`. This decides whether a live pane event
+    /// emits `SubthreadCreated` or `SubthreadUpdated` and is independent of
+    /// internal mapping bookkeeping, which reconciliation may change without
+    /// the panel ever having seen the subthread.
+    published_subthreads: HashSet<(String, String)>,
     status: HerdrConnectionStatus,
     events: Vec<HerdrBridgeEvent>,
     outbound_requests: Vec<OutboundRequest>,
@@ -202,6 +208,7 @@ impl HerdrThreadBridge {
             metadata_dirty: HashSet::default(),
             active_subscription_id: None,
             agent_snapshots: HashMap::default(),
+            published_subthreads: HashSet::default(),
             pane_outputs: HashMap::default(),
             active_subscription_ids: HashSet::default(),
             active: Arc::new(AtomicBool::new(true)),
@@ -229,6 +236,18 @@ impl HerdrThreadBridge {
     #[cfg(test)]
     pub(crate) fn for_test_in_session(session: impl Into<String>) -> Self {
         Self::for_test(session)
+    }
+
+    /// Constructor used by UI tests that must observe outbound API calls.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_api(client: Arc<dyn HerdrApi>) -> Self {
+        Self::new(
+            None,
+            HerdrSessionSelection::Named("alpha".to_string()),
+            Some(client),
+            None,
+            SessionMappings::default(),
+        )
     }
 
     pub(crate) fn window_id(&self) -> Option<WindowId> {
@@ -474,6 +493,28 @@ impl HerdrThreadBridge {
         }
     }
 
+    /// Reconciles one transport event through Task 2's pure state machine.
+    /// `PaneUpdated` carries the same identity payload as `PaneAgentDetected`,
+    /// so both live identity events resolve through the approved
+    /// restore-or-create outcome instead of bypassing reconciliation; a pane
+    /// whose agent restarted with an unknown identity therefore surfaces a
+    /// conflict rather than gaining a second live mapping.
+    fn reconcile_state_event(&mut self, state_event: &HerdrEvent) -> AppliedEvent {
+        match state_event {
+            HerdrEvent::PaneUpdated { pane, sequence } if pane.session_identity.is_some() => {
+                let detected = HerdrEvent::PaneAgentDetected {
+                    pane_id: pane.pane_id.clone(),
+                    workspace_id: pane.workspace_id.clone(),
+                    agent_type: pane.agent_type.clone(),
+                    session_identity: pane.session_identity.clone(),
+                    sequence: *sequence,
+                };
+                apply_event(&mut self.state, &detected)
+            }
+            _ => apply_event(&mut self.state, state_event),
+        }
+    }
+
     /// Apply one pushed Herdr event without requiring a GPUI context. This is
     /// intentionally also used by deterministic bridge tests.
     pub(crate) fn apply_event(&mut self, event: HerdrEvent) {
@@ -483,7 +524,7 @@ impl HerdrThreadBridge {
             return;
         }
         let state_event = self.event_for_state(&event);
-        let applied = apply_event(&mut self.state, &state_event);
+        let applied = self.reconcile_state_event(&state_event);
         self.note_focus_event(&event, &applied, fenced, stale);
         self.apply_actions(applied);
         self.emit_subthread_event(&event);
@@ -496,7 +537,7 @@ impl HerdrThreadBridge {
             return;
         }
         let state_event = self.event_for_state(&event);
-        let applied = apply_event(&mut self.state, &state_event);
+        let applied = self.reconcile_state_event(&state_event);
         self.note_focus_event(&event, &applied, fenced, stale);
         self.apply_actions_in_context(applied, cx);
         self.emit_subthread_event(&event);
@@ -644,6 +685,24 @@ impl HerdrThreadBridge {
             .cloned()
     }
 
+    /// Live (non-tombstone) mapping for a pane. Emission must never bind a
+    /// bridge event to a retained tombstone key.
+    fn live_subthread_record_for_pane(
+        &self,
+        workspace_id: Option<&str>,
+        pane_id: &str,
+    ) -> Option<HerdrMappingRecord> {
+        self.state
+            .mappings
+            .values()
+            .find(|record| {
+                !record.is_tombstone()
+                    && record.key.pane_id.as_deref() == Some(pane_id)
+                    && workspace_id.is_none_or(|workspace| record.key.workspace_id == workspace)
+            })
+            .cloned()
+    }
+
     fn emit_subthread_event(&mut self, event: &HerdrEvent) {
         match event {
             HerdrEvent::PaneAgentDetected {
@@ -656,20 +715,31 @@ impl HerdrThreadBridge {
                 let Some(session) = session_identity.clone() else {
                     return;
                 };
-                let snapshot = HerdrAgentSnapshot {
-                    pane_id: pane_id.clone(),
-                    workspace_id: workspace_id.clone(),
-                    agent_type: agent_type.clone(),
-                    session_identity: Some(session.clone()),
-                    status: HerdrAgentStatus::default(),
-                    title: agent_type.clone(),
-                    ..Default::default()
-                };
-                self.create_agent_mapping(snapshot);
-                let Some(record) = self.subthread_record_for_pane(Some(workspace_id), pane_id)
+                // Translation only: reconciliation has already decided whether
+                // this identity creates, restores, or conflicts, so a
+                // conflicting or unpersisted key is never emitted here.
+                let Some(record) =
+                    self.live_subthread_record_for_pane(Some(workspace_id), pane_id)
                 else {
                     return;
                 };
+                if record.key.agent_session.as_ref() != Some(&session) {
+                    return;
+                }
+                self.agent_snapshots.insert(
+                    record.key.to_key_string(),
+                    HerdrAgentSnapshot {
+                        pane_id: pane_id.clone(),
+                        workspace_id: workspace_id.clone(),
+                        agent_type: agent_type.clone(),
+                        session_identity: Some(session.clone()),
+                        status: HerdrAgentStatus::default(),
+                        title: agent_type.clone(),
+                        ..Default::default()
+                    },
+                );
+                self.published_subthreads
+                    .insert((workspace_id.clone(), pane_id.clone()));
                 self.events.push(HerdrBridgeEvent::SubthreadCreated {
                     key: record.key,
                     thread_id: record.zed_root_thread_id,
@@ -683,26 +753,31 @@ impl HerdrThreadBridge {
                 let Some(session) = pane.session_identity.clone() else {
                     return;
                 };
-                let snapshot = HerdrAgentSnapshot {
-                    pane_id: pane.pane_id.clone(),
-                    workspace_id: pane.workspace_id.clone(),
-                    agent_type: pane.agent_type.clone(),
-                    session_identity: Some(session),
-                    status: pane.status.clone(),
-                    title: pane.title.clone(),
-                    cwd: pane.cwd.clone(),
-                    ..Default::default()
-                };
-                let had_mapping = self
-                    .subthread_record_for_pane(Some(&pane.workspace_id), &pane.pane_id)
-                    .is_some();
-                self.create_agent_mapping(snapshot);
-                let Some(record) =
-                    self.subthread_record_for_pane(Some(&pane.workspace_id), &pane.pane_id)
+                let Some(record) = self
+                    .live_subthread_record_for_pane(Some(&pane.workspace_id), &pane.pane_id)
                 else {
                     return;
                 };
-                if !had_mapping {
+                if record.key.agent_session.as_ref() != Some(&session) {
+                    return;
+                }
+                self.agent_snapshots.insert(
+                    record.key.to_key_string(),
+                    HerdrAgentSnapshot {
+                        pane_id: pane.pane_id.clone(),
+                        workspace_id: pane.workspace_id.clone(),
+                        agent_type: pane.agent_type.clone(),
+                        session_identity: Some(session),
+                        status: pane.status.clone(),
+                        title: pane.title.clone(),
+                        cwd: pane.cwd.clone(),
+                        ..Default::default()
+                    },
+                );
+                let first_publication = self
+                    .published_subthreads
+                    .insert((pane.workspace_id.clone(), pane.pane_id.clone()));
+                if first_publication {
                     self.events.push(HerdrBridgeEvent::SubthreadCreated {
                         key: record.key,
                         thread_id: record.zed_root_thread_id,
@@ -710,10 +785,7 @@ impl HerdrThreadBridge {
                         session: pane.session_identity.clone().unwrap_or_else(|| {
                             HerdrAgentSessionIdentity::id(pane.pane_id.clone())
                         }),
-                        title: pane
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| pane.pane_id.clone()),
+                        title: pane.title.clone().unwrap_or_else(|| pane.pane_id.clone()),
                         status: pane.status.clone(),
                     });
                 } else {
@@ -803,6 +875,8 @@ impl HerdrThreadBridge {
         };
         self.agent_snapshots.remove(&record.key.to_key_string());
         self.pane_outputs.remove(pane_id);
+        self.published_subthreads
+            .remove(&(record.key.workspace_id.clone(), pane_id.to_string()));
         self.events.push(HerdrBridgeEvent::SubthreadClosed {
             key: record.key,
             thread_id: record.zed_root_thread_id,
@@ -1025,12 +1099,20 @@ impl HerdrThreadBridge {
                 let Some(session) = agent.session_identity.clone() else {
                     continue;
                 };
-                self.create_agent_mapping(agent.clone());
-                let Some(record) =
-                    self.subthread_record_for_pane(Some(&workspace.workspace_id), &agent.pane_id)
+                // `reconcile_snapshot` already decided which identities may be
+                // persisted; conflicting or unpersisted keys are never emitted.
+                let Some(record) = self
+                    .live_subthread_record_for_pane(Some(&workspace.workspace_id), &agent.pane_id)
                 else {
                     continue;
                 };
+                if record.key.agent_session.as_ref() != Some(&session) {
+                    continue;
+                }
+                self.agent_snapshots
+                    .insert(record.key.to_key_string(), agent.clone());
+                self.published_subthreads
+                    .insert((workspace.workspace_id.clone(), agent.pane_id.clone()));
                 self.events.push(HerdrBridgeEvent::SubthreadCreated {
                     key: record.key,
                     thread_id: record.zed_root_thread_id,
@@ -1091,7 +1173,7 @@ impl HerdrThreadBridge {
                 continue;
             }
             let state_event = self.event_for_state(&event);
-            let applied = apply_event(&mut self.state, &state_event);
+            let applied = self.reconcile_state_event(&state_event);
             self.note_focus_event(&event, &applied, fenced, stale);
             self.apply_actions(applied);
             self.emit_subthread_event(&event);
@@ -1676,6 +1758,146 @@ impl HerdrBridgeRegistry {
     }
 }
 
+/// Records outbound API calls so UI tests can assert side effects without a
+/// real Herdr server.
+#[cfg(test)]
+pub(crate) struct RecordingHerdrApi {
+    calls: parking_lot::Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl RecordingHerdrApi {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: parking_lot::Mutex::new(Vec::new()),
+        })
+    }
+
+    pub(crate) fn calls(&self) -> Vec<String> {
+        self.calls.lock().clone()
+    }
+
+    fn record(&self, call: String) {
+        self.calls.lock().push(call);
+    }
+}
+
+#[cfg(test)]
+impl HerdrApi for RecordingHerdrApi {
+    fn ping(&self, _cx: &App) -> Task<Result<(), HerdrClientError>> {
+        Task::ready(Ok(()))
+    }
+    fn subscribe_events(&self, _cx: &App) -> Task<Result<String, HerdrClientError>> {
+        Task::ready(Ok(String::new()))
+    }
+    fn bootstrap(&self, _cx: &App) -> Task<Result<HerdrBootstrap, HerdrClientError>> {
+        Task::ready(Err(HerdrClientError::Disconnected))
+    }
+    fn get_snapshot(&self, _cx: &App) -> Task<Result<HerdrSnapshot, HerdrClientError>> {
+        Task::ready(Err(HerdrClientError::Disconnected))
+    }
+    fn focus_workspace(
+        &self,
+        workspace_id: &str,
+        _operation_id: Option<&str>,
+        _origin: Option<&str>,
+        _cx: &App,
+    ) -> Task<Result<(), HerdrClientError>> {
+        self.record(format!("focus_workspace:{workspace_id}"));
+        Task::ready(Ok(()))
+    }
+    fn create_workspace(
+        &self,
+        _label: &str,
+        _paths: Vec<String>,
+        _cx: &App,
+    ) -> Task<Result<HerdrWorkspaceSnapshot, HerdrClientError>> {
+        Task::ready(Err(HerdrClientError::Disconnected))
+    }
+    fn rename_workspace(
+        &self,
+        workspace_id: &str,
+        label: &str,
+        _cx: &App,
+    ) -> Task<Result<(), HerdrClientError>> {
+        self.record(format!("rename_workspace:{workspace_id}:{label}"));
+        Task::ready(Ok(()))
+    }
+    fn close_workspace(&self, workspace_id: &str, _cx: &App) -> Task<Result<(), HerdrClientError>> {
+        self.record(format!("close_workspace:{workspace_id}"));
+        Task::ready(Ok(()))
+    }
+    fn focus_pane(
+        &self,
+        pane_id: &str,
+        _operation_id: Option<&str>,
+        _origin: Option<&str>,
+        _cx: &App,
+    ) -> Task<Result<(), HerdrClientError>> {
+        self.record(format!("focus_pane:{pane_id}"));
+        Task::ready(Ok(()))
+    }
+    fn close_pane(&self, pane_id: &str, _cx: &App) -> Task<Result<(), HerdrClientError>> {
+        self.record(format!("close_pane:{pane_id}"));
+        Task::ready(Ok(()))
+    }
+    fn prompt_agent(&self, pane_id: &str, prompt: &str, _cx: &App) -> Task<Result<(), HerdrClientError>> {
+        self.record(format!("prompt_agent:{pane_id}:{prompt}"));
+        Task::ready(Ok(()))
+    }
+    fn send_agent_keys(&self, pane_id: &str, keys: &str, _cx: &App) -> Task<Result<(), HerdrClientError>> {
+        self.record(format!("send_agent_keys:{pane_id}:{keys}"));
+        Task::ready(Ok(()))
+    }
+    fn send_pane_keys(&self, pane_id: &str, keys: &str, _cx: &App) -> Task<Result<(), HerdrClientError>> {
+        self.record(format!("send_pane_keys:{pane_id}:{keys}"));
+        Task::ready(Ok(()))
+    }
+    fn send_pane_text(&self, pane_id: &str, text: &str, _cx: &App) -> Task<Result<(), HerdrClientError>> {
+        self.record(format!("send_pane_text:{pane_id}:{text}"));
+        Task::ready(Ok(()))
+    }
+    fn send_pane_input(
+        &self,
+        pane_id: &str,
+        text: Option<&str>,
+        keys: Vec<String>,
+        _cx: &App,
+    ) -> Task<Result<(), HerdrClientError>> {
+        self.record(format!("send_pane_input:{pane_id}:{text:?}:{keys:?}"));
+        Task::ready(Ok(()))
+    }
+    fn split_pane(&self, _pane_id: &str, _direction: &str, _cx: &App) -> Task<Result<(), HerdrClientError>> {
+        Task::ready(Err(HerdrClientError::Disconnected))
+    }
+    fn rename_agent(
+        &self,
+        _pane_id: &str,
+        _name: Option<&str>,
+        _cx: &App,
+    ) -> Task<Result<HerdrAgentSnapshot, HerdrClientError>> {
+        Task::ready(Err(HerdrClientError::Disconnected))
+    }
+    fn start_agent(
+        &self,
+        _pane_id: &str,
+        _kind: &str,
+        _name: &str,
+        _args: Vec<String>,
+        _cx: &App,
+    ) -> Task<Result<HerdrAgentSnapshot, HerdrClientError>> {
+        Task::ready(Err(HerdrClientError::Disconnected))
+    }
+    fn read_pane_output(
+        &self,
+        _pane_id: &str,
+        _since_revision: Option<u64>,
+        _cx: &App,
+    ) -> Task<Result<(u64, String), HerdrClientError>> {
+        Task::ready(Err(HerdrClientError::Disconnected))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2178,6 +2400,153 @@ mod tests {
         assert!(bridge.take_events().iter().any(|event| matches!(
             event,
             HerdrBridgeEvent::SubthreadClosed { pane_id, .. } if pane_id == "p1"
+        )));
+    }
+
+    fn pane_updated(
+        pane_id: &str,
+        workspace_id: &str,
+        identity: &str,
+        sequence: u64,
+    ) -> HerdrEvent {
+        HerdrEvent::PaneUpdated {
+            pane: crate::herdr_client::HerdrPaneSnapshot {
+                pane_id: pane_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                agent_type: Some("omp".to_string()),
+                session_identity: Some(HerdrAgentSessionIdentity::id(identity)),
+                status: HerdrAgentStatus::Working,
+                title: Some("live title".to_string()),
+                ..Default::default()
+            },
+            sequence,
+        }
+    }
+
+    #[test]
+    fn pane_updated_updates_the_persisted_subthread_without_recreating_it() {
+        let mut bridge = test_bridge();
+        bridge.apply_event(workspace_created("w1", "/repo", "Review"));
+        bridge.take_events();
+        bridge.apply_event(HerdrEvent::PaneAgentDetected {
+            pane_id: "p1".to_string(),
+            workspace_id: "w1".to_string(),
+            agent_type: Some("omp".to_string()),
+            session_identity: Some(HerdrAgentSessionIdentity::id("session-1")),
+            sequence: 2,
+        });
+        assert_eq!(bridge.take_events().len(), 1); // SubthreadCreated
+
+        bridge.apply_event(pane_updated("p1", "w1", "session-1", 3));
+        let events = bridge.take_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HerdrBridgeEvent::SubthreadUpdated {
+                pane_id,
+                title: Some(title),
+                status: Some(HerdrAgentStatus::Working),
+                ..
+            } if pane_id == "p1" && title == "live title"
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, HerdrBridgeEvent::SubthreadCreated { .. })));
+        let snapshots = bridge.subthread_snapshots("w1");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].session_identity,
+            Some(HerdrAgentSessionIdentity::id("session-1"))
+        );
+    }
+
+    #[test]
+    fn restarted_agent_identity_conflicts_instead_of_duplicating_the_live_mapping() {
+        let mut bridge = test_bridge();
+        bridge.apply_event(workspace_created("w1", "/repo", "Review"));
+        bridge.apply_event(HerdrEvent::PaneAgentDetected {
+            pane_id: "p1".to_string(),
+            workspace_id: "w1".to_string(),
+            agent_type: Some("omp".to_string()),
+            session_identity: Some(HerdrAgentSessionIdentity::id("session-1")),
+            sequence: 2,
+        });
+        bridge.take_events();
+
+        bridge.apply_event(HerdrEvent::PaneAgentDetected {
+            pane_id: "p1".to_string(),
+            workspace_id: "w1".to_string(),
+            agent_type: Some("omp".to_string()),
+            session_identity: Some(HerdrAgentSessionIdentity::id("session-2")),
+            sequence: 3,
+        });
+        let events = bridge.take_events();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, HerdrBridgeEvent::Conflict { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, HerdrBridgeEvent::SubthreadCreated { .. })));
+        let snapshots = bridge.subthread_snapshots("w1");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].session_identity,
+            Some(HerdrAgentSessionIdentity::id("session-1"))
+        );
+    }
+
+    #[test]
+    fn pane_update_with_foreign_identity_surfaces_a_conflict_without_emitting_a_key() {
+        let mut bridge = test_bridge();
+        bridge.apply_event(workspace_created("w1", "/repo", "Review"));
+        bridge.apply_event(HerdrEvent::PaneAgentDetected {
+            pane_id: "p1".to_string(),
+            workspace_id: "w1".to_string(),
+            agent_type: Some("omp".to_string()),
+            session_identity: Some(HerdrAgentSessionIdentity::id("session-1")),
+            sequence: 2,
+        });
+        bridge.take_events();
+
+        bridge.apply_event(pane_updated("p1", "w1", "session-2", 3));
+        let events = bridge.take_events();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, HerdrBridgeEvent::Conflict { .. })));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            HerdrBridgeEvent::SubthreadCreated { .. } | HerdrBridgeEvent::SubthreadUpdated { .. }
+        )));
+        let snapshots = bridge.subthread_snapshots("w1");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].session_identity,
+            Some(HerdrAgentSessionIdentity::id("session-1"))
+        );
+    }
+
+    #[test]
+    fn pane_updated_before_detection_creates_the_subthread_once() {
+        let mut bridge = test_bridge();
+        bridge.apply_event(workspace_created("w1", "/repo", "Review"));
+        bridge.take_events();
+
+        // A PaneUpdated may be the first identity-bearing event for a pane;
+        // it reconciles through the same restore-or-create outcome.
+        bridge.apply_event(pane_updated("p1", "w1", "session-1", 2));
+        let events = bridge.take_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HerdrBridgeEvent::SubthreadCreated { pane_id, .. } if pane_id == "p1"
+        )));
+
+        bridge.apply_event(pane_updated("p1", "w1", "session-1", 3));
+        let events = bridge.take_events();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, HerdrBridgeEvent::SubthreadCreated { .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HerdrBridgeEvent::SubthreadUpdated { pane_id, .. } if pane_id == "p1"
         )));
     }
 }

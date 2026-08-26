@@ -1200,6 +1200,11 @@ pub struct AgentPanel {
     herdr_focus_suppressed: bool,
     herdr_bridge: Option<Entity<HerdrThreadBridge>>,
     _herdr_bridge_subscription: Option<Subscription>,
+    /// On-demand single-line editor for renaming the active Herdr root,
+    /// following the terminal title-editor lifecycle.
+    herdr_title_editor: Option<Entity<Editor>>,
+    herdr_title_editor_initial_title: Option<String>,
+    _herdr_title_editor_subscription: Option<Subscription>,
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
@@ -1671,6 +1676,9 @@ impl AgentPanel {
             herdr_focus_suppressed: false,
             herdr_bridge,
             _herdr_bridge_subscription: herdr_bridge_subscription,
+            herdr_title_editor: None,
+            herdr_title_editor_initial_title: None,
+            _herdr_title_editor_subscription: None,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
             workspace,
             user_store,
@@ -4770,12 +4778,20 @@ impl AgentPanel {
         if !self.route_herdr_workspace(&key.workspace_id, window, cx) {
             return;
         }
-        if self.herdr_active_thread != Some(thread_id) {
+        // Only an explicit focus event may activate the Herdr surface. All
+        // other subthread events update the open view in place so background
+        // activity (including reconnect snapshot re-emissions) never steals
+        // the panel from an ACP thread or draft.
+        if matches!(event, HerdrBridgeEvent::SubthreadFocused { .. })
+            && self.herdr_active_thread != Some(thread_id)
+        {
             self.herdr_focus_suppressed = true;
             self.load_herdr_thread(thread_id, true, window, cx);
             self.herdr_focus_suppressed = false;
         }
-        if let BaseView::HerdrConversation { conversation_view } = &self.base_view {
+        if let BaseView::HerdrConversation { conversation_view } = &self.base_view
+            && conversation_view.read(cx).thread_id == thread_id
+        {
             conversation_view.update(cx, |view, cx| view.apply_bridge_event(event, window, cx));
         }
     }
@@ -4820,6 +4836,10 @@ impl AgentPanel {
                 if self.route_herdr_workspace(workspace_id, window, cx) {
                     // ThreadMetadataStore was updated by the bridge before
                     // this event, so the sidebar observes the durable title.
+                    if let BaseView::HerdrConversation { conversation_view } = &self.base_view {
+                        conversation_view
+                            .update(cx, |view, cx| view.apply_bridge_event(event, window, cx));
+                    }
                     cx.notify();
                 }
             }
@@ -4863,7 +4883,15 @@ impl AgentPanel {
                     );
                 }
             }
-            HerdrBridgeEvent::StatusChanged(_) => cx.notify(),
+            HerdrBridgeEvent::StatusChanged(_) => {
+                // The connection label lives on the open Herdr root view; keep
+                // it in sync alongside the panel-level state.
+                if let BaseView::HerdrConversation { conversation_view } = &self.base_view {
+                    conversation_view
+                        .update(cx, |view, cx| view.apply_bridge_event(event, window, cx));
+                }
+                cx.notify();
+            }
             _ => {}
         }
     }
@@ -5911,12 +5939,100 @@ impl AgentPanel {
         }
     }
 
+    fn active_herdr_conversation(&self) -> Option<Entity<HerdrConversationView>> {
+        match &self.base_view {
+            BaseView::HerdrConversation { conversation_view } => Some(conversation_view.clone()),
+            _ => None,
+        }
+    }
+
+    /// Starts editing the active Herdr root's title, mirroring the terminal
+    /// title-editor lifecycle. The commit path goes through the bridge rename
+    /// request; the durable title (and explicit override) only changes when
+    /// Herdr confirms via `RootRenamed`.
+    fn edit_herdr_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(conversation_view) = self.active_herdr_conversation() else {
+            return;
+        };
+        let title = conversation_view.read(cx).title().to_string();
+        let title_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(title.clone(), window, cx);
+            editor
+        });
+        let subscription = cx.subscribe_in(
+            &title_editor,
+            window,
+            |this, _editor, event: &editor::EditorEvent, window, cx| {
+                if matches!(event, editor::EditorEvent::Blurred) {
+                    this.stop_editing_herdr_title(true, window, cx);
+                }
+            },
+        );
+        title_editor.update(cx, |editor, cx| {
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        self.herdr_title_editor = Some(title_editor);
+        self.herdr_title_editor_initial_title = Some(title);
+        self._herdr_title_editor_subscription = Some(subscription);
+        cx.notify();
+    }
+
+    fn stop_editing_herdr_title(
+        &mut self,
+        commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(title_editor) = self.herdr_title_editor.take() else {
+            return;
+        };
+        let initial_title = self.herdr_title_editor_initial_title.take();
+        self._herdr_title_editor_subscription = None;
+
+        if commit
+            && let Some(conversation_view) = self.active_herdr_conversation()
+        {
+            let new_title = title_editor.read(cx).text(cx).trim().to_string();
+            if !new_title.is_empty() && initial_title.as_deref() != Some(new_title.as_str()) {
+                let task =
+                    conversation_view.update(cx, |view, cx| view.request_rename(&new_title, cx));
+                let workspace = self.workspace.clone();
+                cx.spawn_in(window, async move |_this, cx| {
+                    if let Err(error) = task.await {
+                        let _ = cx.update(|_window, cx| {
+                            Self::show_herdr_toast(
+                                &workspace,
+                                format!("Herdr rename failed: {error}"),
+                                cx,
+                            );
+                        });
+                    }
+                })
+                .detach();
+            }
+        }
+
+        if let Some(conversation_view) = self.active_herdr_conversation() {
+            conversation_view
+                .read(cx)
+                .activation_focus_handle(cx)
+                .focus(window, cx);
+        }
+        cx.notify();
+    }
+
     fn is_title_editor_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
         match self.visible_surface() {
             VisibleSurface::AgentThread(conversation_view) => conversation_view
                 .read(cx)
                 .root_thread_view()
                 .is_some_and(|view| view.read(cx).title_editor.read(cx).is_focused(window)),
+            VisibleSurface::HerdrConversation(_) => self
+                .herdr_title_editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).is_focused(window)),
             VisibleSurface::Terminal(_) => self
                 .active_terminal_id()
                 .and_then(|id| self.terminals.get(&id))
@@ -6032,12 +6148,39 @@ impl AgentPanel {
                         .into_any_element()
                 }
             }
-            VisibleSurface::HerdrConversation(conversation_view) => Label::new(
-                conversation_view.read(cx).title(),
-            )
-            .color(Color::Muted)
-            .truncate()
-            .into_any_element(),
+            VisibleSurface::HerdrConversation(conversation_view) => {
+                if let Some(title_editor) = self.herdr_title_editor.clone() {
+                    div()
+                        .flex_1()
+                        .on_action(cx.listener(
+                            move |this, _: &menu::Confirm, window, cx| {
+                                this.stop_editing_herdr_title(true, window, cx);
+                            },
+                        ))
+                        .on_action(cx.listener(
+                            move |this, _: &editor::actions::Cancel, window, cx| {
+                                this.stop_editing_herdr_title(false, window, cx);
+                            },
+                        ))
+                        .child(title_editor)
+                        .into_any_element()
+                } else {
+                    div()
+                        .id("herdr-title")
+                        .flex_1()
+                        .min_w_0()
+                        .cursor_text()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.edit_herdr_title(window, cx);
+                        }))
+                        .child(
+                            Label::new(conversation_view.read(cx).title())
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                        .into_any_element()
+                }
+            }
             VisibleSurface::Terminal(_) => {
                 if let Some((terminal_id, title_editor, title)) =
                     self.active_terminal_id().and_then(|terminal_id| {
@@ -6114,7 +6257,15 @@ impl AgentPanel {
                             .child(
                                 IconButton::new("edit_tile", IconName::Pencil)
                                     .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Edit Thread Title")),
+                                    .tooltip(Tooltip::text("Edit Thread Title"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if matches!(
+                                            this.visible_surface(),
+                                            VisibleSurface::HerdrConversation(_)
+                                        ) {
+                                            this.edit_herdr_title(window, cx);
+                                        }
+                                    })),
                             ),
                     )
             })
@@ -14220,5 +14371,204 @@ mod tests {
                 "selected_agent should be restored to the original after an agent override"
             );
         });
+    }
+
+    mod herdr {
+        use super::*;
+        use crate::herdr_bridge::{HerdrConnectionStatus, RecordingHerdrApi};
+        use crate::herdr_client::HerdrAgentSessionIdentity;
+        use crate::herdr_mapping_store::HerdrMappingKey;
+
+        fn workspace_created(paths: &[&str]) -> crate::herdr_client::HerdrEvent {
+            crate::herdr_client::HerdrEvent::WorkspaceCreated {
+                workspace: crate::herdr_client::HerdrWorkspaceSnapshot {
+                    workspace_id: "w1".to_string(),
+                    label: "Review".to_string(),
+                    paths: paths.iter().map(|path| path.to_string()).collect(),
+                    ..Default::default()
+                },
+                sequence: 1,
+            }
+        }
+
+        fn subthread_key(pane_id: &str, identity: &str) -> HerdrMappingKey {
+            HerdrMappingKey::subthread(
+                "alpha",
+                "w1",
+                pane_id,
+                HerdrAgentSessionIdentity::id(identity),
+            )
+        }
+
+        async fn setup_herdr_panel(
+            cx: &mut TestAppContext,
+        ) -> (
+            Entity<AgentPanel>,
+            Entity<HerdrThreadBridge>,
+            VisualTestContext,
+        ) {
+            let (panel, mut cx) = setup_panel(cx).await;
+            let bridge = panel.update_in(&mut cx, |panel, _window, cx| {
+                let bridge = cx.new(|_| HerdrThreadBridge::for_test("alpha"));
+                panel.herdr_bridge = Some(bridge.clone());
+                panel._herdr_bridge_subscription = None;
+                bridge
+            });
+            bridge.update(&mut cx, |bridge, _| {
+                bridge.apply_event(workspace_created(&["/project"]));
+            });
+            (panel, bridge, cx)
+        }
+
+        fn root_thread_id(
+            panel: &Entity<AgentPanel>,
+            cx: &TestAppContext,
+        ) -> ThreadId {
+            panel
+                .read_with(cx, |panel, cx| {
+                    panel
+                        .herdr_bridge
+                        .as_ref()
+                        .and_then(|panel_bridge| panel_bridge.read(cx).root_thread_id("w1"))
+                })
+                .expect("workspace-created event should map a root thread")
+        }
+
+        fn handle_event(
+            panel: &Entity<AgentPanel>,
+            cx: &mut VisualTestContext,
+            event: &HerdrBridgeEvent,
+        ) {
+            panel.update_in(cx, |panel, window, cx| {
+                panel.handle_herdr_event(event, window, cx);
+            });
+        }
+
+        #[gpui::test]
+        async fn background_subthread_events_do_not_activate_or_focus_the_herdr_surface(
+            cx: &mut TestAppContext,
+        ) {
+            let (panel, _bridge, mut cx) = setup_herdr_panel(cx).await;
+            let thread_id = root_thread_id(&panel, &cx);
+            let output = HerdrBridgeEvent::SubthreadOutput {
+                key: subthread_key("p1", "session-1"),
+                thread_id,
+                pane_id: "p1".to_string(),
+                revision: 4,
+                output: "background".to_string(),
+            };
+            handle_event(&panel, &mut cx, &output);
+            panel.read_with(&cx, |panel, _| {
+                assert_eq!(panel.herdr_active_thread, None);
+                assert!(!matches!(
+                    panel.base_view,
+                    BaseView::HerdrConversation { .. }
+                ));
+            });
+
+            // A focus event is the only subthread event allowed to activate.
+            let focused = HerdrBridgeEvent::SubthreadFocused {
+                key: subthread_key("p1", "session-1"),
+                thread_id,
+            };
+            handle_event(&panel, &mut cx, &focused);
+            panel.read_with(&cx, |panel, _| {
+                assert_eq!(panel.herdr_active_thread, Some(thread_id));
+                assert!(matches!(
+                    panel.base_view,
+                    BaseView::HerdrConversation { .. }
+                ));
+            });
+        }
+
+        #[gpui::test]
+        async fn root_renamed_and_status_changed_forward_to_the_open_view(
+            cx: &mut TestAppContext,
+        ) {
+            let (panel, _bridge, mut cx) = setup_herdr_panel(cx).await;
+            let thread_id = root_thread_id(&panel, &cx);
+            let focused = HerdrBridgeEvent::SubthreadFocused {
+                key: subthread_key("p1", "session-1"),
+                thread_id,
+            };
+            handle_event(&panel, &mut cx, &focused);
+
+            let renamed = HerdrBridgeEvent::RootRenamed {
+                workspace_id: "w1".to_string(),
+                thread_id,
+                title: "Renamed Root".to_string(),
+            };
+            handle_event(&panel, &mut cx, &renamed);
+            let status = HerdrBridgeEvent::StatusChanged(HerdrConnectionStatus::Ready);
+            handle_event(&panel, &mut cx, &status);
+
+            panel.read_with(&cx, |panel, cx| {
+                let BaseView::HerdrConversation { conversation_view } = &panel.base_view else {
+                    panic!("herdr surface should be active");
+                };
+                assert_eq!(conversation_view.read(cx).title(), "Renamed Root");
+                assert_eq!(
+                    conversation_view.read(cx).connection_status(),
+                    HerdrConnectionStatus::Ready
+                );
+            });
+        }
+
+        #[gpui::test]
+        async fn herdr_title_editing_requests_rename_through_the_bridge(
+            cx: &mut TestAppContext,
+        ) {
+            let (panel, mut cx) = setup_panel(cx).await;
+            let api = RecordingHerdrApi::new();
+            let bridge = panel.update_in(&mut cx, |panel, _window, cx| {
+                let bridge = cx.new(|_| HerdrThreadBridge::for_test_with_api(api.clone()));
+                panel.herdr_bridge = Some(bridge.clone());
+                panel._herdr_bridge_subscription = None;
+                bridge
+            });
+            bridge.update(&mut cx, |bridge, _| {
+                bridge.apply_event(workspace_created(&["/project"]));
+            });
+            let thread_id = root_thread_id(&panel, &cx);
+            let focused = HerdrBridgeEvent::SubthreadFocused {
+                key: subthread_key("p1", "session-1"),
+                thread_id,
+            };
+            handle_event(&panel, &mut cx, &focused);
+
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.edit_herdr_title(window, cx);
+                let editor_focused = panel
+                    .herdr_title_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.read(cx).is_focused(window));
+                assert!(editor_focused);
+                if let Some(editor) = panel.herdr_title_editor.as_ref() {
+                    editor.update(cx, |editor, cx| {
+                        editor.set_text("New Title", window, cx);
+                    });
+                }
+                panel.stop_editing_herdr_title(true, window, cx);
+                assert!(panel.herdr_title_editor.is_none());
+            });
+            cx.run_until_parked();
+            assert!(api
+                .calls()
+                .iter()
+                .any(|call| call == "rename_workspace:w1:New Title"));
+
+            // Cancelling an edit must not send a rename.
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.edit_herdr_title(window, cx);
+                if let Some(editor) = panel.herdr_title_editor.as_ref() {
+                    editor.update(cx, |editor, cx| {
+                        editor.set_text("Discarded", window, cx);
+                    });
+                }
+                panel.stop_editing_herdr_title(false, window, cx);
+            });
+            cx.run_until_parked();
+            assert!(!api.calls().iter().any(|call| call.contains("Discarded")));
+        }
     }
 }
