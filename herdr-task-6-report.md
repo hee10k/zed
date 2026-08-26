@@ -328,3 +328,53 @@ Concerns: the lazy-owner claim is keyed by Herdr workspace id per process; if a
 forward task fails to load the owner panel the event is not redelivered by the
 skipping observers (the next bridge event retries the load). Windows named-pipe
 coverage remains CI-gated as before.
+
+## Final Residual Gate 3 Repairs (HEAD 27872523fb → this commit)
+
+Findings file: `.superpowers/sdd/final-review-residual-3.md`. All four
+findings were fixed with deterministic bridge-state and GPUI regressions.
+
+1. **Status survives reverse identity transitions (P2)** — live identity loss
+   now carries the last identity-bearing snapshot status into the status-only
+   record, and `restore_agent_mapping` promotes that retained record back into
+   the identity-bearing snapshot before the same identity upgrades. Regression:
+   `live_identity_transition_preserves_status_through_reupgrade`.
+2. **Lazy-owner forwarding is window/session scoped and ordered (P3)** —
+   `HerdrLazyOwnerForwardKey` includes the Zed `WindowId`, selected Herdr
+   session, and workspace ID. Events observed while an owner panel loads are
+   queued in arrival order and acknowledged only after replay; failed loads
+   release the claim without dropping the queue. Regressions:
+   `lazy_owner_forward_claim_is_window_session_scoped_and_ordered` and
+   `concurrent_non_owner_panels_claim_the_lazy_owner_once`.
+3. **Repeated identity-less detection refreshes metadata (P3)** — every
+   identity-less detection now updates the cached `agent_type` while retaining
+   the current status. Regression:
+   `repeated_identityless_detection_refreshes_agent_metadata`.
+4. **Workspace close clears status-only rows without a live root (P3)** —
+   close handling clears status-only snapshots before reconciliation in direct,
+   contextual, and replay paths, while the existing archive cleanup remains
+   in place. Regression:
+   `workspace_close_clears_status_only_cache_without_live_root`.
+
+### Verification evidence
+
+```text
+$ cargo test -p agent_ui herdr_bridge
+cargo test: 34 passed (1 suite, 549 filtered, 0.01s)
+
+$ cargo test -p agent_ui herdr_conversation_view
+cargo test: 7 passed (1 suite, 576 filtered, 0.00s)
+
+$ cargo test -p agent_ui agent_panel::tests::herdr
+cargo test: 11 passed (1 suite, 572 filtered, 1.18s)
+
+$ cargo test -p agent_ui herdr_test_support
+cargo test: 9 passed (1 suite, 574 filtered, 0.02s)
+
+$ cargo test -p sidebar tests::
+cargo test: 153 passed (1 suite, 40 warnings, 23.56s)
+```
+
+The sidebar run emitted only existing warning diagnostics from unrelated
+workspace crates. No formatter, linter, or project-wide suite was run.
+Windows named-pipe coverage remains CI-gated on this macOS host.

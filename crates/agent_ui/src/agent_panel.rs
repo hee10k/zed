@@ -85,7 +85,7 @@ use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncApp,
     AsyncWindowContext, ClipboardItem, Entity, EventEmitter, ExternalPaths, FocusHandle,
     Focusable, KeyContext, Pixels, PlatformDisplay, Subscription, Task, TaskExt,
-    WeakEntity, WindowHandle, prelude::*, pulsating_between,
+    WeakEntity, WindowHandle, WindowId, prelude::*, pulsating_between,
 };
 use language::LanguageRegistry;
 use language_model::{
@@ -170,20 +170,32 @@ impl MaxIdleRetainedThreads {
         cx.try_global::<Self>().map_or(5, |g| g.0)
     }
 }
-/// Deduplicates lazy-owner loads for Herdr bridge events. When several
-/// non-owner panels observe the owning workspace's panel absent during the
-/// same synchronous event fanout, exactly one claim wins and performs the
-/// load/forward; the rest skip so the lazy owner receives the event once.
+/// Deduplicates and serializes lazy-owner delivery for Herdr bridge events.
+/// The key includes the Zed window and selected Herdr session because the
+/// same Herdr workspace ID may exist in multiple independent bridges.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct HerdrLazyOwnerForwardKey {
+    window_id: WindowId,
+    session: String,
+    workspace_id: String,
+}
+
 #[derive(Default)]
 struct HerdrLazyOwnerForwards {
-    in_flight: HashSet<String>,
+    in_flight: HashSet<HerdrLazyOwnerForwardKey>,
+    pending: HashMap<HerdrLazyOwnerForwardKey, Vec<HerdrBridgeEvent>>,
     total_claims: usize,
 }
 impl gpui::Global for HerdrLazyOwnerForwards {}
 
-fn claim_lazy_owner_forward(cx: &mut App, workspace_id: &str) -> bool {
+fn queue_lazy_owner_forward(
+    cx: &mut App,
+    key: HerdrLazyOwnerForwardKey,
+    event: HerdrBridgeEvent,
+) -> bool {
     let claims = cx.default_global::<HerdrLazyOwnerForwards>();
-    if claims.in_flight.insert(workspace_id.to_string()) {
+    claims.pending.entry(key.clone()).or_default().push(event);
+    if claims.in_flight.insert(key) {
         claims.total_claims += 1;
         true
     } else {
@@ -191,11 +203,50 @@ fn claim_lazy_owner_forward(cx: &mut App, workspace_id: &str) -> bool {
     }
 }
 
-fn release_lazy_owner_forward(cx: &mut App, workspace_id: &str) {
+fn pending_lazy_owner_forward(
+    cx: &App,
+    key: &HerdrLazyOwnerForwardKey,
+) -> Vec<HerdrBridgeEvent> {
+    cx.try_global::<HerdrLazyOwnerForwards>()
+        .and_then(|claims| claims.pending.get(key).cloned())
+        .unwrap_or_default()
+}
+
+fn acknowledge_lazy_owner_forward(
+    cx: &mut App,
+    key: &HerdrLazyOwnerForwardKey,
+    count: usize,
+) {
+    let claims = cx.default_global::<HerdrLazyOwnerForwards>();
+    if let Some(events) = claims.pending.get_mut(key) {
+        events.drain(..count.min(events.len()));
+    }
+}
+
+fn finish_lazy_owner_forward(cx: &mut App, key: &HerdrLazyOwnerForwardKey) -> bool {
+    let claims = cx.default_global::<HerdrLazyOwnerForwards>();
+    if claims
+        .pending
+        .get(key)
+        .is_some_and(|events| !events.is_empty())
+    {
+        return false;
+    }
+    claims.pending.remove(key);
+    claims.in_flight.remove(key);
+    true
+}
+
+fn release_lazy_owner_forward(cx: &mut App, key: &HerdrLazyOwnerForwardKey) {
     cx.default_global::<HerdrLazyOwnerForwards>()
         .in_flight
-        .remove(workspace_id);
+        .remove(key);
 }
+fn lazy_owner_forward_in_flight(cx: &App, key: &HerdrLazyOwnerForwardKey) -> bool {
+    cx.try_global::<HerdrLazyOwnerForwards>()
+        .is_some_and(|claims| claims.in_flight.contains(key))
+}
+
 #[cfg(test)]
 pub(crate) fn herdr_lazy_forward_total_claims(cx: &App) -> usize {
     cx.try_global::<HerdrLazyOwnerForwards>()
@@ -4817,9 +4868,19 @@ impl AgentPanel {
         let Some(owner) = owner.cloned() else {
             return false;
         };
+        let lazy_key = HerdrLazyOwnerForwardKey {
+            window_id: window.window_handle().window_id(),
+            session: bridge.read(cx).session_name().to_string(),
+            workspace_id: herdr_workspace_id.to_string(),
+        };
+        let lazy_forwarding = lazy_owner_forward_in_flight(cx, &lazy_key);
         let owner_is_current = current_workspace.as_ref() == Some(&owner);
         let owner_is_source = self.workspace.upgrade().as_ref() == Some(&owner);
         if owner_is_current && owner_is_source {
+            if lazy_forwarding {
+                queue_lazy_owner_forward(cx, lazy_key, event.clone());
+                return false;
+            }
             return true;
         }
 
@@ -4835,39 +4896,60 @@ impl AgentPanel {
             return true;
         }
 
+        // Keep events queued for the whole load/replay transaction. The owner
+        // panel may subscribe before the async loader drains the first batch.
+        if lazy_forwarding {
+            queue_lazy_owner_forward(cx, lazy_key, event.clone());
+            return false;
+        }
+
         // The owning panel also receives this bridge event through its own
         // subscription. Forward only when it is not loaded yet; forwarding
         // to an already-subscribed owner would deliver the same event twice.
         if owner.read(cx).panel::<AgentPanel>(cx).is_none() {
             // Multiple non-owner panels can observe the owner absent within
-            // one synchronous fanout; only the first claim may load and
-            // forward so exactly-once delivery holds for lazy convergence.
-            if !claim_lazy_owner_forward(cx, herdr_workspace_id) {
+            // one synchronous fanout; only the first starts the owner load.
+            if !queue_lazy_owner_forward(cx, lazy_key.clone(), event.clone()) {
                 return false;
             }
             let owner_weak = owner.downgrade();
-            let workspace_id = herdr_workspace_id.to_string();
-            let event = event.clone();
             let mut async_window_cx = window.to_async(cx);
             cx.spawn(async move |_this, cx| {
                 let forwarded = async {
                     let panel =
                         AgentPanel::load(owner_weak.clone(), async_window_cx.clone()).await?;
-                    owner.update_in(&mut async_window_cx, |owner, window, cx| {
-                        let panel = owner.panel::<AgentPanel>(cx).unwrap_or_else(|| {
-                            owner.add_panel(panel.clone(), window, cx);
-                            panel.clone()
+                    loop {
+                        let events =
+                            cx.update(|cx| pending_lazy_owner_forward(cx, &lazy_key));
+                        if events.is_empty() {
+                            if cx.update(|cx| finish_lazy_owner_forward(cx, &lazy_key)) {
+                                break;
+                            }
+                            continue;
+                        }
+                        owner.update_in(&mut async_window_cx, |owner, window, cx| {
+                            let panel = owner.panel::<AgentPanel>(cx).unwrap_or_else(|| {
+                                owner.add_panel(panel.clone(), window, cx);
+                                panel.clone()
+                            });
+                            for event in &events {
+                                panel.update(cx, |panel, cx| {
+                                    panel.handle_herdr_event_inner(event, window, cx, false);
+                                });
+                            }
+                        })?;
+                        cx.update(|cx| {
+                            acknowledge_lazy_owner_forward(cx, &lazy_key, events.len())
                         });
-                        panel.update(cx, |panel, cx| {
-                            panel.handle_herdr_event(&event, window, cx);
-                        });
-                    })?;
+                    }
                     anyhow::Ok(())
                 }
                 .await;
-                // Release the claim on success and failure alike so a later
-                // event can retry the load.
-                let _ = cx.update(|cx| release_lazy_owner_forward(cx, &workspace_id));
+                // Release the claim on failure, retaining queued events so a
+                // later event can retry the load and replay the full order.
+                if forwarded.is_err() {
+                    let _ = cx.update(|cx| release_lazy_owner_forward(cx, &lazy_key));
+                }
                 forwarded
             })
             .detach_and_log_err(cx);
@@ -4882,8 +4964,9 @@ impl AgentPanel {
         thread_id: ThreadId,
         window: &mut Window,
         cx: &mut Context<Self>,
+        route: bool,
     ) {
-        if !self.route_herdr_workspace(&key.workspace_id, event, window, cx) {
+        if route && !self.route_herdr_workspace(&key.workspace_id, event, window, cx) {
             return;
         }
         // Only an explicit focus event may activate the Herdr surface. All
@@ -4910,6 +4993,16 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.handle_herdr_event_inner(event, window, cx, true);
+    }
+
+    fn handle_herdr_event_inner(
+        &mut self,
+        event: &HerdrBridgeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        route: bool,
+    ) {
         match event {
             HerdrBridgeEvent::RootCreated { .. } => {
                 // The bridge persists root metadata before publishing this
@@ -4923,7 +5016,7 @@ impl AgentPanel {
                 workspace_id,
                 thread_id,
             } => {
-                if !self.route_herdr_workspace(workspace_id, event, window, cx) {
+                if route && !self.route_herdr_workspace(workspace_id, event, window, cx) {
                     return;
                 }
                 self.herdr_focus_suppressed = true;
@@ -4934,7 +5027,7 @@ impl AgentPanel {
                 workspace_id,
                 thread_id,
             } => {
-                if !self.route_herdr_workspace(workspace_id, event, window, cx) {
+                if route && !self.route_herdr_workspace(workspace_id, event, window, cx) {
                     return;
                 }
                 if self.herdr_active_thread == Some(*thread_id) {
@@ -4952,7 +5045,7 @@ impl AgentPanel {
                 }
             }
             HerdrBridgeEvent::RootRenamed { workspace_id, .. } => {
-                if self.route_herdr_workspace(workspace_id, event, window, cx) {
+                if !route || self.route_herdr_workspace(workspace_id, event, window, cx) {
                     // ThreadMetadataStore was updated by the bridge before
                     // this event, so the sidebar observes the durable title.
                     if let BaseView::HerdrConversation { conversation_view } = &self.base_view {
@@ -4963,7 +5056,7 @@ impl AgentPanel {
                 }
             }
             HerdrBridgeEvent::SubthreadStatusOnly { workspace_id, .. } => {
-                if self.route_herdr_workspace(workspace_id, event, window, cx) {
+                if !route || self.route_herdr_workspace(workspace_id, event, window, cx) {
                     if let BaseView::HerdrConversation { conversation_view } = &self.base_view {
                         conversation_view
                             .update(cx, |view, cx| view.apply_bridge_event(event, window, cx));
@@ -4983,11 +5076,11 @@ impl AgentPanel {
                 key, thread_id, ..
             }
             | HerdrBridgeEvent::SubthreadFocused { key, thread_id } => {
-                self.handle_herdr_subthread_event(event, key, *thread_id, window, cx);
+                self.handle_herdr_subthread_event(event, key, *thread_id, window, cx, route);
             }
             HerdrBridgeEvent::Conflict { key, message } => {
                 self.herdr_conflict_active = true;
-                if self.route_herdr_workspace(&key.workspace_id, event, window, cx) {
+                if !route || self.route_herdr_workspace(&key.workspace_id, event, window, cx) {
                     Self::show_herdr_toast(
                         &self.workspace,
                         format!("Herdr conflict: {message}"),
@@ -5002,7 +5095,7 @@ impl AgentPanel {
             } => {
                 let owns = workspace_id
                     .as_deref()
-                    .map_or(true, |id| self.route_herdr_workspace(id, event, window, cx));
+                    .map_or(true, |id| !route || self.route_herdr_workspace(id, event, window, cx));
                 if owns {
                     Self::show_herdr_toast(
                         &self.workspace,
@@ -15346,16 +15439,71 @@ mod tests {
         }
 
         #[gpui::test]
-        async fn lazy_owner_forward_claim_is_exclusive_until_released(
+        async fn lazy_owner_forward_claim_is_window_session_scoped_and_ordered(
             cx: &mut TestAppContext,
         ) {
+            let key = |window_id: u64, session: &str, workspace_id: &str| HerdrLazyOwnerForwardKey {
+                window_id: WindowId::from(window_id),
+                session: session.to_string(),
+                workspace_id: workspace_id.to_string(),
+            };
+            let event = |title: &str| HerdrBridgeEvent::RootRenamed {
+                workspace_id: "w1".to_string(),
+                thread_id: ThreadId::new(),
+                title: title.to_string(),
+            };
+            let alpha_window_one = key(1, "alpha", "w1");
+            let alpha_window_two = key(2, "alpha", "w1");
+            let beta_window_one = key(1, "beta", "w1");
+
             cx.update(|cx| {
-                assert!(claim_lazy_owner_forward(cx, "w1"));
-                // A second observer in the same fanout must not claim.
-                assert!(!claim_lazy_owner_forward(cx, "w1"));
-                assert!(claim_lazy_owner_forward(cx, "w2"));
-                release_lazy_owner_forward(cx, "w1");
-                assert!(claim_lazy_owner_forward(cx, "w1"));
+                assert!(queue_lazy_owner_forward(
+                    cx,
+                    alpha_window_one.clone(),
+                    event("first")
+                ));
+                assert!(!queue_lazy_owner_forward(
+                    cx,
+                    alpha_window_one.clone(),
+                    event("second")
+                ));
+                assert!(queue_lazy_owner_forward(
+                    cx,
+                    alpha_window_two.clone(),
+                    event("other-window")
+                ));
+                assert!(queue_lazy_owner_forward(
+                    cx,
+                    beta_window_one.clone(),
+                    event("other-session")
+                ));
+
+                let pending = pending_lazy_owner_forward(cx, &alpha_window_one);
+                assert_eq!(pending.len(), 2);
+                assert!(matches!(
+                    &pending[0],
+                    HerdrBridgeEvent::RootRenamed { title, .. } if title == "first"
+                ));
+                assert!(matches!(
+                    &pending[1],
+                    HerdrBridgeEvent::RootRenamed { title, .. } if title == "second"
+                ));
+                assert_eq!(herdr_lazy_forward_total_claims(cx), 3);
+
+                acknowledge_lazy_owner_forward(cx, &alpha_window_one, 1);
+                assert!(!finish_lazy_owner_forward(cx, &alpha_window_one));
+                acknowledge_lazy_owner_forward(cx, &alpha_window_one, 1);
+                assert!(finish_lazy_owner_forward(cx, &alpha_window_one));
+
+                // Releasing a failed load keeps its queued events available
+                // for the next event to trigger a retry.
+                release_lazy_owner_forward(cx, &beta_window_one);
+                assert!(queue_lazy_owner_forward(
+                    cx,
+                    beta_window_one.clone(),
+                    event("retry")
+                ));
+                assert_eq!(pending_lazy_owner_forward(cx, &beta_window_one).len(), 2);
             });
         }
 
@@ -15440,11 +15588,23 @@ mod tests {
                     "exactly one lazy-owner load must be claimed per fanout"
                 );
             });
+            let window_id = cx.update(|window, _cx| window.window_handle().window_id());
             cx.run_until_parked();
             workspace_a.read_with(cx, |workspace, cx| {
                 assert!(
                     workspace.panel::<AgentPanel>(cx).is_some(),
                     "the lazy owner should be loaded exactly once"
+                );
+            });
+            cx.update(|_window, cx| {
+                let key = HerdrLazyOwnerForwardKey {
+                    window_id,
+                    session: "alpha".to_string(),
+                    workspace_id: "w1".to_string(),
+                };
+                assert!(
+                    pending_lazy_owner_forward(cx, &key).is_empty(),
+                    "all events observed while loading must be replayed"
                 );
             });
         }
