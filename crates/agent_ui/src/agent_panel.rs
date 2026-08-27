@@ -5696,22 +5696,6 @@ impl AgentPanel {
                     );
                 }
             }
-            HerdrBridgeEvent::RequestFailed {
-                workspace_id,
-                operation,
-                message,
-            } => {
-                let owns = workspace_id
-                    .as_deref()
-                    .map_or(true, |id| !route || self.route_herdr_workspace(id, event, window, cx));
-                if owns {
-                    Self::show_herdr_toast(
-                        &self.workspace,
-                        format!("Herdr {operation} failed: {message}"),
-                        cx,
-                    );
-                }
-            }
             HerdrBridgeEvent::SessionRebound => {
                 self.reset_herdr_surface_after_rebind(window, cx);
             }
@@ -11667,6 +11651,7 @@ mod tests {
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
+            TerminalThreadMetadataStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
         });
 

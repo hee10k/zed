@@ -128,11 +128,6 @@ pub(crate) enum HerdrBridgeEvent {
         key: HerdrMappingKey,
         message: String,
     },
-    RequestFailed {
-        workspace_id: Option<String>,
-        operation: String,
-        message: String,
-    },
     SubthreadStatusOnly {
         workspace_id: String,
         pane_id: String,
@@ -2101,13 +2096,9 @@ impl HerdrThreadBridge {
                             bridge.active_subscription_id = None;
                             bridge.active_subscription_ids.clear();
                             bridge.set_status(HerdrConnectionStatus::Unavailable);
-                            bridge.events.push(HerdrBridgeEvent::RequestFailed {
-                                workspace_id: None,
-                                operation: "bootstrap".to_string(),
-                                message: error.to_string(),
-                            });
                             bridge.emit_new_events(start, cx);
                         });
+                        log::debug!("Herdr bootstrap failed; retrying: {error}");
                     }
                 }
 
@@ -4380,4 +4371,26 @@ mod tests {
                 if key.workspace_id == "w1" && key.pane_id.as_deref() == Some("p1")
         )));
     }
+    #[gpui::test]
+    async fn bootstrap_failures_do_not_emit_user_request_failure_events(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let bridge = cx.new(|_| HerdrThreadBridge::for_test_with_api(RecordingHerdrApi::new()));
+        bridge.update(cx, |bridge, cx| bridge.begin_sync(cx));
+        cx.run_until_parked();
+
+        let events = bridge.update(cx, |bridge, _| bridge.take_events());
+
+        assert_eq!(
+            events,
+            vec![
+                HerdrBridgeEvent::StatusChanged(HerdrConnectionStatus::Reconnecting),
+                HerdrBridgeEvent::StatusChanged(HerdrConnectionStatus::Unavailable),
+            ],
+            "automatic bootstrap failures must only update connection state"
+        );
+
+        bridge.update(cx, |bridge, _| bridge.stop());
+    }
+
 }
