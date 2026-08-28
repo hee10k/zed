@@ -314,6 +314,8 @@ pub struct MultiWorkspace {
     /// chrome ownership, as that might cause a double lease. Kept in sync with
     /// `active_workspace`.
     active_workspace_id: Rc<Cell<EntityId>>,
+    herdr_session_name: Option<String>,
+    herdr_owned: bool,
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
@@ -376,6 +378,8 @@ impl MultiWorkspace {
             }],
             project_groups: Vec::new(),
             active_workspace_id,
+            herdr_session_name: None,
+            herdr_owned: false,
             sidebar: None,
             sidebar_open: false,
             sidebar_overlay: None,
@@ -388,6 +392,37 @@ impl MultiWorkspace {
             ],
             previous_focus_handle: None,
         }
+    }
+
+    pub fn herdr_session_name(&self) -> Option<&str> {
+        self.herdr_session_name.as_deref()
+    }
+
+    pub fn reserve_herdr_session_name(&mut self, cx: &mut Context<Self>) -> String {
+        if let Some(name) = &self.herdr_session_name {
+            return name.clone();
+        }
+
+        let name = format!("zed-{}", uuid::Uuid::new_v4());
+        self.herdr_session_name = Some(name.clone());
+        self.serialize(cx);
+        name
+    }
+
+    pub fn set_herdr_owned(&mut self, owned: bool, cx: &mut Context<Self>) {
+        self.herdr_owned = owned;
+        self.serialize(cx);
+    }
+
+    pub fn restore_herdr_state(
+        &mut self,
+        session_name: Option<String>,
+        owned: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.herdr_session_name = session_name;
+        self.herdr_owned = owned;
+        self.serialize(cx);
     }
 
     pub fn register_sidebar<T: Sidebar>(&mut self, sidebar: Entity<T>, cx: &mut Context<Self>) {
@@ -1483,6 +1518,8 @@ impl MultiWorkspace {
                             .collect::<Vec<_>>(),
                         sidebar_open: this.sidebar_open,
                         sidebar_state: this.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
+                        herdr_session_name: this.herdr_session_name.clone(),
+                        herdr_owned: this.herdr_owned,
                     };
                     (this.window_id, state)
                 })

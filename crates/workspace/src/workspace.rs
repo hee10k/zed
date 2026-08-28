@@ -9822,6 +9822,8 @@ pub async fn apply_restored_multiworkspace_state(
         sidebar_open,
         project_groups,
         sidebar_state,
+        herdr_session_name,
+        herdr_owned,
         ..
     } = state;
 
@@ -9862,6 +9864,11 @@ pub async fn apply_restored_multiworkspace_state(
             })
             .ok();
     }
+    window_handle
+        .update(cx, |multi_workspace, _window, cx| {
+            multi_workspace.restore_herdr_state(herdr_session_name.clone(), *herdr_owned, cx);
+        })
+        .ok();
 
     if *sidebar_open {
         window_handle

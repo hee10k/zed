@@ -2811,8 +2811,8 @@ mod tests {
         multi_workspace::MultiWorkspace,
         persistence::{
             model::{
-                SerializedItem, SerializedPane, SerializedPaneGroup, SerializedWorkspace,
-                SessionWorkspace,
+                MultiWorkspaceState, SerializedItem, SerializedPane, SerializedPaneGroup,
+                SerializedWorkspace, SessionWorkspace,
             },
             read_multi_workspace_state,
         },
@@ -2832,6 +2832,34 @@ mod tests {
         let dir = PathBuf::from(format!("/test-dirs/{}-{}", prefix, uuid::Uuid::new_v4()));
         fs.insert_tree(&dir, json!({})).await;
         dir
+    }
+
+    #[test]
+    fn multi_workspace_state_round_trips_herdr_ownership() {
+        let state = MultiWorkspaceState {
+            active_workspace_id: None,
+            sidebar_open: false,
+            project_groups: Vec::new(),
+            sidebar_state: None,
+            herdr_session_name: Some("zed-1234".to_string()),
+            herdr_owned: true,
+        };
+
+        let encoded = serde_json::to_string(&state).expect("encode state");
+        let decoded: MultiWorkspaceState =
+            serde_json::from_str(&encoded).expect("decode state");
+        assert_eq!(decoded.herdr_session_name.as_deref(), Some("zed-1234"));
+        assert!(decoded.herdr_owned);
+    }
+
+    #[test]
+    fn legacy_multi_workspace_state_defaults_herdr_fields() {
+        let decoded: MultiWorkspaceState = serde_json::from_str(
+            r#"{"active_workspace_id":null,"sidebar_open":false,"project_groups":[]}"#,
+        )
+        .expect("decode legacy state");
+        assert_eq!(decoded.herdr_session_name, None);
+        assert!(!decoded.herdr_owned);
     }
 
     #[gpui::test]
@@ -4657,6 +4685,8 @@ mod tests {
                 project_groups: vec![],
                 sidebar_open: true,
                 sidebar_state: None,
+                herdr_session_name: Some("zed-window-10".to_string()),
+                herdr_owned: true,
             },
         )
         .await;
@@ -4669,6 +4699,8 @@ mod tests {
                 project_groups: vec![],
                 sidebar_open: false,
                 sidebar_state: None,
+                herdr_session_name: None,
+                herdr_owned: false,
             },
         )
         .await;
@@ -4711,12 +4743,19 @@ mod tests {
         assert_eq!(group_10.active_workspace.workspace_id, WorkspaceId(2));
         assert_eq!(group_10.state.active_workspace_id, Some(WorkspaceId(2)));
         assert_eq!(group_10.state.sidebar_open, true);
+        assert_eq!(
+            group_10.state.herdr_session_name.as_deref(),
+            Some("zed-window-10")
+        );
+        assert!(group_10.state.herdr_owned);
 
         // Window 20: active_workspace_id = 3 picks workspace 3 (paths /c), sidebar closed.
         let group_20 = &results[1];
         assert_eq!(group_20.active_workspace.workspace_id, WorkspaceId(3));
         assert_eq!(group_20.state.active_workspace_id, Some(WorkspaceId(3)));
         assert_eq!(group_20.state.sidebar_open, false);
+        assert_eq!(group_20.state.herdr_session_name, None);
+        assert!(!group_20.state.herdr_owned);
 
         // Orphan: no active_workspace_id, falls back to first workspace (id 4).
         let group_none = &results[2];
@@ -5897,6 +5936,9 @@ mod tests {
         multi_workspace.update(cx, |mw, cx| {
             mw.open_sidebar(cx);
         });
+        multi_workspace.update(cx, |mw, cx| {
+            mw.restore_herdr_state(Some("zed-restored".to_string()), true, cx);
+        });
 
         multi_workspace.update_in(cx, |mw, window, cx| {
             mw.test_add_workspace(project_1.clone(), window, cx);
@@ -5949,6 +5991,11 @@ mod tests {
             active_db_id.unwrap(),
         );
         assert_eq!(serialized.state.project_groups.len(), 2,);
+        assert_eq!(
+            serialized.state.herdr_session_name.as_deref(),
+            Some("zed-restored")
+        );
+        assert!(serialized.state.herdr_owned);
 
         // Verify the serialized project group keys round-trip back to the
         // originals.
@@ -6010,6 +6057,38 @@ mod tests {
             active_paths,
             vec![PathBuf::from("/worktree-feature")],
             "The restored active workspace should be the linked worktree project"
+        );
+
+        let restored_session_name = restored_handle
+            .read_with(cx, |mw, _cx| {
+                mw.herdr_session_name().map(|name| name.to_string())
+            })
+            .unwrap();
+        assert_eq!(
+            restored_session_name.as_deref(),
+            Some("zed-restored"),
+            "Restored window should retain the Herdr session name"
+        );
+
+        let restored_window_id = restored_handle
+            .update(cx, |_, window, _cx| window.window_handle().window_id())
+            .unwrap();
+        let serialize_task = restored_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                multi_workspace.serialize(cx);
+                multi_workspace.flush_serialization()
+            })
+            .unwrap();
+        serialize_task.await;
+        let restored_state = cx.update(|_, cx| read_multi_workspace_state(restored_window_id, cx));
+        assert_eq!(
+            restored_state.herdr_session_name.as_deref(),
+            Some("zed-restored"),
+            "Restored window serialization should retain the Herdr session name"
+        );
+        assert!(
+            restored_state.herdr_owned,
+            "Restored window serialization should retain Herdr ownership"
         );
     }
 
