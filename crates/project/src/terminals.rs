@@ -67,6 +67,24 @@ impl Project {
         spawn_task: SpawnInTerminal,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_task_internal(spawn_task, None, cx)
+    }
+
+    pub fn create_terminal_task_in_window(
+        &mut self,
+        spawn_task: SpawnInTerminal,
+        window_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_task_internal(spawn_task, Some(window_id), cx)
+    }
+
+    fn create_terminal_task_internal(
+        &mut self,
+        spawn_task: SpawnInTerminal,
+        window_id: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
         let is_via_remote = self.remote_client.is_some();
 
         let path: Option<Arc<Path>> = if let Some(cwd) = &spawn_task.cwd {
@@ -175,6 +193,7 @@ impl Project {
                         let to_run =
                             (!activation_script.is_empty()).then(|| format_to_run(&spawn_task));
                         env.extend(spawn_task.env);
+                        apply_herdr_session_env(&mut env, is_via_remote, window_id, cx);
                         match remote_client {
                             Some(remote_client) => match activation_script.clone() {
                                 activation_script if !activation_script.is_empty() => {
@@ -293,7 +312,16 @@ impl Project {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        self.create_terminal_shell_internal(cwd, false, cx)
+        self.create_terminal_shell_internal(cwd, false, None, cx)
+    }
+
+    pub fn create_terminal_shell_in_window(
+        &mut self,
+        cwd: Option<PathBuf>,
+        window_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_shell_internal(cwd, false, Some(window_id), cx)
     }
 
     /// Creates a local terminal even if the project is remote.
@@ -303,6 +331,22 @@ impl Project {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
+        self.create_local_terminal_internal(None, cx)
+    }
+
+    pub fn create_local_terminal_in_window(
+        &mut self,
+        window_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_local_terminal_internal(Some(window_id), cx)
+    }
+
+    fn create_local_terminal_internal(
+        &mut self,
+        window_id: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
         let working_directory = if self.remote_client.is_some() {
             // Remote project: don't use remote paths, let shell use Zed's cwd
             None
@@ -310,7 +354,7 @@ impl Project {
             // Local project: use project directory like normal terminals
             self.active_project_directory(cx).map(|p| p.to_path_buf())
         };
-        self.create_terminal_shell_internal(working_directory, true, cx)
+        self.create_terminal_shell_internal(working_directory, true, window_id, cx)
     }
 
     /// Internal method for creating terminal shells.
@@ -320,6 +364,7 @@ impl Project {
         &mut self,
         cwd: Option<PathBuf>,
         force_local: bool,
+        window_id: Option<u64>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let path = cwd.map(|p| Arc::from(&*p));
@@ -383,6 +428,7 @@ impl Project {
             let shell_kind = ShellKind::new(&shell, path_style.is_windows());
             let mut env = env_task.await.unwrap_or_default();
             env.extend(settings.env);
+            apply_herdr_session_env(&mut env, is_via_remote, window_id, cx);
 
             let activation_script = maybe!(async {
                 for toolchain in toolchains {
@@ -613,6 +659,20 @@ impl Project {
     }
 }
 
+fn apply_herdr_session_env(
+    env: &mut HashMap<String, String>,
+    is_via_remote: bool,
+    window_id: Option<u64>,
+    cx: &App,
+) {
+    if !is_via_remote
+        && let Some(window_id) = window_id
+        && let Some(session_name) = terminal::herdr_session_for_window(window_id, cx)
+    {
+        env.insert("HERDR_SESSION".to_string(), session_name);
+    }
+}
+
 fn create_remote_shell(
     spawn_command: Option<(&String, &Vec<String>)>,
     mut env: HashMap<String, String>,
@@ -719,7 +779,57 @@ fn quote_cmd_command_arg_for_outer_shell(arg: &str, shell_kind: ShellKind) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
     use pretty_assertions::assert_eq;
+
+    #[gpui::test]
+    async fn window_scoped_herdr_session_overlays_only_local_environments(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            terminal::set_herdr_session_for_window(42, "window-session".to_string(), cx);
+
+            let mut local_env = HashMap::default();
+            local_env.insert("HERDR_SESSION".to_string(), "inherited-session".to_string());
+            apply_herdr_session_env(&mut local_env, false, Some(42), cx);
+            assert_eq!(
+                local_env.get("HERDR_SESSION"),
+                Some(&"window-session".to_string()),
+                "a window-owned session must override the inherited project value"
+            );
+
+            let mut ordinary_env = HashMap::default();
+            apply_herdr_session_env(&mut ordinary_env, false, None, cx);
+            assert!(
+                !ordinary_env.contains_key("HERDR_SESSION"),
+                "window-unaware terminal creation must not receive an overlay"
+            );
+
+            let mut remote_env = HashMap::default();
+            apply_herdr_session_env(&mut remote_env, true, Some(42), cx);
+            assert!(
+                !remote_env.contains_key("HERDR_SESSION"),
+                "remote terminal creation must not receive a local overlay"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn window_scoped_herdr_session_overrides_task_environment(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            terminal::set_herdr_session_for_window(42, "window-session".to_string(), cx);
+
+            let mut task_env = HashMap::default();
+            task_env.insert("HERDR_SESSION".to_string(), "task-session".to_string());
+            apply_herdr_session_env(&mut task_env, false, Some(42), cx);
+
+            assert_eq!(
+                task_env.get("HERDR_SESSION"),
+                Some(&"window-session".to_string()),
+                "window-owned sessions must win after task environment composition"
+            );
+        });
+    }
 
     fn prepared_cmd_task(command_arg: &str) -> SpawnInTerminal {
         SpawnInTerminal {

@@ -220,11 +220,12 @@ impl TerminalView {
     ) {
         let local = action.local;
         let working_directory = default_working_directory(workspace, cx);
+        let window_id = window.window_handle().window_id().as_u64();
         TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
             if local {
-                project.create_local_terminal(cx)
+                project.create_local_terminal_in_window(window_id, cx)
             } else {
-                project.create_terminal_shell(working_directory, cx)
+                project.create_terminal_shell_in_window(working_directory, window_id, cx)
             }
         })
         .detach_and_log_err(cx);

@@ -2678,8 +2678,9 @@ impl AgentPanel {
             None
         };
         let session_locator = session.as_ref().map(|(_, locator)| locator.clone());
+        let window_id = window.window_handle().window_id().as_u64();
         let terminal_task = self.project.update(cx, |project, cx| {
-            project.create_terminal_shell(working_directory, cx)
+            project.create_terminal_shell_in_window(working_directory, window_id, cx)
         });
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;

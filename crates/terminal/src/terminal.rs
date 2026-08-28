@@ -93,6 +93,28 @@ impl HeadlessTerminal {
     }
 }
 
+#[derive(Default)]
+struct HerdrSessionsByWindow(HashMap<u64, String>);
+
+impl gpui::Global for HerdrSessionsByWindow {}
+
+pub fn set_herdr_session_for_window(window_id: u64, session_name: String, cx: &mut App) {
+    cx.default_global::<HerdrSessionsByWindow>()
+        .0
+        .insert(window_id, session_name);
+}
+
+pub fn clear_herdr_session_for_window(window_id: u64, cx: &mut App) {
+    if cx.try_global::<HerdrSessionsByWindow>().is_some() {
+        cx.global_mut::<HerdrSessionsByWindow>().0.remove(&window_id);
+    }
+}
+
+pub fn herdr_session_for_window(window_id: u64, cx: &App) -> Option<String> {
+    cx.try_global::<HerdrSessionsByWindow>()
+        .and_then(|sessions| sessions.0.get(&window_id).cloned())
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Scroll {
     Delta(i32),
@@ -2203,6 +2225,11 @@ impl Terminal {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub fn environment(&self) -> &HashMap<String, String> {
+        &self.template.env
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn take_input_log(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.input_log)
     }
@@ -3528,6 +3555,31 @@ mod tests {
     use parking_lot::Mutex;
     use rand::{Rng, distr, rngs::StdRng};
     use task::{Shell, ShellBuilder};
+
+    #[gpui::test]
+    async fn herdr_sessions_are_scoped_to_their_windows(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            set_herdr_session_for_window(1, "first-window".to_string(), cx);
+            set_herdr_session_for_window(2, "second-window".to_string(), cx);
+
+            assert_eq!(
+                herdr_session_for_window(1, cx),
+                Some("first-window".to_string())
+            );
+            assert_eq!(
+                herdr_session_for_window(2, cx),
+                Some("second-window".to_string())
+            );
+
+            clear_herdr_session_for_window(1, cx);
+
+            assert_eq!(herdr_session_for_window(1, cx), None);
+            assert_eq!(
+                herdr_session_for_window(2, cx),
+                Some("second-window".to_string())
+            );
+        });
+    }
 
     #[test]
     fn test_init_command_startup_marker_commands_do_not_contain_marker() {

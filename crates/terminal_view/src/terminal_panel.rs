@@ -569,6 +569,7 @@ impl TerminalPanel {
         } else {
             false
         };
+        let window_id = window.window_handle().window_id().as_u64();
         cx.spawn_in(window, async move |panel, cx| {
             let terminal = project
                 .update(cx, |project, cx| match terminal_view {
@@ -577,7 +578,11 @@ impl TerminalPanel {
                         cx,
                         working_directory,
                     ),
-                    None => project.create_terminal_shell(working_directory, cx),
+                    None => project.create_terminal_shell_in_window(
+                        working_directory,
+                        window_id,
+                        cx,
+                    ),
                 })
                 .await
                 .log_err()?;
@@ -719,12 +724,13 @@ impl TerminalPanel {
     ) -> Task<Result<WeakEntity<Terminal>>> {
         let reveal = spawn_task.reveal;
         let reveal_target = spawn_task.reveal_target;
+        let window_id = window.window_handle().window_id().as_u64();
         match reveal_target {
             RevealTarget::Center => self
                 .workspace
                 .update(cx, |workspace, cx| {
-                    Self::add_center_terminal(workspace, window, cx, |project, cx| {
-                        project.create_terminal_task(spawn_task, cx)
+                    Self::add_center_terminal(workspace, window, cx, move |project, cx| {
+                        project.create_terminal_task_in_window(spawn_task, window_id, cx)
                     })
                 })
                 .unwrap_or_else(|e| Task::ready(Err(e))),
@@ -749,17 +755,17 @@ impl TerminalPanel {
         if center_pane_has_focus && active_center_item_is_terminal {
             let working_directory = default_working_directory(workspace, cx);
             let local = action.local;
+            let window_id = window.window_handle().window_id().as_u64();
             Self::add_center_terminal(workspace, window, cx, move |project, cx| {
                 if local {
-                    project.create_local_terminal(cx)
+                    project.create_local_terminal_in_window(window_id, cx)
                 } else {
-                    project.create_terminal_shell(working_directory, cx)
+                    project.create_terminal_shell_in_window(working_directory, window_id, cx)
                 }
             })
             .detach_and_log_err(cx);
             return;
         }
-
         let Some(terminal_panel) = workspace.panel::<Self>(cx) else {
             return;
         };
@@ -886,13 +892,16 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
         let workspace = self.workspace.clone();
+        let window_id = window.window_handle().window_id().as_u64();
         self.spawn_pending_terminal(window, cx, async move |terminal_panel, cx| {
             if workspace.update(cx, |workspace, cx| !is_enabled_in_workspace(workspace, cx))? {
                 anyhow::bail!("terminal not yet supported for remote projects");
             }
             let project = workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
             let terminal = project
-                .update(cx, |project, cx| project.create_terminal_task(task, cx))
+                .update(cx, |project, cx| {
+                    project.create_terminal_task_in_window(task, window_id, cx)
+                })
                 .await?;
             let pane = terminal_panel
                 .read_with(cx, |terminal_panel, _| terminal_panel.active_pane.clone())?;
@@ -938,6 +947,7 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
         let workspace = self.workspace.clone();
+        let window_id = window.window_handle().window_id().as_u64();
         self.spawn_pending_terminal(window, cx, async move |terminal_panel, cx| {
             if workspace.update(cx, |workspace, cx| !is_enabled_in_workspace(workspace, cx))? {
                 anyhow::bail!("terminal not yet supported for collaborative projects");
@@ -945,11 +955,15 @@ impl TerminalPanel {
             let project = workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
             let terminal = if force_local {
                 project
-                    .update(cx, |project, cx| project.create_local_terminal(cx))
+                    .update(cx, |project, cx| {
+                        project.create_local_terminal_in_window(window_id, cx)
+                    })
                     .await
             } else {
                 project
-                    .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
+                    .update(cx, |project, cx| {
+                        project.create_terminal_shell_in_window(cwd, window_id, cx)
+                    })
                     .await
             };
 
@@ -1104,6 +1118,7 @@ impl TerminalPanel {
     ) -> Task<Result<WeakEntity<Terminal>>> {
         let reveal = spawn_task.reveal;
         let task_workspace = self.workspace.clone();
+        let window_id = window.window_handle().window_id().as_u64();
         cx.spawn_in(window, async move |terminal_panel, cx| {
             let project = terminal_panel.update(cx, |this, cx| {
                 this.workspace
@@ -1111,7 +1126,7 @@ impl TerminalPanel {
             })??;
             let new_terminal = project
                 .update(cx, |project, cx| {
-                    project.create_terminal_task(spawn_task, cx)
+                    project.create_terminal_task_in_window(spawn_task, window_id, cx)
                 })
                 .await?;
             terminal_to_replace.update_in(cx, |terminal_to_replace, window, cx| {
@@ -2487,10 +2502,59 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn terminal_panel_shell_uses_its_window_herdr_session(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let window_id = window_handle.window_id().as_u64();
+        cx.update(|cx| {
+            terminal::set_herdr_session_for_window(window_id, "panel-session".to_string(), cx);
+        });
+
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |terminal_panel, cx| {
+                    terminal_panel.add_terminal_shell(
+                        false,
+                        None,
+                        RevealStrategy::Never,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("terminal panel should create a shell")
+            .await
+            .expect("terminal panel shell should start");
+
+        let terminal = terminal_panel
+            .read_with(cx, |terminal_panel, cx| {
+                terminal_panel
+                    .active_pane
+                    .read(cx)
+                    .active_item()
+                    .and_then(|item| item.downcast::<TerminalView>())
+                    .expect("terminal panel should retain its terminal view")
+                    .read(cx)
+                    .terminal()
+                    .clone()
+            });
+
+        assert_eq!(
+            terminal.read_with(cx, |terminal, _| {
+                terminal.environment().get("HERDR_SESSION").cloned()
+            }),
+            Some("panel-session".to_string())
+        );
+    }
+
     struct FocusOnlyModal {
         focus_handle: gpui::FocusHandle,
     }
     impl gpui::EventEmitter<gpui::DismissEvent> for FocusOnlyModal {}
+
     impl gpui::Focusable for FocusOnlyModal {
         fn focus_handle(&self, _: &gpui::App) -> gpui::FocusHandle {
             self.focus_handle.clone()
