@@ -14,6 +14,7 @@ pub(crate) mod herdr_bridge;
 pub(crate) mod herdr_transport;
 pub(crate) mod herdr_mapping_store;
 pub(crate) mod herdr_state;
+mod herdr_ownership;
 pub(crate) mod conversation_view;
 mod herdr_conversation_view;
 mod herdr_thread_view;
@@ -637,6 +638,7 @@ pub fn init(
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
     herdr_bridge::HerdrBridgeRegistry::init(cx);
+    herdr_ownership::init(cx);
     terminal_thread_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);

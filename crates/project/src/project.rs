@@ -432,6 +432,7 @@ pub enum Event {
     BufferEdited {
         source: BufferEditSource,
     },
+    TerminalAdded,
 }
 
 pub struct AgentLocationChanged;

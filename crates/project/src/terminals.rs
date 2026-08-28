@@ -23,7 +23,7 @@ use util::{
     command::new_std_command, get_default_system_shell, get_system_shell, maybe, rel_path::RelPath,
 };
 
-use crate::{Project, ProjectPath};
+use crate::{Event, Project, ProjectPath};
 
 pub struct Terminals {
     pub(crate) local_handles: Vec<WeakEntity<terminal::Terminal>>,
@@ -287,6 +287,7 @@ impl Project {
                 this.terminals
                     .local_handles
                     .push(terminal_handle.downgrade());
+                cx.emit(Event::TerminalAdded);
 
                 let id = terminal_handle.entity_id();
                 cx.observe_release(&terminal_handle, move |project, _terminal, cx| {
@@ -484,6 +485,7 @@ impl Project {
                 this.terminals
                     .local_handles
                     .push(terminal_handle.downgrade());
+                cx.emit(Event::TerminalAdded);
 
                 let id = terminal_handle.entity_id();
                 cx.observe_release(&terminal_handle, move |project, _terminal, cx| {
@@ -531,6 +533,7 @@ impl Project {
                     .terminals
                     .local_handles
                     .push(terminal_handle.downgrade());
+                cx.emit(Event::TerminalAdded);
 
                 let id = terminal_handle.entity_id();
                 cx.observe_release(&terminal_handle, move |project, _terminal, cx| {
@@ -783,7 +786,7 @@ mod tests {
     use gpui::TestAppContext;
     use pretty_assertions::assert_eq;
     use settings::{Settings as _, SettingsStore};
-    use std::{path::Path, sync::Arc};
+    use std::{cell::Cell, path::Path, rc::Rc, sync::Arc};
 
     fn terminal_exit_command() -> (String, Vec<String>) {
         if cfg!(windows) {
@@ -876,6 +879,48 @@ mod tests {
             )
         });
         (project, ping_handler)
+    }
+
+    #[gpui::test]
+    async fn terminal_added_emits_once_for_each_creation_path(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_terminal_test(cx, true);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let terminal_added_count = Rc::new(Cell::new(0));
+        let terminal_added_count_ref = terminal_added_count.clone();
+        cx.update(|cx| {
+            cx.subscribe(&project, move |_, event: &crate::Event, _cx| {
+                if matches!(event, crate::Event::TerminalAdded) {
+                    terminal_added_count_ref.set(terminal_added_count_ref.get() + 1);
+                }
+            })
+            .detach();
+        });
+
+        project
+            .update(cx, |project, cx| {
+                project.create_terminal_task(SpawnInTerminal::default(), cx)
+            })
+            .unwrap()
+            .await
+            .expect("task terminal should start");
+        assert_eq!(terminal_added_count.get(), 1);
+
+        let shell_terminal = project
+            .update(cx, |project, cx| project.create_terminal_shell(None, cx))
+            .unwrap()
+            .await
+            .expect("shell terminal should start");
+        assert_eq!(terminal_added_count.get(), 2);
+
+        project
+            .update(cx, |project, cx| project.clone_terminal(&shell_terminal, cx, None))
+            .unwrap()
+            .await
+            .expect("cloned terminal should start");
+        assert_eq!(terminal_added_count.get(), 3);
     }
 
     #[gpui::test]
