@@ -1456,14 +1456,66 @@ pub(crate) async fn restore_or_create_workspace(
                         .collect::<Vec<_>>();
                     let state = multi_workspace.state.clone();
                     async {
-                        let window = open_remote_project(
-                            connection_options,
-                            paths,
+                        let workspace_position = cx
+                            .update(|cx| {
+                                workspace::remote_workspace_position_from_db(
+                                    connection_options.clone(),
+                                    &paths,
+                                    cx,
+                                )
+                            })
+                            .await?;
+                        let restored_window = workspace::open_new_with_restored_state(
                             app_state.clone(),
-                            workspace::OpenOptions::default(),
+                            state.clone(),
+                            workspace_position,
                             cx,
                         )
                         .await?;
+                        let window = match open_remote_project(
+                            connection_options,
+                            paths,
+                            app_state.clone(),
+                            workspace::OpenOptions {
+                                requesting_window: Some(restored_window),
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                        .await
+                        {
+                            Ok(window) => window,
+                            Err(error) => {
+                                restored_window
+                                    .update(cx, |_, window, _cx| window.remove_window())
+                                    .ok();
+                                return Err(error);
+                            }
+                        };
+                        // A cancelled connection leaves a requesting window alive,
+                        // unlike the fresh-window path, so remove it explicitly.
+                        if window != restored_window {
+                            restored_window
+                                .update(cx, |_, window, _cx| window.remove_window())
+                                .ok();
+                        }
+                        let has_remote_workspace = window
+                            .update(cx, |multi_workspace, _, cx| {
+                                multi_workspace.workspaces().any(|workspace| {
+                                    workspace
+                                        .read(cx)
+                                        .project()
+                                        .read(cx)
+                                        .is_via_remote_server()
+                                })
+                            })
+                            .unwrap_or(false);
+                        if !has_remote_workspace {
+                            window
+                                .update(cx, |_, window, _cx| window.remove_window())
+                                .ok();
+                            return Ok(());
+                        }
                         workspace::apply_restored_multiworkspace_state(
                             window,
                             &state,
@@ -1471,6 +1523,11 @@ pub(crate) async fn restore_or_create_workspace(
                             cx,
                         )
                         .await;
+                        if let Ok(task) = window.update(cx, |multi_workspace, _window, _cx| {
+                            multi_workspace.flush_serialization()
+                        }) {
+                            task.await;
+                        }
                         Ok::<(), anyhow::Error>(())
                     }
                     .await

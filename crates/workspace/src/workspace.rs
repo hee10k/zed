@@ -10882,6 +10882,80 @@ pub fn open_paths(
     })
 }
 
+/// Opens the local placeholder window used while restoring a remote workspace.
+///
+/// The Herdr fields are installed while `MultiWorkspace` is constructed, before
+/// any startup observer can inspect the window. Persisting the complete restored
+/// state here also makes the new runtime window ID durable before remote startup
+/// begins.
+pub async fn open_new_with_restored_state(
+    app_state: Arc<AppState>,
+    restored_state: MultiWorkspaceState,
+    workspace_position: WorkspacePosition,
+    cx: &mut AsyncApp,
+) -> Result<WindowHandle<MultiWorkspace>> {
+    let WorkspacePosition {
+        window_bounds,
+        display,
+        centered_layout,
+    } = workspace_position;
+    let (herdr_session_name, herdr_owned) = (
+        restored_state.herdr_session_name.clone(),
+        restored_state.herdr_owned,
+    );
+
+    let (window, window_id, kvp) = cx.update(|cx| -> Result<_> {
+        let project = Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        );
+        let mut options = (app_state.build_window_options)(display, cx);
+        options.window_bounds = window_bounds;
+        let app_state_for_window = app_state.clone();
+        let window = cx.open_window(options, move |window, cx| {
+            let workspace = cx.new(|cx| {
+                let mut workspace = Workspace::new(
+                    None,
+                    project,
+                    app_state_for_window,
+                    window,
+                    cx,
+                );
+                workspace.centered_layout = centered_layout;
+                workspace
+            });
+            cx.new(|cx| {
+                MultiWorkspace::new_with_herdr_state(
+                    workspace,
+                    herdr_session_name,
+                    herdr_owned,
+                    window,
+                    cx,
+                )
+            })
+        })?;
+        let window_id = window.update(cx, |_, window, _cx| window.window_handle().window_id())?;
+        let kvp = db::kvp::KeyValueStore::global(cx);
+        Ok((window, window_id, kvp))
+    })?;
+
+    cx.background_spawn(async move {
+        persistence::write_multi_workspace_state(&kvp, window_id, restored_state).await;
+    })
+    .await;
+
+    Ok(window)
+}
+
 pub fn open_new(
     open_options: OpenOptions,
     app_state: Arc<AppState>,
@@ -11886,6 +11960,86 @@ mod tests {
     use settings::SettingsStore;
     use util::path;
     use util::rel_path::rel_path;
+
+    #[gpui::test]
+    async fn restored_remote_workspace_state_is_ready_before_connection(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let app_state = cx.update(AppState::test);
+        let fs = app_state.fs.clone();
+        let restored_state = MultiWorkspaceState {
+            herdr_session_name: Some("zed-remote-restored".to_string()),
+            herdr_owned: true,
+            ..Default::default()
+        };
+
+        let observed_session_name = Rc::new(RefCell::new(None));
+        let observed_session_name_for_observer = observed_session_name.clone();
+        cx.update(|cx| {
+            cx.observe_new(
+                move |multi_workspace: &mut MultiWorkspace, _window, _cx| {
+                    if multi_workspace.herdr_session_name().is_some() {
+                        *observed_session_name_for_observer.borrow_mut() =
+                            multi_workspace.herdr_session_name().map(str::to_owned);
+                    }
+                },
+            )
+            .detach();
+        });
+
+        let mut async_cx = cx.to_async();
+        let window = open_new_with_restored_state(
+            app_state,
+            restored_state.clone(),
+            WorkspacePosition {
+                window_bounds: None,
+                display: None,
+                centered_layout: false,
+            },
+            &mut async_cx,
+        )
+        .await
+        .expect("restored remote workspace placeholder should open");
+
+        assert_eq!(
+            observed_session_name.borrow().as_deref(),
+            Some("zed-remote-restored"),
+            "remote startup observers must see restored Herdr state before connection",
+        );
+        apply_restored_multiworkspace_state(window, &restored_state, fs, &mut async_cx).await;
+        let serialize_task = window
+            .update(cx, |multi_workspace, _window, _cx| {
+                multi_workspace.flush_serialization()
+            })
+            .expect("restored state serialization should be available");
+        serialize_task.await;
+
+
+        let window_id = window
+            .update(cx, |_, window, _cx| window.window_handle().window_id())
+            .expect("window id should be available");
+        let kvp = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
+        let persisted_state = cx
+            .update(|_| {
+                kvp.scoped("multi_workspace_state")
+                    .read(&window_id.as_u64().to_string())
+            })
+            .expect("restored state should be serialized")
+            .map(|json| serde_json::from_str::<MultiWorkspaceState>(&json))
+            .transpose()
+            .expect("restored state should be valid JSON")
+            .expect("restored state should be present");
+        assert_eq!(
+            persisted_state.herdr_session_name.as_deref(),
+            Some("zed-remote-restored"),
+            "restored Herdr state must be durable before remote connection starts",
+        );
+        assert!(
+            persisted_state.herdr_owned,
+            "restored Herdr ownership must be durable before remote connection starts",
+        );
+    }
 
     #[gpui::test]
     async fn test_tab_disambiguation(cx: &mut TestAppContext) {
