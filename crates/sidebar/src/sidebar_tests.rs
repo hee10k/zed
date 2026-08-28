@@ -15245,3 +15245,268 @@ async fn test_find_or_create_workspace_returns_the_created_remote_workspace(
         "the local workspace should have re-activated during the open"
     );
 }
+
+mod herdr_workspace_routing {
+    use super::*;
+    use agent_ui::{AgentPanel, TestHerdrInboundEvent, ThreadId};
+    use gpui::{Entity, VisualTestContext};
+    use project::Project;
+    use workspace::{MultiWorkspace, Workspace};
+
+    async fn init_routing_project(cx: &mut TestAppContext, root: &str) -> Entity<Project> {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(root, serde_json::json!({ "src": {} }))
+            .await;
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        Project::test(fs, [std::path::Path::new(root)], cx).await
+    }
+
+    struct RoutingFixture {
+        multi_workspace: Entity<MultiWorkspace>,
+        workspace_a: Entity<Workspace>,
+        workspace_b: Entity<Workspace>,
+        panel_a: Entity<AgentPanel>,
+        panel_b: Entity<AgentPanel>,
+    }
+
+    async fn build_routing_fixture(
+        cx: &mut TestAppContext,
+        root_a: &str,
+        root_b: &str,
+    ) -> RoutingFixture {
+        init_test(cx);
+        let project_a = init_routing_project(cx, root_a).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+        let workspace_a = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone())
+            .unwrap();
+        let project_b = init_routing_project(cx, root_b).await;
+        let workspace_b = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(project_b.clone(), window, cx)
+            })
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel_a = workspace_a.update_in(&mut cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::test_new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        let panel_b = workspace_b.update_in(&mut cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::test_new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        RoutingFixture {
+            multi_workspace,
+            workspace_a,
+            workspace_b,
+            panel_a,
+            panel_b,
+        }
+    }
+
+    /// Seeds `install_test_herdr_root` on panel_a and shares the bridge with
+    /// panel_b, then returns the mapped root thread id.
+    async fn seed_shared_root(
+        fixture: &RoutingFixture,
+        workspace_id: &str,
+        root_path: &str,
+        cx: &mut VisualTestContext,
+    ) -> ThreadId {
+        fixture.panel_a.update_in(cx, |panel, _window, cx| {
+            panel.install_test_herdr_root(workspace_id, root_path, "Root", cx);
+        });
+        fixture.panel_b.update(cx, |panel, _cx| {
+            panel.share_test_herdr_bridge(&fixture.panel_a, cx);
+        });
+        fixture
+            .panel_a
+            .read_with(cx, |panel, cx| {
+                panel.herdr_root_thread_id(workspace_id, cx)
+            })
+            .expect("the seeded root should map a thread")
+    }
+
+    fn dispatch(
+        panel: &Entity<AgentPanel>,
+        event: &TestHerdrInboundEvent,
+        cx: &mut VisualTestContext,
+    ) {
+        panel.update_in(cx, |panel, window, cx| {
+            panel.test_dispatch_herdr_inbound(event.clone(), window, cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn herdr_workspace_routing_prefers_the_persisted_owner_workspace_id(
+        cx: &mut TestAppContext,
+    ) {
+        // Both workspaces share the same root path, so path identity alone is
+        // ambiguous; the persisted `zed_workspace_id` must pick workspace_b.
+        let fixture = build_routing_fixture(cx, "/repo", "/repo").await;
+        let mut cx = VisualTestContext::from_window(fixture.multi_workspace.clone().into(), cx);
+        let thread_id = seed_shared_root(&fixture, "w1", "/repo", &mut cx).await;
+
+        fixture.workspace_a.update(cx, |workspace, _| {
+            workspace.set_random_database_id();
+        });
+        fixture.workspace_b.update(cx, |workspace, _| {
+            workspace.set_random_database_id();
+        });
+        let id_b = fixture
+            .workspace_b
+            .read_with(cx, |workspace, _| workspace.database_id())
+            .expect("workspace_b should have a database id");
+        let bound = fixture.panel_a.update_in(&mut cx, |panel, _window, cx| {
+            panel.test_set_root_zed_workspace_id("w1", id_b, cx)
+        });
+        assert!(bound, "the seeded root should accept its owning workspace id");
+
+        // A live bridge fanout delivers the event to every panel.
+        dispatch(
+            &fixture.panel_b,
+            &TestHerdrInboundEvent::RootFocused {
+                workspace_id: "w1".to_string(),
+            },
+            &mut cx,
+        );
+        dispatch(
+            &fixture.panel_a,
+            &TestHerdrInboundEvent::RootFocused {
+                workspace_id: "w1".to_string(),
+            },
+            &mut cx,
+        );
+
+        assert_eq!(
+            fixture.panel_b.read_with(&cx, |panel, _| panel.test_herdr_active_thread()),
+            Some(thread_id),
+            "the persisted owner workspace must activate the root"
+        );
+        assert_eq!(
+            fixture.panel_a.read_with(&cx, |panel, _| panel.test_herdr_active_thread()),
+            None,
+            "the non-owned workspace must not activate an id-owned root"
+        );
+        assert_eq!(
+            fixture
+                .panel_a
+                .update_in(&mut cx, |panel, _window, cx| panel.test_take_herdr_conflicts(cx)),
+            Vec::<(String, String)>::new(),
+            "an id-resolved root must not raise a path ambiguity conflict"
+        );
+    }
+
+    #[gpui::test]
+    async fn herdr_workspace_routing_single_canonical_path_match_activates_the_owner(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = build_routing_fixture(cx, "/repo", "/repo-b").await;
+        let mut cx = VisualTestContext::from_window(fixture.multi_workspace.clone().into(), cx);
+        let thread_id = seed_shared_root(&fixture, "w1", "/repo", &mut cx).await;
+
+        dispatch(
+            &fixture.panel_a,
+            &TestHerdrInboundEvent::RootFocused {
+                workspace_id: "w1".to_string(),
+            },
+            &mut cx,
+        );
+        dispatch(
+            &fixture.panel_b,
+            &TestHerdrInboundEvent::RootFocused {
+                workspace_id: "w1".to_string(),
+            },
+            &mut cx,
+        );
+
+        assert_eq!(
+            fixture.panel_a.read_with(&cx, |panel, _| panel.test_herdr_active_thread()),
+            Some(thread_id),
+            "the single canonical path match must own the root"
+        );
+        assert_eq!(
+            fixture.panel_b.read_with(&cx, |panel, _| panel.test_herdr_active_thread()),
+            None,
+            "a non-matching workspace must not activate"
+        );
+    }
+
+    #[gpui::test]
+    async fn herdr_workspace_routing_zero_path_matches_leaves_the_root_disconnected(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = build_routing_fixture(cx, "/repo", "/repo-b").await;
+        let mut cx = VisualTestContext::from_window(fixture.multi_workspace.clone().into(), cx);
+        let _thread_id = seed_shared_root(&fixture, "w-nowhere", "/nowhere", &mut cx).await;
+
+        dispatch(
+            &fixture.panel_a,
+            &TestHerdrInboundEvent::RootFocused {
+                workspace_id: "w-nowhere".to_string(),
+            },
+            &mut cx,
+        );
+        dispatch(
+            &fixture.panel_b,
+            &TestHerdrInboundEvent::RootFocused {
+                workspace_id: "w-nowhere".to_string(),
+            },
+            &mut cx,
+        );
+
+        assert_eq!(
+            fixture.panel_a.read_with(&cx, |panel, _| panel.test_herdr_active_thread()),
+            None,
+            "a root with no matching workspace must stay disconnected"
+        );
+        assert_eq!(
+            fixture.panel_b.read_with(&cx, |panel, _| panel.test_herdr_active_thread()),
+            None
+        );
+    }
+
+    #[gpui::test]
+    async fn herdr_workspace_routing_multiple_path_matches_emit_conflict_without_activation(
+        cx: &mut TestAppContext,
+    ) {
+        // Both workspaces share `/repo`, so canonical path identity is
+        // ambiguous and neither may activate.
+        let fixture = build_routing_fixture(cx, "/repo", "/repo").await;
+        let mut cx = VisualTestContext::from_window(fixture.multi_workspace.clone().into(), cx);
+        let _thread_id = seed_shared_root(&fixture, "w1", "/repo", &mut cx).await;
+
+        dispatch(
+            &fixture.panel_a,
+            &TestHerdrInboundEvent::RootFocused {
+                workspace_id: "w1".to_string(),
+            },
+            &mut cx,
+        );
+        dispatch(
+            &fixture.panel_b,
+            &TestHerdrInboundEvent::RootFocused {
+                workspace_id: "w1".to_string(),
+            },
+            &mut cx,
+        );
+
+        assert_eq!(
+            fixture.panel_a.read_with(&cx, |panel, _| panel.test_herdr_active_thread()),
+            None,
+            "an ambiguous root must not activate either workspace"
+        );
+        assert_eq!(
+            fixture.panel_b.read_with(&cx, |panel, _| panel.test_herdr_active_thread()),
+            None
+        );
+        let conflicts = fixture
+            .panel_a
+            .update_in(&mut cx, |panel, _window, cx| panel.test_take_herdr_conflicts(cx));
+        assert_eq!(conflicts.len(), 1, "one ambiguity conflict must be emitted");
+        assert_eq!(conflicts[0].0, "w1");
+        assert!(!conflicts[0].1.is_empty());
+    }
+}

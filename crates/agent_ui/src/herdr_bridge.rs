@@ -443,8 +443,31 @@ impl HerdrThreadBridge {
             .and_then(|metadata| metadata.title().map(|title| title.to_string()))
     }
 
+    /// Publishes a Conflict event for `key`. Duplicate conflicts for the same
     pub(crate) fn take_events(&mut self) -> Vec<HerdrBridgeEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// key that are still pending are coalesced so a synchronous fanout of
+    /// routing decisions emits at most one event.
+    pub(crate) fn emit_conflict(
+        &mut self,
+        key: HerdrMappingKey,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        let already_pending = self.events.iter().any(|event| {
+            matches!(
+                event,
+                HerdrBridgeEvent::Conflict { key: pending, .. } if *pending == key
+            )
+        });
+        if already_pending {
+            return;
+        }
+        let event = HerdrBridgeEvent::Conflict { key, message };
+        self.events.push(event.clone());
+        cx.emit(event);
     }
 
     pub(crate) fn take_outbound_requests(&mut self) -> Vec<OutboundRequest> {
@@ -4991,4 +5014,38 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    async fn emit_conflict_coalesces_duplicate_pending_events(cx: &mut gpui::TestAppContext) {
+        let bridge = cx.new(|_| test_bridge());
+        bridge.update(cx, |bridge, _cx| {
+            bridge.apply_event(workspace_created("w1", "/repo", "Review"));
+            bridge.take_events();
+        });
+
+        let key = HerdrMappingKey::workspace("alpha", "w1");
+        bridge.update(cx, |bridge, cx| {
+            bridge.emit_conflict(key.clone(), "first".to_string(), cx);
+            // A duplicate while the first is still pending must be coalesced.
+            bridge.emit_conflict(key.clone(), "second".to_string(), cx);
+        });
+        let events = bridge.update(cx, |bridge, _cx| bridge.take_events());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            HerdrBridgeEvent::Conflict { key: pending, message }
+                if *pending == key && message == "first"
+        ));
+
+        // After draining, a new conflict for the same key is emitted again.
+        bridge.update(cx, |bridge, cx| {
+            bridge.emit_conflict(key.clone(), "third".to_string(), cx);
+        });
+        let events = bridge.update(cx, |bridge, _cx| bridge.take_events());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            HerdrBridgeEvent::Conflict { key: pending, message }
+                if *pending == key && message == "third"
+        ));
+    }
 }

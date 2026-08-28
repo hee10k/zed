@@ -25,7 +25,7 @@ use project::{AgentId, ProjectItem, WorktreeId};
 use serde::{Deserialize, Serialize};
 
 use zed_actions::{
-    DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
+    DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize, RevealTarget,
     agent::{
         AddSelectionToThread, ConflictContent, LogoutAgent, NewOmpTerminal, OpenSettings,
         ReauthenticateAgent, ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
@@ -49,7 +49,8 @@ use crate::thread_metadata_store::{
     ActivityStatus, HERDR_AGENT_ID, ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent,
 };
 use crate::herdr_bridge::{
-    HerdrBridgeEvent, HerdrBridgeRegistry, HerdrConnectionStatus, HerdrThreadBridge,
+    HerdrBridgeEvent, HerdrBridgeRegistry, HerdrConnectionStatus, HerdrOwnerProcess,
+    HerdrSessionSelection, HerdrThreadBridge,
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::herdr_bridge::RecordingHerdrApi;
@@ -60,7 +61,7 @@ use crate::thread_group::{
 use crate::terminal_resume::{build_resume_command, resume_comment};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ConnectHerdrSession, ExternalSourcePrompt,
-    NewExternalAgentThread, NewNativeAgentThreadFromSummary,
+    NewExternalAgentThread, NewNativeAgentThreadFromSummary, OpenHerdr,
 };
 use crate::worktree_lifecycle::{
     WorktreeLifecycleCoordinator, WorktreeLifecycleKey, WorktreeLifecycleStore,
@@ -107,9 +108,10 @@ use notifications::status_toast::StatusToast;
 use project::{Project, ProjectPath, Worktree};
 use settings::TerminalDockPosition;
 use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
+use task::{RevealStrategy, SpawnInTerminal};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
-use terminal::{Event as TerminalEvent, terminal_settings::TerminalSettings};
+use terminal::{Event as TerminalEvent, set_herdr_session_for_window, terminal_settings::TerminalSettings};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
@@ -538,6 +540,14 @@ pub fn init(cx: &mut App) {
                             )
                         });
                         workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
+                })
+                .register_action(|workspace, _: &OpenHerdr, window, cx| {
+                    workspace.focus_panel::<AgentPanel>(window, cx);
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.open_herdr(window, cx);
+                        });
                     }
                 })
                 .register_action(|workspace, _: &ConnectHerdrSession, window, cx| {
@@ -5474,7 +5484,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(bridge) = self.herdr_bridge.as_ref() else {
+        let Some(bridge) = self.herdr_bridge.clone() else {
             return false;
         };
         let Some(metadata) = bridge.read(cx).root_metadata(herdr_workspace_id).cloned() else {
@@ -5483,32 +5493,81 @@ impl AgentPanel {
         let herdr_paths = metadata.folder_paths().paths();
         let current_workspace = self.workspace.upgrade();
         let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() else {
-            return current_workspace.is_some_and(|workspace| {
-                let paths = workspace.read(cx).root_paths(cx);
-                !herdr_paths.is_empty()
-                    && paths.iter().any(|path| {
-                        herdr_paths
-                            .iter()
-                            .any(|herdr_path| herdr_path.as_path() == path.as_ref())
-                    })
-            });
-        };
-        let workspaces = multi_workspace
-            .read(cx)
-            .workspaces()
-            .cloned()
-            .collect::<Vec<_>>();
-        let owner = workspaces.iter().find(|workspace| {
-            let paths = workspace.read(cx).root_paths(cx);
-            !herdr_paths.is_empty()
-                && paths.iter().any(|path| {
+            // No MultiWorkspace: this panel's own workspace is the only
+            // candidate. Accept it when the persisted owner id or its paths
+            // match the root.
+            let Some(current_workspace) = current_workspace else {
+                return false;
+            };
+            let id_owned = bridge
+                .read(cx)
+                .root_zed_workspace_id(herdr_workspace_id)
+                .is_some_and(|id| current_workspace.read(cx).database_id() == Some(id));
+            let paths_match = !herdr_paths.is_empty()
+                && current_workspace.read(cx).root_paths(cx).iter().any(|path| {
                     herdr_paths
                         .iter()
                         .any(|herdr_path| herdr_path.as_path() == path.as_ref())
-                })
-        });
-        let Some(owner) = owner.cloned() else {
-            return false;
+                });
+            return id_owned || paths_match;
+        };
+
+        // A persisted owning workspace id binds the root to exactly one
+        // workspace, even when several open workspaces share its paths.
+        let persisted_owner = bridge
+            .read(cx)
+            .root_zed_workspace_id(herdr_workspace_id)
+            .and_then(|id| multi_workspace.read(cx).workspace_for_database_id(id, cx));
+        let owner = match persisted_owner {
+            Some(owner) => owner,
+            None => {
+                // Canonical path identity. Require exactly one matching
+                // workspace: zero matches leaves the root disconnected,
+                // several matches is a mapping conflict and activates none.
+                let herdr_path_list = project::WorktreePaths::from_folder_paths(metadata.folder_paths());
+                let herdr_key =
+                    project::ProjectGroupKey::from_worktree_paths(&herdr_path_list, None);
+                let mut matches = multi_workspace
+                    .read(cx)
+                    .workspaces()
+                    .filter(|workspace| {
+                        workspace.read(cx).project_group_key(cx).matches(&herdr_key)
+                    })
+                    .cloned();
+                let first = matches.next();
+                match first {
+                    None => return false,
+                    Some(only) if matches.next().is_none() => only,
+                    Some(_) => {
+                        let message = format!(
+                            "Herdr workspace {herdr_workspace_id:?} matches multiple open Zed \
+                             workspaces; no workspace was routed"
+                        );
+                        if let Some(key) = bridge
+                            .read(cx)
+                            .root_mapping(herdr_workspace_id)
+                            .map(|record| record.key.clone())
+                        {
+                            let _ = bridge.update(cx, |bridge, cx| {
+                                bridge.emit_conflict(key, message.clone(), cx);
+                            });
+                        }
+                        // Only the displayed workspace surfaces the conflict
+                        // so a multi-panel fanout shows exactly one toast.
+                        if multi_workspace.read(cx).workspace().entity_id()
+                            == current_workspace.as_ref().map(|workspace| workspace.entity_id())
+                        {
+                            self.herdr_conflict_active = true;
+                            Self::show_herdr_toast(
+                                &self.workspace,
+                                format!("Herdr mapping conflict: {message}"),
+                                cx,
+                            );
+                        }
+                        return false;
+                    }
+                }
+            }
         };
         let lazy_key = HerdrLazyOwnerForwardKey {
             window_id: window.window_handle().window_id(),
@@ -5944,6 +6003,143 @@ impl AgentPanel {
         true
     }
 
+    /// Launches the Herdr server in this window's dedicated named session.
+    ///
+    /// Returns `false`, with exactly one specific error toast, when the
+    /// window has no local project/worktree or already owns an active Herdr
+    /// bridge. An ambient Default bridge is never started: the window's
+    /// named session is reserved and persisted before the terminal spawns,
+    /// and the spawned argv plus the terminal env overlay both carry it.
+    pub fn open_herdr(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.has_open_project(cx) || !self.project.read(cx).is_local() {
+            Self::show_herdr_toast(
+                &self.workspace,
+                "Open Herdr requires a local project with an open worktree",
+                cx,
+            );
+            return false;
+        }
+        let window_id = window.window_handle().window_id();
+        let owner_conflict = cx
+            .try_global::<HerdrBridgeRegistry>()
+            .and_then(|registry| registry.bridge_for_window(window_id, cx))
+            .is_some_and(|bridge| bridge.read(cx).owner().is_some());
+        if owner_conflict {
+            Self::show_herdr_toast(
+                &self.workspace,
+                "Herdr is already running in this window; close it before opening a new session.",
+                cx,
+            );
+            return false;
+        }
+        let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() else {
+            Self::show_herdr_toast(
+                &self.workspace,
+                "Open Herdr is unavailable: no window workspace store is attached.",
+                cx,
+            );
+            return false;
+        };
+
+        // Reserve (and persist) the window's named session before spawning;
+        // the spawned argv and the terminal crate window env overlay both
+        // use the same name so the ownership observer recognizes the launch.
+        let session_name = multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.reserve_herdr_session_name(cx)
+        });
+        set_herdr_session_for_window(window_id.as_u64(), session_name.clone(), cx);
+
+        // Launch `herdr --session <name>` as a task terminal: argv and env
+        // are passed as data (never shell-concatenated), and the window-
+        // aware project path applies the session overlay for local terminals
+        // while keeping the generic terminal observer attached.
+        let spawn = SpawnInTerminal {
+            label: "herdr".to_string(),
+            full_label: "herdr".to_string(),
+            command: Some("herdr".to_string()),
+            args: vec!["--session".to_string(), session_name.clone()],
+            command_label: format!("herdr --session {session_name}"),
+            env: HashMap::from([("HERDR_SESSION".to_string(), session_name.clone())]),
+            use_new_terminal: true,
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Dock,
+            ..Default::default()
+        };
+        let terminal_task = self.project.update(cx, |project, cx| {
+            project.create_terminal_task_in_window(spawn, window_id.as_u64(), cx)
+        });
+        let workspace = self.workspace.clone();
+        let workspace_id = self.workspace_id;
+        let project = self.project.downgrade();
+        let terminal_id = TerminalId::new();
+        let session_for_owner = session_name.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let terminal = match terminal_task.await {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    log::error!("failed to spawn the Herdr terminal: {error:#}");
+                    workspace
+                        .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                        .log_err();
+                    return anyhow::Ok(());
+                }
+            };
+            this.update_in(cx, |this, window, cx| {
+                let terminal_view = cx.new(|cx| {
+                    let mut view = TerminalView::new(
+                        terminal.clone(),
+                        workspace,
+                        workspace_id,
+                        project,
+                        window,
+                        cx,
+                    );
+                    view.set_show_workspace_actions(false, cx);
+                    view
+                });
+                this.insert_terminal(
+                    terminal_id,
+                    terminal_view,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    true,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+                // Pending owner (PID not yet observed): the ownership
+                // observer upgrades it when the Herdr process starts.
+                let owner = HerdrOwnerProcess {
+                    terminal_id: terminal.entity_id(),
+                    process_id: None,
+                    session_name: session_for_owner.clone(),
+                };
+                let activated = cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                    registry.activate_window(
+                        window_id,
+                        HerdrSessionSelection::Named(session_for_owner.clone()),
+                        owner,
+                        cx,
+                    )
+                });
+                if let Err(error) = activated {
+                    Self::show_herdr_toast(
+                        &this.workspace,
+                        format!("Herdr launch failed to acquire window ownership: {error}"),
+                        cx,
+                    );
+                }
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+        true
+    }
+
     /// Creates a new Herdr-backed root via `workspace.create`. The response
     /// itself is reconciled and persisted before the Zed row becomes active;
     /// a separate `RootCreated` event is not required. Returns `false` when
@@ -5984,6 +6180,24 @@ impl AgentPanel {
                             );
                             return;
                         };
+                        // The root was created from this explicit action:
+                        // persist the owning Zed workspace id before the root
+                        // activates so routing resolves the owner by id.
+                        let owner_workspace_id = panel
+                            .workspace
+                            .upgrade()
+                            .and_then(|workspace| workspace.read(cx).database_id());
+                        if let (Some(owner_workspace_id), Some(bridge)) =
+                            (owner_workspace_id, panel.herdr_bridge.as_ref())
+                        {
+                            bridge.update(cx, |bridge, cx| {
+                                bridge.set_root_zed_workspace_id(
+                                    &snapshot.workspace_id,
+                                    owner_workspace_id,
+                                    cx,
+                                )
+                            });
+                        }
                         panel.herdr_focus_suppressed = true;
                         panel.load_herdr_thread(thread_id, true, window, cx);
                         panel.herdr_focus_suppressed = false;
@@ -8555,6 +8769,17 @@ impl Dismissable for TrialEndUpsell {
     const KEY: &'static str = "dismissed-trial-end-upsell";
 }
 
+/// Simplified inbound Herdr bridge events for dependent-crate tests. Mirrors
+/// the crate-private [`HerdrBridgeEvent`] surface without exposing it.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TestHerdrInboundEvent {
+    RootFocused { workspace_id: String },
+    RootClosed { workspace_id: String },
+    RootRenamed { workspace_id: String },
+    Conflict { workspace_id: String },
+}
+
 /// Test-only helper methods
 #[cfg(any(test, feature = "test-support"))]
 impl AgentPanel {
@@ -8605,6 +8830,115 @@ impl AgentPanel {
             .as_ref()
             .map(|api| api.calls())
             .unwrap_or_default()
+    }
+
+    /// The Herdr root thread this panel currently has active, if any.
+    pub fn test_herdr_active_thread(&self) -> Option<ThreadId> {
+        self.herdr_active_thread
+    }
+
+    /// Whether this panel currently surfaces the Herdr conflict state.
+    pub fn test_herdr_conflict_active(&self) -> bool {
+        self.herdr_conflict_active
+    }
+
+    /// Drains conflicts queued on the bound bridge since the last call,
+    /// as `(workspace_id, message)` pairs.
+    pub fn test_take_herdr_conflicts(&mut self, cx: &mut Context<Self>) -> Vec<(String, String)> {
+        let Some(bridge) = self.herdr_bridge.as_ref() else {
+            return Vec::new();
+        };
+        bridge
+            .update(cx, |bridge, _cx| {
+                bridge
+                    .take_events()
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        HerdrBridgeEvent::Conflict { key, message } => {
+                            Some((key.workspace_id, message))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Persists the owning Zed workspace id for a Herdr root, as the
+    /// explicit Open Herdr action does before a created root activates.
+    pub fn test_set_root_zed_workspace_id(
+        &mut self,
+        workspace_id: &str,
+        zed_workspace_id: workspace::WorkspaceId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(bridge) = self.herdr_bridge.as_ref() else {
+            return false;
+        };
+        bridge
+            .update(cx, |bridge, cx| {
+                bridge.set_root_zed_workspace_id(workspace_id, zed_workspace_id, cx)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Dispatches one simplified inbound event through the panel's real
+    /// bridge-event routing path (`handle_herdr_event`), exactly as a live
+    /// bridge subscription would deliver it.
+    pub fn test_dispatch_herdr_inbound(
+        &mut self,
+        event: TestHerdrInboundEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_id_for = |workspace_id: &str| {
+            self.herdr_bridge
+                .as_ref()
+                .and_then(|bridge| bridge.read(cx).root_thread_id(workspace_id))
+                .unwrap_or_else(ThreadId::new)
+        };
+        let bridge_event = match event {
+            TestHerdrInboundEvent::RootFocused { workspace_id } => {
+                let thread_id = thread_id_for(&workspace_id);
+                HerdrBridgeEvent::RootFocused {
+                    workspace_id,
+                    thread_id,
+                }
+            }
+            TestHerdrInboundEvent::RootClosed { workspace_id } => {
+                let thread_id = thread_id_for(&workspace_id);
+                HerdrBridgeEvent::RootClosed {
+                    workspace_id,
+                    thread_id,
+                }
+            }
+            TestHerdrInboundEvent::RootRenamed { workspace_id } => {
+                let thread_id = thread_id_for(&workspace_id);
+                HerdrBridgeEvent::RootRenamed {
+                    workspace_id,
+                    thread_id,
+                    title: "Renamed".to_string(),
+                }
+            }
+            TestHerdrInboundEvent::Conflict { workspace_id } => {
+                let key = self
+                    .herdr_bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.read(cx).root_mapping(&workspace_id))
+                    .map(|record| record.key.clone())
+                    .unwrap_or_else(|| {
+                        crate::herdr_mapping_store::HerdrMappingKey::workspace(
+                            "test",
+                            &workspace_id,
+                        )
+                    });
+                HerdrBridgeEvent::Conflict {
+                    key,
+                    message: "test conflict".to_string(),
+                }
+            }
+        };
+        self.handle_herdr_event(&bridge_event, window, cx);
     }
 
 
@@ -16697,16 +17031,142 @@ mod tests {
                     "the lazy owner should be loaded exactly once"
                 );
             });
-            cx.update(|_window, cx| {
-                let key = HerdrLazyOwnerForwardKey {
-                    window_id,
-                    session: "alpha".to_string(),
-                    workspace_id: "w1".to_string(),
-                };
+        }
+
+        #[gpui::test]
+        async fn open_herdr_dispatches_a_task_with_the_reserved_session(
+            cx: &mut TestAppContext,
+        ) {
+            let (panel, mut cx) = setup_visible_panel(cx).await;
+            cx.executor().allow_parking();
+
+            cx.dispatch_action(OpenHerdr);
+
+            let persisted = cx
+                .update(|window, _cx| window.root::<MultiWorkspace>().flatten().unwrap())
+                .read_with(&cx, |multi_workspace, _| {
+                    multi_workspace.herdr_session_name().map(str::to_string)
+                })
+                .expect("Open Herdr must reserve and persist the session name");
+            assert!(
+                persisted.starts_with("zed-"),
+                "the reserved session name must be zed-prefixed"
+            );
+
+            // The task spawn and the terminal environment both carry the
+            // persisted name; poll until the async spawn lands.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                cx.run_until_parked();
+                let spawned = panel.read_with(&cx, |panel, cx| {
+                    panel
+                        .terminals
+                        .values()
+                        .next()
+                        .map(|terminal| terminal.view.read(cx).terminal().clone())
+                        .and_then(|terminal| {
+                            terminal.read_with(cx, |terminal, _| {
+                                let task = terminal.task()?;
+                                Some((
+                                    task.spawned_task.command.clone(),
+                                    task.spawned_task.args.clone(),
+                                    task.spawned_task.env.get("HERDR_SESSION").cloned(),
+                                    terminal.environment().get("HERDR_SESSION").cloned(),
+                                ))
+                            })
+                        })
+                });
+                if let Some((command, args, task_env, terminal_env)) = spawned {
+                    assert_eq!(command.as_deref(), Some("herdr"));
+                    assert_eq!(args, vec!["--session".to_string(), persisted.clone()]);
+                    assert_eq!(task_env.as_deref(), Some(persisted.as_str()));
+                    assert_eq!(terminal_env.as_deref(), Some(persisted.as_str()));
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    panic!("Open Herdr never created the task terminal");
+                }
+                cx.executor().timer(Duration::from_millis(50)).await;
+            }
+        }
+
+        #[gpui::test]
+        async fn open_herdr_refuses_without_a_local_project_worktree(
+            cx: &mut TestAppContext,
+        ) {
+            init_test(cx);
+            cx.update(|cx| {
+                agent::ThreadStore::init_global(cx);
+                TerminalThreadMetadataStore::init_global(cx);
+                language_model::LanguageModelRegistry::test(cx);
+            });
+
+            let fs = FakeFs::new(cx.executor());
+            cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+            let project = Project::test(fs, [], cx).await;
+            let multi_workspace =
+                cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+            let workspace = multi_workspace
+                .read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone())
+                .unwrap();
+            let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+            let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+                cx.new(|cx| AgentPanel::new(workspace, window, cx))
+            });
+
+            let opened = panel.update_in(&mut cx, |panel, window, cx| {
+                panel.open_herdr(window, cx)
+            });
+            assert!(!opened, "an empty local project must refuse Open Herdr");
+            panel.read_with(&cx, |panel, _| {
                 assert!(
-                    pending_lazy_owner_forward(cx, &key).is_empty(),
-                    "all events observed while loading must be replayed"
+                    panel.terminals.is_empty(),
+                    "no terminal may be spawned for an empty project"
                 );
+            });
+        }
+
+        #[gpui::test]
+        async fn open_herdr_refuses_when_the_window_owns_an_active_bridge(
+            cx: &mut TestAppContext,
+        ) {
+            let (panel, mut cx) = setup_panel(cx).await;
+            let window_id = cx.update(|window, _cx| window.window_handle().window_id());
+            let _bridge = cx
+                .update(|_window, cx| {
+                    cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                        registry.activate_window(
+                            window_id,
+                            HerdrSessionSelection::Named("zed-other".to_string()),
+                            HerdrOwnerProcess {
+                                terminal_id: gpui::EntityId::from(11),
+                                process_id: Some(11),
+                                session_name: "zed-other".to_string(),
+                            },
+                            cx,
+                        )
+                    })
+                })
+                .expect("the existing owner should activate the window bridge");
+
+            let opened = panel.update_in(&mut cx, |panel, window, cx| {
+                panel.open_herdr(window, cx)
+            });
+            assert!(
+                !opened,
+                "an actively owned window must refuse a second launch"
+            );
+            panel.read_with(&cx, |panel, _| {
+                assert!(
+                    panel.terminals.is_empty(),
+                    "no terminal may be spawned while the window owns a bridge"
+                );
+            });
+
+            cx.update(|_window, cx| {
+                cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                    registry.release_window(window_id, cx);
+                });
             });
         }
     }

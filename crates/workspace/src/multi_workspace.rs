@@ -1358,6 +1358,20 @@ impl MultiWorkspace {
         self.held.iter().map(|held| &held.workspace)
     }
 
+    /// Resolves the open workspace holding `workspace_id` (a persisted
+    /// database id), if any. Read-only: used to route window-scoped Herdr
+    /// roots to exactly one owning workspace.
+    pub fn workspace_for_database_id(
+        &self,
+        workspace_id: WorkspaceId,
+        cx: &App,
+    ) -> Option<Entity<Workspace>> {
+        self.held
+            .iter()
+            .find(|held| held.workspace.read(cx).database_id() == Some(workspace_id))
+            .map(|held| held.workspace.clone())
+    }
+
     /// Adds a workspace to this window as persistent without changing which
     /// workspace is active. Unlike `activate()`, this always inserts into the
     /// persistent list regardless of sidebar state — it's used for system-

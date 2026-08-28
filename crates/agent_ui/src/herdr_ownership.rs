@@ -863,6 +863,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_or_extra_session_arguments() {
+        let expected = "zed-x";
+        for argv in [
+            vec!["herdr".into(), "--session".into()],
+            vec!["herdr".into(), "server".into(), "--session".into()],
+            vec![
+                "herdr".into(),
+                "--session".into(),
+                expected.into(),
+                "extra".into(),
+            ],
+            vec!["herdr".into(), "server".into(), "extra".into()],
+            vec![
+                "herdr".into(),
+                "server".into(),
+                "--session".into(),
+                "other".into(),
+            ],
+        ] {
+            assert!(parse_server_launch(&argv, expected).is_none(), "unexpected acceptance: {argv:?}");
+        }
+    }
+
+    #[test]
     fn accepts_executable_basename_after_path_normalization() {
         assert!(parse_server_launch(
             &["/usr/local/bin/herdr".into()],
@@ -911,27 +935,127 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_malformed_or_extra_session_arguments() {
-        let expected = "zed-x";
-        for argv in [
-            vec!["herdr".into(), "--session".into()],
-            vec!["herdr".into(), "server".into(), "--session".into()],
-            vec![
-                "herdr".into(),
-                "--session".into(),
-                expected.into(),
-                "extra".into(),
-            ],
-            vec!["herdr".into(), "server".into(), "extra".into()],
-            vec![
-                "herdr".into(),
-                "server".into(),
-                "--session".into(),
-                "other".into(),
-            ],
-        ] {
-            assert!(parse_server_launch(&argv, expected).is_none(), "unexpected acceptance: {argv:?}");
-        }
+    #[gpui::test]
+    async fn in_window_launches_share_one_bridge_and_client_paths_do_not_activate(
+        cx: &mut TestAppContext,
+    ) {
+        use herdr_bridge::{HerdrBridgeRegistry, HerdrSessionSelection};
+
+        cx.update(|cx| {
+            HerdrBridgeRegistry::init(cx);
+            HerdrOwnershipRegistry::init(cx);
+            cx.update_global::<HerdrOwnershipRegistry, _>(|registry, cx| {
+                registry.set_handlers(
+                    |window_id, terminal_id, process, launch, cx| {
+                        let session_name = launch.session_name.clone();
+                        let owner = crate::herdr_bridge::HerdrOwnerProcess {
+                            terminal_id,
+                            process_id: process.pid,
+                            session_name: session_name.clone(),
+                        };
+                        cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                            registry.activate_window(
+                                window_id,
+                                HerdrSessionSelection::Named(session_name),
+                                owner,
+                                cx,
+                            )
+                        })
+                        .is_ok()
+                    },
+                    |_window_id, _terminal_id, _process_id, _cx| {},
+                    |_window_id, _cx| {},
+                );
+            });
+        });
+
+        let window_id = WindowId::from(6);
+        let callbacks = cx.update(|cx| {
+            cx.global::<HerdrOwnershipRegistry>().callbacks.clone()
+        });
+        let mut observer =
+            HerdrOwnershipObserver::new(window_id, "zed-x".to_string(), callbacks);
+        let standard_local_terminal = cx.update(|cx| cx.new(|_| ())).entity_id();
+        let agent_panel_terminal = cx.update(|cx| cx.new(|_| ())).entity_id();
+        let status_terminal = cx.update(|cx| cx.new(|_| ())).entity_id();
+        let mismatch_terminal = cx.update(|cx| cx.new(|_| ())).entity_id();
+        let plain_terminal = cx.update(|cx| cx.new(|_| ())).entity_id();
+
+        let bridge = |cx: &mut TestAppContext| {
+            cx.update(|_window, cx| {
+                cx.global::<HerdrBridgeRegistry>()
+                    .bridge_for_window(window_id, cx)
+            })
+        };
+
+        // A standard local terminal launch activates the per-window bridge.
+        cx.update(|cx| {
+            observer.handle_foreground_process(
+                standard_local_terminal,
+                &process(&["herdr"], 10),
+                cx,
+            );
+        });
+        let bridge_after_standard = bridge(cx).expect("a standard terminal should activate it");
+        assert_eq!(
+            bridge_after_standard.read_with(cx, |bridge, _| {
+                bridge.owner().map(|owner| owner.terminal_id)
+            }),
+            Some(standard_local_terminal)
+        );
+
+        // An AgentPanel terminal launching the same reserved session cannot
+        // replace the owner: both terminals share the SAME per-window bridge
+        // and the first process remains its owner.
+        cx.update(|cx| {
+            observer.handle_foreground_process(
+                agent_panel_terminal,
+                &process(&["herdr", "--session", "zed-x"], 11),
+                cx,
+            );
+        });
+        let bridge_after_panel = bridge(cx).expect("the window bridge must persist");
+        assert_eq!(
+            bridge_after_panel.entity_id(),
+            bridge_after_standard.entity_id(),
+            "both in-window terminals must activate the same per-window bridge"
+        );
+        assert_eq!(
+            bridge_after_panel.read_with(cx, |bridge, _| {
+                bridge.owner().map(|owner| owner.terminal_id)
+            }),
+            Some(standard_local_terminal),
+            "the first terminal must remain the owner after a second launch"
+        );
+
+        // Client commands, mismatched sessions, and non-Herdr processes must
+        // never activate or replace the window bridge.
+        cx.update(|cx| {
+            observer.handle_foreground_process(status_terminal, &process(&["herdr", "status"], 12), cx);
+            observer.handle_foreground_process(
+                mismatch_terminal,
+                &process(&["herdr", "--session", "other"], 13),
+                cx,
+            );
+            observer.handle_foreground_process(plain_terminal, &process(&["/bin/sh"], 14), cx);
+        });
+        let bridge_after_rejects = bridge(cx).expect("rejected launches must keep the bridge");
+        assert_eq!(
+            bridge_after_rejects.entity_id(),
+            bridge_after_standard.entity_id(),
+            "client/mismatched/external processes must not replace the window bridge"
+        );
+        assert_eq!(
+            bridge_after_rejects.read_with(cx, |bridge, _| {
+                bridge.owner().map(|owner| owner.terminal_id)
+            }),
+            Some(standard_local_terminal)
+        );
+
+        cx.update(|cx| {
+            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                registry.release_window(window_id, cx);
+            });
+        });
     }
 }

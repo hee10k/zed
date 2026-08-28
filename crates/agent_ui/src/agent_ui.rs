@@ -88,6 +88,8 @@ pub use crate::agent_panel::{
     AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, MaxIdleRetainedThreads, TerminalId,
     ThreadTitleRegenerationResult,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use crate::agent_panel::TestHerdrInboundEvent;
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
@@ -345,6 +347,8 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Launches Herdr in this Zed window's dedicated named session.
+        OpenHerdr,
         /// Explicitly rebinds the window's Herdr bridge to a named session.
         ConnectHerdrSession,
     ]
