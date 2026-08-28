@@ -2934,7 +2934,8 @@ impl AgentPanel {
                 TerminalEvent::BlinkChanged(_)
                 | TerminalEvent::SelectionsChanged
                 | TerminalEvent::NewNavigationTarget(_)
-                | TerminalEvent::Open(_) => {}
+                | TerminalEvent::Open(_)
+                | TerminalEvent::ForegroundProcessChanged(_) => {}
                 TerminalEvent::ProcessExited => {
                     this.clear_terminal_inferred_status(terminal_id);
                     this.record_terminal_activity(terminal_id, ActivityStatus::Completed, cx);

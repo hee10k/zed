@@ -1228,7 +1228,10 @@ fn subscribe_for_terminal_events(
                     ),
                 },
                 Event::BreadcrumbsChanged => cx.emit(ItemEvent::UpdateBreadcrumbs),
-                Event::ProcessExited => {}
+                Event::ForegroundProcessChanged(process) => {
+                    cx.emit(Event::ForegroundProcessChanged(process.clone()));
+                },
+                Event::ProcessExited => cx.emit(Event::ProcessExited),
                 Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),
                 Event::SelectionsChanged => {
                     window.invalidate_character_coordinates();
@@ -2891,6 +2894,81 @@ mod tests {
             .unwrap();
     }
 
+
+    #[gpui::test]
+    async fn terminal_view_forwards_process_events_after_replacement(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, old_terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, false, cx);
+        let replacement = cx.new(|cx| {
+            terminal::TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let snapshot = terminal::ForegroundProcess {
+            name: "herdr".to_string(),
+            cwd: PathBuf::from("/repo"),
+            argv: vec!["herdr".to_string(), "--session".to_string()],
+            pid: Some(1234),
+        };
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let subscribed_view = terminal_view.clone();
+        cx.update({
+            let events = events.clone();
+            move |cx| {
+                cx.subscribe(&subscribed_view, move |_, event: &Event, _| {
+                    events.borrow_mut().push(event.clone());
+                })
+            }
+        })
+        .detach();
+
+        old_terminal.update(cx, |_, cx| {
+            cx.emit(Event::ForegroundProcessChanged(Some(snapshot.clone())));
+            cx.emit(Event::ProcessExited);
+        });
+        assert_eq!(
+            events.borrow_mut().drain(..).collect::<Vec<_>>(),
+            vec![
+                Event::ForegroundProcessChanged(Some(snapshot.clone())),
+                Event::ProcessExited,
+            ]
+        );
+
+        window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.set_terminal(replacement.clone(), window, cx);
+                });
+            })
+            .unwrap();
+
+        old_terminal.update(cx, |_, cx| {
+            cx.emit(Event::ForegroundProcessChanged(None));
+            cx.emit(Event::ProcessExited);
+        });
+        assert!(events.borrow().is_empty());
+
+        replacement.update(cx, |_, cx| {
+            cx.emit(Event::ForegroundProcessChanged(Some(snapshot.clone())));
+            cx.emit(Event::ProcessExited);
+        });
+        assert_eq!(
+            events.borrow_mut().drain(..).collect::<Vec<_>>(),
+            vec![
+                Event::ForegroundProcessChanged(Some(snapshot)),
+                Event::ProcessExited,
+            ]
+        );
+    }
     // Terminal rename tests
 
     #[gpui::test]

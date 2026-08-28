@@ -7,7 +7,7 @@ use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-use crate::{Event, Terminal};
+use crate::{Event, ForegroundProcess, Terminal};
 
 #[derive(Clone, Copy)]
 pub struct ProcessIdGetter {
@@ -70,6 +70,18 @@ pub(crate) struct ProcessInfo {
     pub(crate) name: String,
     pub(crate) cwd: PathBuf,
     pub(crate) argv: Vec<String>,
+    pub(crate) pid: u32,
+}
+
+impl From<&ProcessInfo> for ForegroundProcess {
+    fn from(process: &ProcessInfo) -> Self {
+        Self {
+            name: process.name.clone(),
+            cwd: process.cwd.clone(),
+            argv: process.argv.clone(),
+            pid: Some(process.pid),
+        }
+    }
 }
 
 /// Fetches Zed-relevant Pseudo-Terminal (PTY) process information
@@ -186,6 +198,7 @@ impl PtyProcessInfo {
                 .iter()
                 .filter_map(|s| s.to_str().map(ToOwned::to_owned))
                 .collect(),
+            pid: process.pid().as_u32(),
         };
         *self.current.write() = Some(info.clone());
         Some(info)
@@ -196,7 +209,7 @@ impl PtyProcessInfo {
         self.load()
     }
 
-    /// Updates the cached process info, emitting a [`Event::TitleChanged`] event if the Zed-relevant info has changed
+    /// Updates the cached process info, emitting terminal metadata events when it changes.
     pub(crate) fn emit_title_changed_if_changed(self: &Arc<Self>, cx: &mut Context<'_, Terminal>) {
         if self.task.lock().is_some() {
             return;
@@ -205,11 +218,7 @@ impl PtyProcessInfo {
         let change_task = cx.background_executor().spawn(async move {
             let previous = this.current.read().clone();
             let current = this.load();
-            let has_changed = match (previous.as_ref(), current.as_ref()) {
-                (None, None) => false,
-                (Some(prev), Some(now)) => prev.cwd != now.cwd || prev.name != now.name,
-                _ => true,
-            };
+            let has_changed = process_info_changed(previous.as_ref(), current.as_ref());
             if has_changed {
                 *this.current.write() = current.clone();
             }
@@ -218,17 +227,19 @@ impl PtyProcessInfo {
                 (None, Some(now)) => Some(now.cwd.clone()),
                 _ => None,
             };
-            (has_changed, changed_cwd)
+            let foreground_process = current.as_ref().map(ForegroundProcess::from);
+            (has_changed, changed_cwd, foreground_process)
         });
         let this = Arc::downgrade(self);
         *self.task.lock() = Some(cx.spawn(async move |term, cx| {
-            let (has_changed, new_cwd) = change_task.await;
+            let (has_changed, new_cwd, foreground_process) = change_task.await;
             if has_changed {
                 term.update(cx, |terminal, cx| {
                     if let Some(cwd) = new_cwd {
                         terminal.record_cwd_change(cwd);
                     }
                     cx.emit(Event::TitleChanged);
+                    cx.emit(Event::ForegroundProcessChanged(foreground_process));
                 })
                 .ok();
             }
@@ -238,14 +249,46 @@ impl PtyProcessInfo {
         }));
     }
 
+
     pub(crate) fn pid(&self) -> Option<Pid> {
         self.pid_getter.pid()
+    }
+}
+
+fn process_info_changed(previous: Option<&ProcessInfo>, current: Option<&ProcessInfo>) -> bool {
+    match (previous, current) {
+        (None, None) => false,
+        (Some(previous), Some(current)) => {
+            previous.cwd != current.cwd
+                || previous.name != current.name
+                || previous.argv != current.argv
+                || previous.pid != current.pid
+        }
+        _ => true,
     }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_info_change_detects_argument_and_pid_only_changes() {
+        let current = ProcessInfo {
+            name: "herdr".to_string(),
+            cwd: PathBuf::from("/repo"),
+            argv: vec!["herdr".to_string(), "--session".to_string()],
+            pid: 1234,
+        };
+
+        let mut changed_argv = current.clone();
+        changed_argv.argv.push("zed-x".to_string());
+        assert!(process_info_changed(Some(&current), Some(&changed_argv)));
+
+        let mut changed_pid = current.clone();
+        changed_pid.pid = 4321;
+        assert!(process_info_changed(Some(&current), Some(&changed_pid)));
+    }
 
     /// Regression test for <https://github.com/zed-industries/zed/issues/58651>:
     /// on Linux, sysinfo keeps an open `/proc/<pid>/stat` handle for every

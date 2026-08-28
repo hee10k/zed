@@ -665,6 +665,14 @@ pub fn insert_zed_terminal_env(
 }
 
 ///Upward flowing events, for changing the title and such
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForegroundProcess {
+    pub name: String,
+    pub cwd: PathBuf,
+    pub argv: Vec<String>,
+    pub pid: Option<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     TitleChanged,
@@ -675,6 +683,7 @@ pub enum Event {
     /// react to the process ending without necessarily closing the terminal —
     /// e.g. to transition a revivable agent session to `sleeping`.
     ProcessExited,
+    ForegroundProcessChanged(Option<ForegroundProcess>),
     Bell,
     Wakeup,
     BlinkChanged(bool),
@@ -2819,6 +2828,25 @@ impl Terminal {
         }
     }
 
+    pub fn foreground_process(&self) -> Option<ForegroundProcess> {
+        if self.is_remote_terminal {
+            return None;
+        }
+
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => info
+                .current
+                .read()
+                .as_ref()
+                .map(ForegroundProcess::from),
+            TerminalType::DisplayOnly => None,
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.is_remote_terminal
+    }
+
     /// Normalizes the command name of the foreground process, if one is known.
     pub fn foreground_process_command_name(&self) -> Option<String> {
         match &self.terminal_type {
@@ -3597,6 +3625,133 @@ mod tests {
             ]),
             Some("customer-data-export".to_string())
         );
+    }
+
+    #[test]
+    fn foreground_process_snapshot_includes_arguments_and_pid() {
+        let snapshot = ForegroundProcess {
+            name: "herdr".to_string(),
+            cwd: PathBuf::from("/repo"),
+            argv: vec![
+                "/usr/local/bin/herdr".to_string(),
+                "--session".to_string(),
+                "zed-x".to_string(),
+            ],
+            pid: Some(1234),
+        };
+
+        assert_eq!(snapshot.argv[0], "/usr/local/bin/herdr");
+        assert_eq!(snapshot.pid, Some(1234));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn foreground_process_is_none_for_display_only_and_remote_terminals(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let display_only = make_display_only_terminal();
+        assert_eq!(display_only.foreground_process(), None);
+        assert!(!display_only.is_remote());
+
+        let (terminal, completion_rx) =
+            build_test_terminal_with_arguments(cx, "sleep".to_string(), vec!["1".to_string()])
+                .await;
+
+        for _ in 0..100 {
+            terminal.update(cx, |terminal, _| {
+                if let TerminalType::Pty { info, .. } = &terminal.terminal_type {
+                    info.load_for_test();
+                }
+            });
+            if terminal.update(cx, |terminal, _| terminal.foreground_process().is_some()) {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert!(terminal.update(cx, |terminal, _| terminal.foreground_process().is_some()));
+
+        terminal.update(cx, |terminal, _| terminal.is_remote_terminal = true);
+        assert!(terminal.update(cx, |terminal, _| terminal.is_remote()));
+        assert_eq!(
+            terminal.update(cx, |terminal, _| terminal.foreground_process()),
+            None
+        );
+        assert!(completion_rx.recv().await.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn foreground_process_event_emits_when_only_arguments_change(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (terminal, completion_rx) =
+            build_test_terminal_with_arguments(cx, "sleep".to_string(), vec!["1".to_string()])
+                .await;
+        let (event_tx, event_rx) = async_channel::unbounded::<Event>();
+        cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, event, _| {
+                event_tx.send_blocking(event.clone()).unwrap();
+            })
+        })
+        .detach();
+
+        let current = loop {
+            let current = terminal.update(cx, |terminal, _| {
+                let TerminalType::Pty { info, .. } = &terminal.terminal_type else {
+                    unreachable!("test terminal must have a PTY");
+                };
+                info.load_for_test()
+            });
+            if let Some(current) = current {
+                break current;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        };
+        let mut stale = current.clone();
+        stale.argv.push("--stale-argument".to_string());
+
+        let mut events = Vec::new();
+        for _ in 0..100 {
+            terminal.update(cx, |terminal, cx| {
+                let TerminalType::Pty { info, .. } = &terminal.terminal_type else {
+                    unreachable!("test terminal must have a PTY");
+                };
+                *info.current.write() = Some(stale.clone());
+                info.emit_title_changed_if_changed(cx);
+            });
+            while let Ok(event) = event_rx.try_recv() {
+                events.push(event);
+            }
+            if events
+                .iter()
+                .any(|event| matches!(event, Event::ForegroundProcessChanged(Some(_))))
+            {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::ForegroundProcessChanged(Some(snapshot))
+                    if snapshot.argv == current.argv && snapshot.pid == Some(current.pid)
+            )),
+            "argv-only changes should emit the refreshed process snapshot, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| *event == Event::TitleChanged),
+            "process changes should continue to update terminal titles, got {events:?}"
+        );
+        assert!(completion_rx.recv().await.is_ok());
     }
 
     #[cfg(not(target_os = "windows"))]
