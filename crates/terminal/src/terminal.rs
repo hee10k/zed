@@ -3043,6 +3043,14 @@ impl Terminal {
             self.child_exited = Some(e);
         }
         self.complete_init_command_startup_handshake();
+        if !self.is_remote_terminal
+            && let TerminalType::Pty { info, .. } = &self.terminal_type
+        {
+            let had_foreground_process = info.clear_current();
+            if had_foreground_process {
+                cx.emit(Event::ForegroundProcessChanged(None));
+            }
+        }
         cx.emit(Event::ProcessExited);
         let task = match &mut self.task {
             Some(task) => task,
@@ -3510,6 +3518,8 @@ mod tests {
         Cell, Content, IndexedCell, TerminalBounds, TerminalBuilder, content_index_for_mouse,
         rgb_for_index,
     };
+    #[cfg(unix)]
+    use crate::pty_info::ProcessInfo;
     use async_channel::Receiver;
     use collections::HashMap;
     use gpui::{
@@ -3753,6 +3763,91 @@ mod tests {
         );
         assert!(completion_rx.recv().await.is_ok());
     }
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn foreground_process_clears_on_direct_pty_exit(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (terminal, _completion_rx) =
+            build_test_terminal_with_arguments(cx, "sleep".to_string(), vec!["60".to_string()])
+                .await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        cx.update({
+            let events = events.clone();
+            |cx| {
+                cx.subscribe(&terminal, move |_, event, _| {
+                    events.lock().push(event.clone());
+                })
+            }
+        })
+        .detach();
+
+        let cached_process = ProcessInfo {
+            name: "sleep".to_string(),
+            cwd: PathBuf::from("/repo"),
+            argv: vec!["sleep".to_string(), "60".to_string()],
+            pid: 1234,
+        };
+        let assert_cleared = |events: &[Event]| {
+            let foreground_process_change = events
+                .iter()
+                .position(|event| *event == Event::ForegroundProcessChanged(None))
+                .expect("a cached process should emit a disappearance");
+            let process_exit = events
+                .iter()
+                .position(|event| *event == Event::ProcessExited)
+                .expect("direct PTY exit should emit ProcessExited");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| **event == Event::ForegroundProcessChanged(None))
+                    .count(),
+                1,
+                "a cached process should emit one disappearance, got {events:?}"
+            );
+            assert!(
+                foreground_process_change < process_exit,
+                "foreground disappearance should precede ProcessExited, got {events:?}"
+            );
+        };
+
+        for event in [
+            TerminalBackendEvent::Exit,
+            TerminalBackendEvent::ChildExit(ExitStatus::default()),
+        ] {
+            let event_count = events.lock().len();
+            terminal.update(cx, |terminal, cx| {
+                let TerminalType::Pty { info, .. } = &terminal.terminal_type else {
+                    unreachable!("test terminal must have a PTY");
+                };
+                *info.current.write() = Some(cached_process.clone());
+                assert_eq!(
+                    terminal.foreground_process(),
+                    Some(ForegroundProcess::from(&cached_process)),
+                    "test setup should expose the cached foreground process"
+                );
+                terminal.process_event(event, cx);
+            });
+
+            assert_eq!(
+                terminal.update(cx, |terminal, _| terminal.foreground_process()),
+                None,
+                "direct PTY exit should clear the cached foreground process"
+            );
+            assert_cleared(&events.lock()[event_count..]);
+        }
+
+        let event_count = events.lock().len();
+        terminal.update(cx, |terminal, cx| {
+            terminal.process_event(TerminalBackendEvent::Exit, cx);
+        });
+        assert!(
+            events.lock()[event_count..]
+                .iter()
+                .all(|event| *event != Event::ForegroundProcessChanged(None)),
+            "an empty foreground-process cache should not emit a disappearance"
+        );
+    }
+
 
     #[cfg(not(target_os = "windows"))]
     fn init_test(cx: &mut TestAppContext) {

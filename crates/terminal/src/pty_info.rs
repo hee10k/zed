@@ -91,7 +91,13 @@ pub(crate) struct PtyProcessInfo {
     pid_getter: ProcessIdGetter,
     last_foreground_pid: Mutex<Option<Pid>>,
     pub(crate) current: RwLock<Option<ProcessInfo>>,
+    lifecycle: Mutex<PtyProcessInfoLifecycle>,
     task: Mutex<Option<Task<()>>>,
+}
+
+#[derive(Default)]
+struct PtyProcessInfoLifecycle {
+    exited: bool,
 }
 
 impl PtyProcessInfo {
@@ -122,6 +128,7 @@ impl PtyProcessInfo {
             pid_getter,
             last_foreground_pid: Mutex::new(None),
             current: RwLock::new(None),
+            lifecycle: Mutex::new(PtyProcessInfoLifecycle::default()),
             task: Mutex::new(None),
         }
     }
@@ -190,7 +197,7 @@ impl PtyProcessInfo {
         let process = self.refresh()?;
         let cwd = process.cwd().map_or(PathBuf::new(), |p| p.to_owned());
 
-        let info = ProcessInfo {
+        Some(ProcessInfo {
             name: process.name().to_str()?.to_owned(),
             cwd,
             argv: process
@@ -199,25 +206,38 @@ impl PtyProcessInfo {
                 .filter_map(|s| s.to_str().map(ToOwned::to_owned))
                 .collect(),
             pid: process.pid().as_u32(),
-        };
-        *self.current.write() = Some(info.clone());
-        Some(info)
+        })
+    }
+
+    pub(crate) fn clear_current(&self) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        lifecycle.exited = true;
+        let had_current = self.current.write().take().is_some();
+        drop(self.task.lock().take());
+        had_current
     }
 
     #[cfg(all(test, unix))]
     pub(crate) fn load_for_test(&self) -> Option<ProcessInfo> {
-        self.load()
+        let info = self.load()?;
+        *self.current.write() = Some(info.clone());
+        Some(info)
     }
 
     /// Updates the cached process info, emitting terminal metadata events when it changes.
     pub(crate) fn emit_title_changed_if_changed(self: &Arc<Self>, cx: &mut Context<'_, Terminal>) {
-        if self.task.lock().is_some() {
+        if self.lifecycle.lock().exited || self.task.lock().is_some() {
             return;
         }
         let this = self.clone();
         let change_task = cx.background_executor().spawn(async move {
             let previous = this.current.read().clone();
             let current = this.load();
+            let lifecycle = this.lifecycle.lock();
+            if lifecycle.exited {
+                return (false, None, None);
+            }
+
             let has_changed = process_info_changed(previous.as_ref(), current.as_ref());
             if has_changed {
                 *this.current.write() = current.clone();
