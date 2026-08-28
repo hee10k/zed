@@ -134,6 +134,7 @@ pub async fn open_remote_project(
     cx: &mut AsyncApp,
 ) -> Result<WindowHandle<MultiWorkspace>> {
     let created_new_window = open_options.requesting_window.is_none();
+    let remove_window_on_failure = open_options.remove_window_on_failure;
 
     let (existing, open_visible) = find_existing_workspace(
         &paths,
@@ -337,7 +338,7 @@ pub async fn open_remote_project(
                     continue;
                 }
 
-                if created_new_window {
+                if created_new_window || remove_window_on_failure {
                     window
                         .update(cx, |_, window, _| window.remove_window())
                         .ok();
@@ -397,7 +398,7 @@ pub async fn open_remote_project(
                     continue;
                 }
 
-                if created_new_window {
+                if created_new_window || remove_window_on_failure {
                     window
                         .update(cx, |_, window, _| window.remove_window())
                         .ok();
@@ -510,18 +511,169 @@ async fn path_exists(connection: &Arc<dyn RemoteConnection>, path: &Path) -> boo
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
+
     use super::*;
     use extension::ExtensionHostProxy;
     use fs::FakeFs;
-    use gpui::{AppContext, TestAppContext};
+    use gpui::{AppContext, Focusable, Render, TestAppContext};
     use http_client::BlockedHttpClient;
     use node_runtime::NodeRuntime;
     use remote::RemoteClient;
     use remote_server::{HeadlessAppState, HeadlessProject};
     use serde_json::json;
     use util::path;
+    use workspace::{MultiWorkspaceState, WorkspacePosition};
     use workspace::find_existing_workspace;
 
+    struct CancelPrompt {
+        focus_handle: gpui::FocusHandle,
+    }
+
+    impl gpui::EventEmitter<gpui::PromptResponse> for CancelPrompt {}
+
+    impl Focusable for CancelPrompt {
+        fn focus_handle(&self, _: &gpui::App) -> gpui::FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for CancelPrompt {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    #[gpui::test]
+    async fn test_remote_restore_cleans_partial_workspace_on_cancel(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let executor = cx.executor();
+
+        cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        server_cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+
+        let (opts, server_session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+
+        let remote_fs = FakeFs::new(server_cx.executor());
+        remote_fs
+            .insert_tree(
+                path!("/project"),
+                json!({
+                    "src": {
+                        "main.rs": "fn main() {}",
+                    },
+                }),
+            )
+            .await;
+
+        server_cx.update(HeadlessProject::init);
+        let http_client = Arc::new(BlockedHttpClient);
+        let node_runtime = NodeRuntime::unavailable();
+        let languages = Arc::new(language::LanguageRegistry::new(server_cx.executor()));
+        let proxy = Arc::new(ExtensionHostProxy::new());
+
+        let _headless = server_cx.new(|cx| {
+            HeadlessProject::new(
+                HeadlessAppState {
+                    session: server_session,
+                    fs: remote_fs.clone(),
+                    http_client,
+                    node_runtime,
+                    languages,
+                    extension_host_proxy: proxy,
+                    startup_time: std::time::Instant::now(),
+                },
+                false,
+                cx,
+            )
+        });
+
+        drop(connect_guard);
+
+        let attached_remote_workspace = Rc::new(Cell::new(false));
+        let attached_remote_workspace_observer = attached_remote_workspace.clone();
+        cx.update(|cx| {
+            cx.observe_new(
+                move |workspace: &mut Workspace, _window, cx| {
+                    if workspace.project().read(cx).is_remote() {
+                        attached_remote_workspace_observer.set(true);
+                    }
+                },
+            )
+            .detach();
+        });
+
+        cx.update(|cx| {
+            cx.set_prompt_builder(|_, _, _, _, handle, window, cx| {
+                let prompt = cx.new(|cx| CancelPrompt {
+                    focus_handle: cx.focus_handle(),
+                });
+                let rendered = handle.with_view(prompt.clone(), window, cx);
+                prompt.update(cx, |_, cx| cx.emit(gpui::PromptResponse(1)));
+                rendered
+            });
+        });
+        let db = cx.update(|cx| workspace::WorkspaceDb::global(cx));
+
+        db.write(|connection| {
+            let mut statement = connection.exec("DROP TABLE toolchains")?;
+            statement()
+        })
+        .await
+        .expect("dropping toolchains should force a post-attach failure");
+
+        let mut async_cx = cx.to_async();
+        let placeholder = workspace::open_new_with_restored_state(
+            app_state.clone(),
+            MultiWorkspaceState::default(),
+            WorkspacePosition {
+                window_bounds: None,
+                display: None,
+                centered_layout: false,
+            },
+            &mut async_cx,
+        )
+        .await
+        .expect("restored placeholder should open");
+
+        let result = open_remote_project(
+            opts,
+            vec![PathBuf::from(path!("/project"))],
+            app_state,
+            workspace::OpenOptions {
+                requesting_window: Some(placeholder),
+                remove_window_on_failure: true,
+                ..Default::default()
+            },
+            &mut async_cx,
+        )
+        .await;
+
+        executor.run_until_parked();
+        cx.update(|cx| cx.reset_prompt_builder());
+
+        assert!(result.is_ok(), "Cancel should preserve Ok(window) semantics");
+        assert!(
+            attached_remote_workspace.get(),
+            "the test must attach a remote workspace before forcing failure"
+        );
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            0,
+            "cancelled post-attach restore must remove the temporary placeholder window"
+        );
+    }
     #[gpui::test]
     async fn test_open_remote_project_with_mock_connection(
         cx: &mut TestAppContext,

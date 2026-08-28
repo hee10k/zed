@@ -1464,7 +1464,17 @@ pub(crate) async fn restore_or_create_workspace(
                                     cx,
                                 )
                             })
-                            .await?;
+                            .await
+                            .unwrap_or_else(|error| {
+                                log::warn!(
+                                    "Failed to restore remote workspace position; using default window position: {error:#}"
+                                );
+                                workspace::WorkspacePosition {
+                                    window_bounds: None,
+                                    display: None,
+                                    centered_layout: false,
+                                }
+                            });
                         let restored_window = workspace::open_new_with_restored_state(
                             app_state.clone(),
                             state.clone(),
@@ -1478,6 +1488,7 @@ pub(crate) async fn restore_or_create_workspace(
                             app_state.clone(),
                             workspace::OpenOptions {
                                 requesting_window: Some(restored_window),
+                                remove_window_on_failure: true,
                                 ..Default::default()
                             },
                             cx,

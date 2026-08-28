@@ -10492,6 +10492,9 @@ pub struct OpenOptions {
     pub add_dirs_to_sidebar: bool,
     pub wait: bool,
     pub requesting_window: Option<WindowHandle<MultiWorkspace>>,
+    /// Whether to remove a requesting window when the remote open is cancelled
+    /// after a failure. Used for temporary restore placeholders only.
+    pub remove_window_on_failure: bool,
     pub open_mode: OpenMode,
     pub env: Option<HashMap<String, String>>,
     pub open_in_dev_container: bool,
@@ -10506,6 +10509,7 @@ impl Default for OpenOptions {
             add_dirs_to_sidebar: true,
             wait: false,
             requesting_window: None,
+            remove_window_on_failure: false,
             open_mode: OpenMode::default(),
             env: None,
             open_in_dev_container: false,
