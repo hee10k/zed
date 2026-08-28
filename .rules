@@ -136,6 +136,11 @@ Other entities can then register a callback to handle these events by doing `cx.
 
 - Use `./script/clippy` instead of `cargo clippy`
 
+### Rust validation cadence
+
+* For a Rust request, finish all planned implementation and test-source edits before running `cargo test`, `cargo check`, or another build command. Defer compilation and test execution to one final validation-and-fix phase so the active agent context/cache survives the editing phase.
+* In that final phase, run the narrowest relevant commands, fix every observed diagnostic, and rerun them to green. Run an earlier command only when an otherwise unresolvable compiler or API question blocks implementation; record the reason in the task report.
+
 # Pull request hygiene
 
 When an agent opens or updates a pull request, it must:
