@@ -1410,6 +1410,37 @@ fn ensure_local_omp_project(is_local: bool) -> Result<()> {
     }
 }
 
+pub(crate) fn attach_herdr_bridge_to_window(
+    window_id: WindowId,
+    bridge: Entity<HerdrThreadBridge>,
+    cx: &mut App,
+) {
+    let Some(window) = cx
+        .windows()
+        .into_iter()
+        .find(|window| window.window_id() == window_id)
+    else {
+        return;
+    };
+    let Some(multi_workspace) = window.downcast::<MultiWorkspace>() else {
+        return;
+    };
+    let _ = multi_workspace.update(cx, |multi_workspace, window, cx| {
+        let panels = multi_workspace
+            .workspaces()
+            .filter_map(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
+            .collect::<Vec<_>>();
+        let mut attached = HashSet::default();
+        for panel in panels {
+            if attached.insert(panel.entity_id()) {
+                panel.update(cx, |panel, cx| {
+                    panel.attach_herdr_bridge(bridge.clone(), window, cx);
+                });
+            }
+        }
+    });
+}
+
 impl AgentPanel {
     fn serialize(&mut self, cx: &mut App) {
         let Some(workspace_id) = self.workspace_id else {
@@ -1923,6 +1954,31 @@ impl AgentPanel {
         }));
     }
 
+    pub(crate) fn attach_herdr_bridge(
+        &mut self,
+        bridge: Entity<HerdrThreadBridge>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let already_attached = self
+            .herdr_bridge
+            .as_ref()
+            .is_some_and(|current| current.entity_id() == bridge.entity_id());
+        if !already_attached {
+            self._herdr_bridge_subscription = None;
+            self.herdr_bridge = Some(bridge.clone());
+        }
+        if self._herdr_bridge_subscription.is_none() {
+            self._herdr_bridge_subscription = Some(cx.subscribe_in(
+                &bridge,
+                window,
+                |this, _bridge, event, window, cx| {
+                    this.handle_herdr_event(event, window, cx);
+                },
+            ));
+        }
+    }
+
     pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let worktree_lifecycle =
@@ -1939,17 +1995,9 @@ impl AgentPanel {
 
         let thread_store = ThreadStore::global(cx);
         let herdr_window_id = window.window_handle().window_id();
-        let herdr_bridge = if cx.try_global::<HerdrBridgeRegistry>().is_some() {
-            Some(cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
-                registry.for_window(
-                    herdr_window_id,
-                    Default::default(),
-                    cx,
-                )
-            }))
-        } else {
-            None
-        };
+        let herdr_bridge = cx
+            .try_global::<HerdrBridgeRegistry>()
+            .and_then(|registry| registry.bridge_for_window(herdr_window_id, cx));
         let herdr_bridge_subscription = herdr_bridge.as_ref().map(|bridge| {
             cx.subscribe_in(
                 bridge,
@@ -1959,11 +2007,6 @@ impl AgentPanel {
                 },
             )
         });
-        // Subscribe before starting bootstrap so RootCreated/StatusChanged
-        // events cannot be emitted into a lifecycle-before-discovery gap.
-        if let Some(bridge) = herdr_bridge.as_ref() {
-            bridge.update(cx, |bridge, cx| bridge.begin_sync(cx));
-        }
 
         let base_view = BaseView::Uninitialized;
 
@@ -2061,16 +2104,6 @@ impl AgentPanel {
         })
         .detach();
 
-        if herdr_bridge.is_some() {
-            cx.on_release(move |_this, cx| {
-                if cx.try_global::<HerdrBridgeRegistry>().is_some() {
-                    cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
-                        registry.release_panel(herdr_window_id, cx);
-                    });
-                }
-            })
-            .detach();
-        }
 
         let mut panel = Self {
             workspace_id,
@@ -5702,9 +5735,13 @@ impl AgentPanel {
                 self.reset_herdr_surface_after_rebind(window, cx);
             }
             HerdrBridgeEvent::StatusChanged(status) => {
-                // A fresh synchronization run supersedes conflicts reported
-                // during the previous one.
-                if *status == HerdrConnectionStatus::Synchronizing {
+                // Losing the owner makes a bridge dormant. Any conflict from
+                // the previous owned synchronization is stale until a fresh
+                // activation runs.
+                if matches!(
+                    status,
+                    HerdrConnectionStatus::Dormant | HerdrConnectionStatus::Synchronizing
+                ) {
                     self.herdr_conflict_active = false;
                 }
                 // The connection label lives on the open Herdr root view; keep
@@ -5993,7 +6030,7 @@ impl AgentPanel {
     }
 
     /// Human-facing connection status for the Herdr surface:
-    /// `Ready`, `Synchronizing`, `Reconnecting`, `Unavailable`, or
+    /// `Dormant`, `Ready`, `Synchronizing`, `Reconnecting`, `Unavailable`, or
     /// `Conflict`. `None` when no bridge is bound.
     pub fn herdr_status_label(&self, cx: &App) -> Option<SharedString> {
         let bridge = self.herdr_bridge.as_ref()?;
@@ -6001,6 +6038,7 @@ impl AgentPanel {
             "Conflict"
         } else {
             match bridge.read(cx).status() {
+                HerdrConnectionStatus::Dormant => "Dormant",
                 HerdrConnectionStatus::Ready => "Ready",
                 HerdrConnectionStatus::Synchronizing => "Synchronizing",
                 HerdrConnectionStatus::Reconnecting => "Reconnecting",
@@ -6050,37 +6088,53 @@ impl AgentPanel {
         if commit {
             let session = editor.read(cx).text(cx).trim().to_string();
             if !session.is_empty() {
-                // Explicit user choice only: rebind through the per-window
-                // registry binding so every surface sharing this window's
-                // bridge observes the same session.
-                let selection = crate::herdr_bridge::HerdrSessionSelection::Named(session);
-                if let Some(bridge) = self.herdr_bridge.as_ref() {
-                    let window_id = bridge.read(cx).window_id();
-                    if let Some(window_id) = window_id
-                        && cx.try_global::<HerdrBridgeRegistry>().is_some()
-                    {
-                        let result = cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
-                            registry.rebind_window_session(window_id, selection, cx)
-                        });
-                        match result {
-                            Ok(()) => self.reset_herdr_surface_after_rebind(window, cx),
-                            Err(error) => {
-                                Self::show_herdr_toast(
+                let owned_persisted_session = self.herdr_bridge.as_ref().is_some_and(|bridge| {
+                    let bridge = bridge.read(cx);
+                    bridge.owner().is_some_and(|owner| {
+                        owner.session_name == session
+                            && owner.session_name == bridge.session_name()
+                    })
+                });
+                if !owned_persisted_session {
+                    Self::show_herdr_toast(
+                        &self.workspace,
+                        "Connect to Herdr requires an active Herdr process launched in this window",
+                        cx,
+                    );
+                } else {
+                    // Explicit user choice only: rebind through the per-window
+                    // registry binding so every surface sharing this window's
+                    // bridge observes the same session.
+                    let selection = crate::herdr_bridge::HerdrSessionSelection::Named(session);
+                    if let Some(bridge) = self.herdr_bridge.as_ref() {
+                        let window_id = bridge.read(cx).window_id();
+                        if let Some(window_id) = window_id
+                            && cx.try_global::<HerdrBridgeRegistry>().is_some()
+                        {
+                            let result = cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                                registry.rebind_window_session(window_id, selection, cx)
+                            });
+                            match result {
+                                Ok(()) => self.reset_herdr_surface_after_rebind(window, cx),
+                                Err(error) => {
+                                    Self::show_herdr_toast(
+                                        &self.workspace,
+                                        format!("Herdr reconnect failed: {error}"),
+                                        cx,
+                                    );
+                                }
+                            }
+                        } else {
+                            match bridge.update(cx, |bridge, cx| {
+                                bridge.rebind_selection(selection, cx)
+                            }) {
+                                Ok(()) => self.reset_herdr_surface_after_rebind(window, cx),
+                                Err(error) => Self::show_herdr_toast(
                                     &self.workspace,
                                     format!("Herdr reconnect failed: {error}"),
                                     cx,
-                                );
+                                ),
                             }
-                        }
-                    } else {
-                        match bridge.update(cx, |bridge, cx| bridge.rebind_selection(selection, cx))
-                        {
-                            Ok(()) => self.reset_herdr_surface_after_rebind(window, cx),
-                            Err(error) => Self::show_herdr_toast(
-                                &self.workspace,
-                                format!("Herdr reconnect failed: {error}"),
-                                cx,
-                            ),
                         }
                     }
                 }
@@ -11652,6 +11706,7 @@ mod tests {
     async fn setup_panel(cx: &mut TestAppContext) -> (Entity<AgentPanel>, VisualTestContext) {
         init_test(cx);
         cx.update(|cx| {
+            HerdrBridgeRegistry::init(cx);
             agent::ThreadStore::init_global(cx);
             TerminalThreadMetadataStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
@@ -15954,6 +16009,23 @@ mod tests {
         use crate::herdr_client::HerdrAgentSessionIdentity;
         use crate::herdr_mapping_store::HerdrMappingKey;
 
+        #[gpui::test]
+        async fn agent_panel_creation_does_not_start_herdr_sync(
+            cx: &mut TestAppContext,
+        ) {
+            let (_panel, visual_cx) = setup_panel(cx).await;
+            let window_id =
+                visual_cx.update(|window, _cx| window.window_handle().window_id());
+            let bridge = visual_cx.update(|_, cx| {
+                cx.global::<HerdrBridgeRegistry>()
+                    .bridge_for_window(window_id, cx)
+            });
+            assert!(
+                bridge.is_none(),
+                "constructing an AgentPanel must not create an active Herdr bridge"
+            );
+        }
+
         fn workspace_created(paths: &[&str]) -> crate::herdr_client::HerdrEvent {
             crate::herdr_client::HerdrEvent::WorkspaceCreated {
                 workspace: crate::herdr_client::HerdrWorkspaceSnapshot {
@@ -16241,7 +16313,7 @@ mod tests {
             panel.read_with(&cx, |panel, cx| {
                 assert_eq!(
                     panel.herdr_status_label(cx),
-                    Some(SharedString::from("Unavailable"))
+                    Some(SharedString::from("Dormant"))
                 );
             });
             // A conflict for a workspace this panel does not own must not
@@ -16257,7 +16329,7 @@ mod tests {
             panel.read_with(&cx, |panel, cx| {
                 assert_eq!(
                     panel.herdr_status_label(cx),
-                    Some(SharedString::from("Unavailable"))
+                    Some(SharedString::from("Dormant"))
                 );
             });
 
@@ -16278,16 +16350,17 @@ mod tests {
                 );
             });
 
-            // A fresh synchronization run supersedes the previous conflict.
+            // Owner process exit supersedes conflicts from the previous
+            // synchronization and returns the label to `Dormant`.
             handle_event(
                 &panel,
                 &mut cx,
-                &HerdrBridgeEvent::StatusChanged(HerdrConnectionStatus::Synchronizing),
+                &HerdrBridgeEvent::StatusChanged(HerdrConnectionStatus::Dormant),
             );
             panel.read_with(&cx, |panel, cx| {
                 assert_eq!(
                     panel.herdr_status_label(cx),
-                    Some(SharedString::from("Unavailable"))
+                    Some(SharedString::from("Dormant"))
                 );
             });
 

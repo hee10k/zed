@@ -639,6 +639,44 @@ pub fn init(
     thread_metadata_store::init(cx);
     herdr_bridge::HerdrBridgeRegistry::init(cx);
     herdr_ownership::init(cx);
+    cx.update_global::<herdr_ownership::HerdrOwnershipRegistry, _>(|registry, _cx| {
+        registry.set_handlers(
+            |window_id, terminal_id, process, launch, cx| {
+                let session_name = launch.session_name.clone();
+                let owner = herdr_bridge::HerdrOwnerProcess {
+                    terminal_id,
+                    process_id: process.pid,
+                    session_name: session_name.clone(),
+                };
+                let result = cx.update_global::<herdr_bridge::HerdrBridgeRegistry, _>(
+                    |registry, cx| {
+                        registry.activate_window(
+                            window_id,
+                            herdr_bridge::HerdrSessionSelection::Named(session_name),
+                            owner,
+                            cx,
+                        )
+                    },
+                );
+                if let Err(error) = result {
+                    log::debug!("Herdr launch did not acquire window ownership: {error}");
+                    false
+                } else {
+                    true
+                }
+            },
+            |window_id, terminal_id, process_id, cx| {
+                cx.update_global::<herdr_bridge::HerdrBridgeRegistry, _>(|registry, cx| {
+                    registry.release_owner_process(window_id, terminal_id, process_id, cx);
+                });
+            },
+            |window_id, cx| {
+                cx.update_global::<herdr_bridge::HerdrBridgeRegistry, _>(|registry, cx| {
+                    registry.release_window(window_id, cx);
+                });
+            },
+        );
+    });
     terminal_thread_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);

@@ -1200,6 +1200,11 @@ mod tests {
     #[test]
     fn lifecycle_reconnect_preserves_threads_rejects_stale_events_and_conflicts_ambiguity() {
         let mut bridge = HerdrThreadBridge::for_test("alpha");
+        bridge.set_owner(crate::herdr_bridge::HerdrOwnerProcess {
+            terminal_id: gpui::EntityId::from(4u64),
+            process_id: Some(4),
+            session_name: "alpha".to_string(),
+        });
         bridge.apply_event(HerdrEvent::WorkspaceCreated {
             workspace: workspace("w1", "Alpha", "/repo"),
             sequence: 1,
@@ -1261,8 +1266,9 @@ mod tests {
             sequence: 7,
         });
         assert!(bridge.root_mapping("w1").is_some_and(HerdrMappingRecord::is_tombstone));
-        bridge.rebind_session("beta").expect("session rebinding");
-        assert_eq!(bridge.session_name(), "beta");
+        assert!(bridge.rebind_session("beta").is_err());
+        bridge.rebind_session("alpha").expect("session rebinding");
+        assert_eq!(bridge.session_name(), "alpha");
         assert_eq!(bridge.status(), HerdrConnectionStatus::Synchronizing);
         assert!(bridge.root_thread_id("w1").is_none());
 

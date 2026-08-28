@@ -72,9 +72,18 @@ impl HerdrSessionSelection {
     }
 }
 
+/// Runtime identity of the local Herdr process that owns a window bridge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HerdrOwnerProcess {
+    pub terminal_id: gpui::EntityId,
+    pub process_id: Option<u32>,
+    pub session_name: String,
+}
+
 /// Connection state for a per-window Herdr bridge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HerdrConnectionStatus {
+    Dormant,
     Unavailable,
     Reconnecting,
     Synchronizing,
@@ -88,6 +97,7 @@ impl HerdrConnectionStatus {
     pub(crate) fn disabled_reason(self) -> Option<&'static str> {
         match self {
             Self::Ready => None,
+            Self::Dormant => Some("Herdr is dormant; launch Herdr from this window to connect."),
             Self::Unavailable => Some("Herdr is unavailable; reconnect to continue."),
             Self::Reconnecting => Some("Herdr is reconnecting; actions are temporarily disabled."),
             Self::Synchronizing => Some("Herdr is synchronizing; actions are temporarily disabled."),
@@ -172,6 +182,7 @@ impl gpui::EventEmitter<HerdrBridgeEvent> for HerdrThreadBridge {}
 pub(crate) struct HerdrThreadBridge {
     window_id: Option<WindowId>,
     selection: HerdrSessionSelection,
+    owner: Option<HerdrOwnerProcess>,
     client: Option<Arc<dyn HerdrApi>>,
     event_receiver: Option<async_channel::Receiver<HerdrEventCursor>>,
     state: BridgeState,
@@ -234,6 +245,7 @@ impl HerdrThreadBridge {
         Self {
             window_id,
             selection,
+            owner: None,
             client,
             event_receiver,
             state: BridgeState {
@@ -241,8 +253,7 @@ impl HerdrThreadBridge {
                 mappings,
                 ..BridgeState::default()
             },
-            root_metadata: HashMap::default(),
-            status: HerdrConnectionStatus::Unavailable,
+            status: HerdrConnectionStatus::Dormant,
             events: Vec::new(),
             outbound_requests: Vec::new(),
             pending_authoritative_focus: None,
@@ -254,7 +265,7 @@ impl HerdrThreadBridge {
             published_subthreads: HashSet::default(),
             pane_outputs: HashMap::default(),
             active_subscription_ids: HashSet::default(),
-            active: Arc::new(AtomicBool::new(true)),
+            active: Arc::new(AtomicBool::new(false)),
             sync_generation: Arc::new(AtomicU64::new(0)),
             sync_cancelled,
             sync_cancel_tx,
@@ -304,6 +315,18 @@ impl HerdrThreadBridge {
 
     pub(crate) fn selection(&self) -> &HerdrSessionSelection {
         &self.selection
+    }
+
+    pub(crate) fn set_owner(&mut self, owner: HerdrOwnerProcess) {
+        self.owner = Some(owner);
+    }
+
+    pub(crate) fn clear_owner(&mut self) -> Option<HerdrOwnerProcess> {
+        self.owner.take()
+    }
+
+    pub(crate) fn owner(&self) -> Option<&HerdrOwnerProcess> {
+        self.owner.as_ref()
     }
 
     pub(crate) fn status(&self) -> HerdrConnectionStatus {
@@ -1982,6 +2005,9 @@ impl HerdrThreadBridge {
         self.persist_mappings(cx);
     }
     fn start_sync(&mut self, cx: &mut Context<Self>) {
+        if self.owner.is_none() {
+            return;
+        }
         self.active.store(true, Ordering::SeqCst);
         let generation = self.sync_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let status_start = self.events.len();
@@ -2001,7 +2027,11 @@ impl HerdrThreadBridge {
         cx.spawn(async move |this, cx| {
             let mut backoff = Duration::from_millis(100);
             loop {
-                if sync_cancelled.load(Ordering::SeqCst)
+                let owner_active = this
+                    .update(cx, |bridge, _cx| bridge.owner.is_some())
+                    .unwrap_or(false);
+                if !owner_active
+                    || sync_cancelled.load(Ordering::SeqCst)
                     || !active.load(Ordering::SeqCst)
                     || sync_generation.load(Ordering::SeqCst) != generation
                 {
@@ -2046,7 +2076,8 @@ impl HerdrThreadBridge {
                         }
                         let applied = this
                             .update(cx, |bridge, cx| {
-                                if !active.load(Ordering::SeqCst)
+                                if bridge.owner.is_none()
+                                    || !active.load(Ordering::SeqCst)
                                     || sync_generation.load(Ordering::SeqCst) != generation
                                 {
                                     return false;
@@ -2112,7 +2143,8 @@ impl HerdrThreadBridge {
                                 }
                                 if this
                                     .update(cx, |bridge, cx| {
-                                        if !active.load(Ordering::SeqCst)
+                                        if bridge.owner.is_none()
+                                            || !active.load(Ordering::SeqCst)
                                             || sync_generation.load(Ordering::SeqCst) != generation
                                         {
                                             return false;
@@ -2137,7 +2169,8 @@ impl HerdrThreadBridge {
                     }
                     Err(error) => {
                         let _ = this.update(cx, |bridge, cx| {
-                            if !active.load(Ordering::SeqCst)
+                            if bridge.owner.is_none()
+                                || !active.load(Ordering::SeqCst)
                                 || sync_generation.load(Ordering::SeqCst) != generation
                             {
                                 return;
@@ -2151,8 +2184,11 @@ impl HerdrThreadBridge {
                         log::debug!("Herdr bootstrap failed; retrying: {error}");
                     }
                 }
-
-                if !active.load(Ordering::SeqCst)
+                let owner_active = this
+                    .update(cx, |bridge, _cx| bridge.owner.is_some())
+                    .unwrap_or(false);
+                if !owner_active
+                    || !active.load(Ordering::SeqCst)
                     || sync_generation.load(Ordering::SeqCst) != generation
                 {
                     return;
@@ -2168,7 +2204,8 @@ impl HerdrThreadBridge {
                     futures::future::Either::Right((_result, _)) => return,
                 }
                 let _ = this.update(cx, |bridge, cx| {
-                    if !active.load(Ordering::SeqCst)
+                    if bridge.owner.is_none()
+                        || !active.load(Ordering::SeqCst)
                         || sync_generation.load(Ordering::SeqCst) != generation
                     {
                         return;
@@ -2184,7 +2221,7 @@ impl HerdrThreadBridge {
     }
 
     pub(crate) fn begin_sync(&mut self, cx: &mut Context<Self>) {
-        if self.sync_started {
+        if self.owner.is_none() || self.sync_started {
             return;
         }
         self.sync_started = true;
@@ -2205,9 +2242,35 @@ impl HerdrThreadBridge {
         self.sync_started = false;
         self.active_subscription_id = None;
         self.active_subscription_ids.clear();
+        self.owner = None;
         self.client = None;
         self.event_receiver = None;
-        self.set_status(HerdrConnectionStatus::Unavailable);
+        self.set_status(HerdrConnectionStatus::Dormant);
+    }
+
+    fn activate(
+        &mut self,
+        selection: HerdrSessionSelection,
+        owner: HerdrOwnerProcess,
+        client: Arc<dyn HerdrApi>,
+        event_receiver: async_channel::Receiver<HerdrEventCursor>,
+        mappings: SessionMappings,
+    ) {
+        let session = selection.session_name();
+        let (sync_cancel_tx, sync_cancel_rx) = async_channel::unbounded();
+        self.selection = selection;
+        self.owner = Some(owner);
+        self.client = Some(client);
+        self.event_receiver = Some(event_receiver);
+        self.state.session = session;
+        self.state.mappings = mappings;
+        self.active.store(true, Ordering::SeqCst);
+        self.sync_cancelled = Arc::new(AtomicBool::new(false));
+        self.sync_cancel_tx = sync_cancel_tx;
+        self.sync_cancel_rx = sync_cancel_rx;
+        self.sync_started = false;
+        self.active_subscription_id = None;
+        self.active_subscription_ids.clear();
     }
 
     /// Disconnect the current state before binding this bridge to a new
@@ -2216,6 +2279,17 @@ impl HerdrThreadBridge {
         let session = session.into();
         if session.trim().is_empty() {
             return Err(anyhow!("Herdr session name cannot be empty"));
+        }
+        let Some(owner) = self.owner.as_ref() else {
+            return Err(anyhow!(
+                "Herdr session rebind requires an active owned bridge"
+            ));
+        };
+        if owner.session_name != session || self.state.session != session {
+            return Err(anyhow!(
+                "Herdr session rebind must use the active persisted session {:?}",
+                owner.session_name
+            ));
         }
         self.active.store(false, Ordering::SeqCst);
         self.sync_cancelled.store(true, Ordering::SeqCst);
@@ -2246,13 +2320,33 @@ impl HerdrThreadBridge {
         self.set_status(HerdrConnectionStatus::Synchronizing);
         Ok(())
     }
-
     pub(crate) fn rebind_selection(
         &mut self,
         selection: HerdrSessionSelection,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        let session_name = selection.session_name();
+        let session_name = match &selection {
+            HerdrSessionSelection::Named(session) if !session.trim().is_empty() => session.clone(),
+            HerdrSessionSelection::Named(_) => {
+                return Err(anyhow!("Herdr session name cannot be empty"));
+            }
+            HerdrSessionSelection::Default | HerdrSessionSelection::Explicit(_) => {
+                return Err(anyhow!(
+                    "Herdr session rebind requires the active named session"
+                ));
+            }
+        };
+        let Some(owner) = self.owner.as_ref() else {
+            return Err(anyhow!(
+                "Herdr session rebind requires an active owned bridge"
+            ));
+        };
+        if owner.session_name != session_name || self.state.session != session_name {
+            return Err(anyhow!(
+                "Herdr session rebind must use the active persisted session {:?}",
+                owner.session_name
+            ));
+        }
         let event_start = self.events.len();
         self.rebind_session(session_name.clone())?;
         self.selection = selection.clone();
@@ -2282,6 +2376,7 @@ impl HerdrThreadBridge {
         self.start_sync(cx);
         Ok(())
     }
+
     /// Request Herdr to focus a mapped root and return the fenced operation.
     /// Reflected events with this operation ID are consumed by Task 2's state
     /// machine and never produce another outbound request.
@@ -2481,14 +2576,12 @@ impl HerdrThreadBridge {
 /// panel construction in that window reuses that entity.
 pub(crate) struct HerdrBridgeRegistry {
     bridges: HashMap<WindowId, Entity<HerdrThreadBridge>>,
-    panel_counts: HashMap<WindowId, usize>,
 }
 
 impl Default for HerdrBridgeRegistry {
     fn default() -> Self {
         Self {
             bridges: HashMap::default(),
-            panel_counts: HashMap::default(),
         }
     }
 }
@@ -2502,52 +2595,134 @@ impl HerdrBridgeRegistry {
         }
     }
 
-    pub(crate) fn for_window(
+
+    pub(crate) fn activate_window(
         &mut self,
         window_id: WindowId,
-        session: HerdrSessionSelection,
+        selection: HerdrSessionSelection,
+        owner: HerdrOwnerProcess,
         cx: &mut App,
-    ) -> Entity<HerdrThreadBridge> {
-        if let Some(bridge) = self.bridges.get(&window_id).cloned() {
-            *self.panel_counts.entry(window_id).or_default() += 1;
-            return bridge;
-        }
-
-        let endpoint = session.endpoint();
-        let (client, event_receiver) = match HerdrClientHandle::new(endpoint, cx) {
-            Ok(client) => {
-                let event_receiver = client.subscribe_with_cursor();
-                (
-                    Some(Arc::new(client) as Arc<dyn HerdrApi>),
-                    Some(event_receiver),
-                )
+    ) -> Result<Entity<HerdrThreadBridge>> {
+        let session_name = match &selection {
+            HerdrSessionSelection::Named(session) if !session.trim().is_empty() => session.clone(),
+            HerdrSessionSelection::Named(_) => {
+                return Err(anyhow!("Herdr session name cannot be empty"));
             }
-            Err(error) => {
-                log::warn!("Herdr bridge client creation failed: {error}");
-                (None, None)
+            HerdrSessionSelection::Default | HerdrSessionSelection::Explicit(_) => {
+                return Err(anyhow!(
+                    "owned Herdr activation requires a named session"
+                ));
             }
         };
-        let mappings =
-            match HerdrMappingStore::load_session(&KeyValueStore::global(cx), &session.session_name())
-            {
+        if owner.session_name != session_name {
+            return Err(anyhow!(
+                "Herdr owner session {:?} does not match activation session {:?}",
+                owner.session_name,
+                session_name
+            ));
+        }
+
+        if let Some(bridge) = self.bridges.get(&window_id).cloned() {
+            let current_owner = bridge.read(cx).owner().cloned();
+            if let Some(current_owner) = current_owner {
+                let same_process = match (current_owner.process_id, owner.process_id) {
+                    (None, None) => true,
+                    (None, Some(_)) => true,
+                    (Some(existing), Some(candidate)) => existing == candidate,
+                    (Some(_), None) => false,
+                };
+                if current_owner.terminal_id != owner.terminal_id
+                    || current_owner.session_name != owner.session_name
+                    || !same_process
+                {
+                    return Err(anyhow!(
+                        "Herdr window {window_id:?} has a conflicting owner terminal {:?} session {:?} process {:?}",
+                        current_owner.terminal_id,
+                        current_owner.session_name,
+                        current_owner.process_id
+                    ));
+                }
+                if bridge.read(cx).session_name() != session_name {
+                    return Err(anyhow!(
+                        "Herdr window {window_id:?} is bound to persisted session {:?}",
+                        bridge.read(cx).session_name()
+                    ));
+                }
+                if current_owner.process_id.is_none() && owner.process_id.is_some() {
+                    bridge.update(cx, |bridge, _cx| {
+                        if let Some(current_owner) = bridge.owner.as_mut() {
+                            current_owner.process_id = owner.process_id;
+                        }
+                    });
+                }
+                return Ok(bridge);
+            }
+
+            if bridge.read(cx).session_name() != session_name {
+                return Err(anyhow!(
+                    "Herdr window {window_id:?} is bound to persisted session {:?}",
+                    bridge.read(cx).session_name()
+                ));
+            }
+
+            let endpoint = selection.endpoint();
+            let client = HerdrClientHandle::new(endpoint, cx)
+                .map_err(|error| anyhow!("Herdr bridge client creation failed: {error}"))?;
+            let event_receiver = client.subscribe_with_cursor();
+            let client: Arc<dyn HerdrApi> = Arc::new(client);
+            let mappings = match HerdrMappingStore::load_session(
+                &KeyValueStore::global(cx),
+                &session_name,
+            ) {
                 Ok(mappings) => mappings,
                 Err(error) => {
                     log::warn!("Herdr bridge mapping load failed: {error}");
                     SessionMappings::default()
                 }
             };
+            bridge.update(cx, |bridge, _cx| {
+                bridge.activate(
+                    selection,
+                    owner,
+                    client,
+                    event_receiver,
+                    mappings,
+                );
+            });
+            crate::agent_panel::attach_herdr_bridge_to_window(window_id, bridge.clone(), cx);
+            bridge.update(cx, |bridge, cx| bridge.begin_sync(cx));
+            return Ok(bridge);
+        }
+
+        let endpoint = selection.endpoint();
+        let client = HerdrClientHandle::new(endpoint, cx)
+            .map_err(|error| anyhow!("Herdr bridge client creation failed: {error}"))?;
+        let event_receiver = client.subscribe_with_cursor();
+        let client: Arc<dyn HerdrApi> = Arc::new(client);
+        let mappings = match HerdrMappingStore::load_session(
+            &KeyValueStore::global(cx),
+            &session_name,
+        ) {
+            Ok(mappings) => mappings,
+            Err(error) => {
+                log::warn!("Herdr bridge mapping load failed: {error}");
+                SessionMappings::default()
+            }
+        };
         let bridge = cx.new(|_| {
             HerdrThreadBridge::new(
                 Some(window_id),
-                session,
-                client,
-                event_receiver,
+                selection,
+                Some(client),
+                Some(event_receiver),
                 mappings,
             )
         });
+        bridge.update(cx, |bridge, _cx| bridge.set_owner(owner));
         self.bridges.insert(window_id, bridge.clone());
-        self.panel_counts.insert(window_id, 1);
-        bridge
+        crate::agent_panel::attach_herdr_bridge_to_window(window_id, bridge.clone(), cx);
+        bridge.update(cx, |bridge, cx| bridge.begin_sync(cx));
+        Ok(bridge)
     }
 
     pub(crate) fn bridge_for_window(
@@ -2558,9 +2733,10 @@ impl HerdrBridgeRegistry {
         self.bridges.get(&window_id).cloned()
     }
 
-    /// Explicitly rebinds the bridge bound to `window_id` to `selection`
-    /// after a user picks a Herdr session. The fresh snapshot is loaded by
-    /// the resulting sync run.
+    /// Rebinds an already-owned bridge to its persisted named session.
+    ///
+    /// Arbitrary/default sessions are deliberately rejected by
+    /// [`HerdrThreadBridge::rebind_selection`].
     pub(crate) fn rebind_window_session(
         &mut self,
         window_id: WindowId,
@@ -2575,19 +2751,41 @@ impl HerdrBridgeRegistry {
         bridge.update(cx, |bridge, cx| bridge.rebind_selection(selection, cx))
     }
 
-    pub(crate) fn release_panel(&mut self, window_id: WindowId, cx: &mut App) {
-        let Some(count) = self.panel_counts.get_mut(&window_id) else {
+    pub(crate) fn release_owner_process(
+        &mut self,
+        window_id: WindowId,
+        terminal_id: gpui::EntityId,
+        process_id: Option<u32>,
+        cx: &mut App,
+    ) {
+        let Some(bridge) = self.bridges.get(&window_id).cloned() else {
             return;
         };
-        if *count > 1 {
-            *count -= 1;
-            return;
-        }
-        self.panel_counts.remove(&window_id);
-        if let Some(bridge) = self.bridges.remove(&window_id) {
-            bridge.update(cx, |bridge, _cx| bridge.stop());
+        let owner_matches = bridge.read(cx).owner().is_some_and(|owner| {
+            owner.terminal_id == terminal_id
+                && (owner.process_id == process_id
+                    || owner.process_id.is_none()
+                    || process_id.is_none())
+        });
+        if owner_matches {
+            let _ = bridge.update(cx, |bridge, cx| {
+                let start = bridge.events.len();
+                bridge.stop();
+                bridge.emit_new_events(start, cx);
+            });
         }
     }
+
+    pub(crate) fn release_window(&mut self, window_id: WindowId, cx: &mut App) {
+        if let Some(bridge) = self.bridges.remove(&window_id) {
+            let _ = bridge.update(cx, |bridge, _cx| bridge.stop());
+        }
+    }
+
+    /// A panel release only detaches that panel's subscription. The window
+    /// observer owns bridge lifetime, so this method intentionally does not
+    /// stop or remove the bridge.
+    pub(crate) fn release_panel(&mut self, _window_id: WindowId, _cx: &mut App) {}
 }
 
 /// Records outbound API calls so UI tests can assert side effects without a
@@ -2610,11 +2808,11 @@ impl RecordingHerdrApi {
     pub(crate) fn set_create_response(&self, snapshot: HerdrWorkspaceSnapshot) {
         *self.create_response.lock() = Some(snapshot);
     }
-
-
     pub(crate) fn calls(&self) -> Vec<String> {
         self.calls.lock().clone()
     }
+
+
 
     fn record(&self, call: String) {
         self.calls.lock().push(call);
@@ -2630,6 +2828,7 @@ impl HerdrApi for RecordingHerdrApi {
         Task::ready(Ok(String::new()))
     }
     fn bootstrap(&self, _cx: &App) -> Task<Result<HerdrBootstrap, HerdrClientError>> {
+        self.record("bootstrap".to_string());
         Task::ready(Err(HerdrClientError::Disconnected))
     }
     fn get_snapshot(&self, _cx: &App) -> Task<Result<HerdrSnapshot, HerdrClientError>> {
@@ -2836,11 +3035,19 @@ mod tests {
     }
 
     #[test]
-    fn session_rebind_disconnects_old_session_before_loading_new_snapshot() {
+    fn session_rebind_requires_the_active_persisted_session() {
         let mut bridge = HerdrThreadBridge::for_test_in_session("alpha");
         bridge.apply_event(workspace_created("w1", "/repo", "Review"));
-        bridge.rebind_session("beta").expect("session rebind should succeed");
-        assert_eq!(bridge.session_name(), "beta");
+        bridge.set_owner(HerdrOwnerProcess {
+            terminal_id: gpui::EntityId::from(3u64),
+            process_id: Some(3),
+            session_name: "alpha".to_string(),
+        });
+        assert!(bridge.rebind_session("beta").is_err());
+        bridge
+            .rebind_session("alpha")
+            .expect("rebind to the active persisted session should succeed");
+        assert_eq!(bridge.session_name(), "alpha");
         assert_eq!(bridge.status(), HerdrConnectionStatus::Synchronizing);
         assert!(bridge.root_mapping("w1").is_none());
     }
@@ -3714,10 +3921,15 @@ mod tests {
     #[test]
     fn rebind_wakes_old_worker_and_replaces_cancellation_generation() {
         let mut bridge = test_bridge();
+        bridge.set_owner(HerdrOwnerProcess {
+            terminal_id: gpui::EntityId::from(1u64),
+            process_id: Some(1),
+            session_name: "alpha".to_string(),
+        });
         let old_cancellation = bridge.sync_cancel_rx.clone();
         let old_cancellation_clone = bridge.sync_cancel_rx.clone();
         let old_cancelled = bridge.sync_cancelled.clone();
-        bridge.rebind_session("beta").expect("rebind");
+        bridge.rebind_session("alpha").expect("rebind");
         assert!(old_cancelled.load(Ordering::SeqCst));
         assert!(old_cancellation.try_recv().is_ok());
         assert!(
@@ -4488,12 +4700,18 @@ mod tests {
             bridge.set_root_zed_workspace_id("missing", owner, cx)
         }));
     }
-
     #[gpui::test]
     async fn bootstrap_failures_do_not_emit_user_request_failure_events(
         cx: &mut gpui::TestAppContext,
     ) {
         let bridge = cx.new(|_| HerdrThreadBridge::for_test_with_api(RecordingHerdrApi::new()));
+        bridge.update(cx, |bridge, _cx| {
+            bridge.set_owner(HerdrOwnerProcess {
+                terminal_id: gpui::EntityId::from(2u64),
+                process_id: Some(2),
+                session_name: "alpha".to_string(),
+            });
+        });
         bridge.update(cx, |bridge, cx| bridge.begin_sync(cx));
         cx.run_until_parked();
 
@@ -4509,6 +4727,268 @@ mod tests {
         );
 
         bridge.update(cx, |bridge, _| bridge.stop());
+    }
+    #[gpui::test]
+    async fn owner_release_stops_future_bootstrap_retries(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let api = RecordingHerdrApi::new();
+        let bridge = cx.new(|_| HerdrThreadBridge::for_test_with_api(api.clone()));
+        let owner = HerdrOwnerProcess {
+            terminal_id: gpui::EntityId::from(42u64),
+            process_id: Some(42),
+            session_name: "alpha".to_string(),
+        };
+
+        bridge.update(cx, |bridge, cx| {
+            bridge.set_owner(owner.clone());
+            bridge.begin_sync(cx);
+        });
+        cx.run_until_parked();
+        let attempts_before_release = api
+            .calls()
+            .iter()
+            .filter(|call| call.as_str() == "bootstrap")
+            .count();
+        assert!(attempts_before_release > 0);
+
+        bridge.update(cx, |bridge, _cx| {
+            assert_eq!(bridge.clear_owner(), Some(owner));
+        });
+        cx.run_until_parked();
+        let attempts_after_release = api
+            .calls()
+            .iter()
+            .filter(|call| call.as_str() == "bootstrap")
+            .count();
+        assert_eq!(
+            attempts_after_release, attempts_before_release,
+            "clearing the owner must stop the retry loop"
+        );
+    }
+
+    #[gpui::test]
+    async fn duplicate_owner_activation_is_rejected(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| HerdrBridgeRegistry::init(cx));
+        let window_id = WindowId::from(7u64);
+        let first_owner = HerdrOwnerProcess {
+            terminal_id: gpui::EntityId::from(10u64),
+            process_id: None,
+            session_name: "zed-test".to_string(),
+        };
+        let upgraded_owner = HerdrOwnerProcess {
+            terminal_id: gpui::EntityId::from(10u64),
+            process_id: Some(10),
+            session_name: "zed-test".to_string(),
+        };
+        let different_process_owner = HerdrOwnerProcess {
+            terminal_id: gpui::EntityId::from(10u64),
+            process_id: Some(99),
+            session_name: "zed-test".to_string(),
+        };
+        let second_owner = HerdrOwnerProcess {
+            terminal_id: gpui::EntityId::from(11u64),
+            process_id: Some(11),
+            session_name: "zed-test".to_string(),
+        };
+
+        let first = cx.update(|cx| {
+            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                registry.activate_window(
+                    window_id,
+                    HerdrSessionSelection::Named("zed-test".to_string()),
+                    first_owner.clone(),
+                    cx,
+                )
+            })
+        })
+        .expect("first owner should activate the bridge");
+        let reused = cx.update(|cx| {
+            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                registry.activate_window(
+                    window_id,
+                    HerdrSessionSelection::Named("zed-test".to_string()),
+                    upgraded_owner,
+                    cx,
+                )
+            })
+        })
+        .expect("same terminal/session should reuse and upgrade the bridge owner");
+        let same_terminal_conflict = cx.update(|cx| {
+            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                registry.activate_window(
+                    window_id,
+                    HerdrSessionSelection::Named("zed-test".to_string()),
+                    different_process_owner,
+                    cx,
+                )
+            })
+        });
+        assert!(
+            same_terminal_conflict.is_err(),
+            "a concrete PID change in the same terminal must be rejected"
+        );
+        assert_eq!(first, reused);
+        assert_eq!(
+            first.read_with(cx, |bridge, _cx| bridge.owner().and_then(|owner| owner.process_id)),
+            Some(10)
+        );
+        cx.update(|cx| {
+            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                registry.release_owner_process(
+                    window_id,
+                    gpui::EntityId::from(10u64),
+                    Some(99),
+                    cx,
+                );
+            })
+        });
+        assert_eq!(
+            first.read_with(cx, |bridge, _cx| bridge.owner().and_then(|owner| owner.process_id)),
+            Some(10),
+            "a concrete PID mismatch must not release the active owner"
+        );
+
+        let conflict = cx.update(|cx| {
+            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                registry.activate_window(
+                    window_id,
+                    HerdrSessionSelection::Named("zed-test".to_string()),
+                    second_owner,
+                    cx,
+                )
+            })
+        });
+        assert!(
+            conflict.is_err(),
+            "a different terminal/process must not replace the active owner"
+        );
+        cx.update(|cx| {
+            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                registry.release_window(window_id, cx);
+            })
+        });
+    }
+
+    #[gpui::test]
+    async fn rebind_requires_the_active_owned_named_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let bridge = cx.new(|_| HerdrThreadBridge::for_test("alpha"));
+        let default_selection = bridge.update(cx, |bridge, cx| {
+            bridge.rebind_selection(HerdrSessionSelection::Default, cx)
+        });
+        assert!(
+            default_selection.is_err(),
+            "an unowned bridge must not attach the default session"
+        );
+
+        bridge.update(cx, |bridge, _cx| {
+            bridge.set_owner(HerdrOwnerProcess {
+                terminal_id: gpui::EntityId::from(12u64),
+                process_id: Some(12),
+                session_name: "alpha".to_string(),
+            });
+        });
+        let different_named_selection = bridge.update(cx, |bridge, cx| {
+            bridge.rebind_selection(
+                HerdrSessionSelection::Named("external".to_string()),
+                cx,
+            )
+        });
+        assert!(
+            different_named_selection.is_err(),
+            "rebind must use the persisted session owned by this bridge"
+        );
+    }
+
+    #[gpui::test]
+    async fn releasing_a_panel_does_not_drop_an_owned_bridge(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| HerdrBridgeRegistry::init(cx));
+        let window_id = WindowId::from(8u64);
+        let owner = HerdrOwnerProcess {
+            terminal_id: gpui::EntityId::from(13u64),
+            process_id: Some(13),
+            session_name: "zed-panel".to_string(),
+        };
+        let bridge = cx
+            .update(|cx| {
+                cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                    registry.activate_window(
+                        window_id,
+                        HerdrSessionSelection::Named("zed-panel".to_string()),
+                        owner,
+                        cx,
+                    )
+                })
+            })
+            .expect("owner should activate the bridge");
+        cx.update(|cx| {
+            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                registry.release_panel(window_id, cx);
+                assert!(registry.bridge_for_window(window_id, cx).is_some());
+            })
+        });
+        cx.update(|cx| {
+            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                registry.release_window(window_id, cx);
+            })
+        });
+
+    }
+    #[gpui::test]
+    async fn owner_process_release_marks_bridge_dormant(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| HerdrBridgeRegistry::init(cx));
+        let window_id = WindowId::from(9u64);
+        let owner = HerdrOwnerProcess {
+            terminal_id: gpui::EntityId::from(14u64),
+            process_id: None,
+            session_name: "zed-dormant".to_string(),
+        };
+        let bridge = cx
+            .update(|cx| {
+                cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                    registry.activate_window(
+                        window_id,
+                        HerdrSessionSelection::Named("zed-dormant".to_string()),
+                        owner.clone(),
+                        cx,
+                    )
+                })
+            })
+            .expect("owner should activate the bridge");
+        bridge.update(cx, |bridge, _cx| {
+            bridge.apply_event(workspace_created("w1", "/project", "Review"));
+        });
+        cx.update(|cx| {
+            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                registry.release_owner_process(
+                    window_id,
+                    owner.terminal_id,
+                    owner.process_id,
+                    cx,
+                );
+            })
+        });
+        bridge.read_with(cx, |bridge, _cx| {
+            assert_eq!(bridge.status(), HerdrConnectionStatus::Dormant);
+            assert!(bridge.owner().is_none());
+            assert!(
+                bridge.root_mapping("w1").is_some(),
+                "owner release must preserve persisted root mappings"
+            );
+        });
+        cx.update(|cx| {
+            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                assert!(registry.bridge_for_window(window_id, cx).is_some());
+            })
+        });
     }
 
 }

@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::Rc,
 };
 
@@ -135,6 +135,10 @@ struct HerdrOwnershipObserver {
     terminal_entities: HashMap<EntityId, WeakEntity<Terminal>>,
     terminal_subscriptions: HashMap<EntityId, TerminalSubscriptions>,
     owner: Option<HerdrOwner>,
+    /// Terminal IDs already notified about process teardown. This keeps
+    /// foreground-clear, process-exit, and release callbacks idempotent while
+    /// allowing a later accepted launch on the same terminal to re-arm it.
+    process_exit_notifications: HashSet<EntityId>,
     _multi_workspace_subscription: Option<Subscription>,
 }
 
@@ -154,6 +158,7 @@ impl HerdrOwnershipObserver {
             terminal_entities: HashMap::default(),
             terminal_subscriptions: HashMap::default(),
             owner: None,
+            process_exit_notifications: HashSet::default(),
             _multi_workspace_subscription: None,
         }
     }
@@ -279,7 +284,9 @@ impl HerdrOwnershipObserver {
             &terminal,
             window,
             move |observer, _terminal, _window, cx| {
-                observer.release_owner_and_rescan(terminal_id, cx);
+                if observer.release_owner_or_notify_terminal(terminal_id, cx) {
+                    observer.rescan_foreground_processes(Some(terminal_id), cx);
+                }
                 observer.terminal_subscriptions.remove(&terminal_id);
                 observer.terminal_projects.remove(&terminal_id);
                 observer.terminal_entities.remove(&terminal_id);
@@ -313,14 +320,14 @@ impl HerdrOwnershipObserver {
             .iter()
             .filter_map(|(terminal_id, id)| (*id == project_id).then_some(*terminal_id))
             .collect::<Vec<_>>();
-        let mut owner_released = false;
+        let mut process_exit_notified = false;
         for terminal_id in terminal_ids {
-            owner_released |= self.release_owner_for_terminal(terminal_id, cx);
+            process_exit_notified |= self.release_owner_or_notify_terminal(terminal_id, cx);
             self.terminal_entities.remove(&terminal_id);
             self.terminal_projects.remove(&terminal_id);
             self.terminal_subscriptions.remove(&terminal_id);
         }
-        if owner_released {
+        if process_exit_notified {
             self.rescan_foreground_processes(None, cx);
         }
     }
@@ -329,17 +336,18 @@ impl HerdrOwnershipObserver {
         &mut self,
         terminal: &Entity<Terminal>,
         event: &TerminalEvent,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) {
         match event {
             TerminalEvent::ForegroundProcessChanged(Some(process)) => {
                 self.handle_foreground_process(terminal.entity_id(), process, cx);
             }
-            TerminalEvent::ForegroundProcessChanged(None) => {
-                self.release_owner_and_rescan(terminal.entity_id(), cx);
-            }
-            TerminalEvent::ProcessExited => {
-                self.release_owner_and_rescan(terminal.entity_id(), cx);
+            TerminalEvent::ForegroundProcessChanged(None)
+            | TerminalEvent::ProcessExited => {
+                let terminal_id = terminal.entity_id();
+                if self.release_owner_or_notify_terminal(terminal_id, cx) {
+                    self.rescan_foreground_processes(Some(terminal_id), cx);
+                }
             }
             _ => {}
         }
@@ -388,6 +396,7 @@ impl HerdrOwnershipObserver {
         );
         if accepted {
             self.owner = Some(owner);
+            self.process_exit_notifications.remove(&terminal_id);
         }
     }
 
@@ -399,6 +408,7 @@ impl HerdrOwnershipObserver {
             self.owner = Some(owner);
             return false;
         }
+        self.process_exit_notifications.insert(terminal_id);
 
         let on_process_exit = self.callbacks.on_process_exit.borrow().clone();
         on_process_exit(
@@ -409,9 +419,30 @@ impl HerdrOwnershipObserver {
         );
         true
     }
+    fn release_owner_or_notify_terminal(
+        &mut self,
+        terminal_id: EntityId,
+        cx: &mut App,
+    ) -> bool {
+        if !self.process_exit_notifications.insert(terminal_id) {
+            return false;
+        }
+        let process_id = self
+            .owner
+            .as_ref()
+            .filter(|owner| owner.terminal_id == terminal_id)
+            .map(|owner| owner.process_id)
+            .unwrap_or(None);
+        let released = self.release_owner_for_terminal(terminal_id, cx);
+        if !released {
+            let on_process_exit = self.callbacks.on_process_exit.borrow().clone();
+            on_process_exit(self.window_id, terminal_id, process_id, cx);
+        }
+        true
+    }
 
     fn release_owner_and_rescan(&mut self, terminal_id: EntityId, cx: &mut App) {
-        if self.release_owner_for_terminal(terminal_id, cx) {
+        if self.release_owner_or_notify_terminal(terminal_id, cx) {
             self.rescan_foreground_processes(Some(terminal_id), cx);
         }
     }
@@ -496,6 +527,20 @@ mod tests {
             argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
             pid: Some(pid),
         }
+    }
+
+    fn terminal_entity(cx: &mut TestAppContext) -> gpui::Entity<Terminal> {
+        cx.new(|cx| {
+            terminal::TerminalBuilder::new_display_only(
+                terminal::terminal_settings::CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx)
+        })
     }
 
     fn recording_observer(
@@ -674,6 +719,56 @@ mod tests {
 
         assert_eq!(&*exits.borrow(), &[(terminal_id, Some(11))]);
     }
+    #[gpui::test]
+    fn terminal_release_notifies_pending_owner_without_observer_owner(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut observer, _launches, exits) = recording_observer();
+        let terminal_id = cx.update(|cx| cx.new(|_| ())).entity_id();
+
+        cx.update(|cx| {
+            assert!(observer.release_owner_or_notify_terminal(terminal_id, cx));
+            assert!(!observer.release_owner_or_notify_terminal(terminal_id, cx));
+        });
+
+        assert_eq!(&*exits.borrow(), &[(terminal_id, None)]);
+    }
+    #[gpui::test]
+    fn foreground_clear_notifies_pending_owner_while_terminal_lives(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut observer, _launches, exits) = recording_observer();
+        let terminal = terminal_entity(cx);
+        let terminal_id = terminal.entity_id();
+
+        cx.update(|cx| {
+            observer.handle_terminal_event(
+                &terminal,
+                &TerminalEvent::ForegroundProcessChanged(None),
+                cx,
+            );
+        });
+
+        assert_eq!(&*exits.borrow(), &[(terminal_id, None)]);
+    }
+
+    #[gpui::test]
+    fn process_exit_notifies_pending_owner_without_double_release(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut observer, _launches, exits) = recording_observer();
+        let terminal = terminal_entity(cx);
+        let terminal_id = terminal.entity_id();
+
+        cx.update(|cx| {
+            observer.handle_terminal_event(&terminal, &TerminalEvent::ProcessExited, cx);
+            observer.handle_terminal_event(&terminal, &TerminalEvent::ProcessExited, cx);
+        });
+
+        assert_eq!(&*exits.borrow(), &[(terminal_id, None)]);
+    }
+
+
 
     #[gpui::test]
     fn workspace_removal_releases_owned_terminal_once(cx: &mut TestAppContext) {
