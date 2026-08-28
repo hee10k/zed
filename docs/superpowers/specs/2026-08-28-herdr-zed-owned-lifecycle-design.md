@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved design, pending written-spec review.
+Revised design, pending user review.
 
 ## Problem
 
@@ -58,8 +58,12 @@ client, start synchronization, or retry an endpoint. A bridge is created only
 when one of the following ownership triggers occurs:
 
 1. The user invokes the Zed `Open Herdr` action.
-2. Zed observes a direct executable named `herdr` as the foreground process in
-   one of the window's embedded terminals.
+2. Zed observes a direct server-launch executable named `herdr` in any local
+   terminal belonging to that window.
+
+Remote terminals cannot trigger ownership. Running Herdr in a local Zed
+terminal is an ownership trigger; running Herdr in a separate terminal outside
+Zed is not.
 
 The bridge uses `HerdrSessionSelection::Named` with the persisted session name.
 It never uses the ambient default session for an owned window.
@@ -83,9 +87,25 @@ The existing workspace restoration flow carries the serialized state from the
 previous runtime window key to the newly created window; serialization then
 writes the restored Herdr state under the new runtime key.
 
-A new window may reserve a name before any Herdr launch so Zed-created terminal
+A new window reserves its name before any Herdr launch so Zed-created terminal
 shells can receive the correct `HERDR_SESSION` environment value. Reservation
 alone does not set `herdr_owned` and does not activate a bridge.
+
+The live owner process is runtime state, not persisted state. The bridge must
+track the terminal and process that satisfied the current launch trigger. A
+bridge may retry while that process is still alive or while its initial launch
+is pending; observing that Herdr process exit returns the bridge to `Dormant`
+and stops retries. A Herdr server restarted outside Zed cannot reactivate the
+bridge.
+
+The persisted `herdr_owned` bit records prior ownership history only. The
+runtime bridge also keeps an owner terminal identifier and process identity.
+Those runtime values are cleared when the process exits or the window closes;
+they are never reconstructed from endpoint availability alone.
+
+Session reservation is flushed before the launch action returns and during
+normal Zed window shutdown. A crash may lose an unflushed reservation, but it
+must not overwrite an already persisted name or root mapping.
 
 On Zed restart:
 
@@ -117,25 +137,57 @@ The action records ownership before waiting for the endpoint. The bridge may
 remain `Unavailable` while Herdr starts, then retries until the named endpoint
 accepts a bootstrap.
 
-### Direct embedded-terminal execution
+### Direct local-terminal execution
 
-Zed terminal process observation recognizes only an executable whose basename
-is exactly `herdr`. It does not infer ownership from a pipe, cwd, output text,
-agent name, shell alias, or unrelated external process.
+Zed observes all local terminals in the window, including the standard
+workspace `TerminalPanel` and terminals managed by the `AgentPanel`. It
+recognizes a server-launch invocation whose normalized executable basename is
+exactly `herdr` (or `herdr.exe` on Windows). Accepted forms are a bare `herdr`
+using the injected `HERDR_SESSION`, or a supported launch form whose explicit
+session equals the reserved name. The `herdr server` form is also eligible
+when its session is provided through the reserved environment.
 
-Zed-created terminal shells receive the window's `HERDR_SESSION` value, so a
-bare `herdr` command launches the reserved named session. If process arguments
-contain an explicit `--session` value, that value must equal the reserved name;
-otherwise the process is not bound to this Zed window.
+Remote terminals and terminals in other Zed windows cannot trigger ownership.
+
+CLI client commands are not ownership triggers. In particular, `status`,
+`workspace`, `tab`, `pane`, `agent`, `notification`, `session`, `api`,
+`update`, `completion`, and unknown subcommands are excluded. Zed must inspect
+the foreground process arguments, not only the normalized executable name.
+
+Zed does not infer ownership from a pipe, cwd, output text, agent name, shell
+alias, wrapper, or unrelated external process.
+
+Zed-created local terminal shells receive the window's `HERDR_SESSION` value,
+so a bare `herdr` command launches the reserved named session. If process
+arguments contain an explicit `--session` value, that value must equal the
+reserved name; otherwise the process is not bound to this Zed window.
 
 A shell alias or wrapper is outside the direct-executable contract. Users can
-use the explicit Zed action or invoke `herdr --session <reserved-name>` when an
-existing terminal was created without the Zed session environment.
+use the explicit Zed action or invoke `herdr --session <reserved-name>` when
+an existing local terminal was created without the Zed session environment.
+
+A process that exits before establishing a connection clears the pending
+launch claim and leaves the bridge dormant.
 
 An external terminal process cannot trigger ownership because it is not
 observed by the Zed terminal process monitor. An existing socket or pipe is
 never sufficient on its own.
 
+
+### Process-observation seam
+
+The ownership observer is window-scoped but terminal-surface agnostic. The
+existing terminal process monitor must publish the normalized executable name,
+full argv, local/remote flag, terminal identity, and process identity whenever
+the foreground process changes, and publish process exit for the tracked
+terminal. The current command-name-only accessor and name/cwd-only change event
+are insufficient for session-argument validation and owner-process teardown.
+
+Both the standard workspace `TerminalPanel` and `AgentPanel` terminals feed
+this observer. The observer forwards only local terminals to the
+`HerdrBridgeRegistry`; the registry applies the exact launch-command and
+session checks before creating a bridge. No Herdr-specific logic is placed in
+the standard terminal's UI.
 ## Bridge lifecycle
 
 ### Start
@@ -167,11 +219,30 @@ another terminal remains independent during this dormant period.
 
 A broken pipe/socket or server exit changes bridge status to `Unavailable` or
 `Reconnecting`, preserves known roots/subthreads, and keeps retrying only while
-the bridge is active. The bridge must not create repeated user notifications
-for these automatic attempts.
+the Zed-owned Herdr process is still alive or its initial in-Zed launch is
+still pending. Once the owner process exits, the bridge stops retrying and
+returns to `Dormant`; a later launch from another terminal does not reconnect
+it.
 
-When Herdr later accepts the named endpoint after an in-window launch, the
-next bootstrap restores the persisted mapping and returns to `Ready`.
+The retry loop is gated by the runtime owner process. A connection loss while
+the owner process is alive may retry automatically. If the owner process exits,
+the bridge cancels subscriptions, clears its runtime owner, and becomes
+`Dormant`. A Herdr background server that remains alive after its Zed client
+exits is not enough to reactivate that bridge; a new in-Zed launch trigger is
+required.
+
+The bridge must not create repeated user notifications for automatic attempts.
+
+When Herdr later accepts the named endpoint after an in-window launch, the next
+bootstrap restores the persisted mapping and returns to `Ready`.
+
+When `Open Herdr` starts a process, the action records the terminal and process
+identity before the first endpoint attempt. If process creation fails or the
+process exits before a successful bootstrap, the pending owner record is
+cleared and the bridge returns to `Dormant`. A second launch in the same window
+cannot claim the session while a different owner process is still active; it
+must either reuse the existing owner or report a deterministic ownership
+conflict.
 
 ## Deterministic workspace and thread mapping
 
@@ -203,6 +274,7 @@ The path value remains diagnostic and a unique fallback only; it is not an
 implicit authority when a persisted workspace owner exists.
 
 Recognized agent panes use the existing session-qualified identity:
+
 
 ```text
 Herdr session + workspace_id + pane_id + agent_session
@@ -240,6 +312,10 @@ external Herdr session is running.
 - Existing default-session mappings are not silently claimed by a new Zed
   window. The user must launch Herdr through an ownership trigger to establish
   the new Zed-owned named session.
+- Moving a Zed workspace between windows does not transfer Herdr ownership or
+  share a named session. The destination window must establish its own
+  ownership; the old session mapping remains historical until explicitly
+  re-associated.
 - Herdr's public API, Unix socket, Windows named-pipe transport, and structured
   request payloads remain unchanged.
 
@@ -251,22 +327,23 @@ external Herdr session is running.
   `WindowId`.
 - Deserialize older `MultiWorkspaceState` records without Herdr fields.
 - Restore Herdr state into a new runtime window ID.
-- Accept exact `herdr` executable detection and reject aliases/wrappers,
-  mismatched `--session` values, and unrelated process names.
-- Persist and reuse an optional owning Zed `WorkspaceId`.
-- Reject zero-match and multi-match workspace ownership instead of choosing by
-  list order.
+- Flush a newly reserved session before launch and preserve it across restart.
+- Accept only server-launch `herdr` argument forms; reject CLI subcommands,
+  aliases/wrappers, mismatched `--session` values, remote terminals, and
+  unrelated process names.
 
 ### GPUI and integration tests
-
 - Constructing an AgentPanel without a launch trigger creates no bridge and no
   Herdr retry task.
 - The explicit action launches the persisted named session and activates one
   bridge per window.
-- A direct `herdr` process in a Zed terminal activates the same bridge.
-- A fake Herdr server started after Zed bootstrap reconnects automatically and
-  reaches `Ready`.
+- A direct server-launch `herdr` process in any local Zed terminal activates
+  the same bridge.
+- A fake Herdr server started after an in-window launch reconnects
+  automatically and reaches `Ready`.
 - Missing endpoints produce status changes but no repeated Toast events.
+- Herdr process exit stops retries; a later external Herdr process does not
+  reactivate a dormant bridge.
 - Restart restores root `ThreadId` mappings and requires a new in-window launch
   trigger before synchronization.
 - Closing Zed leaves the Herdr process/session running and detaches the bridge.
