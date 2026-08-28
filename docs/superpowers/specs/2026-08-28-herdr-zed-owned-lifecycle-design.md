@@ -133,6 +133,14 @@ The terminal environment also contains:
 HERDR_SESSION=<persisted-session-name>
 ```
 
+The action is available only for a local project/workspace with a usable
+working directory. It creates a visible local terminal using the current
+project's terminal construction path, overlays `HERDR_SESSION` without
+overwriting unrelated user environment entries, and passes the session as
+structured process arguments rather than interpolating it into shell text.
+Failure to create the terminal clears the pending ownership claim and does not
+start a bridge.
+
 The action records ownership before waiting for the endpoint. The bridge may
 remain `Unavailable` while Herdr starts, then retries until the named endpoint
 accepts a bootstrap.
@@ -188,6 +196,14 @@ this observer. The observer forwards only local terminals to the
 `HerdrBridgeRegistry`; the registry applies the exact launch-command and
 session checks before creating a bridge. No Herdr-specific logic is placed in
 the standard terminal's UI.
+
+The implementation seam is the existing terminal process-information path:
+`PtyProcessInfo` must expose a safe snapshot containing normalized executable
+name, argv, local/remote status, terminal identity, and a stable process
+identity. The terminal emits a foreground-process-changed event whenever any
+of those ownership-relevant values changes, not only when title or cwd changes.
+The existing `TerminalBuilder::new` environment map receives the
+window-scoped `HERDR_SESSION` overlay for local terminals.
 ## Bridge lifecycle
 
 ### Start
@@ -282,6 +298,12 @@ Herdr session + workspace_id + pane_id + agent_session
 ```
 
 Shell and non-agent panes remain outside the Zed subthread model.
+
+The bridge keeps the Herdr process identity separate from the Herdr server
+identity. The foreground `herdr` client is the ownership witness; the
+background Herdr server may outlive it, but cannot wake a dormant bridge by
+itself. This distinction is required to keep an external restart from
+reconnecting automatically.
 
 ## State transitions
 
