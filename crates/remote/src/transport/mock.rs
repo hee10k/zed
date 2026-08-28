@@ -45,6 +45,7 @@ use futures::{
     select_biased,
 };
 use gpui::{App, AppContext as _, AsyncApp, Global, Task, TestAppContext};
+use parking_lot::Mutex;
 use rpc::{AnyProtoClient, proto::Envelope};
 use std::{
     path::PathBuf,
@@ -66,6 +67,7 @@ pub struct MockRemoteConnection {
     options: MockConnectionOptions,
     server_channel: Arc<ChannelClient>,
     server_cx: SendableCx,
+    terminal_command: Mutex<Option<(String, Vec<String>)>>,
 }
 
 /// Wrapper to pass `AsyncApp` across thread boundaries in tests.
@@ -104,6 +106,24 @@ pub struct MockConnectionRegistry {
 impl Global for MockConnectionRegistry {}
 
 impl MockConnectionRegistry {
+    /// Configures the command returned for terminal construction by a pending
+    /// mock connection.
+    ///
+    /// Mock connections normally return the non-existent `mock` executable,
+    /// which is useful for transport-only tests but cannot be spawned by a
+    /// real `TerminalBuilder`. Tests that exercise Project terminal creation
+    /// can provide a valid command before calling `RemoteClient::connect_mock`.
+    pub fn set_terminal_command(
+        &mut self,
+        opts: &MockConnectionOptions,
+        program: String,
+        args: Vec<String>,
+    ) {
+        let Some((_, connection)) = self.pending.get(&opts.id) else {
+            panic!("missing pending mock connection {}", opts.id);
+        };
+        *connection.terminal_command.lock() = Some((program, args));
+    }
     /// Called by `ConnectionPool::connect` to retrieve a pre-registered mock connection.
     pub fn take(
         &mut self,
@@ -169,6 +189,7 @@ impl MockConnection {
             options: opts.clone(),
             server_channel: server_client.clone(),
             server_cx: SendableCx::new(server_cx),
+            terminal_command: Mutex::new(None),
         });
 
         let (tx, rx) = oneshot::channel();
@@ -206,9 +227,14 @@ impl RemoteConnection for MockRemoteConnection {
         let mut shell_args = Vec::new();
         shell_args.push(shell_program);
         shell_args.extend(args.iter().cloned());
+        let (program, args) = self
+            .terminal_command
+            .lock()
+            .clone()
+            .unwrap_or_else(|| ("mock".to_string(), shell_args));
         Ok(CommandTemplate {
-            program: "mock".into(),
-            args: shell_args,
+            program,
+            args,
             env: env.clone(),
         })
     }

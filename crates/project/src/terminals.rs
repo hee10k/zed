@@ -779,8 +779,214 @@ fn quote_cmd_command_arg_for_outer_shell(arg: &str, shell_kind: ShellKind) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs::FakeFs;
     use gpui::TestAppContext;
     use pretty_assertions::assert_eq;
+    use settings::{Settings as _, SettingsStore};
+    use std::{path::Path, sync::Arc};
+
+    fn terminal_exit_command() -> (String, Vec<String>) {
+        if cfg!(windows) {
+            let program = util::shell::get_windows_system_shell();
+            let args = match ShellKind::new(&program, true) {
+                ShellKind::Cmd => vec!["/C".to_string(), "exit".to_string()],
+                ShellKind::PowerShell | ShellKind::Pwsh => vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    "exit".to_string(),
+                ],
+                _ => vec!["-c".to_string(), "exit".to_string()],
+            };
+            (program, args)
+        } else {
+            (
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), "exit".to_string()],
+            )
+        }
+    }
+
+    fn init_terminal_test(cx: &mut TestAppContext, headless: bool) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            cx.set_global(terminal::HeadlessTerminal(headless));
+
+            let mut settings = TerminalSettings::get_global(cx).clone();
+            settings
+                .env
+                .insert("HERDR_SESSION".to_string(), "inherited-session".to_string());
+            if headless {
+                let (program, args) = terminal_exit_command();
+                settings.shell = Shell::WithArguments {
+                    program,
+                    args,
+                    title_override: None,
+                };
+            }
+            TerminalSettings::override_global(settings, cx);
+        });
+    }
+
+    async fn setup_remote_project(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (Entity<Project>, Entity<()>) {
+        let (options, server_session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        let (terminal_program, terminal_args) = terminal_exit_command();
+        let mock_options = match &options {
+            remote::RemoteConnectionOptions::Mock(options) => options,
+            _ => unreachable!("fake_server must return mock connection options"),
+        };
+        cx.update(|cx| {
+            cx.default_global::<remote::MockConnectionRegistry>()
+                .set_terminal_command(mock_options, terminal_program, terminal_args);
+        });
+        let ping_handler = server_cx.new(|_| ());
+        server_session.add_request_handler::<rpc::proto::Ping, (), _, _>(
+            ping_handler.downgrade(),
+            |_, _, _| async { Ok(rpc::proto::Ack {}) },
+        );
+        drop(connect_guard);
+
+        let remote = RemoteClient::connect_mock(options, cx).await;
+        let client = cx.update(|cx| {
+            client::Client::new(
+                Arc::new(clock::FakeSystemClock::new()),
+                http_client::FakeHttpClient::with_404_response(),
+                cx,
+            )
+        });
+        cx.update(|cx| Project::init(&client, cx));
+
+        let user_store = cx.new(|cx| client::UserStore::new(client.clone(), cx));
+        let languages = Arc::new(language::LanguageRegistry::test(cx.executor()));
+        let fs = FakeFs::new(cx.executor());
+        let project = cx.update(|cx| {
+            Project::remote(
+                remote,
+                client,
+                node_runtime::NodeRuntime::unavailable(),
+                user_store,
+                languages,
+                fs,
+                false,
+                cx,
+            )
+        });
+        (project, ping_handler)
+    }
+
+    #[gpui::test]
+    async fn project_terminal_shell_in_window_overrides_composed_herdr_session(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_terminal_test(cx, true);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(Path::new("/project"), serde_json::json!({}))
+            .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        cx.update(|cx| {
+            terminal::set_herdr_session_for_window(42, "window-session".to_string(), cx);
+        });
+
+        let window_terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_shell_in_window(None, 42, cx)
+            })
+            .unwrap()
+            .await
+            .expect("window-aware local terminal should start");
+        let ordinary_terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_shell(None, cx)
+            })
+            .unwrap()
+            .await
+            .expect("ordinary local terminal should start");
+
+        assert_eq!(
+            window_terminal.read_with(cx, |terminal, _| {
+                terminal.environment().get("HERDR_SESSION").cloned()
+            }),
+            Some("window-session".to_string()),
+            "the window-aware Project path must override the composed environment",
+        );
+        assert_eq!(
+            ordinary_terminal.read_with(cx, |terminal, _| {
+                terminal.environment().get("HERDR_SESSION").cloned()
+            }),
+            Some("inherited-session".to_string()),
+            "the window-unaware Project path must omit the window overlay",
+        );
+    }
+
+    #[gpui::test]
+    async fn project_terminal_shell_in_window_omits_herdr_session_overlay_for_remote(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_terminal_test(cx, true);
+
+        let (project, _ping_handler) = setup_remote_project(cx, server_cx).await;
+        cx.update(|cx| {
+            terminal::set_herdr_session_for_window(42, "window-session".to_string(), cx);
+        });
+
+        let terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_shell_in_window(
+                    Some(Path::new("/remote/project").to_path_buf()),
+                    42,
+                    cx,
+                )
+            })
+            .unwrap()
+            .await
+            .expect("window-aware remote terminal should start");
+
+        assert_eq!(
+            terminal.read_with(cx, |terminal, _| {
+                terminal.environment().get("HERDR_SESSION").cloned()
+            }),
+            Some("inherited-session".to_string()),
+            "remote Project terminals must omit the local window overlay",
+        );
+    }
+
+    #[gpui::test]
+    async fn project_force_local_terminal_in_window_applies_herdr_session(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_terminal_test(cx, true);
+
+        let (project, _ping_handler) = setup_remote_project(cx, server_cx).await;
+        cx.update(|cx| {
+            terminal::set_herdr_session_for_window(42, "window-session".to_string(), cx);
+        });
+
+        let terminal = project
+            .update(cx, |project, cx| {
+                project.create_local_terminal_in_window(42, cx)
+            })
+            .unwrap()
+            .await
+            .expect("force-local terminal should start");
+
+        assert_eq!(
+            terminal.read_with(cx, |terminal, _| {
+                terminal.environment().get("HERDR_SESSION").cloned()
+            }),
+            Some("window-session".to_string()),
+            "force-local Project terminals must receive the local window overlay",
+        );
+    }
 
     #[gpui::test]
     async fn window_scoped_herdr_session_overlays_only_local_environments(
