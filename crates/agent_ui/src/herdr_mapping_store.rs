@@ -111,6 +111,8 @@ pub(crate) struct HerdrMappingRecord {
     pub key: HerdrMappingKey,
     pub zed_root_thread_id: ThreadId,
     #[serde(default)]
+    pub zed_workspace_id: Option<workspace::WorkspaceId>,
+    #[serde(default)]
     pub zed_subthread_session_id: Option<String>,
     /// Stored for diagnostics only. Worktree/cwd identity NEVER participates
     /// in matching: an equal cwd must not silently merge two mappings.
@@ -131,6 +133,7 @@ impl HerdrMappingRecord {
         Self {
             key: HerdrMappingKey::workspace(session, workspace_id),
             zed_root_thread_id: thread_id,
+            zed_workspace_id: None,
             zed_subthread_session_id: None,
             worktree_or_cwd_identity: None,
             last_seen_sequence: 0,
@@ -398,6 +401,7 @@ mod tests {
                 HerdrAgentSessionIdentity::id(agent_value),
             ),
             zed_root_thread_id: ThreadId::new(),
+            zed_workspace_id: None,
             zed_subthread_session_id: Some(format!("subthread-{agent_value}")),
             worktree_or_cwd_identity: None,
             last_seen_sequence: 0,
@@ -443,6 +447,53 @@ mod tests {
             assert_eq!(decoded.get(key), Some(record));
         }
     }
+
+    #[test]
+    fn mapping_record_round_trips_owning_zed_workspace() {
+        let workspace_id = workspace::WorkspaceId::from_i64(42);
+        let mut record = root_mapping("alpha", "herdr-workspace");
+        record.zed_workspace_id = Some(workspace_id);
+        let encoded = encode_session_map(&SessionMappings::from([(
+            record.key.to_key_string(),
+            record.clone(),
+        )]))
+        .expect("encode mapping");
+        let decoded = decode_session_map(Some(&encoded)).expect("decode mapping");
+        assert_eq!(
+            decoded.values().next().and_then(|record| record.zed_workspace_id),
+            Some(workspace_id)
+        );
+    }
+
+    #[test]
+    fn mapping_record_without_owner_defaults_to_none() {
+        let record = root_mapping("alpha", "herdr-workspace");
+        let key = record.key.to_key_string();
+        let mut record_json = serde_json::to_value(&record).expect("encode legacy record");
+        record_json
+            .as_object_mut()
+            .expect("record object")
+            .remove("zed_workspace_id");
+        let legacy_map = serde_json::json!({
+            "version": 1,
+            "records": {
+                key: record_json,
+            }
+        });
+        let decoded =
+            decode_session_map(Some(&legacy_map.to_string())).expect("decode legacy mapping");
+        assert_eq!(
+            decoded
+                .values()
+                .next()
+                .and_then(|record| record.zed_workspace_id),
+            None
+        );
+        assert!(decode_session_map(Some(r#"{"version":1,"records":{}}"#))
+            .expect("decode empty legacy map")
+            .is_empty());
+    }
+
 
     #[test]
     fn missing_session_decodes_to_empty_map_and_bad_payload_is_rejected() {
@@ -559,6 +610,7 @@ mod tests {
                 pane_id: Some("p1".into()),
                 agent_session: None,
             },
+            zed_workspace_id: None,
             ..root_mapping("alpha", "w1")
         };
         let invalid_map = serde_json::json!({
@@ -576,6 +628,7 @@ mod tests {
                 pane_id: None,
                 agent_session: Some(HerdrAgentSessionIdentity::id("agent-1")),
             },
+            zed_workspace_id: None,
             ..root_mapping("alpha", "w1")
         };
         let invalid_root_map = serde_json::json!({

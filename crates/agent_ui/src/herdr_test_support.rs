@@ -1278,6 +1278,7 @@ mod tests {
                     HerdrAgentSessionIdentity::id("same-agent"),
                 ),
                 zed_root_thread_id: crate::thread_metadata_store::ThreadId::new(),
+                zed_workspace_id: None,
                 zed_subthread_session_id: None,
                 worktree_or_cwd_identity: None,
                 last_seen_sequence: 1,

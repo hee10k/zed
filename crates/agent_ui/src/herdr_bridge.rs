@@ -315,6 +315,55 @@ impl HerdrThreadBridge {
         self.state.mappings.get(&key)
     }
 
+    pub(crate) fn root_zed_workspace_id(
+        &self,
+        herdr_workspace_id: &str,
+    ) -> Option<workspace::WorkspaceId> {
+        self.root_mapping(herdr_workspace_id)
+            .filter(|record| !record.is_tombstone())
+            .and_then(|record| record.zed_workspace_id)
+    }
+
+    pub(crate) fn set_root_zed_workspace_id(
+        &mut self,
+        herdr_workspace_id: &str,
+        zed_workspace_id: workspace::WorkspaceId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = self.state.workspace_key(herdr_workspace_id);
+        let key_string = key.to_key_string();
+        let Some(existing_record) = self.state.mappings.get(&key_string) else {
+            return false;
+        };
+        if existing_record.is_tombstone() {
+            return false;
+        }
+
+        match existing_record.zed_workspace_id {
+            Some(existing) if existing == zed_workspace_id => false,
+            Some(existing) => {
+                let event = HerdrBridgeEvent::Conflict {
+                    key,
+                    message: format!(
+                        "Herdr root {herdr_workspace_id:?} is already owned by Zed workspace \
+                         {existing:?}; refusing to overwrite it with {zed_workspace_id:?}"
+                    ),
+                };
+                cx.emit(event.clone());
+                self.events.push(event);
+                false
+            }
+            None => {
+                let Some(record) = self.state.mappings.get_mut(&key_string) else {
+                    return false;
+                };
+                record.zed_workspace_id = Some(zed_workspace_id);
+                self.persist_mappings(cx);
+                true
+            }
+        }
+    }
+
     pub(crate) fn root_mapping_for_thread(
         &self,
         thread_id: ThreadId,
@@ -872,6 +921,7 @@ impl HerdrThreadBridge {
         let record = HerdrMappingRecord {
             key: key.clone(),
             zed_root_thread_id: root_thread_id,
+            zed_workspace_id: None,
             zed_subthread_session_id: Some(identity.value.clone()),
             worktree_or_cwd_identity: agent.cwd.clone(),
             last_seen_sequence: agent.last_seen_sequence,
@@ -4244,6 +4294,7 @@ mod tests {
                     HerdrAgentSessionIdentity::id(session),
                 ),
                 zed_root_thread_id: root_thread_id,
+                zed_workspace_id: None,
                 zed_subthread_session_id: Some(session.to_string()),
                 worktree_or_cwd_identity: None,
                 last_seen_sequence: 2,
@@ -4371,6 +4422,73 @@ mod tests {
                 if key.workspace_id == "w1" && key.pane_id.as_deref() == Some("p1")
         )));
     }
+    #[gpui::test]
+    async fn root_workspace_owner_setter_getter_and_conflict_behavior(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let bridge = cx.new(|_| test_bridge());
+        bridge.update(cx, |bridge, _cx| {
+            bridge.apply_event(workspace_created("w1", "/repo", "Review"));
+        });
+        bridge.update(cx, |bridge, _cx| {
+            bridge.take_events();
+        });
+        let owner = workspace::WorkspaceId::from_i64(42);
+        let other_owner = workspace::WorkspaceId::from_i64(43);
+
+        assert_eq!(
+            bridge.update(cx, |bridge, _cx| bridge.root_zed_workspace_id("w1")),
+            None
+        );
+        assert!(bridge.update(cx, |bridge, cx| {
+            bridge.set_root_zed_workspace_id("w1", owner, cx)
+        }));
+        assert_eq!(
+            bridge.update(cx, |bridge, _cx| bridge.root_zed_workspace_id("w1")),
+            Some(owner)
+        );
+        cx.run_until_parked();
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        let persisted = cx
+            .background_spawn(async move {
+                HerdrMappingStore::load_session(&kvp, "alpha")
+            })
+            .await
+            .expect("owner mapping should persist");
+        assert_eq!(
+            persisted
+                .get(&HerdrMappingKey::workspace("alpha", "w1").to_key_string())
+                .and_then(|record| record.zed_workspace_id),
+            Some(owner)
+        );
+
+        assert!(!bridge.update(cx, |bridge, cx| {
+            bridge.set_root_zed_workspace_id("w1", owner, cx)
+        }));
+        assert!(bridge
+            .update(cx, |bridge, _cx| bridge.take_events())
+            .is_empty());
+
+        assert!(!bridge.update(cx, |bridge, cx| {
+            bridge.set_root_zed_workspace_id("w1", other_owner, cx)
+        }));
+        let events = bridge.update(cx, |bridge, _cx| bridge.take_events());
+        assert!(matches!(
+            events.as_slice(),
+            [HerdrBridgeEvent::Conflict { key, message }]
+                if *key == HerdrMappingKey::workspace("alpha", "w1")
+                    && !message.is_empty()
+        ));
+        assert_eq!(
+            bridge.update(cx, |bridge, _cx| bridge.root_zed_workspace_id("w1")),
+            Some(owner)
+        );
+
+        assert!(!bridge.update(cx, |bridge, cx| {
+            bridge.set_root_zed_workspace_id("missing", owner, cx)
+        }));
+    }
+
     #[gpui::test]
     async fn bootstrap_failures_do_not_emit_user_request_failure_events(
         cx: &mut gpui::TestAppContext,

@@ -1192,6 +1192,7 @@ mod tests {
                 HerdrAgentSessionIdentity::id(agent_value),
             ),
             zed_root_thread_id: ThreadId::new(),
+            zed_workspace_id: None,
             zed_subthread_session_id: Some(format!("sub-{agent_value}")),
             worktree_or_cwd_identity: None,
             last_seen_sequence: 0,
@@ -1225,6 +1226,24 @@ mod tests {
         let actions = reconcile_snapshot(session, &[workspace_snapshot("w1", "Review")], &mappings);
         assert_eq!(actions, vec![ReconciliationAction::RestoreWorkspaceRoot(mapping)]);
     }
+
+    #[test]
+    fn snapshot_restores_root_owner_metadata() {
+        let session = "alpha";
+        let owner = workspace::WorkspaceId::from_i64(42);
+        let mut mapping = root_record(session, "w1");
+        mapping.zed_workspace_id = Some(owner);
+        let mut mappings = SessionMappings::new();
+        upsert_record(&mut mappings, mapping);
+
+        let actions = reconcile_snapshot(session, &[workspace_snapshot("w1", "Review")], &mappings);
+        assert!(matches!(
+            &actions[..],
+            [ReconciliationAction::RestoreWorkspaceRoot(record)]
+                if record.zed_workspace_id == Some(owner)
+        ));
+    }
+
 
     #[test]
     fn snapshot_creates_roots_for_unknown_workspaces() {
