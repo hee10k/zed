@@ -1923,6 +1923,28 @@ impl Workspace {
         open_mode: OpenMode,
         cx: &mut App,
     ) -> Task<anyhow::Result<OpenResult>> {
+        Self::new_local_with_restored_state(
+            abs_paths,
+            app_state,
+            requesting_window,
+            env,
+            init,
+            open_mode,
+            None,
+            cx,
+        )
+    }
+
+    pub(crate) fn new_local_with_restored_state(
+        abs_paths: Vec<PathBuf>,
+        app_state: Arc<AppState>,
+        requesting_window: Option<WindowHandle<MultiWorkspace>>,
+        env: Option<HashMap<String, String>>,
+        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        open_mode: OpenMode,
+        restored_state: Option<MultiWorkspaceState>,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<OpenResult>> {
         let project_handle = Project::local(
             app_state.client.clone(),
             app_state.node_runtime.clone(),
@@ -1936,6 +1958,7 @@ impl Workspace {
 
         let db = WorkspaceDb::global(cx);
         let kvp = db::kvp::KeyValueStore::global(cx);
+        let restored_state_for_construction = restored_state.clone();
         cx.spawn(async move |cx| {
             let mut paths_to_open = Vec::with_capacity(abs_paths.len());
             for path in abs_paths.into_iter() {
@@ -2086,6 +2109,9 @@ impl Workspace {
                         .as_ref()
                         .map(|w| w.centered_layout)
                         .unwrap_or(false);
+                    let (herdr_session_name, herdr_owned) = restored_state_for_construction
+                        .map(|state| (state.herdr_session_name, state.herdr_owned))
+                        .unwrap_or_default();
                     let window = cx.open_window(options, {
                         let app_state = app_state.clone();
                         let project_handle = project_handle.clone();
@@ -2107,7 +2133,15 @@ impl Workspace {
 
                                 workspace
                             });
-                            cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+                            cx.new(|cx| {
+                                MultiWorkspace::new_with_herdr_state(
+                                    workspace,
+                                    herdr_session_name,
+                                    herdr_owned,
+                                    window,
+                                    cx,
+                                )
+                            })
                         }
                     })?;
                     let workspace =
@@ -2116,6 +2150,16 @@ impl Workspace {
                         })?;
                     (window, workspace)
                 };
+            if let Some(restored_state) = restored_state {
+                let window_id = window
+                    .update(cx, |_, window, _cx| window.window_handle().window_id())?;
+                let kvp = kvp.clone();
+                cx.background_spawn(async move {
+                    persistence::write_multi_workspace_state(&kvp, window_id, restored_state)
+                        .await;
+                })
+                .await;
+            }
 
             notify_if_database_failed(window, cx);
             // Check if this is an empty workspace (no paths to open)
@@ -9745,18 +9789,25 @@ pub async fn restore_multiworkspace(
 
     let workspace_result = if active_workspace.paths.is_empty() {
         cx.update(|cx| {
-            open_workspace_by_id(active_workspace.workspace_id, app_state.clone(), None, cx)
+            open_workspace_by_id_with_restored_state(
+                active_workspace.workspace_id,
+                app_state.clone(),
+                None,
+                Some(state.clone()),
+                cx,
+            )
         })
         .await
     } else {
         cx.update(|cx| {
-            Workspace::new_local(
+            Workspace::new_local_with_restored_state(
                 active_workspace.paths.paths().to_vec(),
                 app_state.clone(),
                 None,
                 None,
                 None,
                 OpenMode::Activate,
+                Some(state.clone()),
                 cx,
             )
         })
@@ -9775,13 +9826,14 @@ pub async fn restore_multiworkspace(
                 let paths = key.path_list().paths().to_vec();
                 match cx
                     .update(|cx| {
-                        Workspace::new_local(
+                        Workspace::new_local_with_restored_state(
                             paths,
                             app_state.clone(),
                             None,
                             None,
                             None,
                             OpenMode::Activate,
+                            Some(state.clone()),
                             cx,
                         )
                     })
@@ -9802,6 +9854,12 @@ pub async fn restore_multiworkspace(
     };
 
     apply_restored_multiworkspace_state(window_handle, &state, app_state.fs.clone(), cx).await;
+
+    if let Ok(task) = window_handle.update(cx, |multi_workspace, _window, _cx| {
+        multi_workspace.flush_serialization()
+    }) {
+        task.await;
+    }
 
     window_handle
         .update(cx, |_, window, _cx| {
@@ -10479,6 +10537,22 @@ pub fn open_workspace_by_id(
     requesting_window: Option<WindowHandle<MultiWorkspace>>,
     cx: &mut App,
 ) -> Task<anyhow::Result<WindowHandle<MultiWorkspace>>> {
+    open_workspace_by_id_with_restored_state(
+        workspace_id,
+        app_state,
+        requesting_window,
+        None,
+        cx,
+    )
+}
+
+fn open_workspace_by_id_with_restored_state(
+    workspace_id: WorkspaceId,
+    app_state: Arc<AppState>,
+    requesting_window: Option<WindowHandle<MultiWorkspace>>,
+    restored_state: Option<MultiWorkspaceState>,
+    cx: &mut App,
+) -> Task<anyhow::Result<WindowHandle<MultiWorkspace>>> {
     let project_handle = Project::local(
         app_state.client.clone(),
         app_state.node_runtime.clone(),
@@ -10495,6 +10569,7 @@ pub fn open_workspace_by_id(
 
     let db = WorkspaceDb::global(cx);
     let kvp = db::kvp::KeyValueStore::global(cx);
+    let restored_state_for_construction = restored_state.clone();
     cx.spawn(async move |cx| {
         let serialized_workspace = db
             .workspace_for_id(workspace_id)
@@ -10539,7 +10614,9 @@ pub fn open_workspace_by_id(
                 options.window_bounds = window_bounds;
                 options
             });
-
+            let (herdr_session_name, herdr_owned) = restored_state_for_construction
+                .map(|state| (state.herdr_session_name, state.herdr_owned))
+                .unwrap_or_default();
             let window = cx.open_window(options, {
                 let app_state = app_state.clone();
                 let project_handle = project_handle.clone();
@@ -10555,7 +10632,15 @@ pub fn open_workspace_by_id(
                         workspace.centered_layout = centered_layout;
                         workspace
                     });
-                    cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+                    cx.new(|cx| {
+                        MultiWorkspace::new_with_herdr_state(
+                            workspace,
+                            herdr_session_name,
+                            herdr_owned,
+                            window,
+                            cx,
+                        )
+                    })
                 }
             })?;
 
@@ -10565,6 +10650,16 @@ pub fn open_workspace_by_id(
 
             (window, workspace)
         };
+
+        if let Some(restored_state) = restored_state {
+            let window_id = window
+                .update(cx, |_, window, _cx| window.window_handle().window_id())?;
+            cx.background_spawn(async move {
+                persistence::write_multi_workspace_state(&kvp, window_id, restored_state)
+                    .await;
+            })
+            .await;
+        }
 
         notify_if_database_failed(window, cx);
 

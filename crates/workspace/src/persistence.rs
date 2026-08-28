@@ -2804,7 +2804,7 @@ pub fn delete_unloaded_items(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PathList;
+    use crate::Workspace;
     use crate::ProjectGroupKey;
     use crate::RemovalIntent;
     use crate::{
@@ -2824,7 +2824,7 @@ mod tests {
     use project::Project;
     use remote::SshConnectionOptions;
     use serde_json::json;
-    use std::{thread, time::Duration};
+    use std::{cell::RefCell, rc::Rc, thread, time::Duration};
 
     /// Creates a unique directory in a FakeFs, returning the path.
     /// Uses a UUID suffix to avoid collisions with other tests sharing the global DB.
@@ -2860,6 +2860,50 @@ mod tests {
         .expect("decode legacy state");
         assert_eq!(decoded.herdr_session_name, None);
         assert!(!decoded.herdr_owned);
+    }
+    #[gpui::test]
+    async fn restored_multi_workspace_state_is_available_during_construction(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let observed_session_name = Rc::new(RefCell::new(None));
+        let observed_session_name_for_observer = observed_session_name.clone();
+        cx.update(|cx| {
+            cx.observe_new(
+                move |multi_workspace: &mut MultiWorkspace, _window, _cx| {
+                    if multi_workspace.herdr_session_name().is_some() {
+                        *observed_session_name_for_observer.borrow_mut() =
+                            multi_workspace.herdr_session_name().map(str::to_owned);
+                    }
+                },
+            )
+            .detach();
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            let workspace = cx.new(|cx| Workspace::test_new(project.clone(), window, cx));
+            MultiWorkspace::new_with_herdr_state(
+                workspace,
+                Some("zed-construction".to_string()),
+                true,
+                window,
+                cx,
+            )
+        });
+
+        assert_eq!(
+            observed_session_name.borrow().as_deref(),
+            Some("zed-construction"),
+            "startup observers must see restored Herdr state during construction",
+        );
+        assert_eq!(
+            multi_workspace.read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.herdr_session_name().map(str::to_owned)
+            }),
+            Some("zed-construction".to_string()),
+        );
     }
 
     #[gpui::test]
@@ -6030,6 +6074,20 @@ mod tests {
             .await
             .expect("restore_multiworkspace should succeed");
 
+        let restored_window_id = restored_handle
+            .update(cx, |_, window, _cx| window.window_handle().window_id())
+            .unwrap();
+        let restored_state = cx.update(|_, cx| read_multi_workspace_state(restored_window_id, cx));
+        assert_eq!(
+            restored_state.herdr_session_name.as_deref(),
+            Some("zed-restored"),
+            "restored Herdr state must be durable before restore returns",
+        );
+        assert!(
+            restored_state.herdr_owned,
+            "restored Herdr ownership must be durable before restore returns",
+        );
+
         cx.run_until_parked();
 
         // The restored window should have the same project group keys.
@@ -6070,9 +6128,6 @@ mod tests {
             "Restored window should retain the Herdr session name"
         );
 
-        let restored_window_id = restored_handle
-            .update(cx, |_, window, _cx| window.window_handle().window_id())
-            .unwrap();
         let serialize_task = restored_handle
             .update(cx, |multi_workspace, _window, cx| {
                 multi_workspace.serialize(cx);

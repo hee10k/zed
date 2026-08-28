@@ -342,6 +342,16 @@ impl MultiWorkspace {
     }
 
     pub fn new(workspace: Entity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_herdr_state(workspace, None, false, window, cx)
+    }
+
+    pub(crate) fn new_with_herdr_state(
+        workspace: Entity<Workspace>,
+        herdr_session_name: Option<String>,
+        herdr_owned: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let release_subscription = cx.on_release(|this: &mut MultiWorkspace, _cx| {
             if let Some(task) = this._serialize_task.take() {
                 task.detach();
@@ -378,8 +388,8 @@ impl MultiWorkspace {
             }],
             project_groups: Vec::new(),
             active_workspace_id,
-            herdr_session_name: None,
-            herdr_owned: false,
+            herdr_session_name,
+            herdr_owned,
             sidebar: None,
             sidebar_open: false,
             sidebar_overlay: None,
