@@ -4752,6 +4752,108 @@ mod tests {
         bridge.update(cx, |bridge, _| bridge.stop());
     }
     #[gpui::test]
+    async fn owned_bridge_reconnects_quietly_after_late_herdr_start(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::herdr_test_support::FakeHerdrServer;
+
+        cx.executor().allow_parking();
+        let root_thread_id = ThreadId::new();
+        let root = HerdrMappingRecord::root("alpha", "w1", root_thread_id);
+        let mappings = SessionMappings::from([(root.key.to_key_string(), root)]);
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        HerdrMappingStore::save_session(&kvp, "alpha", &mappings)
+            .await
+            .expect("persisted root mapping");
+        let persisted_mappings =
+            HerdrMappingStore::load_session(&kvp, "alpha").expect("load persisted root mapping");
+
+        let server = FakeHerdrServer::new(HerdrSnapshot {
+            session: "alpha".to_string(),
+            protocol: Some(20),
+            workspaces: vec![HerdrWorkspaceSnapshot {
+                workspace_id: "w1".to_string(),
+                label: "Review".to_string(),
+                paths: vec!["/repo".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .expect("fixture server");
+        server.stop_accepting();
+        let client: Arc<dyn HerdrApi> = Arc::new(HerdrClientHandle::new_with_executor(
+            server.endpoint(),
+            cx.executor().clone(),
+        ));
+        let bridge = cx.new(|_| {
+            HerdrThreadBridge::new(
+                None,
+                HerdrSessionSelection::Named("alpha".to_string()),
+                Some(client),
+                None,
+                persisted_mappings,
+            )
+        });
+        bridge.update(cx, |bridge, cx| {
+            bridge.set_owner(HerdrOwnerProcess {
+                terminal_id: gpui::EntityId::from(42u64),
+                process_id: Some(42),
+                session_name: "alpha".to_string(),
+            });
+            bridge.begin_sync(cx);
+        });
+
+        // An unavailable endpoint is a normal owned-session state: only
+        // connection-status events are emitted, never a user request failure.
+        for _ in 0..20 {
+            cx.run_until_parked();
+            if bridge.read_with(cx, |bridge, _cx| bridge.status())
+                == HerdrConnectionStatus::Unavailable
+            {
+                break;
+            }
+            cx.executor().advance_clock(Duration::from_millis(50));
+        }
+        let unavailable_events = bridge.update(cx, |bridge, _cx| bridge.take_events());
+        assert!(
+            unavailable_events.iter().all(|event| matches!(
+                event,
+                HerdrBridgeEvent::StatusChanged(
+                    HerdrConnectionStatus::Reconnecting | HerdrConnectionStatus::Unavailable
+                )
+            )),
+            "late-start recovery must not emit user-facing failure events: {unavailable_events:?}"
+        );
+        assert_eq!(
+            bridge.read_with(cx, |bridge, _cx| bridge.status()),
+            HerdrConnectionStatus::Unavailable
+        );
+
+        // Make the named endpoint available and advance the deterministic
+        // executor through the retry backoff.
+        server.reconnect();
+        for _ in 0..20 {
+            cx.executor().advance_clock(Duration::from_millis(250));
+            cx.run_until_parked();
+            if bridge.read_with(cx, |bridge, _cx| bridge.status())
+                == HerdrConnectionStatus::Ready
+            {
+                break;
+            }
+        }
+
+        bridge.read_with(cx, |bridge, _cx| {
+            assert_eq!(bridge.status(), HerdrConnectionStatus::Ready);
+            assert_eq!(
+                bridge.root_thread_id("w1"),
+                Some(root_thread_id),
+                "late-start bootstrap must reuse the persisted root ThreadId"
+            );
+            assert_eq!(bridge.root_title("w1").as_deref(), Some("Review"));
+        });
+        bridge.update(cx, |bridge, _cx| bridge.stop());
+    }
+    #[gpui::test]
     async fn owner_release_stops_future_bootstrap_retries(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -4950,6 +5052,25 @@ mod tests {
                 })
             })
             .expect("owner should activate the bridge");
+        let root_thread_id = bridge.update(cx, |bridge, _cx| {
+            bridge.apply_event(workspace_created("w1", "/project", "Review"));
+            bridge.root_thread_id("w1").expect("root mapping")
+        });
+        cx.run_until_parked();
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        let persisted_before_release = cx
+            .background_spawn(async move {
+                HerdrMappingStore::load_session(&kvp, "zed-panel")
+            })
+            .await
+            .expect("root mapping persists");
+        assert_eq!(
+            persisted_before_release
+                .get(&HerdrMappingKey::workspace("zed-panel", "w1").to_key_string())
+                .map(|record| record.zed_root_thread_id),
+            Some(root_thread_id)
+        );
+
         cx.update(|cx| {
             cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
                 registry.release_panel(window_id, cx);
@@ -4962,6 +5083,42 @@ mod tests {
             })
         });
 
+        assert!(
+            cx.update(|cx| {
+                cx.try_global::<HerdrBridgeRegistry>()
+                    .and_then(|registry| registry.bridge_for_window(window_id, cx))
+            })
+            .is_none(),
+            "releasing the window must detach the registry bridge"
+        );
+        bridge.read_with(cx, |bridge, _cx| {
+            assert_eq!(bridge.status(), HerdrConnectionStatus::Dormant);
+            assert!(bridge.owner().is_none());
+            assert!(
+                bridge.root_mapping("w1").is_some(),
+                "window release must preserve the named-session root mapping"
+            );
+        });
+        bridge.update(cx, |bridge, _cx| {
+            assert!(
+                bridge.take_outbound_requests().is_empty(),
+                "window release must not enqueue a workspace.close request"
+            );
+        });
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        let persisted_after_release = cx
+            .background_spawn(async move {
+                HerdrMappingStore::load_session(&kvp, "zed-panel")
+            })
+            .await
+            .expect("mapping remains persisted");
+        assert_eq!(
+            persisted_after_release
+                .get(&HerdrMappingKey::workspace("zed-panel", "w1").to_key_string())
+                .map(|record| record.zed_root_thread_id),
+            Some(root_thread_id),
+            "window release must retain the named-session mapping"
+        );
     }
     #[gpui::test]
     async fn owner_process_release_marks_bridge_dormant(
@@ -4971,7 +5128,7 @@ mod tests {
         let window_id = WindowId::from(9u64);
         let owner = HerdrOwnerProcess {
             terminal_id: gpui::EntityId::from(14u64),
-            process_id: None,
+            process_id: Some(14),
             session_name: "zed-dormant".to_string(),
         };
         let bridge = cx
@@ -4989,8 +5146,12 @@ mod tests {
         bridge.update(cx, |bridge, _cx| {
             bridge.apply_event(workspace_created("w1", "/project", "Review"));
         });
+        cx.run_until_parked();
+        let _ = bridge.update(cx, |bridge, _cx| bridge.take_events());
         cx.update(|cx| {
             cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
+                // This is the registry seam used by the ownership observer
+                // when the terminal emits ProcessExited for its owner.
                 registry.release_owner_process(
                     window_id,
                     owner.terminal_id,
@@ -4999,6 +5160,11 @@ mod tests {
                 );
             })
         });
+        let release_events = bridge.update(cx, |bridge, _cx| bridge.take_events());
+        assert!(release_events.iter().any(|event| matches!(
+            event,
+            HerdrBridgeEvent::StatusChanged(HerdrConnectionStatus::Dormant)
+        )));
         bridge.read_with(cx, |bridge, _cx| {
             assert_eq!(bridge.status(), HerdrConnectionStatus::Dormant);
             assert!(bridge.owner().is_none());
@@ -5007,9 +5173,18 @@ mod tests {
                 "owner release must preserve persisted root mappings"
             );
         });
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+        assert!(
+            bridge
+                .update(cx, |bridge, _cx| bridge.take_events())
+                .is_empty(),
+            "an exited owner must not schedule more bootstrap retries"
+        );
         cx.update(|cx| {
             cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
                 assert!(registry.bridge_for_window(window_id, cx).is_some());
+                registry.release_window(window_id, cx);
             })
         });
     }

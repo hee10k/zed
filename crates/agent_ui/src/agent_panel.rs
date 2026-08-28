@@ -16360,6 +16360,44 @@ mod tests {
             );
         }
 
+        #[gpui::test]
+        async fn restored_herdr_state_stays_dormant_until_a_new_in_window_launch(
+            cx: &mut TestAppContext,
+        ) {
+            let (_panel, mut cx) = setup_panel(cx).await;
+            let multi_workspace = cx
+                .update(|window, _cx| window.root::<MultiWorkspace>().flatten())
+                .expect("test window should contain a MultiWorkspace");
+            let window_id = cx.update(|window, _cx| window.window_handle().window_id());
+
+            multi_workspace.update(&mut cx, |multi_workspace, cx| {
+                multi_workspace.restore_herdr_state(Some("zed-stable".to_string()), true, cx);
+            });
+            cx.run_until_parked();
+
+            let persisted = cx
+                .update(|_, cx| {
+                    KeyValueStore::global(cx)
+                        .scoped("multi_workspace_state")
+                        .read(&window_id.as_u64().to_string())
+                })
+                .expect("restored Herdr state should serialize")
+                .expect("restored Herdr state should be present");
+            let state: workspace::persistence::model::MultiWorkspaceState =
+                serde_json::from_str(&persisted).expect("restored state should decode");
+            assert_eq!(state.herdr_session_name.as_deref(), Some("zed-stable"));
+            assert!(state.herdr_owned);
+
+            let bridge = cx.update(|_, cx| {
+                cx.global::<HerdrBridgeRegistry>()
+                    .bridge_for_window(window_id, cx)
+            });
+            assert!(
+                bridge.is_none(),
+                "restoring a named Herdr session must not activate its bridge"
+            );
+        }
+
         fn workspace_created(paths: &[&str]) -> crate::herdr_client::HerdrEvent {
             crate::herdr_client::HerdrEvent::WorkspaceCreated {
                 workspace: crate::herdr_client::HerdrWorkspaceSnapshot {

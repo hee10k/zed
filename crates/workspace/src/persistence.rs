@@ -5981,7 +5981,7 @@ mod tests {
             mw.open_sidebar(cx);
         });
         multi_workspace.update(cx, |mw, cx| {
-            mw.restore_herdr_state(Some("zed-restored".to_string()), true, cx);
+            mw.restore_herdr_state(Some("zed-stable".to_string()), true, cx);
         });
 
         multi_workspace.update_in(cx, |mw, window, cx| {
@@ -6037,7 +6037,7 @@ mod tests {
         assert_eq!(serialized.state.project_groups.len(), 2,);
         assert_eq!(
             serialized.state.herdr_session_name.as_deref(),
-            Some("zed-restored")
+            Some("zed-stable")
         );
         assert!(serialized.state.herdr_owned);
 
@@ -6080,7 +6080,7 @@ mod tests {
         let restored_state = cx.update(|_, cx| read_multi_workspace_state(restored_window_id, cx));
         assert_eq!(
             restored_state.herdr_session_name.as_deref(),
-            Some("zed-restored"),
+            Some("zed-stable"),
             "restored Herdr state must be durable before restore returns",
         );
         assert!(
@@ -6124,7 +6124,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             restored_session_name.as_deref(),
-            Some("zed-restored"),
+            Some("zed-stable"),
             "Restored window should retain the Herdr session name"
         );
 
@@ -6138,7 +6138,7 @@ mod tests {
         let restored_state = cx.update(|_, cx| read_multi_workspace_state(restored_window_id, cx));
         assert_eq!(
             restored_state.herdr_session_name.as_deref(),
-            Some("zed-restored"),
+            Some("zed-stable"),
             "Restored window serialization should retain the Herdr session name"
         );
         assert!(
