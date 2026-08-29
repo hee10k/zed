@@ -28,6 +28,7 @@ pub(crate) struct HerdrThreadView {
     error: Option<SharedString>,
 }
 
+#[allow(dead_code)]
 impl HerdrThreadView {
     pub(crate) fn new(
         workspace_id: String,
@@ -78,6 +79,7 @@ impl HerdrThreadView {
             .unwrap_or(HerdrConnectionStatus::Unavailable)
     }
 
+#[allow(dead_code)]
     pub(crate) fn controls_enabled(&self, cx: &App) -> bool {
         self.connection_status(cx).allows_actions()
     }

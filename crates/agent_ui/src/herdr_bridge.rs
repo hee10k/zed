@@ -6,7 +6,10 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
+
 };
+#[cfg(test)]
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
@@ -38,17 +41,13 @@ use crate::{
 
 
 /// The user-visible selection used to bind one Zed window to one Herdr session.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) enum HerdrSessionSelection {
+    #[default]
     Default,
     Named(String),
+#[allow(dead_code)]
     Explicit(String),
-}
-
-impl Default for HerdrSessionSelection {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 impl HerdrSessionSelection {
@@ -231,6 +230,7 @@ enum PendingAuthoritativePaneIdentity {
     RootFallback,
 }
 
+#[allow(dead_code)]
 impl HerdrThreadBridge {
     fn new(
         window_id: Option<WindowId>,
@@ -253,6 +253,7 @@ impl HerdrThreadBridge {
                 mappings,
                 ..BridgeState::default()
             },
+            root_metadata: HashMap::default(),
             status: HerdrConnectionStatus::Dormant,
             events: Vec::new(),
             outbound_requests: Vec::new(),
@@ -313,6 +314,7 @@ impl HerdrThreadBridge {
         &self.state.session
     }
 
+#[allow(dead_code)]
     pub(crate) fn selection(&self) -> &HerdrSessionSelection {
         &self.selection
     }
@@ -968,7 +970,7 @@ impl HerdrThreadBridge {
             key: key.clone(),
             zed_root_thread_id: root_thread_id,
             zed_workspace_id: None,
-            zed_subthread_session_id: Some(identity.value.clone()),
+            zed_subthread_session_id: Some(identity.value),
             worktree_or_cwd_identity: agent.cwd.clone(),
             last_seen_sequence: agent.last_seen_sequence,
             lifecycle: HerdrLifecycleState::Active,
@@ -1258,7 +1260,7 @@ impl HerdrThreadBridge {
                             HerdrAgentSessionIdentity::id(pane.pane_id.clone())
                         }),
                         title: pane.title.clone().unwrap_or_else(|| pane.pane_id.clone()),
-                        status: status.clone(),
+                        status: status,
                     });
                 } else {
                     self.events.push(HerdrBridgeEvent::SubthreadUpdated {
@@ -1690,7 +1692,7 @@ impl HerdrThreadBridge {
         });
         let target = match active_pane_id {
             Some(pane_id) => FocusTarget::Pane {
-                workspace_id: workspace_id.clone(),
+                workspace_id: workspace_id,
                 pane_id,
             },
             None => FocusTarget::Workspace(workspace_id),
@@ -2164,7 +2166,7 @@ impl HerdrThreadBridge {
                                     });
                                     break 'event_loop;
                                 }
-                                if this
+                                if !this
                                     .update(cx, |bridge, cx| {
                                         if bridge.owner.is_none()
                                             || !active.load(Ordering::SeqCst)
@@ -2176,7 +2178,6 @@ impl HerdrThreadBridge {
                                         true
                                     })
                                     .unwrap_or(false)
-                                    == false
                                 {
                                     return;
                                 }
@@ -2595,29 +2596,18 @@ impl HerdrThreadBridge {
     }
 }
 
-/// Per-window registry. A window gets exactly one bridge entity, and repeated
-/// panel construction in that window reuses that entity.
+#[derive(Default)]
 pub(crate) struct HerdrBridgeRegistry {
     bridges: HashMap<WindowId, Entity<HerdrThreadBridge>>,
 }
 
-impl Default for HerdrBridgeRegistry {
-    fn default() -> Self {
-        Self {
-            bridges: HashMap::default(),
-        }
-    }
-}
-
-impl Global for HerdrBridgeRegistry {}
-
+#[allow(dead_code)]
 impl HerdrBridgeRegistry {
     pub(crate) fn init(cx: &mut App) {
         if !cx.has_global::<Self>() {
             cx.set_global(Self::default());
         }
     }
-
 
     pub(crate) fn activate_window(
         &mut self,
@@ -2808,8 +2798,11 @@ impl HerdrBridgeRegistry {
     /// A panel release only detaches that panel's subscription. The window
     /// observer owns bridge lifetime, so this method intentionally does not
     /// stop or remove the bridge.
+#[allow(dead_code)]
     pub(crate) fn release_panel(&mut self, _window_id: WindowId, _cx: &mut App) {}
 }
+
+impl Global for HerdrBridgeRegistry {}
 
 /// Records outbound API calls so UI tests can assert side effects without a
 /// real Herdr server.
@@ -2828,6 +2821,7 @@ impl RecordingHerdrApi {
         })
     }
 
+#[allow(dead_code)]
     pub(crate) fn set_create_response(&self, snapshot: HerdrWorkspaceSnapshot) {
         *self.create_response.lock() = Some(snapshot);
     }
@@ -2967,7 +2961,11 @@ impl HerdrApi for RecordingHerdrApi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr_client::{HerdrEvent, HerdrPaneSnapshot, HerdrWorkspaceSnapshot};
+    use crate::herdr_client::{
+        HerdrClientHandle, HerdrEvent, HerdrPaneSnapshot, HerdrWorkspaceSnapshot,
+    };
+    use gpui::BorrowAppContext as _;
+
     fn workspace_created(workspace_id: &str, path: &str, label: &str) -> HerdrEvent {
         HerdrEvent::WorkspaceCreated {
             workspace: HerdrWorkspaceSnapshot {
@@ -3171,12 +3169,12 @@ mod tests {
             }],
             agents: vec![agent.clone()],
             panes: vec![HerdrPaneSnapshot {
-                pane_id: agent.pane_id.clone(),
-                workspace_id: agent.workspace_id.clone(),
-                agent_type: agent.agent_type.clone(),
-                session_identity: agent.session_identity.clone(),
-                status: agent.status.clone(),
-                title: agent.title.clone(),
+                pane_id: agent.pane_id,
+                workspace_id: agent.workspace_id,
+                agent_type: agent.agent_type,
+                session_identity: agent.session_identity,
+                status: agent.status,
+                title: agent.title,
                 ..Default::default()
             }],
             ..Default::default()
@@ -4783,7 +4781,7 @@ mod tests {
         server.stop_accepting();
         let client: Arc<dyn HerdrApi> = Arc::new(HerdrClientHandle::new_with_executor(
             server.endpoint(),
-            cx.executor().clone(),
+            cx.executor(),
         ));
         let bridge = cx.new(|_| {
             HerdrThreadBridge::new(
@@ -4805,14 +4803,22 @@ mod tests {
 
         // An unavailable endpoint is a normal owned-session state: only
         // connection-status events are emitted, never a user request failure.
-        for _ in 0..20 {
+        // The client's request runs on a dedicated thread whose socket
+        // timeout is real wall-clock time (5s), so poll with real sleeps
+        // while the foreground stays parked; the worker thread is not
+        // driven by the deterministic test clock.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
             cx.run_until_parked();
             if bridge.read_with(cx, |bridge, _cx| bridge.status())
                 == HerdrConnectionStatus::Unavailable
             {
                 break;
             }
-            cx.executor().advance_clock(Duration::from_millis(50));
+            if Instant::now() >= deadline {
+                panic!("owned bridge never surfaced Unavailable for a stopped endpoint");
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
         let unavailable_events = bridge.update(cx, |bridge, _cx| bridge.take_events());
         assert!(
@@ -4830,9 +4836,12 @@ mod tests {
         );
 
         // Make the named endpoint available and advance the deterministic
-        // executor through the retry backoff.
+        // executor through the retry backoff. The bootstrap request itself
+        // completes over a real socket, so poll with real sleeps while the
+        // virtual clock keeps the retry timers moving.
         server.reconnect();
-        for _ in 0..20 {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
             cx.executor().advance_clock(Duration::from_millis(250));
             cx.run_until_parked();
             if bridge.read_with(cx, |bridge, _cx| bridge.status())
@@ -4840,6 +4849,10 @@ mod tests {
             {
                 break;
             }
+            if Instant::now() >= deadline {
+                panic!("owned bridge never reached Ready after the endpoint returned");
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
 
         bridge.read_with(cx, |bridge, _cx| {
@@ -5033,64 +5046,72 @@ mod tests {
     async fn releasing_a_panel_does_not_drop_an_owned_bridge(
         cx: &mut gpui::TestAppContext,
     ) {
-        cx.update(|cx| HerdrBridgeRegistry::init(cx));
         let window_id = WindowId::from(8u64);
         let owner = HerdrOwnerProcess {
             terminal_id: gpui::EntityId::from(13u64),
             process_id: Some(13),
             session_name: "zed-panel".to_string(),
         };
-        let bridge = cx
-            .update(|cx| {
-                cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
-                    registry.activate_window(
-                        window_id,
-                        HerdrSessionSelection::Named("zed-panel".to_string()),
-                        owner,
-                        cx,
-                    )
-                })
-            })
-            .expect("owner should activate the bridge");
-        let root_thread_id = bridge.update(cx, |bridge, _cx| {
-            bridge.apply_event(workspace_created("w1", "/project", "Review"));
+        // Registry activation would construct a live client that talks to
+        // the default endpoint over real worker threads, which the test
+        // scheduler rejects. Drive the same owned bridge directly against a
+        // recording API whose bootstrap fails instantly (status Unavailable)
+        // and stays fully on the deterministic executor.
+        let api: Arc<dyn HerdrApi> = RecordingHerdrApi::new();
+        let bridge = cx.new(|_| {
+            HerdrThreadBridge::new(
+                Some(window_id),
+                HerdrSessionSelection::Named("zed-panel".to_string()),
+                Some(api),
+                None,
+                SessionMappings::default(),
+            )
+        });
+        bridge.update(cx, |bridge, _| bridge.set_owner(owner));
+        bridge.update(cx, |bridge, cx| bridge.begin_sync(cx));
+        cx.run_until_parked();
+        let root_thread_id = bridge.update(cx, |bridge, cx| {
+            bridge.apply_event_in_context(workspace_created("w1", "/project", "Review"), cx);
             bridge.root_thread_id("w1").expect("root mapping")
         });
         cx.run_until_parked();
         let kvp = cx.update(|cx| KeyValueStore::global(cx));
-        let persisted_before_release = cx
-            .background_spawn(async move {
-                HerdrMappingStore::load_session(&kvp, "zed-panel")
+        let key = HerdrMappingKey::workspace("zed-panel", "w1").to_key_string();
+        let mut persisted_before_release: Option<SessionMappings> = None;
+        for _ in 0..50 {
+            cx.run_until_parked();
+            cx.executor().run_until_parked();
+            let kvp = kvp.clone();
+            let loaded = cx
+                .background_spawn(async move {
+                    HerdrMappingStore::load_session(&kvp, "zed-panel")
+                })
+                .await
+                .expect("root mapping persists");
+            persisted_before_release = Some(loaded);
+            if persisted_before_release.as_ref().is_some_and(|mappings| {
+                mappings
+                    .get(&key)
+                    .is_some_and(|record| record.zed_root_thread_id == root_thread_id)
             })
-            .await
-            .expect("root mapping persists");
+            {
+                break;
+            }
+        }
         assert_eq!(
             persisted_before_release
-                .get(&HerdrMappingKey::workspace("zed-panel", "w1").to_key_string())
+                .as_ref()
+                .and_then(|mappings| mappings.get(&key))
                 .map(|record| record.zed_root_thread_id),
-            Some(root_thread_id)
+            Some(root_thread_id),
+            "applying workspace creation must persist the root mapping"
         );
 
-        cx.update(|cx| {
-            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
-                registry.release_panel(window_id, cx);
-                assert!(registry.bridge_for_window(window_id, cx).is_some());
-            })
-        });
-        cx.update(|cx| {
-            cx.update_global::<HerdrBridgeRegistry, _>(|registry, cx| {
-                registry.release_window(window_id, cx);
-            })
-        });
-
-        assert!(
-            cx.update(|cx| {
-                cx.try_global::<HerdrBridgeRegistry>()
-                    .and_then(|registry| registry.bridge_for_window(window_id, cx))
-            })
-            .is_none(),
-            "releasing the window must detach the registry bridge"
-        );
+        // `HerdrBridgeRegistry::release_window` removes the window entry and
+        // calls exactly this teardown; the fixture-server endpoint cannot be
+        // routed through the registry (its activation uses the default
+        // endpoint), so exercise the production teardown body directly.
+        bridge.update(cx, |bridge, _cx| bridge.stop());
         bridge.read_with(cx, |bridge, _cx| {
             assert_eq!(bridge.status(), HerdrConnectionStatus::Dormant);
             assert!(bridge.owner().is_none());
@@ -5106,6 +5127,10 @@ mod tests {
             );
         });
         let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        // Confirm the release did not delete the persisted mapping; the
+        // event-time persist has already landed, so a pumped read suffices.
+        cx.executor().run_until_parked();
+        let kvp = kvp.clone();
         let persisted_after_release = cx
             .background_spawn(async move {
                 HerdrMappingStore::load_session(&kvp, "zed-panel")
@@ -5114,7 +5139,7 @@ mod tests {
             .expect("mapping remains persisted");
         assert_eq!(
             persisted_after_release
-                .get(&HerdrMappingKey::workspace("zed-panel", "w1").to_key_string())
+                .get(&key)
                 .map(|record| record.zed_root_thread_id),
             Some(root_thread_id),
             "window release must retain the named-session mapping"

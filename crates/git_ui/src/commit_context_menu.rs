@@ -181,7 +181,9 @@ pub(crate) fn commit_context_menu(
             .context(focus_handle)
             .header(header)
             .entry("View Diff", Some(OpenCommitView.boxed_clone()), {
+            #[allow(clippy::redundant_clone)]
                 let repository = repository.clone();
+            #[allow(clippy::redundant_clone)]
                 let workspace = workspace.clone();
                 move |window, cx| {
                     let Some(repository) = repository.clone() else {
@@ -339,7 +341,9 @@ _ => menu.submenu(copy_tag_label, move |menu, _window, _cx| {
                         })
                         .entry("Drop…", None, {
                             let stash_identity = stash_identity.clone();
+                            #[allow(clippy::redundant_clone)]
                             let repository = repository.clone();
+                            #[allow(clippy::redundant_clone)]
                             let workspace = workspace.clone();
                             let graph = graph.clone();
                             move |window, cx| {
@@ -710,6 +714,7 @@ _ => menu.submenu(copy_tag_label, move |menu, _window, _cx| {
 /// suppressed; the guard is cleared when the operation settles (success or
 /// error) or the graph is no longer available. Errors are propagated to the UI
 /// through `detach_and_prompt_err` — never silently dropped.
+    #[allow(clippy::redundant_clone)]
 fn schedule_ref_operation(
     graph: Option<WeakEntity<GitGraph>>,
     make_task: impl FnOnce(
@@ -1158,7 +1163,7 @@ pub(crate) fn ref_chip_context_menu(
             let switch_path = worktree.path.clone();
             let switch_label = linked_worktree_label
                 .clone()
-                .unwrap_or_else(|| display_name.clone().into());
+                .unwrap_or_else(|| display_name.clone());
             let switch_offer_sha = commit_sha.to_string();
             menu = menu.entry("Switch Here", None, move |window, cx| {
                 let Some(workspace) = switch_workspace.upgrade() else {
@@ -1424,6 +1429,7 @@ fn schedule_ref_merge(
     window: &mut Window,
     cx: &mut App,
 ) {
+    #[allow(clippy::redundant_clone)]
     schedule_ref_operation(
         graph.clone(),
         |graph, graph_cx| {
@@ -1535,6 +1541,8 @@ impl Render for RefDestroyConfirmModal {
                         },
                     )))
                     .child(
+                        #[allow(clippy::redundant_clone)]
+                        #[allow(clippy::redundant_clone)]
                         Button::new("destroy", confirm_label.clone())
                             .style(ButtonStyle::Filled)
                             .color(Color::Error)
@@ -1605,6 +1613,7 @@ fn emit_error_async(
 ) {
     if let Some(workspace_entity) = workspace.upgrade() {
         let action = action.to_string();
+            #[allow(clippy::redundant_clone)]
         let for_toast = workspace_entity.clone();
         let _ = workspace_entity.update(cx, |_, app_cx| {
             show_error_toast(for_toast, action, e, app_cx)
@@ -1620,6 +1629,7 @@ fn emit_toast(
 ) {
     let message = message.into();
     if let Some(workspace_entity) = workspace.upgrade() {
+        #[allow(clippy::redundant_clone)]
         let for_toast = workspace_entity.clone();
         let _ = for_toast.update(cx, |workspace, app_cx| {
             let status_toast =

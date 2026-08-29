@@ -35,7 +35,6 @@ pub fn stable_worktree_id(
 ) -> SharedString {
     WorktreeLifecycleKey::new(repository_path, worktree_path, remote_identity)
         .stable_key()
-        .into()
 }
 
 
@@ -356,7 +355,7 @@ fn execute_move_or_clone(
             created_at: Some(Utc::now()),
             interacted_at: None,
             worktree_paths: cloned_paths,
-            remote_connection: source_thread.remote_connection.clone(),
+            remote_connection: source_thread.remote_connection,
             archived: false,
             user_order: None,
             group_id: Some(target_group_id),
@@ -515,7 +514,7 @@ mod tests {
             group(1),
             group(2),
             None,
-            Some(target_root.clone()),
+            Some(target_root),
             false,
             false,
         )
@@ -573,7 +572,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             created_at: Some(chrono::Utc::now()),
             interacted_at: None,
-            worktree_paths: project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[source_root.clone()])),
+            worktree_paths: project::WorktreePaths::from_folder_paths(&workspace::PathList::new(std::slice::from_ref(&source_root))),
             remote_connection: None,
             archived: false,
             user_order: None,
@@ -594,7 +593,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             created_at: Some(chrono::Utc::now()),
             interacted_at: None,
-            worktree_paths: project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[target_root.clone()])),
+            worktree_paths: project::WorktreePaths::from_folder_paths(&workspace::PathList::new(std::slice::from_ref(&target_root))),
             remote_connection: None,
             archived: false,
             user_order: None,
@@ -625,7 +624,7 @@ mod tests {
                     false,
                     false,
                     || RebaseResult::Conflict { details: "conflict".to_string() },
-                    || Ok((project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[target_root.clone()])), "target-wt-id".into())),
+                    || Ok((project::WorktreePaths::from_folder_paths(&workspace::PathList::new(std::slice::from_ref(&target_root))), "target-wt-id".into())),
                     store,
                     cx,
                 );
@@ -657,7 +656,7 @@ mod tests {
                         rebase_called = true;
                         RebaseResult::Success
                     },
-                    || Ok((project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[target_root.clone()])), "target-wt-id".into())),
+                    || Ok((project::WorktreePaths::from_folder_paths(&workspace::PathList::new(std::slice::from_ref(&target_root))), "target-wt-id".into())),
                     store,
                     cx,
                 );
@@ -688,7 +687,7 @@ mod tests {
                     false,
                     false,
                     || RebaseResult::Success,
-                    || Ok((project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[target_root.clone()])), "target-wt-id".into())),
+                    || Ok((project::WorktreePaths::from_folder_paths(&workspace::PathList::new(std::slice::from_ref(&target_root))), "target-wt-id".into())),
                     store,
                     cx,
                 );
@@ -728,7 +727,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             created_at: Some(chrono::Utc::now()),
             interacted_at: None,
-            worktree_paths: project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[source_root.clone()])),
+            worktree_paths: project::WorktreePaths::from_folder_paths(&workspace::PathList::new(std::slice::from_ref(&source_root))),
             remote_connection: None,
             archived: false,
             user_order: None,
@@ -749,7 +748,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             created_at: Some(chrono::Utc::now()),
             interacted_at: None,
-            worktree_paths: project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[target_root.clone()])),
+            worktree_paths: project::WorktreePaths::from_folder_paths(&workspace::PathList::new(std::slice::from_ref(&target_root))),
             remote_connection: None,
             archived: false,
             user_order: None,
@@ -806,7 +805,7 @@ mod tests {
                     false,
                     false,
                     || RebaseResult::Success,
-                    || Ok((project::WorktreePaths::from_folder_paths(&workspace::PathList::new(&[target_root.clone()])), "cloned-wt-id".into())),
+                    || Ok((project::WorktreePaths::from_folder_paths(&workspace::PathList::new(std::slice::from_ref(&target_root))), "cloned-wt-id".into())),
                     store,
                     cx,
                 );

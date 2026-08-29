@@ -429,7 +429,7 @@ impl Project {
             let shell_kind = ShellKind::new(&shell, path_style.is_windows());
             let mut env = env_task.await.unwrap_or_default();
             env.extend(settings.env);
-            apply_herdr_session_env(&mut env, is_via_remote, window_id, cx);
+            cx.update(|cx| apply_herdr_session_env(&mut env, is_via_remote, window_id, cx));
 
             let activation_script = maybe!(async {
                 for toolchain in toolchains {
@@ -783,9 +783,9 @@ fn quote_cmd_command_arg_for_outer_shell(arg: &str, shell_kind: ShellKind) -> Op
 mod tests {
     use super::*;
     use fs::FakeFs;
-    use gpui::TestAppContext;
+            use gpui::TestAppContext;
     use pretty_assertions::assert_eq;
-    use settings::{Settings as _, SettingsStore};
+    use settings::SettingsStore;
     use std::{cell::Cell, path::Path, rc::Rc, sync::Arc};
 
     fn terminal_exit_command() -> (String, Vec<String>) {
@@ -903,21 +903,18 @@ mod tests {
             .update(cx, |project, cx| {
                 project.create_terminal_task(SpawnInTerminal::default(), cx)
             })
-            .unwrap()
             .await
             .expect("task terminal should start");
         assert_eq!(terminal_added_count.get(), 1);
 
         let shell_terminal = project
             .update(cx, |project, cx| project.create_terminal_shell(None, cx))
-            .unwrap()
             .await
             .expect("shell terminal should start");
         assert_eq!(terminal_added_count.get(), 2);
 
         project
             .update(cx, |project, cx| project.clone_terminal(&shell_terminal, cx, None))
-            .unwrap()
             .await
             .expect("cloned terminal should start");
         assert_eq!(terminal_added_count.get(), 3);
@@ -942,14 +939,12 @@ mod tests {
             .update(cx, |project, cx| {
                 project.create_terminal_shell_in_window(None, 42, cx)
             })
-            .unwrap()
             .await
             .expect("window-aware local terminal should start");
         let ordinary_terminal = project
             .update(cx, |project, cx| {
                 project.create_terminal_shell(None, cx)
             })
-            .unwrap()
             .await
             .expect("ordinary local terminal should start");
 
@@ -990,7 +985,6 @@ mod tests {
                     cx,
                 )
             })
-            .unwrap()
             .await
             .expect("window-aware remote terminal should start");
 
@@ -1020,7 +1014,6 @@ mod tests {
             .update(cx, |project, cx| {
                 project.create_local_terminal_in_window(42, cx)
             })
-            .unwrap()
             .await
             .expect("force-local terminal should start");
 

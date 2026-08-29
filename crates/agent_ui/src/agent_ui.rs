@@ -62,8 +62,8 @@ use editor::{Editor, SelectionEffects, scroll::Autoscroll};
 use feature_flags::FeatureFlagAppExt as _;
 use fs::Fs;
 use gpui::{
-    Action, App, Context, Entity, ImageSource, ReadGlobal as _, Resource, SharedString, SharedUri,
-    TaskExt, Window, actions,
+    Action, App, BorrowAppContext, Context, Entity, ImageSource, ReadGlobal as _, Resource,
+    SharedString, SharedUri, TaskExt, Window, actions,
 };
 use language::{
     LanguageRegistry,
@@ -646,7 +646,7 @@ pub fn init(
     cx.update_global::<herdr_ownership::HerdrOwnershipRegistry, _>(|registry, _cx| {
         registry.set_handlers(
             |window_id, terminal_id, process, launch, cx| {
-                let session_name = launch.session_name.clone();
+                let session_name = launch.session_name;
                 let owner = herdr_bridge::HerdrOwnerProcess {
                     terminal_id,
                     process_id: process.pid,

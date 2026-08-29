@@ -15248,8 +15248,9 @@ async fn test_find_or_create_workspace_returns_the_created_remote_workspace(
 
 mod herdr_workspace_routing {
     use super::*;
+    use pretty_assertions::assert_eq;
     use agent_ui::{AgentPanel, TestHerdrInboundEvent, ThreadId};
-    use gpui::{Entity, VisualTestContext};
+    use gpui::{Entity, VisualTestContext, WindowHandle};
     use project::Project;
     use workspace::{MultiWorkspace, Workspace};
 
@@ -15262,7 +15263,7 @@ mod herdr_workspace_routing {
     }
 
     struct RoutingFixture {
-        multi_workspace: Entity<MultiWorkspace>,
+        multi_workspace: WindowHandle<MultiWorkspace>,
         workspace_a: Entity<Workspace>,
         workspace_b: Entity<Workspace>,
         panel_a: Entity<AgentPanel>,
@@ -15279,8 +15280,9 @@ mod herdr_workspace_routing {
         let multi_workspace =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
         let workspace_a = multi_workspace
-            .read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone())
-            .unwrap();
+            .root(cx)
+            .unwrap()
+            .read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone());
         let project_b = init_routing_project(cx, root_b).await;
         let workspace_b = multi_workspace
             .update(cx, |multi_workspace, window, cx| {
@@ -15318,7 +15320,7 @@ mod herdr_workspace_routing {
         fixture.panel_a.update_in(cx, |panel, _window, cx| {
             panel.install_test_herdr_root(workspace_id, root_path, "Root", cx);
         });
-        fixture.panel_b.update(cx, |panel, _cx| {
+        fixture.panel_b.update(cx, |panel, cx| {
             panel.share_test_herdr_bridge(&fixture.panel_a, cx);
         });
         fixture
@@ -15346,18 +15348,18 @@ mod herdr_workspace_routing {
         // Both workspaces share the same root path, so path identity alone is
         // ambiguous; the persisted `zed_workspace_id` must pick workspace_b.
         let fixture = build_routing_fixture(cx, "/repo", "/repo").await;
-        let mut cx = VisualTestContext::from_window(fixture.multi_workspace.clone().into(), cx);
+        let mut cx = VisualTestContext::from_window(fixture.multi_workspace.into(), cx);
         let thread_id = seed_shared_root(&fixture, "w1", "/repo", &mut cx).await;
 
-        fixture.workspace_a.update(cx, |workspace, _| {
+        fixture.workspace_a.update(&mut cx, |workspace, _| {
             workspace.set_random_database_id();
         });
-        fixture.workspace_b.update(cx, |workspace, _| {
+        fixture.workspace_b.update(&mut cx, |workspace, _| {
             workspace.set_random_database_id();
         });
         let id_b = fixture
             .workspace_b
-            .read_with(cx, |workspace, _| workspace.database_id())
+            .read_with(&cx, |workspace, _| workspace.database_id())
             .expect("workspace_b should have a database id");
         let bound = fixture.panel_a.update_in(&mut cx, |panel, _window, cx| {
             panel.test_set_root_zed_workspace_id("w1", id_b, cx)
@@ -15404,7 +15406,7 @@ mod herdr_workspace_routing {
         cx: &mut TestAppContext,
     ) {
         let fixture = build_routing_fixture(cx, "/repo", "/repo-b").await;
-        let mut cx = VisualTestContext::from_window(fixture.multi_workspace.clone().into(), cx);
+        let mut cx = VisualTestContext::from_window(fixture.multi_workspace.into(), cx);
         let thread_id = seed_shared_root(&fixture, "w1", "/repo", &mut cx).await;
 
         dispatch(
@@ -15439,7 +15441,7 @@ mod herdr_workspace_routing {
         cx: &mut TestAppContext,
     ) {
         let fixture = build_routing_fixture(cx, "/repo", "/repo-b").await;
-        let mut cx = VisualTestContext::from_window(fixture.multi_workspace.clone().into(), cx);
+        let mut cx = VisualTestContext::from_window(fixture.multi_workspace.into(), cx);
         let _thread_id = seed_shared_root(&fixture, "w-nowhere", "/nowhere", &mut cx).await;
 
         dispatch(
@@ -15475,7 +15477,7 @@ mod herdr_workspace_routing {
         // Both workspaces share `/repo`, so canonical path identity is
         // ambiguous and neither may activate.
         let fixture = build_routing_fixture(cx, "/repo", "/repo").await;
-        let mut cx = VisualTestContext::from_window(fixture.multi_workspace.clone().into(), cx);
+        let mut cx = VisualTestContext::from_window(fixture.multi_workspace.into(), cx);
         let _thread_id = seed_shared_root(&fixture, "w1", "/repo", &mut cx).await;
 
         dispatch(

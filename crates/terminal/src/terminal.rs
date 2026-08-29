@@ -3810,7 +3810,7 @@ mod tests {
             "argv-only changes should emit the refreshed process snapshot, got {events:?}"
         );
         assert!(
-            events.iter().any(|event| *event == Event::TitleChanged),
+            events.contains(&Event::TitleChanged),
             "process changes should continue to update terminal titles, got {events:?}"
         );
         assert!(completion_rx.recv().await.is_ok());

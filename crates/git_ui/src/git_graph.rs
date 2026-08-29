@@ -1376,6 +1376,7 @@ pub(crate) struct BranchDiff {
 /// The selected working-tree file's diff, shown in the right detail panel when
 /// a file in the expandable worktree status breakdown is clicked.
 pub(crate) struct WorktreeFileDiff {
+#[allow(dead_code)]
     pub(crate) repo_path: RepoPath,
     /// Display label (`dir/file` or `file`) shown in the panel header.
     pub(crate) label: SharedString,
@@ -1938,7 +1939,7 @@ impl GitGraph {
             return chip.into_any_element();
         };
         let ref_for_menu = resolved_ref.clone();
-        let ref_for_click = resolved_ref.clone();
+        let ref_for_click = resolved_ref;
         div()
             .min_w_0()
             .id(("git-graph-ref-chip", commit_idx))
@@ -6741,7 +6742,7 @@ mod tests {
 
         // Verify initial graph data is loaded
         let initial_commit_count =
-            git_graph.read_with(&*cx, |graph, _| graph.graph_data.commits.len());
+            git_graph.read_with(&**cx, |graph, _| graph.graph_data.commits.len());
         assert!(
             initial_commit_count > 0,
             "graph data should have been loaded, got 0 commits"
@@ -9164,7 +9165,7 @@ mod tests {
         git_graph: &Entity<GitGraph>,
         cx: &VisualTestContext,
     ) -> Vec<String> {
-        git_graph.read_with(&*cx, |git_graph, app_cx| {
+        git_graph.read_with(cx, |git_graph, app_cx| {
             git_graph
                 .context_menu
                 .as_ref()

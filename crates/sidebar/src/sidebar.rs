@@ -511,6 +511,7 @@ struct SidebarContents {
 /// Drop boundary for a sidebar row. `Before` and `After` are kept explicit so
 /// hit testing and persistence do not depend on an implicit row convention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum DropPosition {
     Before,
     After,
@@ -2998,7 +2999,8 @@ impl Sidebar {
                     // New Herdr-backed roots: creation goes through the
                     // bridge's `workspace.create` and the new row becomes
                     // active only after its identity is persisted.
-                    for workspace in open_workspaces.iter().cloned() {
+                    for workspace in open_workspaces.iter() {
+                        let workspace = workspace.clone();
                         let this = this.clone();
                         let key = key.clone();
                         menu = menu.entry("New Herdr Thread", None, move |window, cx| {
@@ -6658,14 +6660,13 @@ impl Sidebar {
                 .cloned()
                 .unwrap_or_else(|| folder_path.clone());
             let worktree_id = stable_worktree_id(&main_path, &folder_path, "local");
-            let clone_paths = paths.clone();
             let clone_id = worktree_id.clone();
             let result = panel.update(cx, |panel, cx| {
                 panel.execute_thread_group_transfer(
                     payload,
                     Some(worktree_id),
                     || RebaseResult::Success,
-                    move || Ok((clone_paths, clone_id)),
+                    move || Ok((paths, clone_id)),
                     cx,
                 )
             });
@@ -7274,7 +7275,7 @@ impl Sidebar {
                 .regenerating_titles
                 .contains(&thread.metadata.thread_id);
 
-        let thread_item = ThreadItem::new(id, title.clone())
+        let thread_item = ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
             .icon(icon)
             .when(is_draft, |this| {

@@ -4229,8 +4229,7 @@ impl GitRepository for RealGitRepository {
             let object_type = tag_object_type(
                 &git.run(&["cat-file", "-t", target_oid_str.as_str()])
                     .await?
-                    .trim()
-                    .to_string(),
+                    .trim(),
             )?;
             Ok(TagDetails {
                 ref_name: ref_name.clone().into(),
@@ -9283,8 +9282,7 @@ mod tests {
 
             let repository = new_real_repo(repo_dir.path(), cx);
             set_stash_rename_fault(&repository, {
-                let boundary = boundary;
-                move |step| {
+                                move |step| {
                     if step == boundary {
                         anyhow::bail!("injected {label} failure");
                     }
@@ -9319,7 +9317,7 @@ mod tests {
             let listed = stash_rename_recovery_refs(repo_dir.path());
             assert!(!listed.is_empty(), "{label}: no recovery refs retained");
             assert!(
-                listed.iter().any(|r| *r == recovery.manifest_ref),
+                                listed.contains(&recovery.manifest_ref),
                 "{label}: manifest ref {0} not in retained refs {listed:?}",
                 recovery.manifest_ref
             );

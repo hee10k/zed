@@ -165,10 +165,12 @@ impl HerdrConversationState {
         }
     }
 
+#[allow(dead_code)]
     pub(crate) fn subthreads(&self) -> &IndexMap<String, HerdrSubthreadState> {
         &self.subthreads
     }
 
+#[allow(dead_code)]
     pub(crate) fn status_only(&self, pane_id: &str) -> Option<&HerdrAgentStatus> {
         self.status_only.get(pane_id)
     }
@@ -181,10 +183,12 @@ impl HerdrConversationState {
         self.active_pane_id.as_deref()
     }
 
+#[allow(dead_code)]
     pub(crate) fn output(&self, pane_id: &str) -> Option<&str> {
         self.subthreads.get(pane_id).map(|state| state.output.as_str())
     }
 
+#[allow(dead_code)]
     pub(crate) fn status(&self, pane_id: &str) -> Option<&HerdrAgentStatus> {
         self.subthreads
             .get(pane_id)
@@ -208,6 +212,7 @@ pub(crate) struct HerdrConversationView {
     connection_status: HerdrConnectionStatus,
 }
 
+#[allow(dead_code)]
 impl HerdrConversationView {
     pub(crate) fn new(
         thread_id: ThreadId,
@@ -241,6 +246,7 @@ impl HerdrConversationView {
         self.title.clone()
     }
 
+#[allow(dead_code)]
     pub(crate) fn connection_status(&self) -> HerdrConnectionStatus {
         self.connection_status
     }
@@ -759,7 +765,7 @@ mod tests {
                 cx,
             )
         });
-        let mut cx = VisualTestContext::from_window(conversation.clone().into(), cx);
+        let mut cx = VisualTestContext::from_window(conversation.into(), cx);
 
         let initial_child_id = conversation.update(&mut cx, |view, window, cx| {
             view.apply_event(
@@ -838,7 +844,7 @@ mod tests {
                 cx,
             )
         });
-        let mut cx = VisualTestContext::from_window(conversation.clone().into(), cx);
+        let mut cx = VisualTestContext::from_window(conversation.into(), cx);
         conversation.update(&mut cx, |view, window, cx| {
             view.title = "User title".into();
             view.title_override = Some("User title".into());
@@ -851,9 +857,12 @@ mod tests {
                 window,
                 cx,
             );
-        });
-        conversation.read_with(&cx, |view, _| {
-            assert_eq!(view.title(), "User title");
-        });
+        })
+        .expect("rename should apply");
+        conversation
+            .read_with(&cx, |view, _| {
+                assert_eq!(view.title(), "User title");
+            })
+            .expect("conversation should still be alive");
     }
 }

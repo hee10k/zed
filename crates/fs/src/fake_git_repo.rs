@@ -19,7 +19,7 @@ use git::{
         commit_hash_search_query,
     },
     stash::{
-        GitStash, STASH_RENAME_RECOVERY_PREFIX, STASH_REF, StashIdentity, StashRenameRecovery,
+                GitStash, STASH_REF, StashIdentity, StashRenameRecovery,
         StashRenameResult, renamed_stash_subject, resolve_stash_identity,
     },
     status::{
@@ -1421,7 +1421,7 @@ impl GitRepository for FakeGitRepository {
                 .and_then(|sha| Oid::try_from(sha.as_str()).ok())
                 .unwrap_or(Oid::default());
             Ok(git::repository::TagDetails {
-                ref_name: ref_name.clone().into(),
+                ref_name: ref_name.into(),
                 name: name.into(),
                 target_oid,
                 object_type: git::repository::TagObjectType::Commit,
@@ -1581,7 +1581,7 @@ fn stash_drop(
                         let original_subject =
                             format!("On {}: {}", entry.branch.as_deref().unwrap_or(""), entry.message);
                         entry.message =
-                            renamed_stash_subject(&original_subject, message).to_string();
+                            renamed_stash_subject(&original_subject, message);
                     }
                     entry
                 })

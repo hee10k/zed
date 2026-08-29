@@ -16,6 +16,7 @@ use crate::herdr_mapping_store::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HerdrOperationOrigin {
     Zed,
+#[allow(dead_code)]
     Herdr,
 }
 
@@ -64,6 +65,7 @@ impl BridgeState {
     }
 
     /// Registers a Zed-originated pending focus operation.
+#[allow(dead_code)]
     pub(crate) fn with_pending_focus(
         mut self,
         operation_id: impl Into<String>,

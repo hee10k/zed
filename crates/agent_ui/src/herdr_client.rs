@@ -178,6 +178,7 @@ impl HerdrAgentSessionIdentity {
         }
     }
 
+#[allow(dead_code)]
     pub(crate) fn path(value: impl Into<String>) -> Self {
         Self {
             kind: "path".to_string(),
@@ -311,6 +312,7 @@ struct HerdrEventEnvelope {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) enum HerdrEvent {
     WorkspaceCreated { workspace: HerdrWorkspaceSnapshot, sequence: u64 },
     WorkspaceUpdated { workspace: HerdrWorkspaceSnapshot, sequence: u64 },
@@ -323,11 +325,13 @@ pub(crate) enum HerdrEvent {
     WorkspaceClosed { workspace_id: String, sequence: u64 },
     WorkspaceMoved {
         workspace_id: String,
+#[allow(dead_code)]
         insert_index: u64,
         workspaces: Vec<HerdrWorkspaceSnapshot>,
         sequence: u64,
     },
     WorkspaceReordered {
+#[allow(dead_code)]
         workspace_ids: Vec<String>,
         before_workspace_id: Option<String>,
         workspaces: Vec<HerdrWorkspaceSnapshot>,
@@ -339,6 +343,7 @@ pub(crate) enum HerdrEvent {
         pane: HerdrPaneSnapshot,
         previous_pane_id: Option<String>,
         previous_workspace_id: Option<String>,
+#[allow(dead_code)]
         previous_tab_id: Option<String>,
         sequence: u64,
     },
@@ -357,9 +362,11 @@ pub(crate) enum HerdrEvent {
         sequence: u64,
     },
     PaneClosed { pane_id: String, workspace_id: String, sequence: u64 },
+#[allow(dead_code)]
     PaneExited { pane_id: String, exit_code: Option<i32>, sequence: u64 },
     PaneOutput { pane_id: String, revision: u64, delta: String, sequence: u64 },
     PaneScrollChanged { pane_id: String, sequence: u64 },
+#[allow(dead_code)]
     SubscriptionStarted { subscription_id: String },
     Unknown { event: String, data: Box<RawValue> },
 }
@@ -428,6 +435,7 @@ impl HerdrEvent {
             .and_then(|origins| origins.get(operation_id).cloned())
     }
 
+#[allow(dead_code)]
     pub(crate) fn pane_id(&self) -> Option<&str> {
         match self {
             Self::PaneAgentDetected { pane_id, .. }
@@ -802,6 +810,7 @@ pub(crate) fn decode_event(input: &str) -> Result<HerdrEvent, HerdrClientError> 
     }
 }
 
+#[allow(dead_code)]
 fn fail_pending(pending: &PendingRequests, error: HerdrClientError) {
     let mut requests = match pending.lock() {
         Ok(requests) => requests,
@@ -856,6 +865,7 @@ fn record_event(
     }
 }
 
+#[allow(dead_code)]
 fn event_log_len(event_log: &SharedEventLog) -> usize {
     match event_log.lock() {
         Ok(log) => log.events.len(),
@@ -902,6 +912,7 @@ fn finish_event_log_replay(event_log: &SharedEventLog, replay_until: usize) {
     prune_event_log(&mut log);
 }
 
+#[allow(dead_code)]
 fn events_since(
     event_log: &SharedEventLog,
     start: usize,
@@ -931,6 +942,7 @@ fn events_since_with_boundary(
         }
     }
 }
+#[allow(dead_code)]
 fn bootstrap_primary_subscription_ended(
     events: &[HerdrEvent],
     subscription_id: &str,
@@ -1020,6 +1032,7 @@ pub(crate) struct HerdrClientHandle {
     next_id: Arc<AtomicU64>,
     pending: PendingRequests,
     event_tx: Sender<HerdrEvent>,
+#[allow(dead_code)]
     event_rx: Receiver<HerdrEvent>,
     event_cursor_tx: Sender<HerdrEventCursor>,
     event_cursor_rx: Receiver<HerdrEventCursor>,
@@ -1034,6 +1047,7 @@ pub(crate) struct HerdrClientHandle {
     executor: BackgroundExecutor,
 }
 
+#[allow(dead_code)]
 impl HerdrClientHandle {
     pub(crate) fn new(endpoint: HerdrEndpoint, cx: &App) -> Result<Self, HerdrClientError> {
         Ok(Self::new_with_executor(
@@ -1067,6 +1081,7 @@ impl HerdrClientHandle {
         }
     }
 
+#[allow(dead_code)]
     pub(crate) fn connect(endpoint: &HerdrEndpoint, cx: &App) -> Task<Result<Self, HerdrClientError>> {
         let endpoint = endpoint.clone();
         let executor = cx.background_executor().clone();
@@ -1201,7 +1216,7 @@ impl HerdrClientHandle {
     ) -> Task<Result<(String, usize, ConnectionKillSwitch, u64), HerdrClientError>> {
         let request_id = format!("req-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let request = HerdrRequest {
-            id: request_id.clone(),
+            id: request_id,
             method: "events.subscribe".to_string(),
             params,
         };
@@ -1313,7 +1328,7 @@ impl HerdrClientHandle {
 
         let filter_cancel = cancel.clone();
         let filters = self.start_subscription_with_cancellation_at_generation(
-            pane_filter_subscription_params(&[pane_id.clone()]),
+            pane_filter_subscription_params(std::slice::from_ref(&pane_id)),
             false,
             filter_cancel.clone(),
             expected_generation,
@@ -1442,7 +1457,7 @@ impl HerdrClientHandle {
                     previous.trigger();
                 }
             }
-            Some(_) | None => drop(kill.trigger()),
+            Some(_) | None => kill.trigger(),
         }
         drop(generation_guard);
     }
@@ -1498,7 +1513,7 @@ impl HerdrClientHandle {
             self.subscription_generation.clone(),
             generation,
             self.publish_lock.clone(),
-            cancel.clone(),
+            cancel,
         );
         self.executor
             .clone()
@@ -1672,7 +1687,7 @@ impl HerdrClientHandle {
         let client = self.clone();
         let event_log = self.event_log.clone();
         let executor = self.executor.clone();
-        executor.clone().spawn(async move {
+        executor.spawn(async move {
             client.cancel_subscription_generation();
             let result = async {
                 let ping = client.request_on_executor("ping", empty_params()).await?;
@@ -2163,8 +2178,11 @@ pub(crate) struct HerdrBootstrap {
     /// boundary are either replayed here or superseded by the snapshot.
     pub replay_until: usize,
 }
+#[allow(dead_code)]
 pub(crate) trait HerdrApi: Send + Sync {
+#[allow(dead_code)]
     fn ping(&self, cx: &App) -> Task<Result<(), HerdrClientError>>;
+    #[allow(dead_code)]
     fn subscribe_events(&self, cx: &App) -> Task<Result<String, HerdrClientError>>;
     fn bootstrap(&self, cx: &App) -> Task<Result<HerdrBootstrap, HerdrClientError>>;
     fn cancel_subscriptions(&self) {}
@@ -2264,6 +2282,7 @@ fn events_wait_params(pane_id: &str, min_revision: u64) -> Value {
     })
 }
 
+#[allow(dead_code)]
 fn pane_input_params(pane_id: &str, text: Option<&str>, keys: &[String]) -> Value {
     let mut params = serde_json::json!({"pane_id": pane_id, "keys": keys});
     if let Some(text) = text {
@@ -2960,6 +2979,7 @@ mod tests {
 
 
     #[cfg(unix)]
+    #[allow(dead_code)]
     fn recorded_methods(log: &[Value]) -> Vec<String> {
         log.iter()
             .map(|value| value["method"].as_str().unwrap_or_default().to_string())

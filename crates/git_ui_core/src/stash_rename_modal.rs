@@ -105,8 +105,7 @@ impl ModalView for StashRenameModal {}
 
 #[cfg(any(test, feature = "test-support"))]
 impl StashRenameModal {
-    /// Test hook: set the composed message directly so a test can drive the
-    /// confirm path without synthesizing keystrokes.
+        #[allow(dead_code)]
     pub(crate) fn test_set_editor_text(
         &mut self,
         message: &str,

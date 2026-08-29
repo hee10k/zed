@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Deterministic Herdr fixtures used by the synchronization verification suite.
 //!
 //! The fixture speaks the same one-request-per-connection NDJSON protocol as a
@@ -811,7 +812,7 @@ mod tests {
         assert_eq!(server.next_sequence(), 41);
         server.enqueue_response("workspace.focus", json!({"accepted":true}));
         server.enqueue_pane_output("w1:p1", 8, "newer output");
-        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor().clone());
+        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor());
 
         let ping = client.request_on_executor("ping", empty_params()).await.expect("ping");
         validate_ping_result(ping.get()).expect("ping protocol");
@@ -883,7 +884,7 @@ mod tests {
         let server =
             FakeHerdrServer::new(snapshot("alpha", vec![workspace("w1", "Alpha", "/repo")]))
                 .expect("fixture server");
-        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor().clone());
+        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor());
         let result = client
             .request_on_executor("unsupported.fixture.method", json!({}))
             .await;
@@ -902,7 +903,7 @@ mod tests {
         let server =
             FakeHerdrServer::new(snapshot("alpha", vec![workspace("w1", "Alpha", "/repo")]))
                 .expect("fixture server");
-        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor().clone());
+        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor());
         let results = join_all((0..8).map(|_| {
             client.start_subscription(subscription_params(), false)
         }))
@@ -927,7 +928,7 @@ mod tests {
         cx.executor().allow_parking();
         let server = FakeHerdrServer::new(snapshot("alpha", vec![workspace("w1", "Alpha", "/repo")]))
             .expect("fixture server");
-        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor().clone());
+        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor());
         let events = client.subscribe_with_cursor();
         server.queue_event(json!({
             "event": "workspace.focused",
@@ -977,7 +978,7 @@ mod tests {
         let server = FakeHerdrServer::new(first.clone()).expect("fixture server");
         server.enqueue_snapshot(first);
         server.enqueue_snapshot(second);
-        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor().clone());
+        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor());
 
         let bootstrap = client.bootstrap_on_executor().await.expect("bootstrap");
         assert_eq!(bootstrap.snapshot.workspaces[0].label, "Authoritative");
@@ -1092,7 +1093,7 @@ mod tests {
                 .expect("fixture server");
         let client = Arc::new(HerdrClientHandle::new_with_executor(
             server.endpoint(),
-            cx.executor().clone(),
+            cx.executor(),
         ));
         let bridge = cx.new(|_| HerdrThreadBridge::for_test_with_api(client));
         bridge.update(cx, |bridge, _| {
@@ -1336,7 +1337,7 @@ mod tests {
     async fn windows_fixture_round_trips_named_pipe_and_reconnects(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let server = FakeHerdrServer::new(snapshot("alpha", vec![])).expect("fixture server");
-        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor().clone());
+        let client = HerdrClientHandle::new_with_executor(server.endpoint(), cx.executor());
         let ping = client.request_on_executor("ping", empty_params()).await.expect("pipe ping");
         validate_ping_result(ping.get()).expect("pipe protocol");
         let events = client.subscribe_with_cursor();

@@ -1940,7 +1940,7 @@ impl AgentPanel {
         let coordinator = self.worktree_lifecycle.clone();
         let previous_task = self._worktree_lifecycle_task.take();
         let terminal_store = TerminalThreadMetadataStore::try_global(cx);
-        self._worktree_lifecycle_task = Some(cx.spawn(async move |_this, mut cx| {
+        self._worktree_lifecycle_task = Some(cx.spawn(async move |_this, cx| {
             if let Some(previous_task) = previous_task {
                 previous_task.await;
             }
@@ -5533,7 +5533,9 @@ impl AgentPanel {
                     .filter(|workspace| {
                         workspace.read(cx).project_group_key(cx).matches(&herdr_key)
                     })
-                    .cloned();
+                                        .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter();
                 let first = matches.next();
                 match first {
                     None => return false,
@@ -5554,7 +5556,7 @@ impl AgentPanel {
                         }
                         // Only the displayed workspace surfaces the conflict
                         // so a multi-panel fanout shows exactly one toast.
-                        if multi_workspace.read(cx).workspace().entity_id()
+                                                                        if Some(multi_workspace.read(cx).workspace().entity_id())
                             == current_workspace.as_ref().map(|workspace| workspace.entity_id())
                         {
                             self.herdr_conflict_active = true;
@@ -6059,7 +6061,9 @@ impl AgentPanel {
             command: Some("herdr".to_string()),
             args: vec!["--session".to_string(), session_name.clone()],
             command_label: format!("herdr --session {session_name}"),
-            env: HashMap::from([("HERDR_SESSION".to_string(), session_name.clone())]),
+            env: [("HERDR_SESSION".to_string(), session_name.clone())]
+                .into_iter()
+                .collect(),
             use_new_terminal: true,
             reveal: RevealStrategy::Always,
             reveal_target: RevealTarget::Dock,
@@ -6072,7 +6076,7 @@ impl AgentPanel {
         let workspace_id = self.workspace_id;
         let project = self.project.downgrade();
         let terminal_id = TerminalId::new();
-        let session_for_owner = session_name.clone();
+        let session_for_owner = session_name;
 
         cx.spawn_in(window, async move |this, cx| {
             let terminal = match terminal_task.await {
@@ -8859,9 +8863,8 @@ impl AgentPanel {
                         }
                         _ => None,
                     })
-                    .collect()
+                                        .collect::<Vec<_>>()
             })
-            .unwrap_or_default()
     }
 
     /// Persists the owning Zed workspace id for a Herdr root, as the
@@ -8878,8 +8881,7 @@ impl AgentPanel {
         bridge
             .update(cx, |bridge, cx| {
                 bridge.set_root_zed_workspace_id(workspace_id, zed_workspace_id, cx)
-            })
-            .unwrap_or(false)
+                        })
     }
 
     /// Dispatches one simplified inbound event through the panel's real
@@ -16347,7 +16349,7 @@ mod tests {
         async fn agent_panel_creation_does_not_start_herdr_sync(
             cx: &mut TestAppContext,
         ) {
-            let (_panel, visual_cx) = setup_panel(cx).await;
+            let (_panel, mut visual_cx) = setup_panel(cx).await;
             let window_id =
                 visual_cx.update(|window, _cx| window.window_handle().window_id());
             let bridge = visual_cx.update(|_, cx| {
@@ -16383,10 +16385,10 @@ mod tests {
                 })
                 .expect("restored Herdr state should serialize")
                 .expect("restored Herdr state should be present");
-            let state: workspace::persistence::model::MultiWorkspaceState =
+            let state: serde_json::Value =
                 serde_json::from_str(&persisted).expect("restored state should decode");
-            assert_eq!(state.herdr_session_name.as_deref(), Some("zed-stable"));
-            assert!(state.herdr_owned);
+            assert_eq!(state["herdr_session_name"].as_str(), Some("zed-stable"));
+            assert_eq!(state["herdr_owned"].as_bool(), Some(true));
 
             let bridge = cx.update(|_, cx| {
                 cx.global::<HerdrBridgeRegistry>()
@@ -16814,7 +16816,7 @@ mod tests {
             });
             assert!(started);
             cx.run_until_parked();
-            let (thread_id, metadata) = panel.read_with(&cx, |panel, cx| {
+            let (_thread_id, metadata) = panel.read_with(&cx, |panel, cx| {
                 let thread_id = panel
                     .herdr_root_thread_id("created-workspace", cx)
                     .expect("create response should establish a root mapping");
@@ -17076,6 +17078,10 @@ mod tests {
             cx: &mut TestAppContext,
         ) {
             let (panel, mut cx) = setup_visible_panel(cx).await;
+            cx.update(|_window, cx| {
+                HerdrBridgeRegistry::init(cx);
+                TerminalThreadMetadataStore::init_global(cx);
+            });
             cx.executor().allow_parking();
 
             cx.dispatch_action(OpenHerdr);

@@ -324,6 +324,7 @@ pub(crate) fn tombstone_record(
 
 
 /// Live (non-tombstoned) records in insertion-stable canonical order.
+#[allow(dead_code)]
 pub(crate) fn live_records(mappings: &SessionMappings) -> Vec<&HerdrMappingRecord> {
     mappings.values().filter(|r| !r.is_tombstone()).collect()
 }
@@ -455,7 +456,7 @@ mod tests {
         record.zed_workspace_id = Some(workspace_id);
         let encoded = encode_session_map(&SessionMappings::from([(
             record.key.to_key_string(),
-            record.clone(),
+            record,
         )]))
         .expect("encode mapping");
         let decoded = decode_session_map(Some(&encoded)).expect("decode mapping");
@@ -597,7 +598,7 @@ mod tests {
         let duplicate = serde_json::json!({
             "version": 1,
             "records": {
-                canonical.clone(): record.clone(),
+                canonical: record,
                 "another-key": record,
             }
         });

@@ -989,7 +989,7 @@ impl ThreadMetadataStore {
         }
         thread.last_activity_at = Some(at);
         thread.activity_status = status;
-        self.save_internal(thread.clone());
+        self.save_internal(thread);
         cx.notify();
     }
     pub fn flush_pending(&self, cx: &App) -> Task<()> {

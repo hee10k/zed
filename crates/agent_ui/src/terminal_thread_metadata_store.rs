@@ -486,7 +486,7 @@ impl TerminalThreadMetadataStore {
             .map(|terminal| terminal.terminal_id)
             .collect();
 
-        for terminal_id in terminal_ids.iter().copied() {
+        for terminal_id in terminal_ids.iter() {
             if let Some(mut terminal) = self.terminals.get(&terminal_id).cloned() {
                 terminal.worktree_paths.remove_folder_path(worktree_path);
                 self.save_internal(terminal);

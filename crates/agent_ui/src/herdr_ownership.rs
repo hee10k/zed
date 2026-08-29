@@ -76,18 +76,10 @@ impl Default for HerdrOwnershipCallbacks {
     }
 }
 
+#[derive(Default)]
 pub(crate) struct HerdrOwnershipRegistry {
     observers: HashMap<WindowId, Entity<HerdrOwnershipObserver>>,
     callbacks: HerdrOwnershipCallbacks,
-}
-
-impl Default for HerdrOwnershipRegistry {
-    fn default() -> Self {
-        Self {
-            observers: HashMap::default(),
-            callbacks: HerdrOwnershipCallbacks::default(),
-        }
-    }
 }
 
 impl Global for HerdrOwnershipRegistry {}
@@ -455,7 +447,7 @@ impl HerdrOwnershipObserver {
         let terminals = self
             .terminal_entities
             .iter()
-            .filter(|(terminal_id, _)| Some(*terminal_id) != excluded_terminal_id)
+            .filter(|(terminal_id, _)| excluded_terminal_id != Some(**terminal_id))
             .filter_map(|(terminal_id, terminal)| {
                 terminal.upgrade().map(|terminal| (*terminal_id, terminal))
             })
@@ -517,6 +509,7 @@ pub(crate) fn init(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use gpui::TestAppContext;
     use std::{cell::{Cell, RefCell}, path::PathBuf, rc::Rc};
 
@@ -939,15 +932,15 @@ mod tests {
     async fn in_window_launches_share_one_bridge_and_client_paths_do_not_activate(
         cx: &mut TestAppContext,
     ) {
-        use herdr_bridge::{HerdrBridgeRegistry, HerdrSessionSelection};
+        use crate::herdr_bridge::{HerdrBridgeRegistry, HerdrSessionSelection};
 
         cx.update(|cx| {
             HerdrBridgeRegistry::init(cx);
             HerdrOwnershipRegistry::init(cx);
-            cx.update_global::<HerdrOwnershipRegistry, _>(|registry, cx| {
+            cx.update_global::<HerdrOwnershipRegistry, _>(|registry, _cx| {
                 registry.set_handlers(
                     |window_id, terminal_id, process, launch, cx| {
-                        let session_name = launch.session_name.clone();
+                        let session_name = launch.session_name;
                         let owner = crate::herdr_bridge::HerdrOwnerProcess {
                             terminal_id,
                             process_id: process.pid,
@@ -982,7 +975,7 @@ mod tests {
         let plain_terminal = cx.update(|cx| cx.new(|_| ())).entity_id();
 
         let bridge = |cx: &mut TestAppContext| {
-            cx.update(|_window, cx| {
+                        cx.update(|cx| {
                 cx.global::<HerdrBridgeRegistry>()
                     .bridge_for_window(window_id, cx)
             })

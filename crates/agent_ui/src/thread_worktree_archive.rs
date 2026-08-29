@@ -1077,7 +1077,7 @@ fn current_app_state(cx: &mut AsyncApp) -> Option<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fs::{FakeFs, Fs as _};
+    use fs::{FakeFs};
     use git::repository::Worktree as GitWorktree;
     use gpui::{BorrowAppContext, TestAppContext};
     use project::Project;

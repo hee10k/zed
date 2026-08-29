@@ -7,6 +7,7 @@ use anyhow::{Result, anyhow};
 
 /// Default connect/read/write window for endpoint connections when no
 /// explicit request deadline is supplied.
+#[allow(dead_code)]
 pub(crate) const DEFAULT_CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,9 +167,11 @@ impl HerdrStream {
         }
     }
 
+#[allow(dead_code)]
     pub(crate) fn connect(endpoint: &HerdrEndpoint) -> Result<Self> {
         Self::connect_with_deadline(endpoint, DEFAULT_CONNECT_DEADLINE)
     }
+    #[allow(dead_code)]
     pub(crate) fn try_clone(&self) -> Result<Self> {
         match self {
             #[cfg(unix)]
@@ -272,6 +275,7 @@ impl ConnectionKillSwitch {
 }
 
 /// Interval between repeated cancellations once a deadline has expired.
+#[allow(dead_code)]
 const DEADLINE_REARM_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Deadline watchdog loop, kept platform-neutral so its expiry semantics
@@ -280,6 +284,7 @@ const DEADLINE_REARM_INTERVAL: Duration = Duration::from_millis(25);
 /// closes (disarm or drop). One cancellation pass only reaches I/O already
 /// in flight at that instant — Windows `CancelIoEx` cancels nothing for a
 /// read that starts later — so cancellation must stay active after expiry.
+#[allow(dead_code)]
 fn run_deadline_watchdog(
     cancel_rx: std::sync::mpsc::Receiver<()>,
     deadline: Duration,
