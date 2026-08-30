@@ -1,0 +1,119 @@
+# Release-gated fork sync: merges upstream zed-industries/zed main into this
+# fork's main every time upstream publishes a NEW stable release.
+#
+# A fork's Actions cannot subscribe to the upstream repository's `release`
+# events (`on: release` only fires for the repo that owns the workflow), so
+# this polls the upstream repo's latest stable release tag on a schedule. It
+# compares that tag to the last one this workflow synced (`.github/
+# upstream-last-release`), syncs upstream/main only when the tag changed, and
+# otherwise no-ops — so in practice it runs once per upstream release.
+# Builds are triggered from this workflow's completion by build-binaries.yml.
+# Before pushing, the merged tree is compile-checked on windows-2022 (the same
+# environment the release bundle builds in) so broken auto-merges never land
+# on main and never reach the hourly build-binaries runs.
+name: sync-fork
+
+on:
+  schedule:
+    - cron: '0 21 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # windows-2022: the release bundle (build-binaries) proves this runner has
+    # the complete build environment for this tree, so the compile gate below
+    # runs in an environment known to work.
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          ref: main
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Add upstream
+        run: git remote add upstream https://github.com/zed-industries/zed.git
+      - name: Fetch upstream
+        run: git fetch upstream main
+      - name: Resolve latest upstream release tag
+        id: release
+        run: |
+          tag=$(curl -fsSL https://api.github.com/repos/zed-industries/zed/releases/latest \
+            | jq -r .tag_name)
+          echo "tag=${tag:-}" >> "$GITHUB_OUTPUT"
+      - name: Gate on whether this release was already synced
+        id: gate
+        run: |
+          tag="${{ steps.release.outputs.tag }}"
+          last="$(cat .github/upstream-last-release 2>/dev/null || echo none)"
+          if [ -z "$tag" ] || [ "$tag" = "null" ] || [ "$tag" = "$last" ]; then
+            echo "::notice::upstream release ${tag:-none} already synced (last=$last); skipping"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::new upstream release $tag detected; syncing"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Merge upstream main
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          git checkout main
+          if git merge --ff-only upstream/main 2>/dev/null; then
+            # Also reached when main is already up to date with upstream.
+            echo "::notice::main synced with upstream/main"
+          elif git merge upstream/main -m "Merge upstream main"; then
+            echo "::notice::merged upstream/main into main"
+          else
+            # Cargo.lock is intentionally kept on a newer cxx release for the
+            # fork's macOS toolchain. Rebase it onto upstream, then reapply that
+            # one fork-specific dependency update.
+            conflicts=$(git diff --name-only --diff-filter=U)
+            if [ "$conflicts" != "Cargo.lock" ]; then
+              echo "::error::upstream merge has unsupported conflicts: $conflicts"
+              git merge --abort
+              exit 1
+            fi
+            git checkout --theirs Cargo.lock
+            cargo update -p cxx --precise 1.0.198
+            git add Cargo.lock
+            git commit --no-edit
+            echo "::notice::merged upstream/main and refreshed Cargo.lock"
+          fi
+          echo "${{ steps.release.outputs.tag }}" > .github/upstream-last-release
+          git add .github/upstream-last-release
+          git commit -m "chore: record upstream release sync"
+      - name: Cache Rust dependencies
+        if: steps.gate.outputs.proceed == 'true'
+        uses: Swatinem/rust-cache@72d126e709cad40056a62344eee609d696d62d33
+        with:
+          # Share the cache used by build-binaries (same Cargo.lock once the
+          # merge is pushed), so the gate re-checks only the merge delta.
+          cache-on-failure: true
+      - name: Verify merged tree compiles before push
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          # Never push a merge that does not compile. The fork carries
+          # fork-only code over upstream types (e.g. GitStore::delete_refs_on_remote
+          # in crates/project), and `git merge` resolves cleanly even when an
+          # upstream refactor leaves fork code with a type error. A broken merge
+          # pushed to main makes build-binaries fail ~hourly until a release
+          # exists, so gate the push on the same environment the release bundle
+          # builds in (windows-2022) -- mirroring the exact package set from
+          # script/bundle-windows.ps1 BuildZedAndItsFriends.
+          cargo check -p zed -p cli -p auto_update_helper
+          cargo check -p explorer_command_injector --no-default-features --features stable
+      - name: Push
+        if: steps.gate.outputs.proceed == 'true'
+        run: git push origin main

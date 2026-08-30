@@ -109,14 +109,64 @@ actions!(
     ]
 );
 
+/// The GitHub repository that publishes releases for this fork, in `owner/repo`
+/// form. Override at build time with `ZED_FORK_REPO` for Windows release assets.
+const DEFAULT_FORK_REPOSITORY: &str = "hee10k/zed";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseSource<'a> {
+    ForkGitHub(&'a str),
+    UpstreamCloud,
+}
+
+fn release_source_for_target<'a>(
+    target_os: &str,
+    fork_override: Option<&'a str>,
+) -> ReleaseSource<'a> {
+    if target_os == "windows" {
+        ReleaseSource::ForkGitHub(fork_override.unwrap_or(DEFAULT_FORK_REPOSITORY))
+    } else {
+        ReleaseSource::UpstreamCloud
+    }
+}
+
+fn release_source() -> ReleaseSource<'static> {
+    release_source_for_target(OS, option_env!("ZED_FORK_REPO"))
+}
+
+#[cfg(test)]
+mod release_source_tests {
+    use super::*;
+
+    #[test]
+    fn windows_without_override_use_default_fork() {
+        assert_eq!(
+            release_source_for_target("windows", None),
+            ReleaseSource::ForkGitHub(DEFAULT_FORK_REPOSITORY)
+        );
+    }
+}
+
 #[derive(Serialize, Debug)]
-pub struct AssetQuery<'a> {
+struct AssetQuery<'a> {
     asset: &'a str,
     os: &'a str,
     arch: &'a str,
     metrics_id: Option<&'a str>,
     system_id: Option<&'a str>,
     is_staff: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -339,23 +389,36 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
 
 pub fn release_notes_url(cx: &mut App) -> Option<String> {
     let release_channel = ReleaseChannel::try_global(cx)?;
-    let url = match release_channel {
-        ReleaseChannel::Stable | ReleaseChannel::Preview => {
-            let auto_updater = AutoUpdater::get(cx)?;
-            let auto_updater = auto_updater.read(cx);
-            let mut current_version = auto_updater.current_version.clone();
-            current_version.pre = semver::Prerelease::EMPTY;
-            current_version.build = semver::BuildMetadata::EMPTY;
-            let release_channel = release_channel.dev_name();
-            let path = format!("/releases/{release_channel}/{current_version}");
-            auto_updater.client.http_client().build_url(&path)
+    match release_source() {
+        ReleaseSource::ForkGitHub(repository) => {
+            let url = match release_channel {
+                ReleaseChannel::Stable | ReleaseChannel::Preview => {
+                    format!("https://github.com/{repository}/releases")
+                }
+                ReleaseChannel::Nightly | ReleaseChannel::Dev => {
+                    format!("https://github.com/{repository}/commits/main/")
+                }
+            };
+            Some(url)
         }
-        ReleaseChannel::Nightly => {
-            "https://github.com/zed-industries/zed/commits/nightly/".to_string()
-        }
-        ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
-    };
-    Some(url)
+        ReleaseSource::UpstreamCloud => match release_channel {
+            ReleaseChannel::Stable | ReleaseChannel::Preview => {
+                let updater = AutoUpdater::get(cx)?;
+                let updater = updater.read(cx);
+                let mut current_version = updater.current_version.clone();
+                current_version.pre = semver::Prerelease::EMPTY;
+                current_version.build = semver::BuildMetadata::EMPTY;
+                let path = format!("/releases/{}/{current_version}", release_channel.dev_name());
+                Some(updater.client.http_client().build_url(&path))
+            }
+            ReleaseChannel::Nightly => {
+                Some("https://github.com/zed-industries/zed/commits/nightly/".to_string())
+            }
+            ReleaseChannel::Dev => {
+                Some("https://github.com/zed-industries/zed/commits/main/".to_string())
+            }
+        },
+    }
 }
 
 pub fn view_release_notes(_: &ViewReleaseNotes, cx: &mut App) -> Option<()> {
@@ -677,16 +740,7 @@ impl AutoUpdater {
         cx: &mut AsyncApp,
     ) -> Result<ReleaseAsset> {
         let client = this.read_with(cx, |this, _| this.client.clone());
-
-        let (system_id, metrics_id, is_staff) = if client.telemetry().metrics_enabled() {
-            (
-                client.telemetry().system_id(),
-                client.telemetry().metrics_id(),
-                client.telemetry().is_staff(),
-            )
-        } else {
-            (None, None, None)
-        };
+        let http_client = client.http_client();
 
         let version = if let Some(mut version) = version {
             version.pre = semver::Prerelease::EMPTY;
@@ -695,39 +749,91 @@ impl AutoUpdater {
         } else {
             "latest".to_string()
         };
-        let http_client = client.http_client();
 
-        let path = format!("/releases/{}/{}/asset", release_channel.dev_name(), version,);
-        let url = http_client.build_zed_cloud_url_with_query(
-            &path,
-            AssetQuery {
-                os,
-                arch,
-                asset,
-                metrics_id: metrics_id.as_deref(),
-                system_id: system_id.as_deref(),
-                is_staff,
-            },
-        )?;
+        match release_source_for_target(os, option_env!("ZED_FORK_REPO")) {
+            ReleaseSource::ForkGitHub(repository) => {
+                let url = if version == "latest" {
+                    format!("https://api.github.com/repos/{repository}/releases/latest")
+                } else {
+                    format!("https://api.github.com/repos/{repository}/releases/tags/{version}")
+                };
+                let mut response = http_client
+                    .get(url.as_str(), Default::default(), true)
+                    .await?;
+                let mut body = Vec::new();
+                response.body_mut().read_to_end(&mut body).await?;
 
-        let mut response = http_client
-            .get(url.as_str(), Default::default(), true)
-            .await?;
-        let mut body = Vec::new();
-        response.body_mut().read_to_end(&mut body).await?;
+                anyhow::ensure!(
+                    response.status().is_success(),
+                    "failed to fetch release: {:?}",
+                    String::from_utf8_lossy(&body),
+                );
 
-        anyhow::ensure!(
-            response.status().is_success(),
-            "failed to fetch release: {:?}",
-            String::from_utf8_lossy(&body),
-        );
+                let release: GitHubRelease = serde_json::from_slice(&body).with_context(|| {
+                    format!(
+                        "error deserializing release {:?}",
+                        String::from_utf8_lossy(&body),
+                    )
+                })?;
+                let asset_name = format!("{asset}-{os}-{arch}");
+                let release_asset = release
+                    .assets
+                    .iter()
+                    .find(|release_asset| release_asset.name.starts_with(&asset_name))
+                    .with_context(|| {
+                        format!(
+                            "release {} has no asset matching {asset_name}",
+                            release.tag_name
+                        )
+                    })?;
 
-        serde_json::from_slice(body.as_slice()).with_context(|| {
-            format!(
-                "error deserializing release {:?}",
-                String::from_utf8_lossy(&body),
-            )
-        })
+                Ok(ReleaseAsset {
+                    version: release.tag_name.trim_start_matches('v').to_string(),
+                    url: release_asset.browser_download_url.clone(),
+                })
+            }
+            ReleaseSource::UpstreamCloud => {
+                let (system_id, metrics_id, is_staff) = if client.telemetry().metrics_enabled() {
+                    (
+                        client.telemetry().system_id(),
+                        client.telemetry().metrics_id(),
+                        client.telemetry().is_staff(),
+                    )
+                } else {
+                    (None, None, None)
+                };
+                let path = format!("/releases/{}/{version}/asset", release_channel.dev_name());
+                let url = http_client.build_zed_cloud_url_with_query(
+                    &path,
+                    AssetQuery {
+                        asset,
+                        os,
+                        arch,
+                        metrics_id: metrics_id.as_deref(),
+                        system_id: system_id.as_deref(),
+                        is_staff,
+                    },
+                )?;
+                let mut response = http_client
+                    .get(url.as_str(), Default::default(), true)
+                    .await?;
+                let mut body = Vec::new();
+                response.body_mut().read_to_end(&mut body).await?;
+
+                anyhow::ensure!(
+                    response.status().is_success(),
+                    "failed to fetch release: {:?}",
+                    String::from_utf8_lossy(&body),
+                );
+
+                serde_json::from_slice(body.as_slice()).with_context(|| {
+                    format!(
+                        "error deserializing release {:?}",
+                        String::from_utf8_lossy(&body),
+                    )
+                })
+            }
+        }
     }
 
     async fn update(this: Entity<Self>, cx: &mut AsyncApp) -> Result<()> {
@@ -1368,6 +1474,23 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn test_release_source_uses_explicit_fork_for_windows() {
+        assert_eq!(
+            release_source_for_target("windows", Some("example/zed")),
+            ReleaseSource::ForkGitHub("example/zed")
+        );
+    }
+
+    #[test]
+    fn test_release_source_uses_upstream_cloud_for_macos_and_linux() {
+        for target_os in ["macos", "linux"] {
+            assert_eq!(
+                release_source_for_target(target_os, Some("example/zed")),
+                ReleaseSource::UpstreamCloud
+            );
+        }
+    }
 
     pub(super) struct InstallOverride(pub Rc<dyn Fn(&Path, &AsyncApp) -> Result<Option<PathBuf>>>);
     impl Global for InstallOverride {}

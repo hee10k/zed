@@ -1,11 +1,71 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+[![CI](https://github.com/hee10k/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/hee10k/zed/actions/workflows/run_tests.yml)
 
 Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
 
+> **Fork of `zed-industries/zed`.** This repository contains fork-specific CI and a
+> fork-specific auto-update endpoint. See [Fork builds & auto-update](#fork-builds--auto-update) below.
+
 ---
+
+### Fork builds & auto-update
+
+This fork keeps `main` in sync with upstream and publishes a ready-to-install
+Windows build:
+
+- [`sync-fork`](.github/workflows/sync-fork.yml) runs daily at 21:00 UTC and merges
+  `zed-industries/zed` `main` into this fork's `main` (local fork commits are preserved
+  via a merge commit).
+- [`build-binaries`](.github/workflows/build-binaries.yml) runs on pushes to `main`,
+  after each successful sync (or manually via **Actions → build-binaries → Run workflow**).
+  It builds the Windows installer (`.exe`) and publishes a GitHub release on
+  `hee10k/zed`. If the source commit already has a release, the workflow skips the
+  build and does not bump the release version.
+
+The auto-update check in `crates/auto_update` selects the update source by
+platform:
+
+- Windows receives releases from this fork (`hee10k/zed`), or from the repository
+  supplied through `ZED_FORK_REPO` at build time. This includes the Windows remote
+  server archive.
+- macOS and Linux use upstream Zed's release service for automatic updates.
+
+Windows release assets are named `zed-{os}-{arch}.{ext}`. The current fork release
+contains `zed-windows-x86_64.exe` and the Windows remote server archive.
+- The fork builds on the `stable` release channel (`crates/zed/RELEASE_CHANNEL`), so
+  `zed update` polls for updates and installs them in place on Windows.
+- macOS binaries are not produced by this workflow. Build macOS locally with
+  `cargo run -p zed` or `./script/bundle-mac -d -o aarch64-apple-darwin`.
+
+If `sync-fork` hits a merge conflict (e.g. upstream changed `crates/auto_update`),
+resolve it locally and push, then re-run the workflow.
+
+
+### Local macOS builds
+
+The GitHub binary workflow intentionally skips macOS. To run this fork locally:
+
+```sh
+cargo run -p zed
+```
+
+For a local `.app` bundle:
+
+```sh
+./script/bundle-mac -d -o aarch64-apple-darwin
+```
+
+An ad-hoc-signed local app may be blocked by Gatekeeper. Remove quarantine
+from that local copy only:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Zed.app
+open /Applications/Zed.app
+```
 
 ### Installation
 
