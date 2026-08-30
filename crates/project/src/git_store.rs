@@ -34,9 +34,9 @@ use git::{
     blame::Blame,
     parse_git_remote_url,
     repository::{
-        Branch, BranchesScanResult, CommitData, CommitDetails, CommitDiff, CommitFile,
-        CommitFileStatus, CommitOptions, CreateTagOptions, CreateWorktreeTarget, DiffStatType,
-        DiffType, FetchOptions, FileHistoryChangedFileSets, GitCommitTemplate, GitOperationAction,
+        Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
+        CreateTagOptions, CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions,
+        FileHistoryChangedFileSets, GitCommitTemplate, GitOperationAction,
         GitOperationKind, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder,
         LogSource, MergeMode, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode,
         SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
@@ -7817,7 +7817,10 @@ impl Repository {
             move |git_repo, cx| async move {
                 match git_repo {
                     RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                        backend.load_commit_range(base, target, cx).await
+                        backend
+                            .load_commit_range(base, target, cx)
+                            .await
+                            .map(decode_commit_diff)
                     }
                     RepositoryState::Remote(RemoteRepositoryState {
                         client, project_id, ..
@@ -7843,6 +7846,7 @@ impl Repository {
                                     })
                                 })
                                 .collect::<Result<Vec<_>>>()?,
+                            is_shallow_boundary: false,
                         })
                     }
                 }
@@ -9704,12 +9708,8 @@ impl Repository {
                         )
                         .await,
                     RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
-                        askpass_delegates.lock().insert(askpass_id, askpass);
-                        let _defer = util::defer(|| {
-                            let askpass_delegate =
-                                askpass_delegates.lock().remove(&askpass_id);
-                            debug_assert!(askpass_delegate.is_some());
-                        });
+                        let _askpass_operation =
+                            RemoteAskPassOperation::new(askpass_id, askpass, askpass_delegates);
                         let response = client
                             .request(proto::GitDeleteRefsOnRemote {
                                 project_id: project_id.0,
@@ -12061,7 +12061,7 @@ fn git_operation_kind_to_proto(kind: GitOperationKind) -> proto::GitOperationKin
 }
 
 fn git_operation_kind_from_proto(proto_val: i32) -> GitOperationKind {
-    match proto::GitOperationKind::from_i32(proto_val) {
+    match proto::GitOperationKind::try_from(proto_val).ok() {
         Some(proto::GitOperationKind::MergeOperation) | None => GitOperationKind::Merge,
         Some(proto::GitOperationKind::RebaseOperation) => GitOperationKind::Rebase,
         Some(proto::GitOperationKind::CherryPickOperation) => GitOperationKind::CherryPick,
@@ -12078,7 +12078,7 @@ fn git_operation_action_to_proto(action: GitOperationAction) -> proto::GitOperat
 }
 
 fn git_operation_action_from_proto(proto_val: i32) -> GitOperationAction {
-    match proto::GitOperationAction::from_i32(proto_val) {
+    match proto::GitOperationAction::try_from(proto_val).ok() {
         Some(proto::GitOperationAction::ContinueAction) | None => GitOperationAction::Continue,
         Some(proto::GitOperationAction::SkipAction) => GitOperationAction::Skip,
         Some(proto::GitOperationAction::AbortAction) => GitOperationAction::Abort,

@@ -2351,7 +2351,7 @@ impl FakeFs {
                 .map(|(sha, contents)| {
                     let contents = contents
                         .iter()
-                        .map(|(path, contents)| (repo_path(path), contents.clone()))
+                        .map(|(path, contents)| (repo_path(path), contents.as_bytes().to_vec()))
                         .collect::<HashMap<_, _>>();
                     FakeCommitSnapshot {
                         head_contents: contents.clone(),

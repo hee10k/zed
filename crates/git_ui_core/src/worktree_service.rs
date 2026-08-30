@@ -2975,7 +2975,7 @@ mod tests {
         let project = Project::test(fs.clone(), [old_root.as_path()], cx).await;
         project.update(cx, |project, cx| project.git_scans_complete(cx)).await;
 
-let (multi_workspace, cx) =
+        let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         multi_workspace.update(cx, |mw, cx| mw.retain_active_workspace(cx));
         let source_workspace =

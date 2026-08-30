@@ -203,6 +203,7 @@ fn open_commit_view_in_workspace(
                     workspace_entity,
                     workspace_handle,
                     None,
+                    None,
                     window,
                     cx,
                 )
@@ -241,7 +242,7 @@ impl CommitView {
         commit_sha: String,
         repo: WeakEntity<Repository>,
         workspace: WeakEntity<Workspace>,
-        stash: Option<usize>,
+        stash: Option<StashIdentity>,
         file_filter: Option<RepoPath>,
         ignore_shallow_boundary: bool,
         window: &mut Window,
@@ -646,7 +647,7 @@ impl CommitView {
         let commit_sha = self.commit.sha.to_string();
         let repository = self.repository.clone();
         let workspace = self.workspace.clone();
-        let stash = self.stash;
+        let stash = self.stash.clone();
         let file_filter = self.file_filter.clone();
         let unshallow_state = self.repository.read(cx).unshallow_state();
         let can_fetch = !self.project.read(cx).is_via_collab()
@@ -675,6 +676,7 @@ impl CommitView {
                         let repository = repository.clone();
                         let workspace = workspace.clone();
                         let file_filter = file_filter.clone();
+                        let stash = stash.clone();
                         this.child(
                             Button::new(
                                 "fetch-unshallow",
@@ -700,6 +702,7 @@ impl CommitView {
                                     let repository = repository.downgrade();
                                     let workspace = workspace.clone();
                                     let file_filter = file_filter.clone();
+                                    let stash = stash.clone();
                                     window
                                         .spawn(cx, async move |cx| {
                                             fetch.await?;
@@ -740,7 +743,7 @@ impl CommitView {
                                     commit_sha.clone(),
                                     repository.downgrade(),
                                     workspace.clone(),
-                                    stash,
+                                    stash.clone(),
                                     file_filter.clone(),
                                     true,
                                     window,

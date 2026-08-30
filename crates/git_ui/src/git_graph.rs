@@ -17,10 +17,8 @@ use file_icons::FileIcons;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
-    repository::{InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs},
     repository::{
-        CommitDiff, CommitFile, GitOperationKind, InitialGraphCommitData, LogOrder, LogSource,
-        RepoPath, SearchCommitArgs,
+        GitOperationKind, InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs,
     },
     status::{FileStatus, GitSummary, StatusCode, TrackedStatus},
 };
@@ -9886,7 +9884,6 @@ mod tests {
         assert_eq!(mutations.len(), 1, "after the op settles, a merge dispatches");
     }
 
-    #[gpui::test]
     #[gpui::test]
     async fn test_graph_invalidated_on_worktree_list_change(cx: &mut TestAppContext) {
         init_test(cx);

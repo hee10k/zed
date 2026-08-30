@@ -1652,6 +1652,7 @@ fn parse_remote_urls(stdout: &str) -> HashMap<String, String> {
         }
     }
     urls
+}
 async fn resolve_commit_oid(git: &GitBinary, commit: &str) -> Result<String> {
     let commit = format!("{commit}^{{commit}}");
     git.run(&["rev-parse", "--verify", "--end-of-options", &commit])

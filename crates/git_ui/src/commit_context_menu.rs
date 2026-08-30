@@ -1901,19 +1901,29 @@ fn askpass_delegate(
 ) -> AskPassDelegate {
     let workspace = workspace.clone();
     let operation: SharedString = operation.to_string().into();
-    AskPassDelegate::new(&mut cx.to_async(), move |prompt, tx, cx| {
-        let workspace = workspace.clone();
-        let operation = operation.clone();
-        window_handle
-            .update(cx, |_, window, cx| {
-                workspace.update(cx, |workspace, cx| {
-                    workspace.toggle_modal(window, cx, |window, cx| {
-                        AskPassModal::new(operation.clone(), prompt.into(), tx, window, cx)
-                    });
+    AskPassDelegate::new_with_cancellation(
+        &mut cx.to_async(),
+        move |prompt, tx, cancellation, cx| {
+            let workspace = workspace.clone();
+            let operation = operation.clone();
+            window_handle
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.toggle_modal(window, cx, |window, cx| {
+                            AskPassModal::new(
+                                operation,
+                                prompt.into(),
+                                tx,
+                                cancellation,
+                                window,
+                                cx,
+                            )
+                        });
+                    })
                 })
-            })
-            .ok();
-    })
+                .ok();
+        },
+    )
 }
 
 /// Deletes the clicked remote-tracking branch on its server remote via an

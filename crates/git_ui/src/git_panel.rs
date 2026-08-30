@@ -13389,7 +13389,6 @@ mod tests {
     }
 
     #[gpui::test]
-<<<<<<< ours
     async fn test_collapse_selected_entry(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -13778,6 +13777,9 @@ mod tests {
                 Status(GitStatusEntry { staging: StageStatus::Unstaged, .. }),
             ],
         );
+    }
+
+    #[gpui::test]
     async fn test_git_panel_operation_lifecycle_banner(cx: &mut TestAppContext) {
         init_test(cx);
         let (_, _, _, panel, mut cx) = setup_git_panel_with_changes(
@@ -13799,6 +13801,5 @@ mod tests {
         panel.update(&mut cx, |panel, cx| {
             assert!(panel.render_operation_lifecycle_banner(cx).is_some());
         });
->>>>>>> theirs
     }
 }

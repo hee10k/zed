@@ -34,6 +34,7 @@ jobs:
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
+      source_sha: ${{ steps.compute.outputs.source_sha }}
       version: ${{ steps.compute.outputs.version }}
       skip: ${{ steps.compute.outputs.skip }}
     steps:
@@ -47,13 +48,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          source_sha=$(git rev-parse HEAD)
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           # Skip the build when the source commit already has a release (e.g. a
           # no-op sync where upstream did not change), instead of publishing an
           # identical binary under a bumped version every day.
-          if gh release list --limit 50 --json body --jq \
-            'any(.[]; .body | contains("commit: '"$GITHUB_SHA"'"))' | grep -q true; then
+          if gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=50" --jq \
+            "any(.[]; (.body // \"\") | contains(\"commit: $source_sha\"))" | grep -F "true" >/dev/null; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Source commit $GITHUB_SHA already built; skipping."
+            echo "Source commit $source_sha already built; skipping."
             exit 0
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -90,6 +93,7 @@ jobs:
       ZED_WORKSPACE: ${{ github.workspace }}
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
       ZED_RELEASE_CHANNEL: stable
+      CARGO_BUILD_JOBS: 1
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -106,9 +110,181 @@ jobs:
         run: |
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f
           git config --global core.longpaths true
+      - name: Update MSVC toolset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installerRoot = ${env:ProgramFiles(x86)}
+          $vswhere = Join-Path $installerRoot "Microsoft Visual Studio\Installer\vswhere.exe"
+          $setup = Join-Path $installerRoot "Microsoft Visual Studio\Installer\setup.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "Visual Studio installation discovery tool not found: $vswhere"
+          }
+
+          $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($installationPath)) {
+            throw "No Visual Studio installation with MSVC tools was found"
+          }
+          $installationPath = $installationPath.Trim()
+          $msvcPath = Join-Path $installationPath "VC\Tools\MSVC"
+          $minimumToolset = [version]"14.44.35207"
+
+          function Find-MsvcToolset {
+            Get-ChildItem -Path $msvcPath -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
+              Sort-Object { [version]$_.Name } -Descending |
+              Select-Object -First 1
+          }
+
+          $toolset = Find-MsvcToolset
+          if (-not $toolset -or [version]$toolset.Name -lt $minimumToolset) {
+            if (-not (Test-Path $setup)) {
+              throw "Visual Studio Installer not found: $setup"
+            }
+            $installerProcess = Start-Process -FilePath $setup -ArgumentList @(
+              "update"
+              "--installPath"
+              "`"$installationPath`""
+              "--quiet"
+              "--norestart"
+            ) -Wait -PassThru
+            if ($installerProcess.ExitCode -notin @(0, 3010)) {
+              throw "Visual Studio update failed with exit code $($installerProcess.ExitCode)"
+            }
+            $toolset = Find-MsvcToolset
+          }
+          if (-not $toolset -or [version]$toolset.Name -lt $minimumToolset) {
+            throw "MSVC $minimumToolset or newer is required"
+          }
+
+          $vcvarsPath = Join-Path $installationPath "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvarsPath)) {
+            throw "MSVC environment script not found: $vcvarsPath"
+          }
+          $environmentLines = cmd.exe /c "call `"$vcvarsPath`" && set"
+          $environmentNames = @(
+            "PATH"
+            "INCLUDE"
+            "LIB"
+            "LIBPATH"
+            "VCToolsInstallDir"
+            "VCINSTALLDIR"
+            "WindowsSdkDir"
+            "WindowsSDKVersion"
+            "UniversalCRTSdkDir"
+            "UCRTVersion"
+            "VSCMD_ARG_TGT_ARCH"
+            "VSCMD_VER"
+            "VisualStudioVersion"
+          )
+          foreach ($line in $environmentLines) {
+            $separator = $line.IndexOf("=")
+            if ($separator -gt 0 -and $environmentNames -contains $line.Substring(0, $separator)) {
+              $line >> $env:GITHUB_ENV
+            }
+          }
+          Write-Host "Using MSVC toolset $($toolset.Name)"
+      - name: Ensure Spectre-mitigated libraries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installerRoot = ${env:ProgramFiles(x86)}
+          $vswhere = Join-Path $installerRoot "Microsoft Visual Studio\Installer\vswhere.exe"
+          $setup = Join-Path $installerRoot "Microsoft Visual Studio\Installer\setup.exe"
+          $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($installationPath)) {
+            throw "No Visual Studio installation with MSVC tools was found"
+          }
+          $installationPath = $installationPath.Trim()
+          $msvcPath = Join-Path $installationPath "VC\Tools\MSVC"
+          $spectreLib = Get-ChildItem -Path $msvcPath -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName "lib\spectre\x64" } |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+          if (-not $spectreLib) {
+            if (-not (Test-Path $setup)) {
+              throw "Visual Studio Installer not found: $setup"
+            }
+            $installerProcess = Start-Process -FilePath $setup -ArgumentList @(
+              "modify"
+              "--installPath"
+              "`"$installationPath`""
+              "--add"
+              "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre"
+              "--quiet"
+              "--norestart"
+            ) -Wait -PassThru
+            if ($installerProcess.ExitCode -notin @(0, 3010)) {
+              throw "Visual Studio Spectre library installation failed with exit code $($installerProcess.ExitCode)"
+            }
+            $spectreLib = Get-ChildItem -Path $msvcPath -Directory -ErrorAction SilentlyContinue |
+              ForEach-Object { Join-Path $_.FullName "lib\spectre\x64" } |
+              Where-Object { Test-Path $_ } |
+              Select-Object -First 1
+          }
+          if (-not $spectreLib) {
+            throw "Spectre-mitigated x64 libraries are unavailable"
+          }
+          Write-Host "Using Spectre-mitigated libraries: $spectreLib"
+      - name: Configure WebRTC Windows SDK compatibility
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Include"
+          $hasWindows11Sdk = Get-ChildItem -Path $sdkRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^10\.0\.26100\.' } |
+            Select-Object -First 1
+          if ($hasWindows11Sdk) {
+            Write-Host "Windows 11 SDK 10.0.26100 is installed: $($hasWindows11Sdk.Name)"
+            exit 0
+          }
+
+          $compatibilityFlag = "-DNTDDI_WIN11_GE=0x0A000010"
+          $compilerFlags = [Environment]::GetEnvironmentVariable("CXXFLAGS")
+          if ([string]::IsNullOrWhiteSpace($compilerFlags)) {
+            $compilerFlags = $compatibilityFlag
+          } elseif ($compilerFlags -notlike "*$compatibilityFlag*") {
+            $compilerFlags = "$compilerFlags $compatibilityFlag"
+          }
+          "CXXFLAGS=$compilerFlags" >> $env:GITHUB_ENV
+          Write-Warning "Windows 11 SDK 10.0.26100 is unavailable; using $compatibilityFlag"
       - name: Fetch dependencies
-        shell: bash
-        run: cargo fetch
+        shell: pwsh
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $innoSetupPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (Test-Path $innoSetupPath) {
+            Write-Host "Inno Setup is already installed: $innoSetupPath"
+            exit 0
+          }
+
+          $installerPath = Join-Path $env:RUNNER_TEMP "innosetup-6.7.3.exe"
+          Invoke-WebRequest `
+            -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe" `
+            -OutFile $installerPath
+          $expectedHash = "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732"
+          $actualHash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "Inno Setup installer checksum mismatch: $actualHash"
+          }
+
+          $installerProcess = Start-Process -FilePath $installerPath -ArgumentList @(
+            "/VERYSILENT"
+            "/SUPPRESSMSGBOXES"
+            "/NORESTART"
+            "/SP-"
+          ) -Wait -PassThru
+          if ($installerProcess.ExitCode -ne 0) {
+            throw "Inno Setup installer failed with exit code $($installerProcess.ExitCode)"
+          }
+          if (-not (Test-Path $innoSetupPath)) {
+            throw "Inno Setup did not install ISCC.exe at $innoSetupPath"
+          }
       - name: Bundle Windows installer
         shell: pwsh
         run: ./script/bundle-windows.ps1
@@ -139,7 +315,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
-          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
           if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release delete "$VERSION" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
@@ -147,6 +323,6 @@ jobs:
           gh release create "$VERSION" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Zed $VERSION" \
-            --notes "Auto-built from hee10k/zed. Install and run 'zed update' to receive future builds.
+            --notes "Auto-built from $GITHUB_REPOSITORY. Install and run 'zed update' to receive future builds.
             commit: $COMMIT_SHA" \
             $(find assets -type f)

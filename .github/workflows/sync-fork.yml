@@ -76,9 +76,8 @@ jobs:
           elif git merge upstream/main -m "Merge upstream main"; then
             echo "::notice::merged upstream/main into main"
           else
-            # Cargo.lock is intentionally kept on a newer cxx release for the
-            # fork's macOS toolchain. Rebase it onto upstream, then reapply that
-            # one fork-specific dependency update.
+            # Cargo.lock carries the fork's cxx 1.0.187 pin for Windows MSVC
+            # compatibility. Rebase it onto upstream, then reapply that pin.
             conflicts=$(git diff --name-only --diff-filter=U)
             if [ "$conflicts" != "Cargo.lock" ]; then
               echo "::error::upstream merge has unsupported conflicts: $conflicts"
@@ -86,7 +85,7 @@ jobs:
               exit 1
             fi
             git checkout --theirs Cargo.lock
-            cargo update -p cxx --precise 1.0.198
+            cargo update -p cxx --precise 1.0.187
             git add Cargo.lock
             git commit --no-edit
             echo "::notice::merged upstream/main and refreshed Cargo.lock"
