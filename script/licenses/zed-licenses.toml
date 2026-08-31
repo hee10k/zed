@@ -8,6 +8,7 @@ accepted = [
     "Apache-2.0",
     "MIT",
     "MIT-0",
+    "0BSD",
     "Apache-2.0 WITH LLVM-exception",
     "MPL-2.0",
     "BSD-3-Clause",
