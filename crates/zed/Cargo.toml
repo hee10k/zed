@@ -23,7 +23,6 @@ track-project-leak = ["gpui/leak-detection"]
 test-support = [
     "gpui/test-support",
     "gpui_platform/screen-capture",
-    "dep:image",
     "workspace/test-support",
     "project/test-support",
     "editor/test-support",
@@ -37,7 +36,6 @@ visual-tests = [
     "gpui/test-support",
     "gpui_platform/screen-capture",
     "gpui_platform/test-support",
-    "dep:image",
     "dep:tempfile",
     "dep:action_log",
     "dep:agent_servers",
@@ -133,7 +131,7 @@ gpui_platform = { workspace = true, features = [
     "x11",
 ] }
 gpui_tokio.workspace = true
-image = { workspace = true, optional = true }
+herdr.workspace = true
 spin = "0.10.0"
 itertools.workspace = true
 rayon.workspace = true
@@ -206,6 +204,7 @@ snippets_ui.workspace = true
 svg_preview.workspace = true
 sysinfo.workspace = true
 tab_switcher.workspace = true
+task.workspace = true
 tasks_ui.workspace = true
 telemetry.workspace = true
 telemetry_events.workspace = true

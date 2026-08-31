@@ -1,5 +1,6 @@
 mod app_menus;
 pub mod edit_prediction_registry;
+mod herdr_host;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
 mod migrate;
@@ -197,6 +198,24 @@ pub fn init(cx: &mut App) {
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(quit);
+    cx.on_action(|_: &zed_actions::herdr::OpenHerdR, cx| {
+        herdr_host::open_current_from_app(cx);
+    })
+    .on_action(|_: &zed_actions::herdr::OpenHerdRInNewWindow, cx| {
+        herdr_host::open_new_window_from_app(cx);
+    })
+    .on_action(|_: &zed_actions::herdr::ToggleHerdRMaximize, cx| {
+        herdr_host::toggle_maximize_from_app(cx);
+    })
+    .on_action(|_: &zed_actions::herdr::ToggleHerdRCollapse, cx| {
+        herdr_host::toggle_collapse_from_app(cx);
+    })
+    .on_action(|_: &zed_actions::herdr::CloseHerdR, cx| {
+        herdr_host::close_from_app(cx);
+    })
+    .on_action(|_: &zed_actions::herdr::ShowHerdRStatus, cx| {
+        herdr_host::status_from_app(cx);
+    });
 
     cx.on_action(|_: &RestoreBanner, cx| title_bar::restore_banner(cx));
 
@@ -5869,6 +5888,7 @@ mod tests {
                 "git_panel",
                 "git_picker",
                 "go_to_line",
+                "herdr",
                 "highlights_tree_view",
                 "icon_theme_selector",
                 "image_viewer",

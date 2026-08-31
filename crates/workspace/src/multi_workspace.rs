@@ -316,6 +316,7 @@ pub struct MultiWorkspace {
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
+    window_root_host: Option<AnyView>,
     pending_removal_tasks: Vec<Task<()>>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -377,6 +378,7 @@ impl MultiWorkspace {
             sidebar: None,
             sidebar_open: false,
             sidebar_overlay: None,
+            window_root_host: None,
             pending_removal_tasks: Vec::new(),
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
@@ -404,6 +406,15 @@ impl MultiWorkspace {
 
     pub fn set_sidebar_overlay(&mut self, overlay: Option<AnyView>, cx: &mut Context<Self>) {
         self.sidebar_overlay = overlay;
+        cx.notify();
+    }
+
+    pub fn window_root_host(&self) -> Option<&AnyView> {
+        self.window_root_host.as_ref()
+    }
+
+    pub fn set_window_root_host(&mut self, host: Option<AnyView>, cx: &mut Context<Self>) {
+        self.window_root_host = host;
         cx.notify();
     }
 
@@ -2171,11 +2182,13 @@ impl Render for MultiWorkspace {
                 .children(left_sidebar)
                 .child(
                     div()
-                        .flex()
+                        .relative()
+                        .flex_col()
                         .flex_1()
                         .size_full()
                         .overflow_hidden()
-                        .child(self.workspace().clone()),
+                        .child(self.workspace().clone())
+                        .children(self.window_root_host().cloned()),
                 )
                 .children(right_sidebar)
                 .child(self.workspace().read(cx).modal_layer.clone())

@@ -1005,3 +1005,31 @@ pub mod git_panel {
         ]
     );
 }
+
+pub mod herdr {
+    use gpui::actions;
+
+    actions!(
+        herdr,
+        [
+            /// Opens or focuses HerdR in the current window.
+            #[action(name = "Open HerdR")]
+            OpenHerdR,
+            /// Opens HerdR in a new window.
+            #[action(name = "Open HerdR in New Window")]
+            OpenHerdRInNewWindow,
+            /// Toggles the maximized state of HerdR.
+            #[action(name = "Toggle HerdR Maximize")]
+            ToggleHerdRMaximize,
+            /// Toggles the collapsed state of HerdR.
+            #[action(name = "Toggle HerdR Collapse")]
+            ToggleHerdRCollapse,
+            /// Closes HerdR.
+            #[action(name = "Close HerdR")]
+            CloseHerdR,
+            /// Shows the current HerdR status.
+            #[action(name = "Show HerdR Status")]
+            ShowHerdRStatus,
+        ]
+    );
+}
