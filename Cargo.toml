@@ -102,7 +102,7 @@ members = [
     "crates/gpui_wgpu",
     "crates/gpui_windows",
     "crates/grammars",
-    "crates/html_to_markdown",
+    "crates/herdr",
     "crates/http_client",
     "crates/http_client_tls",
     "crates/http_proxy",
@@ -370,6 +370,7 @@ gpui_web = { path = "crates/gpui_web" }
 gpui_wgpu = { path = "crates/gpui_wgpu" }
 gpui_windows = { path = "crates/gpui_windows", default-features = false }
 grammars = { path = "crates/grammars" }
+herdr = { path = "crates/herdr" }
 html_to_markdown = { path = "crates/html_to_markdown" }
 http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }
@@ -640,7 +641,7 @@ httparse = "1.10"
 human_bytes = "0.4.1"
 idna = "1.0"
 ignore = "0.4.22"
-# image's default features minus "avif", which only adds an encoder (rav1e);
+interprocess = "2.4.3"
 # decoding AVIF would additionally need the non-default "avif-native" feature.
 image = { version = "0.25.1", default-features = false, features = [
     "bmp",
