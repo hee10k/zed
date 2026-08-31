@@ -1461,6 +1461,17 @@ impl GitGraph {
         cx.notify();
     }
 
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        if let Some(repository) = self.get_repository(cx) {
+            let log_source = self.log_source.clone();
+            let log_order = self.log_order;
+            repository.update(cx, |repository, _| {
+                repository.clear_graph_data(log_source, log_order);
+            });
+        }
+        self.invalidate_state(cx);
+    }
+
     /// Computes the height of a single commit row in the git graph.
     ///
     /// The returned value is snapped to the nearest physical pixel. This is
@@ -3594,7 +3605,7 @@ pub fn worktree_status_detail(summary: GitSummary) -> String {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 // Reload the graph from the live repository snapshot without
                                 // issuing a fetch. The loading spinner reflects in-flight state.
-                                this.invalidate_state(cx);
+                                this.refresh(cx);
                             })),
                     ),
             )
@@ -7535,6 +7546,128 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(reloaded_shas, vec![updated_stash, updated_head]);
+    }
+
+    #[gpui::test]
+    async fn test_git_graph_refresh_reloads_repository_graph_data(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let initial_head =
+            Oid::from_bytes(&[1; 20]).expect("initial graph commit should have a valid OID");
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: initial_head,
+                parents: smallvec![],
+                ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+            })],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have an active repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let initial_shas = git_graph.read_with(&*cx, |graph, _| {
+            graph
+                .graph_data
+                .commits
+                .iter()
+                .map(|commit| commit.data.sha)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(initial_shas, vec![initial_head]);
+        let initial_ref_names = git_graph.read_with(&*cx, |graph, _| {
+            graph.graph_data.commits[0]
+                .data
+                .ref_names
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            initial_ref_names,
+            vec!["HEAD".to_string(), "refs/heads/main".to_string()]
+        );
+
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: initial_head,
+                parents: smallvec![],
+                ref_names: vec![
+                    "HEAD".into(),
+                    "refs/heads/main".into(),
+                    "tag: refs/tags/v2".into(),
+                ],
+            })],
+        );
+
+        git_graph.update(cx, |graph, cx| {
+            graph.refresh(cx);
+        });
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| git_graph.clone().into_any_element(),
+        );
+        cx.run_until_parked();
+
+        let refreshed_shas = git_graph.read_with(&*cx, |graph, _| {
+            graph
+                .graph_data
+                .commits
+                .iter()
+                .map(|commit| commit.data.sha)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(refreshed_shas, vec![initial_head]);
+        let refreshed_ref_names = git_graph.read_with(&*cx, |graph, _| {
+            graph.graph_data.commits[0]
+                .data
+                .ref_names
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            refreshed_ref_names,
+            vec![
+                "HEAD".to_string(),
+                "refs/heads/main".to_string(),
+                "tag: refs/tags/v2".to_string()
+            ]
+        );
     }
 
     #[gpui::test]

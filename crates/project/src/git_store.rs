@@ -7936,6 +7936,10 @@ impl Repository {
         })
     }
 
+    pub fn clear_graph_data(&mut self, log_source: LogSource, log_order: LogOrder) {
+        self.initial_graph_data.remove(&(log_source, log_order));
+    }
+
     pub fn get_graph_data(
         &self,
         log_source: LogSource,
@@ -10112,6 +10116,52 @@ impl Repository {
                 }
             }
         })
+    }
+
+    /// Lists git worktrees without going through the serial per-repository git
+    /// job queue. `git worktree list` is read-only and independent of the
+    /// status snapshot, so it must not wait behind long-running scans (status /
+    /// diff refreshes) in a large monorepo, where queuing it makes the worktree
+    /// switcher take minutes to populate. Runs directly against the backend,
+    /// mirroring the off-queue pattern used by [`Self::search_commits`] and the
+    /// git graph data readers. The queued [`Self::worktrees`] is still used by
+    /// `compute_snapshot`, where ordering keeps the snapshot internally
+    /// consistent.
+    pub fn worktrees_unqueued(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<Vec<GitWorktree>>> {
+        let (tx, rx) = oneshot::channel();
+        let repository_state = self.repository_state.clone();
+        let id = self.id;
+        cx.background_spawn(async move {
+            let result = match repository_state.await {
+                Ok(RepositoryState::Local(LocalRepositoryState { backend, .. })) => {
+                    backend.worktrees().await
+                }
+                Ok(RepositoryState::Remote(RemoteRepositoryState { project_id, client })) => {
+                    async move {
+                        let response = client
+                            .request(proto::GitGetWorktrees {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                            })
+                            .await?;
+                        let worktrees = response
+                            .worktrees
+                            .into_iter()
+                            .map(|worktree| proto_to_worktree(&worktree))
+                            .collect();
+                        Ok(worktrees)
+                    }
+                    .await
+                }
+                Err(error) => Err(anyhow!(error)),
+            };
+            tx.send(result).ok();
+        })
+        .detach();
+        rx
     }
 
     pub fn create_worktree(
@@ -12648,6 +12698,70 @@ mod tests {
         assert!(!is_submodule_git_dir(Path::new("/foo/.bare")));
         // A directory literally named `modules` that isn't under a git dir.
         assert!(!is_submodule_git_dir(Path::new("/Foo/modules/Bar")));
+    }
+
+    #[gpui::test]
+    async fn test_worktrees_unqueued_bypasses_serial_git_queue(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "buffer_text",
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("file.txt", "buffer_text".to_string())],
+            "deadbeef",
+        );
+
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .repositories(cx)
+                .values()
+                .next()
+                .cloned()
+                .expect("test project should have a repository")
+        });
+        let (release_sender, release_receiver) = oneshot::channel();
+        let blocked_job = repository.update(cx, |repository, _| {
+            repository.send_job("test_blocked_job", None, move |_, _| async move {
+                release_receiver
+                    .await
+                    .expect("test blocked job should be released");
+            })
+        });
+        cx.executor().run_until_parked();
+
+        let worktrees_request =
+            repository.update(cx, |repository, cx| repository.worktrees_unqueued(cx));
+        let timeout = cx.background_executor.timer(Duration::from_secs(1)).fuse();
+        futures::pin_mut!(worktrees_request, timeout);
+        futures::select! {
+            worktrees = worktrees_request.fuse() => {
+                let worktrees = worktrees
+                    .expect("worktree request should not be cancelled")
+                    .expect("worktree listing should succeed");
+                assert_eq!(worktrees.len(), 1);
+            }
+            _ = timeout => panic!("unqueued worktree request waited for serial git queue"),
+        }
+
+        release_sender
+            .send(())
+            .expect("test blocked job should still be waiting");
+        blocked_job
+            .await
+            .expect("test blocked job result should be delivered");
     }
 
     #[gpui::test]
