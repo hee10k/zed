@@ -6,7 +6,8 @@ use agent_settings::AgentSettings;
 use client::proto;
 use fs::{FakeFs, Fs};
 use gpui::{
-    AppContext, Context, IntoElement, Render, TestAppContext, VisualTestContext, Window, div, px,
+    AppContext, Context, EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Render,
+    TestAppContext, VisualTestContext, Window, div, px,
     size,
 };
 use project::DisableAiSettings;
@@ -49,6 +50,132 @@ impl Render for TestHerdrCentralHost {
             .min_h_0()
             .w_full()
     }
+}
+
+struct TestSidebar {
+    focus_handle: FocusHandle,
+}
+
+impl TestSidebar {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
+impl EventEmitter<SidebarEvent> for TestSidebar {}
+
+impl Focusable for TestSidebar {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Sidebar for TestSidebar {
+    fn width(&self, _cx: &gpui::App) -> Pixels {
+        px(300.0)
+    }
+
+    fn set_width(&mut self, _width: Option<Pixels>, _cx: &mut Context<Self>) {}
+
+    fn has_notifications(&self, _cx: &gpui::App) -> bool {
+        false
+    }
+
+    fn side(&self, cx: &gpui::App) -> SidebarSide {
+        AgentSettings::get_global(cx).sidebar_side()
+    }
+}
+
+impl Render for TestSidebar {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().debug_selector(|| "test-sidebar".to_owned())
+    }
+}
+
+struct TestWideHerdrCentralHost;
+
+impl Render for TestWideHerdrCentralHost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .debug_selector(|| "wide-herdr-central-host".to_owned())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w(px(800.0))
+            .w(px(800.0))
+            .child(div().w(px(800.0)).h(px(32.0)))
+    }
+}
+
+#[gpui::test]
+async fn test_right_sidebar_stays_inside_narrow_viewport(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "file.txt": "" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+
+    let window = cx.open_window(size(px(400.0), px(700.0)), |window, cx| {
+        let mut multi_workspace = MultiWorkspace::test_new(project, window, cx);
+        let sidebar = cx.new(TestSidebar::new);
+        multi_workspace.register_sidebar(sidebar, cx);
+        multi_workspace
+    });
+    cx.run_until_parked();
+    let (multi_workspace, cx) = {
+        let view = window.root(cx).unwrap();
+        (
+            view,
+            VisualTestContext::from_window(window.into(), cx).into_mut(),
+        )
+    };
+    let host = cx.update(|_, cx| cx.new(|_| TestWideHerdrCentralHost));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.set_window_root_host(Some(host.into()), cx);
+        multi_workspace.set_herdr_visible(true, cx);
+    });
+    cx.update(|_, cx| {
+        let mut settings = AgentSettings::get_global(cx).clone();
+        settings.enabled = true;
+        settings.sidebar_side = settings::SidebarDockPosition::Right;
+        AgentSettings::override_global(settings, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.open_sidebar(cx);
+    });
+    cx.run_until_parked();
+    let viewport = size(px(400.0), px(700.0));
+    cx.simulate_resize(viewport);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    cx.run_until_parked();
+    let central_bounds = cx
+        .debug_bounds("herdr-central-content")
+        .expect("the HerdR central content should be rendered");
+    let sidebar_bounds = cx
+        .debug_bounds("sidebar-container")
+        .expect("the right sidebar should be rendered");
+    let content_bounds = cx
+        .debug_bounds("test-sidebar")
+        .expect("the right sidebar content should be rendered");
+    assert!(content_bounds.size.width > px(0.0) && content_bounds.size.height > px(0.0));
+    assert!(
+        content_bounds.origin.x >= sidebar_bounds.origin.x
+            && content_bounds.bottom_right().x <= sidebar_bounds.bottom_right().x
+            && content_bounds.origin.y >= sidebar_bounds.origin.y
+            && content_bounds.bottom_right().y <= sidebar_bounds.bottom_right().y
+            && content_bounds.bottom_right().x <= viewport.width,
+        "the sidebar content should stay inside its container and viewport: {content_bounds:?} vs {sidebar_bounds:?} / {viewport:?}"
+    );
+    assert!(sidebar_bounds.size.width > px(0.0));
+    assert!(
+        central_bounds.size.width <= viewport.width - sidebar_bounds.size.width,
+        "central content should fit beside the right sidebar: {central_bounds:?} vs {sidebar_bounds:?}"
+    );
 }
 
 struct StackedWindowRootHost;

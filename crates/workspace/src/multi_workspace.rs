@@ -2073,6 +2073,7 @@ impl Render for MultiWorkspace {
 
                 div()
                     .id("sidebar-container")
+                    .debug_selector(|| "sidebar-container".to_owned())
                     .relative()
                     .h_full()
                     .w(sidebar_width)
@@ -2202,6 +2203,7 @@ impl Render for MultiWorkspace {
                         .flex()
                         .flex_col()
                         .flex_1()
+                        .min_w_0()
                         .size_full()
                         .overflow_hidden()
                         .child(
@@ -2212,6 +2214,7 @@ impl Render for MultiWorkspace {
                                 .flex_col()
                                 .flex_1()
                                 .min_h_0()
+                                .min_w_0()
                                 .w_full()
                                 .overflow_hidden()
                                 .when(
