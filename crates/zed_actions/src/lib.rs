@@ -1018,6 +1018,12 @@ pub mod herdr {
             /// Opens HerdR in a new window.
             #[action(name = "Open HerdR in New Window")]
             OpenHerdRInNewWindow,
+            /// Toggles the HerdR central view and its focus.
+            #[action(name = "Toggle HerdR")]
+            ToggleHerdR,
+            /// Shows HerdR and moves focus to it.
+            #[action(name = "Focus HerdR")]
+            FocusHerdR,
             /// Toggles the maximized state of HerdR.
             #[action(name = "Toggle HerdR Maximize")]
             ToggleHerdRMaximize,

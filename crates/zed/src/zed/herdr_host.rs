@@ -5,9 +5,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext as _, Context, DragMoveEvent, Entity, FocusHandle, Focusable, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Render, Styled, Subscription, Task, TaskExt,
-    WeakEntity, Window, div, px,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement,
+    Render, Styled, Subscription, Task, TaskExt, WeakEntity, Window, div, px,
 };
 use herdr::{
     CanonicalPath, ClientConfig, Endpoint, FocusEvent, Generation, HerdRClient, SessionSnapshot,
@@ -17,7 +16,7 @@ use paths::home_dir;
 use project::{Event as ProjectEvent, ProjectPath};
 use task::{RevealStrategy, RevealTarget, Shell, SpawnInTerminal, TaskId};
 use terminal_view::TerminalView;
-use ui::prelude::*;
+use ui::{TintColor, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{MultiWorkspace, MultiWorkspaceEvent, OpenMode, Workspace};
 
@@ -53,17 +52,39 @@ fn release_session(endpoint: &Endpoint, owner: u64) {
         Err(_) => log::error!("HerdR session ownership registry was poisoned"),
     }
 }
-const DEFAULT_HOST_HEIGHT: gpui::Pixels = px(320.0);
-const MIN_HOST_HEIGHT: gpui::Pixels = px(140.0);
 const HOST_HEADER_HEIGHT: gpui::Pixels = px(32.0);
 
-#[derive(Clone)]
-struct DraggedHerdRHost;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HerdRVisibilityTransition {
+    ShowAndFocus,
+    FocusOnly,
+    HideAndRestoreEditor,
+}
 
-impl Render for DraggedHerdRHost {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        gpui::Empty
+pub(crate) fn toggle_visibility(
+    visible: bool,
+    herdr_focused: bool,
+) -> HerdRVisibilityTransition {
+    match (visible, herdr_focused) {
+        (false, _) => HerdRVisibilityTransition::ShowAndFocus,
+        (true, false) => HerdRVisibilityTransition::FocusOnly,
+        (true, true) => HerdRVisibilityTransition::HideAndRestoreEditor,
     }
+}
+
+fn find_workspace_for_path(
+    multi_workspace: &MultiWorkspace,
+    path: &CanonicalPath,
+    cx: &App,
+) -> Option<Entity<Workspace>> {
+    multi_workspace.workspaces().find_map(|workspace| {
+        let project = workspace.read(cx).project().read(cx);
+        project.worktrees(cx).find_map(|worktree| {
+            let root = worktree.read(cx).root_dir()?;
+            let root = canonical_checkout_path(root.as_ref()).ok()?;
+            (root == *path).then(|| workspace.clone())
+        })
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +119,70 @@ struct PendingFocus {
     origin: FocusOrigin,
 }
 
+pub struct HerdRStatusButton {
+    multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+    _multi_workspace_subscription: Option<Subscription>,
+}
+
+impl HerdRStatusButton {
+    pub fn new(
+        multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let subscription = multi_workspace.as_ref().and_then(|multi_workspace| {
+            multi_workspace
+                .upgrade()
+                .map(|multi_workspace| cx.observe(&multi_workspace, |_, _, cx| cx.notify()))
+        });
+        Self {
+            multi_workspace,
+            _multi_workspace_subscription: subscription,
+        }
+    }
+}
+
+impl Render for HerdRStatusButton {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self
+            .multi_workspace
+            .as_ref()
+            .and_then(|multi_workspace| multi_workspace.upgrade())
+            .is_some_and(|multi_workspace| multi_workspace.read(cx).herdr_visible());
+
+        div().child(
+            IconButton::new("herdr-status-button", IconName::Terminal)
+                .icon_size(IconSize::Small)
+                .tab_index(0isize)
+                .aria_label("HerdR")
+                .toggle_state(selected)
+                .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                .tooltip(|_window, cx| {
+                    Tooltip::for_action("Toggle HerdR", &zed_actions::herdr::ToggleHerdR, cx)
+                })
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(
+                        Box::new(zed_actions::herdr::ToggleHerdR),
+                        cx,
+                    );
+                }),
+        )
+    }
+}
+
+impl workspace::StatusItemView for HerdRStatusButton {
+    fn set_active_pane_item(
+        &mut self,
+        _active_pane_item: Option<&dyn workspace::ItemHandle>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn hide_setting(&self, _cx: &App) -> Option<workspace::HideStatusItem> {
+        None
+    }
+}
+
 pub struct HerdRHost {
     multi_workspace: WeakEntity<MultiWorkspace>,
     backing_workspace: Entity<Workspace>,
@@ -114,7 +199,6 @@ pub struct HerdRHost {
     _subscriptions: Vec<Subscription>,
     subscribed_projects: HashSet<gpui::EntityId>,
     multi_workspace_subscribed: bool,
-    dock_height: gpui::Pixels,
     collapsed: bool,
     maximized: bool,
     client: Option<HerdRClient>,
@@ -159,7 +243,6 @@ impl HerdRHost {
             _subscriptions: Vec::new(),
             subscribed_projects: HashSet::default(),
             multi_workspace_subscribed: false,
-            dock_height: DEFAULT_HOST_HEIGHT,
             collapsed: false,
             maximized: false,
             client: None,
@@ -723,19 +806,11 @@ impl HerdRHost {
         }
     }
 
-    fn close(&mut self, cx: &mut Context<Self>) {
-        self.terminate(cx);
-        let host_id = cx.entity().entity_id();
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(multi_workspace) = self.multi_workspace.upgrade() {
             multi_workspace.update(cx, |multi_workspace, cx| {
-                let is_this_host = multi_workspace
-                    .window_root_host()
-                    .cloned()
-                    .and_then(|host| host.downcast::<HerdRHost>().ok())
-                    .is_some_and(|host| host.entity_id() == host_id);
-                if is_this_host {
-                    multi_workspace.set_window_root_host(None, cx);
-                }
+                multi_workspace.set_herdr_visible(false, cx);
+                multi_workspace.focus_active_workspace(window, cx);
             });
         }
         cx.notify();
@@ -756,6 +831,10 @@ impl HerdRHost {
             status.push_str(error);
         }
         status
+    }
+
+    fn is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.focus_handle.contains_focused(window, cx)
     }
 }
 
@@ -778,11 +857,6 @@ impl Render for HerdRHost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let collapsed = self.collapsed;
         let maximized = self.maximized;
-        let host_height = if collapsed {
-            HOST_HEADER_HEIGHT
-        } else {
-            self.dock_height
-        };
         let terminal = self.terminal_view.clone();
         let status = self.status_text();
         let fixed_worktree = self.fixed_worktree.display().to_string();
@@ -792,14 +866,15 @@ impl Render for HerdRHost {
             .relative()
             .flex()
             .flex_col()
-            .flex_shrink_0()
+            .flex_1()
+            .min_h_0()
             .w_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
             .border_t_1()
             .border_color(cx.theme().colors().border)
             .when(maximized, |this| this.absolute().inset_0().h_full())
-            .when(!maximized, |this| this.h(host_height))
+            .when(!maximized && collapsed, |this| this.h(HOST_HEADER_HEIGHT))
             .child(
                 h_flex()
                     .h(HOST_HEADER_HEIGHT)
@@ -835,8 +910,7 @@ impl Render for HerdRHost {
                     .child(
                         Button::new("herdr-close", "Close")
                             .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(|host, _, _, cx| host.close(cx))),
+                            .on_click(cx.listener(|host, _, window, cx| host.close(window, cx))),
                     ),
             )
             .when(!collapsed, |this| {
@@ -852,49 +926,10 @@ impl Render for HerdRHost {
                             this.child("Starting HerdR…")
                         }),
                 )
-                .child(
-                    div()
-                        .id("herdr-resize-handle")
-                        .absolute()
-                        .top(-px(3.0))
-                        .left_0()
-                        .w_full()
-                        .h(px(6.0))
-                        .cursor_row_resize()
-                        .on_drag(DraggedHerdRHost, |_, _, _, cx| cx.new(|_| DraggedHerdRHost))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
-                        ),
-                )
-            });
-
-        host.on_drag_move(cx.listener(
-            |host, event: &DragMoveEvent<DraggedHerdRHost>, window, cx| {
-                let viewport_height = window.viewport_size().height;
-                let height = (viewport_height - event.event.position.y)
-                    .max(MIN_HOST_HEIGHT)
-                    .min(viewport_height - HOST_HEADER_HEIGHT);
-                host.dock_height = height;
-                cx.notify();
-            },
-        ))
+            })
+            .into_any_element();
+        host
     }
-}
-
-fn find_workspace_for_path(
-    multi_workspace: &MultiWorkspace,
-    path: &CanonicalPath,
-    cx: &App,
-) -> Option<Entity<Workspace>> {
-    multi_workspace.workspaces().find_map(|workspace| {
-        let project = workspace.read(cx).project().read(cx);
-        project.worktrees(cx).find_map(|worktree| {
-            let root = worktree.read(cx).root_dir()?;
-            let root = canonical_checkout_path(root.as_ref()).ok()?;
-            (root == *path).then(|| workspace.clone())
-        })
-    })
 }
 
 fn fixed_worktree_for(workspace: &Workspace, cx: &App) -> PathBuf {
@@ -1028,16 +1063,18 @@ pub fn open_new_window(
     })
     .detach_and_log_err(cx);
 }
-
 pub fn open_new_window_from_app(cx: &mut App) {
     workspace::with_active_or_new_workspace(cx, |workspace, window, cx| {
         open_new_window(workspace, window, cx);
     });
 }
-
-fn with_active_host(
+fn with_active_multi_workspace(
     cx: &mut App,
-    action: impl FnOnce(&mut HerdRHost, &mut Window, &mut Context<HerdRHost>) + 'static,
+    update: impl FnOnce(
+            &mut MultiWorkspace,
+            &mut Window,
+            &mut Context<MultiWorkspace>,
+        ) + 'static,
 ) {
     let Some(window_handle) = cx
         .active_window()
@@ -1045,19 +1082,74 @@ fn with_active_host(
     else {
         return;
     };
+
     cx.spawn(async move |cx| {
         cx.background_executor()
             .timer(Duration::from_millis(1))
             .await;
-        window_handle
-            .update(cx, |multi_workspace, window, cx| {
-                if let Some(host) = host_from_multi_workspace(multi_workspace) {
-                    host.update(cx, |host, cx| action(host, window, cx));
-                }
-            })
-            .log_err();
+        window_handle.update(cx, update).log_err();
     })
     .detach();
+}
+
+pub fn toggle_from_app(cx: &mut App) {
+    with_active_multi_workspace(cx, |multi_workspace, window, cx| {
+        let workspace = multi_workspace.workspace().clone();
+        let Some(host) = host_from_multi_workspace(multi_workspace) else {
+            install_host(
+                multi_workspace,
+                workspace.clone(),
+                fixed_worktree_for(workspace.read(cx), cx),
+                window,
+                cx,
+            );
+            return;
+        };
+
+        match toggle_visibility(
+            multi_workspace.herdr_visible(),
+            host.read(cx).is_focused(window, cx),
+        ) {
+            HerdRVisibilityTransition::ShowAndFocus
+            | HerdRVisibilityTransition::FocusOnly => {
+                multi_workspace.set_herdr_visible(true, cx);
+                host.update(cx, |host, cx| host.focus_handle.focus(window, cx));
+            }
+            HerdRVisibilityTransition::HideAndRestoreEditor => {
+                multi_workspace.set_herdr_visible(false, cx);
+                multi_workspace.focus_active_workspace(window, cx);
+            }
+        }
+    });
+}
+
+pub fn focus_from_app(cx: &mut App) {
+    with_active_multi_workspace(cx, |multi_workspace, window, cx| {
+        let workspace = multi_workspace.workspace().clone();
+        if let Some(host) = host_from_multi_workspace(multi_workspace) {
+            multi_workspace.set_herdr_visible(true, cx);
+            host.update(cx, |host, cx| host.focus_handle.focus(window, cx));
+        } else {
+            install_host(
+                multi_workspace,
+                workspace.clone(),
+                fixed_worktree_for(workspace.read(cx), cx),
+                window,
+                cx,
+            );
+        }
+    });
+}
+
+fn with_active_host(
+    cx: &mut App,
+    action: impl FnOnce(&mut HerdRHost, &mut Window, &mut Context<HerdRHost>) + 'static,
+) {
+    with_active_multi_workspace(cx, move |multi_workspace, window, cx| {
+        if let Some(host) = host_from_multi_workspace(multi_workspace) {
+            host.update(cx, |host, cx| action(host, window, cx));
+        }
+    });
 }
 
 pub fn toggle_maximize_from_app(cx: &mut App) {
@@ -1069,30 +1161,34 @@ pub fn toggle_collapse_from_app(cx: &mut App) {
 }
 
 pub fn close_from_app(cx: &mut App) {
-    let Some(window_handle) = cx
-        .active_window()
-        .and_then(|window| window.downcast::<MultiWorkspace>())
-    else {
-        return;
-    };
-    cx.spawn(async move |cx| {
-        cx.background_executor()
-            .timer(Duration::from_millis(1))
-            .await;
-        window_handle
-            .update(cx, |multi_workspace, _window, cx| {
-                if let Some(host) = host_from_multi_workspace(multi_workspace) {
-                    host.update(cx, |host, cx| host.terminate(cx));
-                    multi_workspace.set_window_root_host(None, cx);
-                }
-            })
-            .log_err();
-    })
-    .detach();
+    with_active_multi_workspace(cx, |multi_workspace, window, cx| {
+        multi_workspace.set_herdr_visible(false, cx);
+        multi_workspace.focus_active_workspace(window, cx);
+    });
 }
 
 pub fn status_from_app(cx: &mut App) {
     with_active_host(cx, |host, window, cx| host.focus_handle.focus(window, cx));
+}
+#[cfg(test)]
+mod tests {
+    use super::{HerdRVisibilityTransition, toggle_visibility};
+
+    #[test]
+    fn herdr_toggle_visibility() {
+        assert_eq!(
+            toggle_visibility(false, false),
+            HerdRVisibilityTransition::ShowAndFocus
+        );
+        assert_eq!(
+            toggle_visibility(true, false),
+            HerdRVisibilityTransition::FocusOnly
+        );
+        assert_eq!(
+            toggle_visibility(true, true),
+            HerdRVisibilityTransition::HideAndRestoreEditor
+        );
+    }
 }
 
 

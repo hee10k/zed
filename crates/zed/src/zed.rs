@@ -204,6 +204,12 @@ pub fn init(cx: &mut App) {
     .on_action(|_: &zed_actions::herdr::OpenHerdRInNewWindow, cx| {
         herdr_host::open_new_window_from_app(cx);
     })
+    .on_action(|_: &zed_actions::herdr::ToggleHerdR, cx| {
+        herdr_host::toggle_from_app(cx);
+    })
+    .on_action(|_: &zed_actions::herdr::FocusHerdR, cx| {
+        herdr_host::focus_from_app(cx);
+    })
     .on_action(|_: &zed_actions::herdr::ToggleHerdRMaximize, cx| {
         herdr_host::toggle_maximize_from_app(cx);
     })
@@ -652,6 +658,12 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
+        let multi_workspace = window.root::<MultiWorkspace>().flatten();
+        let herdr_status_button = multi_workspace.as_ref().map(|multi_workspace| {
+            cx.new(|cx| {
+                herdr_host::HerdRStatusButton::new(Some(multi_workspace.downgrade()), cx)
+            })
+        });
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
@@ -667,7 +679,9 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_right_item(line_ending_indicator, window, cx);
             status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(cursor_position, window, cx);
-            status_bar.add_right_item(image_info, window, cx);
+            if let Some(herdr_status_button) = herdr_status_button {
+                status_bar.add_right_item(herdr_status_button, window, cx);
+            }
         });
 
         let panels_task = initialize_panels(window, cx);

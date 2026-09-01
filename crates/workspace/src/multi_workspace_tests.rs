@@ -264,6 +264,55 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_herdr_central_view_keeps_status_bar_visible(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "file.txt": "" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let status_bar = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspace()
+            .read(cx)
+            .status_bar()
+            .clone()
+    });
+    let status_bar_id = status_bar.entity_id();
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.set_herdr_visible(true, cx);
+    });
+    cx.simulate_resize(size(px(900.0), px(700.0)));
+    cx.draw(
+        gpui::Point::default(),
+        size(px(900.0), px(700.0)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.run_until_parked();
+
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .status_bar()
+                .entity_id()
+        }),
+        status_bar_id,
+        "the active Workspace status bar should remain installed while HerdR is visible"
+    );
+    let status_bounds = cx
+        .debug_bounds("status-bar")
+        .expect("the active Workspace status bar should be rendered outside the central switch");
+    assert!(
+        status_bounds.size.width > px(0.0) && status_bounds.size.height > px(0.0),
+        "the status bar should have visible bounds while HerdR is selected: {status_bounds:?}"
+    );
+}
+
+#[gpui::test]
 async fn test_herdr_visibility_preserves_entities(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

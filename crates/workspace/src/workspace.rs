@@ -2704,13 +2704,14 @@ impl Workspace {
         &self.status_bar
     }
 
+    pub fn status_bar_visible(&self, cx: &App) -> bool {
+        StatusBarSettings::get_global(cx).show
+    }
+
     pub fn set_sidebar_focus_handle(&mut self, handle: Option<FocusHandle>) {
         self.sidebar_focus_handle = handle;
     }
 
-    pub fn status_bar_visible(&self, cx: &App) -> bool {
-        StatusBarSettings::get_global(cx).show
-    }
 
     pub fn multi_workspace(&self) -> Option<&WeakEntity<MultiWorkspace>> {
         self.multi_workspace.as_ref()
@@ -9726,9 +9727,10 @@ impl Render for Workspace {
                             }))
                             .children(self.render_notifications(window, cx)),
                     )
-                    .when(self.status_bar_visible(cx), |parent| {
-                        parent.child(self.status_bar.clone())
-                    })
+                    .when(
+                        self.status_bar_visible(cx) && self.multi_workspace.is_none(),
+                        |parent| parent.child(self.status_bar.clone()),
+                    )
                     .child(self.toast_layer.clone()),
             )
     }

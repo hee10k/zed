@@ -118,6 +118,7 @@ impl Render for StatusBar {
 
         h_flex()
             .id("status-bar")
+            .debug_selector(|| "status-bar".to_owned())
             .track_focus(&self.focus_handle)
             .key_context("StatusBar")
             // Expose the status bar as an ARIA toolbar so assistive technology

@@ -2226,7 +2226,10 @@ impl Render for MultiWorkspace {
                                             .child(self.workspace().clone())
                                     },
                                 ),
-                        ),
+                        )
+                        .when(self.workspace().read(cx).status_bar_visible(cx), |this| {
+                            this.child(self.workspace().read(cx).status_bar().clone())
+                        }),
                 )
                 .children(right_sidebar)
                 .child(self.workspace().read(cx).modal_layer.clone())
