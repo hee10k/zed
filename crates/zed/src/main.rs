@@ -74,7 +74,7 @@ use workspace::{
 use zed::{
     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
     derive_paths_with_position, edit_prediction_registry, handle_cli_connection,
-    handle_keymap_file_changes, initialize_workspace, open_paths_with_positions,
+    handle_keymap_file_changes, herdr_host, initialize_workspace, open_paths_with_positions,
 };
 
 use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon_theme};
@@ -1427,7 +1427,9 @@ pub(crate) async fn restore_or_create_workspace(
                 SerializedWorkspaceLocation::Local => {
                     restore_multiworkspace(multi_workspace, app_state.clone(), cx)
                         .await
-                        .map(|_| ())
+                        .map(|window| {
+                            herdr_host::restore_if_visible(window, cx);
+                        })
                 }
                 SerializedWorkspaceLocation::Remote(connection_options) => {
                     let mut connection_options = connection_options.clone();
@@ -1462,6 +1464,7 @@ pub(crate) async fn restore_or_create_workspace(
                             cx,
                         )
                         .await;
+                        herdr_host::restore_if_visible(window, cx);
                         Ok::<(), anyhow::Error>(())
                     }
                     .await

@@ -5,8 +5,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement,
-    Render, Styled, Subscription, Task, TaskExt, WeakEntity, Window, div, px,
+    App, AppContext as _, AsyncApp, Context, Entity, FocusHandle, Focusable, IntoElement,
+    ParentElement, Render, Styled, Subscription, Task, TaskExt, WeakEntity, Window, WindowHandle,
+    div, px,
 };
 use herdr::{
     CanonicalPath, ClientConfig, Endpoint, FocusEvent, Generation, HerdRClient, SessionSnapshot,
@@ -947,6 +948,29 @@ fn host_from_multi_workspace(multi_workspace: &MultiWorkspace) -> Option<Entity<
         .window_root_host()
         .cloned()
         .and_then(|host| host.downcast::<HerdRHost>().ok())
+}
+
+/// Recreates the runtime HerdR host after persisted MultiWorkspace state has
+/// been applied. The serialized flag is only a desired visibility state; the
+/// live host is intentionally rebuilt through the normal install lifecycle.
+pub fn restore_if_visible(
+    window_handle: WindowHandle<MultiWorkspace>,
+    cx: &mut AsyncApp,
+) {
+    let _ = window_handle.update(cx, |multi_workspace, window, cx| {
+        if !multi_workspace.herdr_visible() || host_from_multi_workspace(multi_workspace).is_some() {
+            return;
+        }
+
+        let workspace = multi_workspace.workspace().clone();
+        install_host(
+            multi_workspace,
+            workspace.clone(),
+            fixed_worktree_for(workspace.read(cx), cx),
+            window,
+            cx,
+        );
+    });
 }
 
 fn install_host(

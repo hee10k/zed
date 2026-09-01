@@ -1,6 +1,6 @@
 mod app_menus;
 pub mod edit_prediction_registry;
-mod herdr_host;
+pub(crate) mod herdr_host;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
 mod migrate;

@@ -371,7 +371,7 @@ async fn test_herdr_visibility_preserves_entities(cx: &mut TestAppContext) {
     let host_id = host.entity_id();
 
     cx.simulate_resize(size(px(900.0), px(700.0)));
-    for visible in [true, false] {
+    for visible in [true, false, true, false] {
         multi_workspace.update(cx, |multi_workspace, cx| {
             multi_workspace.set_herdr_visible(visible, cx);
         });
@@ -403,6 +403,85 @@ async fn test_herdr_visibility_preserves_entities(cx: &mut TestAppContext) {
     });
 }
 
+
+#[gpui::test]
+async fn test_herdr_state_restores(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let older_state: MultiWorkspaceState = serde_json::from_value(json!({
+        "active_workspace_id": null,
+        "sidebar_open": false,
+        "project_groups": [],
+    }))
+    .expect("older MultiWorkspaceState JSON should remain readable");
+    assert!(!older_state.herdr_visible);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "file.txt": "" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+    let visible_state = MultiWorkspaceState {
+        herdr_visible: true,
+        ..Default::default()
+    };
+    let serialized = serde_json::to_string(&visible_state).expect("state should serialize");
+    let restored_state: MultiWorkspaceState =
+        serde_json::from_str(&serialized).expect("state should deserialize");
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.set_herdr_visible(restored_state.herdr_visible, cx);
+    });
+    assert!(multi_workspace.read_with(cx, |multi_workspace, _| {
+        multi_workspace.herdr_visible()
+    }));
+}
+
+#[gpui::test]
+async fn test_herdr_state_survives_workspace_switch(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/root_b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_a = multi_workspace.read_with(cx, |multi_workspace, _| {
+        multi_workspace.workspace().clone()
+    });
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx)
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.set_herdr_visible(true, cx);
+    });
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.activate(workspace_a.clone(), None, window, cx);
+    });
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            multi_workspace.workspace().entity_id()
+        }),
+        workspace_a.entity_id()
+    );
+    assert_eq!(
+        workspace_b.entity_id(),
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            multi_workspace
+                .workspaces()
+                .find(|workspace| workspace.entity_id() == workspace_b.entity_id())
+                .expect("workspace B should remain held")
+                .entity_id()
+        })
+    );
+    assert!(multi_workspace.read_with(cx, |multi_workspace, _| {
+        multi_workspace.herdr_visible()
+    }));
+}
 fn setup_multi_workspace<'a>(
     projects: &[Entity<Project>],
     cx: &'a mut TestAppContext,
