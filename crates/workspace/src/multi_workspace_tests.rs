@@ -73,6 +73,7 @@ async fn test_stacked_window_root_host_allocates_terminal_space(cx: &mut TestApp
     multi_workspace.update(cx, |multi_workspace, cx| {
         let host = cx.new(|_| StackedWindowRootHost);
         multi_workspace.set_window_root_host(Some(host.into()), cx);
+        multi_workspace.set_herdr_visible(true, cx);
     });
     cx.simulate_resize(size(px(900.0), px(700.0)));
     cx.draw(
@@ -104,6 +105,7 @@ async fn test_window_root_host_is_laid_out_inside_window(cx: &mut TestAppContext
     multi_workspace.update(cx, |multi_workspace, cx| {
         let host = cx.new(|_| TestWindowRootHost);
         multi_workspace.set_window_root_host(Some(host.into()), cx);
+        multi_workspace.set_herdr_visible(true, cx);
     });
     cx.simulate_resize(size(px(900.0), px(700.0)));
     cx.draw(
@@ -128,6 +130,115 @@ async fn test_window_root_host_is_laid_out_inside_window(cx: &mut TestAppContext
         host_bounds.bottom_left().y <= viewport_size.height,
         "window root host should remain inside the viewport: {host_bounds:?} vs {viewport_size:?}"
     );
+}
+
+#[gpui::test]
+async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "file.txt": "" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let (editor_id, host) = multi_workspace.update(cx, |multi_workspace, cx| {
+        let editor_id = multi_workspace.workspace().entity_id();
+        let host = cx.new(|_| TestWindowRootHost);
+        multi_workspace.set_window_root_host(Some(host.clone().into()), cx);
+        assert!(!multi_workspace.herdr_visible());
+        (editor_id, host)
+    });
+
+    cx.simulate_resize(size(px(900.0), px(700.0)));
+    cx.draw(
+        gpui::Point::default(),
+        size(px(900.0), px(700.0)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.run_until_parked();
+
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            multi_workspace.workspace().entity_id()
+        }),
+        editor_id,
+        "the normal workspace Entity should remain installed while HerdR is hidden"
+    );
+    assert!(
+        cx.debug_bounds("test-window-root-host").is_none(),
+        "the HerdR host should be hidden while HerdR is hidden"
+    );
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.set_herdr_visible(true, cx);
+    });
+    cx.draw(
+        gpui::Point::default(),
+        size(px(900.0), px(700.0)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("test-window-root-host").is_some(),
+        "the HerdR host should be rendered while HerdR is visible"
+    );
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            multi_workspace.workspace().entity_id()
+        }),
+        editor_id,
+        "the normal workspace Entity should remain installed while HerdR is visible"
+    );
+}
+
+#[gpui::test]
+async fn test_herdr_visibility_preserves_entities(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "file.txt": "" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let (editor, host) = multi_workspace.update(cx, |multi_workspace, cx| {
+        let editor = multi_workspace.workspace().clone();
+        let host = cx.new(|_| TestWindowRootHost);
+        multi_workspace.set_window_root_host(Some(host.clone().into()), cx);
+        (editor, host)
+    });
+    let editor_id = editor.entity_id();
+    let host_id = host.entity_id();
+
+    cx.simulate_resize(size(px(900.0), px(700.0)));
+    for visible in [true, false] {
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.set_herdr_visible(visible, cx);
+        });
+        cx.draw(
+            gpui::Point::default(),
+            size(px(900.0), px(700.0)),
+            |_, _| multi_workspace.clone().into_any_element(),
+        );
+        cx.run_until_parked();
+    }
+
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(
+            multi_workspace.workspace().entity_id(),
+            editor_id,
+            "the workspace Entity should survive both visibility toggles"
+        );
+        let stored_host = multi_workspace
+            .window_root_host()
+            .expect("the HerdR host should remain installed")
+            .clone()
+            .downcast::<TestWindowRootHost>()
+            .expect("the installed host should retain its test type");
+        assert_eq!(
+            stored_host.entity_id(),
+            host_id,
+            "the HerdR host Entity should survive both visibility toggles"
+        );
+    });
 }
 
 fn setup_multi_workspace<'a>(

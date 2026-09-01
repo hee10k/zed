@@ -110,6 +110,8 @@ impl From<SerializedProjectGroup> for ProjectGroupKey {
 pub struct MultiWorkspaceState {
     pub active_workspace_id: Option<WorkspaceId>,
     pub sidebar_open: bool,
+    #[serde(default)]
+    pub herdr_visible: bool,
     #[serde(alias = "project_group_keys")]
     pub project_groups: Vec<SerializedProjectGroup>,
     #[serde(default)]

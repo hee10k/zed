@@ -315,6 +315,7 @@ pub struct MultiWorkspace {
     active_workspace_id: Rc<Cell<EntityId>>,
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
+    herdr_visible: bool,
     sidebar_overlay: Option<AnyView>,
     window_root_host: Option<AnyView>,
     pending_removal_tasks: Vec<Task<()>>,
@@ -377,6 +378,7 @@ impl MultiWorkspace {
             active_workspace_id,
             sidebar: None,
             sidebar_open: false,
+            herdr_visible: false,
             sidebar_overlay: None,
             window_root_host: None,
             pending_removal_tasks: Vec::new(),
@@ -420,6 +422,19 @@ impl MultiWorkspace {
 
     pub fn sidebar_open(&self) -> bool {
         self.sidebar_open
+    }
+
+    pub fn herdr_visible(&self) -> bool {
+        self.herdr_visible
+    }
+
+    pub fn set_herdr_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.herdr_visible == visible {
+            return;
+        }
+        self.herdr_visible = visible;
+        self.serialize(cx);
+        cx.notify();
     }
 
     pub fn sidebar_has_notifications(&self, cx: &App) -> bool {
@@ -1474,6 +1489,7 @@ impl MultiWorkspace {
                 })
                 .collect::<Vec<_>>(),
             sidebar_open: self.sidebar_open,
+            herdr_visible: self.herdr_visible,
             sidebar_state: self.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
         };
         let window_id = self.window_id;
@@ -2190,14 +2206,21 @@ impl Render for MultiWorkspace {
                         .overflow_hidden()
                         .child(
                             div()
+                                .id("herdr-central-content")
                                 .relative()
                                 .flex_1()
                                 .min_h_0()
                                 .w_full()
                                 .overflow_hidden()
-                                .child(self.workspace().clone()),
-                        )
-                        .children(self.window_root_host().cloned()),
+                                .when(
+                                    self.herdr_visible && self.window_root_host.is_some(),
+                                    |this| this.children(self.window_root_host().cloned()),
+                                )
+                                .when(
+                                    !self.herdr_visible || self.window_root_host.is_none(),
+                                    |this| this.child(self.workspace().clone()),
+                                ),
+                        ),
                 )
                 .children(right_sidebar)
                 .child(self.workspace().read(cx).modal_layer.clone())

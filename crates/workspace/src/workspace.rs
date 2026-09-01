@@ -10001,6 +10001,7 @@ pub async fn apply_restored_multiworkspace_state(
 ) {
     let MultiWorkspaceState {
         sidebar_open,
+        herdr_visible,
         project_groups,
         sidebar_state,
         ..
@@ -10043,6 +10044,12 @@ pub async fn apply_restored_multiworkspace_state(
             })
             .ok();
     }
+
+    window_handle
+        .update(cx, |multi_workspace, _window, cx| {
+            multi_workspace.set_herdr_visible(*herdr_visible, cx);
+        })
+        .ok();
 
     if *sidebar_open {
         window_handle
