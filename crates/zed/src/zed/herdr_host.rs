@@ -866,7 +866,7 @@ impl Render for HerdRHost {
             .relative()
             .flex()
             .flex_col()
-            .flex_1()
+            .when(!collapsed, |this| this.flex_1())
             .min_h_0()
             .w_full()
             .overflow_hidden()

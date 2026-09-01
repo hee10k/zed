@@ -69,6 +69,15 @@ Prior commit: `f326513924f90c7e8fe84347b12ae750fccf5571 feat(herdr): add persist
 
 - Focused coverage verifies production-shaped layout and status-bar preservation but does not initialize the real HerdR PTY/server, by design.
 - Workspace test compilation remains blocked by the unrelated `RemoteConnectionIdentity::Mock { .. }` match error described above.
+- Root cause: the production `HerdRHost` retained unconditional `.flex_1()` while collapsed and only added a height constraint, allowing the new column-flex central parent to allocate the full central slot.
+- Fix: apply `.flex_1()` only when expanded; preserve the existing collapsed `.h(HOST_HEADER_HEIGHT)` branch and all header controls.
+- Added deterministic GPUI coverage: `test_herdr_collapsed_host_is_header_sized` uses the pure test host fixture and asserts collapsed height is exactly 32px without starting PTY/server.
+- Exact validation: `cargo test -p workspace --lib test_herdr_collapsed_host_is_header_sized` — 1 passed (268 filtered).
+- Exact validation: `cargo test -p workspace --lib herdr_central_view` — 2 passed (267 filtered).
+- Exact validation: `cargo test -p workspace --lib test_herdr_visibility_preserves_entities` — 1 passed (268 filtered).
+- Exact validation: `cargo test -p zed --bin zed herdr_toggle_visibility` — 1 passed (82 filtered; 2 existing warnings).
+- Exact validation: `cargo check -p zed --bin zed` — passed with existing warnings (`git_ui` dead code, unused `HerdRHost::terminate`, and future-incompatibility warning for `block v0.1.6`).
+- Self-review: only `crates/zed/src/zed/herdr_host.rs`, `crates/workspace/src/multi_workspace_tests.rs`, and this report are bounded fix files; maximize, close-hide, session persistence, ImageInfo/status items, and deferred lifecycle paths are untouched.
 
 ## Report path
 

@@ -34,7 +34,9 @@ impl Render for TestWindowRootHost {
     }
 }
 
-struct TestHerdrCentralHost;
+struct TestHerdrCentralHost {
+    collapsed: bool,
+}
 
 impl Render for TestHerdrCentralHost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
@@ -42,11 +44,13 @@ impl Render for TestHerdrCentralHost {
             .debug_selector(|| "herdr-central-host".to_owned())
             .flex()
             .flex_col()
-            .flex_1()
+            .when(!self.collapsed, |this| this.flex_1())
+            .when(self.collapsed, |this| this.h(px(32.0)))
             .min_h_0()
             .w_full()
     }
 }
+
 struct StackedWindowRootHost;
 
 impl Render for StackedWindowRootHost {
@@ -157,7 +161,7 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
     let (editor_id, host) = multi_workspace.update(cx, |multi_workspace, cx| {
         let editor_id = multi_workspace.workspace().entity_id();
-        let host = cx.new(|_| TestHerdrCentralHost);
+        let host = cx.new(|_| TestHerdrCentralHost { collapsed: false });
         multi_workspace.set_window_root_host(Some(host.clone().into()), cx);
         assert!(!multi_workspace.herdr_visible());
         (editor_id, host)
@@ -268,6 +272,38 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_herdr_collapsed_host_is_header_sized(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "file.txt": "" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        let host = cx.new(|_| TestHerdrCentralHost { collapsed: true });
+        multi_workspace.set_window_root_host(Some(host.into()), cx);
+        multi_workspace.set_herdr_visible(true, cx);
+    });
+    cx.simulate_resize(size(px(900.0), px(700.0)));
+    cx.draw(
+        gpui::Point::default(),
+        size(px(900.0), px(700.0)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.run_until_parked();
+
+    let host_bounds = cx
+        .debug_bounds("herdr-central-host")
+        .expect("the collapsed HerdR host should be rendered");
+    assert_eq!(
+        host_bounds.size.height,
+        px(32.0),
+        "a collapsed HerdR host should remain header-sized instead of flex-filling the central slot"
+    );
+}
+
+#[gpui::test]
 async fn test_herdr_central_view_keeps_status_bar_visible(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
@@ -327,7 +363,7 @@ async fn test_herdr_visibility_preserves_entities(cx: &mut TestAppContext) {
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
     let (editor, host) = multi_workspace.update(cx, |multi_workspace, cx| {
         let editor = multi_workspace.workspace().clone();
-        let host = cx.new(|_| TestHerdrCentralHost);
+        let host = cx.new(|_| TestHerdrCentralHost { collapsed: false });
         multi_workspace.set_window_root_host(Some(host.clone().into()), cx);
         (editor, host)
     });
