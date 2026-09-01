@@ -2208,6 +2208,8 @@ impl Render for MultiWorkspace {
                             div()
                                 .id("herdr-central-content")
                                 .relative()
+                                .flex()
+                                .flex_col()
                                 .flex_1()
                                 .min_h_0()
                                 .w_full()

@@ -679,6 +679,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_right_item(line_ending_indicator, window, cx);
             status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(cursor_position, window, cx);
+            status_bar.add_right_item(image_info, window, cx);
             if let Some(herdr_status_button) = herdr_status_button {
                 status_bar.add_right_item(herdr_status_button, window, cx);
             }

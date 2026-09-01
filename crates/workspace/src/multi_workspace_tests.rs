@@ -40,7 +40,11 @@ impl Render for TestHerdrCentralHost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .debug_selector(|| "herdr-central-host".to_owned())
-            .size_full()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
     }
 }
 struct StackedWindowRootHost;

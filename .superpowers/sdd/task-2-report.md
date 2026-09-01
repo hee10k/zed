@@ -48,7 +48,27 @@ No formatter, linter, project-wide suite, real PTY, or HerdR server was run.
 
 ## Commit
 
-Pending commit: `feat(herdr): add persistent central view toggle`
+Prior commit: `f326513924f90c7e8fe84347b12ae750fccf5571 feat(herdr): add persistent central view toggle`
+
+## Fix validation
+
+- Restored `status_bar.add_right_item(image_info, window, cx)` so every initialized Workspace retains its ImageInfo status item alongside HerdR.
+- Changed `herdr-central-content` to a flex-column parent and kept the real HerdR host flex-filling that slot with `flex_1`, `min_h_0`, and `w_full`; no fixed arbitrary height was added.
+- Strengthened `TestHerdrCentralHost` to use the same flex-fill child contract instead of `.size_full()`, so the central layout tests exercise production-shaped parent/child sizing.
+- `cargo test -p workspace --lib herdr_central_view` — 2 passed (visibility and status-bar coverage).
+- `cargo test -p workspace --lib test_herdr_visibility_preserves_entities` — 1 passed.
+- `cargo test -p zed --bin zed herdr_toggle_visibility` — 1 passed (82 filtered; 2 existing warnings).
+- `cargo check -p zed_actions` — passed; future-incompatibility warning for `block v0.1.6`.
+- `cargo check -p zed --bin zed` — passed; existing dead-code warning for `git_ui::WorktreeFileDiff::repo_path`, existing unused `HerdRHost::terminate`, and future-incompatibility warning for `block v0.1.6`.
+- `cargo check -p workspace --lib --tests` — could not complete because the unrelated pre-existing `RemoteConnectionIdentity::Mock { .. }` exhaustiveness error remains in `crates/workspace/src/persistence.rs:1712`.
+- No focused ImageInfo-preserving initialization test is available in the current test surface; the restored registration was verified by source/semantic diff against the prior initialization path.
+- The initial multi-filter command `cargo test -p workspace --lib multi_workspace_tests::test_herdr_central_view_visibility multi_workspace_tests::test_herdr_central_view_keeps_status_bar_visible multi_workspace_tests::test_herdr_visibility_preserves_entities` was rejected by Cargo because `cargo test` accepts one filter; the equivalent valid filters above were run.
+- No formatter, linter, project-wide suite, real PTY, or HerdR server was run.
+
+## Fix concerns
+
+- Focused coverage verifies production-shaped layout and status-bar preservation but does not initialize the real HerdR PTY/server, by design.
+- Workspace test compilation remains blocked by the unrelated `RemoteConnectionIdentity::Mock { .. }` match error described above.
 
 ## Report path
 
