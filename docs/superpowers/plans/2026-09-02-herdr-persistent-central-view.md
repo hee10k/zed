@@ -168,6 +168,8 @@ Refactor the app-level helpers in `herdr_host.rs` to use the existing deferred `
 
 Change the existing in-view Close behavior to hide the central view instead of terminating and dropping the host. Keep session ownership, terminal Entity, snapshot, and connection tasks alive while hidden. Retain the current pending lifecycle changes to `install_host`, `open_current`, `open_new_window`, and `with_active_host`.
 
+Because `Workspace::render` owns the status bar but the central switch replaces the whole Workspace view, render the active Workspace's existing status bar outside the mutually-exclusive central content selector when MultiWorkspace is used, and prevent duplicate status-bar rendering inside the nested Workspace. The HerdR toggle must remain available while HerdR is visible. Make the real HerdR host fill the selected central content area in its non-maximized state; preserve the existing Collapse and Maximize controls and avoid restoring a bottom-dock split.
+
 Expose a pure transition helper for deterministic tests rather than testing real terminal startup.
 
 - [ ] **Step 5: Add the status-bar icon**
