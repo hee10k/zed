@@ -922,6 +922,7 @@ fn install_host(
     cx: &mut Context<MultiWorkspace>,
 ) {
     if let Some(host) = host_from_multi_workspace(multi_workspace) {
+        multi_workspace.set_herdr_visible(true, cx);
         host.update(cx, |host, cx| host.focus_handle.focus(window, cx));
         return;
     }
@@ -945,8 +946,22 @@ fn install_host(
         )
     });
     multi_workspace.set_window_root_host(Some(host.clone().into()), cx);
-    host.update(cx, |host, cx| host.start(window, cx));
-    host.update(cx, |host, cx| host.focus_handle.focus(window, cx));
+    multi_workspace.set_herdr_visible(true, cx);
+    let window_handle = window.window_handle();
+    cx.defer(move |cx| {
+        cx.spawn(async move |cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1))
+                .await;
+            window_handle
+                .update(cx, |_, window, cx| {
+                    host.update(cx, |host, cx| host.start(window, cx));
+                    host.update(cx, |host, cx| host.focus_handle.focus(window, cx));
+                })
+                .log_err();
+        })
+        .detach();
+    });
 }
 
 pub fn open_current(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -955,17 +970,23 @@ pub fn open_current(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
         return;
     };
     let workspace_entity = cx.entity();
-    window_handle
-        .update(cx, |multi_workspace, window, cx| {
-            install_host(
-                multi_workspace,
-                workspace_entity,
-                fixed_worktree,
-                window,
-                cx,
-            );
-        })
-        .log_err();
+    cx.spawn(async move |_, cx| {
+        cx.background_executor()
+            .timer(Duration::from_millis(1))
+            .await;
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                install_host(
+                    multi_workspace,
+                    workspace_entity,
+                    fixed_worktree,
+                    window,
+                    cx,
+                );
+            })
+            .log_err();
+    })
+    .detach();
 }
 
 pub fn open_current_from_app(cx: &mut App) {
@@ -1001,12 +1022,13 @@ pub fn open_new_window(
                 fixed_worktree,
                 window,
                 cx,
-            );
+            )
         })?;
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
 }
+
 pub fn open_new_window_from_app(cx: &mut App) {
     workspace::with_active_or_new_workspace(cx, |workspace, window, cx| {
         open_new_window(workspace, window, cx);
@@ -1015,7 +1037,7 @@ pub fn open_new_window_from_app(cx: &mut App) {
 
 fn with_active_host(
     cx: &mut App,
-    action: impl FnOnce(&mut HerdRHost, &mut Window, &mut Context<HerdRHost>),
+    action: impl FnOnce(&mut HerdRHost, &mut Window, &mut Context<HerdRHost>) + 'static,
 ) {
     let Some(window_handle) = cx
         .active_window()
@@ -1023,13 +1045,19 @@ fn with_active_host(
     else {
         return;
     };
-    window_handle
-        .update(cx, |multi_workspace, window, cx| {
-            if let Some(host) = host_from_multi_workspace(multi_workspace) {
-                host.update(cx, |host, cx| action(host, window, cx));
-            }
-        })
-        .log_err();
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .timer(Duration::from_millis(1))
+            .await;
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                if let Some(host) = host_from_multi_workspace(multi_workspace) {
+                    host.update(cx, |host, cx| action(host, window, cx));
+                }
+            })
+            .log_err();
+    })
+    .detach();
 }
 
 pub fn toggle_maximize_from_app(cx: &mut App) {
@@ -1047,16 +1075,24 @@ pub fn close_from_app(cx: &mut App) {
     else {
         return;
     };
-    window_handle
-        .update(cx, |multi_workspace, _window, cx| {
-            if let Some(host) = host_from_multi_workspace(multi_workspace) {
-                host.update(cx, |host, cx| host.terminate(cx));
-                multi_workspace.set_window_root_host(None, cx);
-            }
-        })
-        .log_err();
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .timer(Duration::from_millis(1))
+            .await;
+        window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                if let Some(host) = host_from_multi_workspace(multi_workspace) {
+                    host.update(cx, |host, cx| host.terminate(cx));
+                    multi_workspace.set_window_root_host(None, cx);
+                }
+            })
+            .log_err();
+    })
+    .detach();
 }
 
 pub fn status_from_app(cx: &mut App) {
     with_active_host(cx, |host, window, cx| host.focus_handle.focus(window, cx));
 }
+
+

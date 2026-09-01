@@ -2214,11 +2214,17 @@ impl Render for MultiWorkspace {
                                 .overflow_hidden()
                                 .when(
                                     self.herdr_visible && self.window_root_host.is_some(),
-                                    |this| this.children(self.window_root_host().cloned()),
+                                    |this| {
+                                        this.debug_selector(|| "herdr-central-content".to_owned())
+                                            .children(self.window_root_host().cloned())
+                                    },
                                 )
                                 .when(
                                     !self.herdr_visible || self.window_root_host.is_none(),
-                                    |this| this.child(self.workspace().clone()),
+                                    |this| {
+                                        this.debug_selector(|| "workspace-central-content".to_owned())
+                                            .child(self.workspace().clone())
+                                    },
                                 ),
                         ),
                 )

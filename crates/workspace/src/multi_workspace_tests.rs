@@ -33,6 +33,16 @@ impl Render for TestWindowRootHost {
             .h(px(100.0))
     }
 }
+
+struct TestHerdrCentralHost;
+
+impl Render for TestHerdrCentralHost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .debug_selector(|| "herdr-central-host".to_owned())
+            .size_full()
+    }
+}
 struct StackedWindowRootHost;
 
 impl Render for StackedWindowRootHost {
@@ -138,11 +148,12 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/root", json!({ "file.txt": "" })).await;
     let project = Project::test(fs, ["/root".as_ref()], cx).await;
+
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
     let (editor_id, host) = multi_workspace.update(cx, |multi_workspace, cx| {
         let editor_id = multi_workspace.workspace().entity_id();
-        let host = cx.new(|_| TestWindowRootHost);
+        let host = cx.new(|_| TestHerdrCentralHost);
         multi_workspace.set_window_root_host(Some(host.clone().into()), cx);
         assert!(!multi_workspace.herdr_visible());
         (editor_id, host)
@@ -156,6 +167,14 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
     );
     cx.run_until_parked();
 
+    let workspace_central_bounds = cx
+        .debug_bounds("workspace-central-content")
+        .expect("the normal Workspace branch should be rendered while HerdR is hidden");
+    assert!(
+        workspace_central_bounds.size.width > px(0.0)
+            && workspace_central_bounds.size.height > px(0.0),
+        "the normal Workspace branch should have central content bounds: {workspace_central_bounds:?}"
+    );
     assert_eq!(
         multi_workspace.read_with(cx, |multi_workspace, _cx| {
             multi_workspace.workspace().entity_id()
@@ -164,9 +183,10 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
         "the normal workspace Entity should remain installed while HerdR is hidden"
     );
     assert!(
-        cx.debug_bounds("test-window-root-host").is_none(),
+        cx.debug_bounds("herdr-central-host").is_none(),
         "the HerdR host should be hidden while HerdR is hidden"
     );
+
     multi_workspace.update(cx, |multi_workspace, cx| {
         multi_workspace.set_herdr_visible(true, cx);
     });
@@ -177,9 +197,23 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
     );
     cx.run_until_parked();
 
+    let herdr_central_bounds = cx
+        .debug_bounds("herdr-central-content")
+        .expect("the HerdR central branch should be rendered while HerdR is visible");
+    let host_bounds = cx
+        .debug_bounds("herdr-central-host")
+        .expect("the visible HerdR host should be rendered");
+    assert_eq!(
+        host_bounds.origin, herdr_central_bounds.origin,
+        "the visible HerdR host should start at the central content origin"
+    );
+    assert_eq!(
+        host_bounds.size, herdr_central_bounds.size,
+        "the visible HerdR host should fill the central content bounds"
+    );
     assert!(
-        cx.debug_bounds("test-window-root-host").is_some(),
-        "the HerdR host should be rendered while HerdR is visible"
+        cx.debug_bounds("workspace-central-content").is_none(),
+        "the normal Workspace branch should be hidden while HerdR is visible"
     );
     assert_eq!(
         multi_workspace.read_with(cx, |multi_workspace, _cx| {
@@ -187,6 +221,45 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
         }),
         editor_id,
         "the normal workspace Entity should remain installed while HerdR is visible"
+    );
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.set_window_root_host(None, cx);
+    });
+    cx.draw(
+        gpui::Point::default(),
+        size(px(900.0), px(700.0)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.run_until_parked();
+
+    let fallback_bounds = cx
+        .debug_bounds("workspace-central-content")
+        .expect("the normal Workspace branch should fall back when the host is unavailable");
+    assert!(
+        fallback_bounds.size.width > px(0.0) && fallback_bounds.size.height > px(0.0),
+        "the Workspace fallback should have central content bounds: {fallback_bounds:?}"
+    );
+    assert!(
+        cx.debug_bounds("herdr-central-host").is_none(),
+        "the HerdR host should be absent when no host is installed"
+    );
+    assert!(
+        cx.debug_bounds("herdr-central-content").is_none(),
+        "the HerdR central branch should be absent when no host is installed"
+    );
+    assert!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            multi_workspace.herdr_visible()
+        }),
+        "visibility remains selected while the Workspace fallback is shown"
+    );
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            multi_workspace.workspace().entity_id()
+        }),
+        editor_id,
+        "the normal workspace Entity should remain installed for the fallback"
     );
 }
 
@@ -201,7 +274,7 @@ async fn test_herdr_visibility_preserves_entities(cx: &mut TestAppContext) {
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
     let (editor, host) = multi_workspace.update(cx, |multi_workspace, cx| {
         let editor = multi_workspace.workspace().clone();
-        let host = cx.new(|_| TestWindowRootHost);
+        let host = cx.new(|_| TestHerdrCentralHost);
         multi_workspace.set_window_root_host(Some(host.clone().into()), cx);
         (editor, host)
     });
@@ -231,7 +304,7 @@ async fn test_herdr_visibility_preserves_entities(cx: &mut TestAppContext) {
             .window_root_host()
             .expect("the HerdR host should remain installed")
             .clone()
-            .downcast::<TestWindowRootHost>()
+            .downcast::<TestHerdrCentralHost>()
             .expect("the installed host should retain its test type");
         assert_eq!(
             stored_host.entity_id(),
