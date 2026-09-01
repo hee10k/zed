@@ -790,6 +790,7 @@ impl Render for HerdRHost {
             .id("herdr-host")
             .track_focus(&self.focus_handle)
             .relative()
+            .flex()
             .flex_col()
             .flex_shrink_0()
             .w_full()
@@ -844,7 +845,8 @@ impl Render for HerdRHost {
                         .id("herdr-terminal")
                         .flex_1()
                         .min_h_0()
-                        .size_full()
+                        .w_full()
+                        .overflow_hidden()
                         .children(terminal)
                         .when(self.terminal_view.is_none(), |this| {
                             this.child("Starting HerdR…")
@@ -944,6 +946,7 @@ fn install_host(
     });
     multi_workspace.set_window_root_host(Some(host.clone().into()), cx);
     host.update(cx, |host, cx| host.start(window, cx));
+    host.update(cx, |host, cx| host.focus_handle.focus(window, cx));
 }
 
 pub fn open_current(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {

@@ -33,6 +33,64 @@ impl Render for TestWindowRootHost {
             .h(px(100.0))
     }
 }
+struct StackedWindowRootHost;
+
+impl Render for StackedWindowRootHost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("stacked-window-root-host")
+            .debug_selector(|| "stacked-window-root-host".to_owned())
+            .flex()
+            .flex_col()
+            .h(px(320.0))
+            .child(
+                div()
+                    .id("stacked-window-root-host-header")
+                    .debug_selector(|| "stacked-window-root-host-header".to_owned())
+                    .h(px(32.0))
+                    .flex_shrink_0(),
+            )
+            .child(
+                div()
+                    .id("stacked-window-root-host-terminal")
+                    .debug_selector(|| "stacked-window-root-host-terminal".to_owned())
+                    .flex_1()
+                    .min_h_0()
+                    .w_full(),
+            )
+    }
+}
+
+#[gpui::test]
+async fn test_stacked_window_root_host_allocates_terminal_space(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "file.txt": "" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        let host = cx.new(|_| StackedWindowRootHost);
+        multi_workspace.set_window_root_host(Some(host.into()), cx);
+    });
+    cx.simulate_resize(size(px(900.0), px(700.0)));
+    cx.draw(
+        gpui::Point::default(),
+        size(px(900.0), px(700.0)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.run_until_parked();
+
+    let header_bounds = cx
+        .debug_bounds("stacked-window-root-host-header")
+        .expect("stacked host header should be rendered");
+    let terminal_bounds = cx
+        .debug_bounds("stacked-window-root-host-terminal")
+        .expect("stacked host terminal should be rendered");
+    assert_eq!(header_bounds.size.height, px(32.0));
+    assert_eq!(terminal_bounds.size.height, px(288.0));
+}
 
 #[gpui::test]
 async fn test_window_root_host_is_laid_out_inside_window(cx: &mut TestAppContext) {
