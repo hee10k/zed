@@ -8013,6 +8013,10 @@ impl Repository {
         .detach();
     }
 
+    pub fn invalidate_graph_data(&mut self) {
+        self.initial_graph_data.clear();
+    }
+
     pub fn graph_data(
         &mut self,
         log_source: LogSource,

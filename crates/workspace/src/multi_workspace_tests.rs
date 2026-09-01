@@ -5,7 +5,10 @@ use crate::item::test::TestItem;
 use agent_settings::AgentSettings;
 use client::proto;
 use fs::{FakeFs, Fs};
-use gpui::{TestAppContext, VisualTestContext};
+use gpui::{
+    AppContext, Context, IntoElement, Render, TestAppContext, VisualTestContext, Window, div, px,
+    size,
+};
 use project::DisableAiSettings;
 use serde_json::json;
 use settings::{Settings, SettingsStore};
@@ -18,6 +21,55 @@ fn init_test(cx: &mut TestAppContext) {
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         DisableAiSettings::register(cx);
     });
+}
+
+struct TestWindowRootHost;
+
+impl Render for TestWindowRootHost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("test-window-root-host")
+            .debug_selector(|| "test-window-root-host".to_owned())
+            .h(px(100.0))
+    }
+}
+
+#[gpui::test]
+async fn test_window_root_host_is_laid_out_inside_window(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "file.txt": "" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        let host = cx.new(|_| TestWindowRootHost);
+        multi_workspace.set_window_root_host(Some(host.into()), cx);
+    });
+    cx.simulate_resize(size(px(900.0), px(700.0)));
+    cx.draw(
+        gpui::Point::default(),
+        size(px(900.0), px(700.0)),
+        |_, _| multi_workspace.clone().into_any_element(),
+    );
+    cx.run_until_parked();
+
+    let host_bounds = cx.debug_bounds("test-window-root-host");
+    let workspace_bounds = cx.debug_bounds("workspace");
+    assert!(
+        host_bounds.is_some(),
+        "window root host should be rendered; workspace={workspace_bounds:?}"
+    );
+    let Some(host_bounds) = host_bounds else {
+        return;
+    };
+    let viewport_size = cx.update(|window, _| window.viewport_size());
+    assert_eq!(host_bounds.size.height, px(100.0));
+    assert!(
+        host_bounds.bottom_left().y <= viewport_size.height,
+        "window root host should remain inside the viewport: {host_bounds:?} vs {viewport_size:?}"
+    );
 }
 
 fn setup_multi_workspace<'a>(

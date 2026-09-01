@@ -1461,6 +1461,13 @@ impl GitGraph {
         cx.notify();
     }
 
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        if let Some(repository) = self.get_repository(cx) {
+            repository.update(cx, |repository, _| repository.invalidate_graph_data());
+        }
+        self.invalidate_state(cx);
+    }
+
     /// Computes the height of a single commit row in the git graph.
     ///
     /// The returned value is snapped to the nearest physical pixel. This is
@@ -3594,7 +3601,7 @@ pub fn worktree_status_detail(summary: GitSummary) -> String {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 // Reload the graph from the live repository snapshot without
                                 // issuing a fetch. The loading spinner reflects in-flight state.
-                                this.invalidate_state(cx);
+                                this.refresh(cx);
                             })),
                     ),
             )
@@ -6614,6 +6621,76 @@ mod tests {
             commit_count_after,
             "initial_graph_data should remain populated after events emitted by initial repository scan"
         );
+    }
+
+    #[gpui::test]
+    async fn test_refresh_reloads_graph_from_repository(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let first_commits = generate_random_commit_dag(&mut StdRng::seed_from_u64(1), 3, false);
+        fs.set_graph_commits(Path::new("/project/.git"), first_commits.clone());
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let first_shas: Vec<_> = first_commits.iter().map(|commit| commit.sha).collect();
+        let loaded_shas = git_graph.update(cx, |graph, _| {
+            graph
+                .initial_commit_data_for_test()
+                .into_iter()
+                .map(|commit| commit.sha)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(loaded_shas, first_shas);
+
+        let second_commits = generate_random_commit_dag(&mut StdRng::seed_from_u64(2), 5, false);
+        fs.set_graph_commits(Path::new("/project/.git"), second_commits.clone());
+        git_graph.update(cx, |graph, cx| {
+            graph.refresh(cx);
+            graph.commit_count_and_loading_state_for_test(cx);
+        });
+        cx.run_until_parked();
+
+        let second_shas: Vec<_> = second_commits.iter().map(|commit| commit.sha).collect();
+        let refreshed_shas = git_graph.update(cx, |graph, _| {
+            graph
+                .initial_commit_data_for_test()
+                .into_iter()
+                .map(|commit| commit.sha)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(refreshed_shas, second_shas);
     }
 
     #[gpui::test]

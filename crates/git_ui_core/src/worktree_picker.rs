@@ -80,13 +80,14 @@ impl WorktreePicker {
             .visible_worktrees(cx)
             .map(|wt| wt.read(cx).abs_path().to_path_buf())
             .collect();
-
         let project_worktree_paths = active_worktree_paths.clone();
 
         let repository_count = project_ref.repositories(cx).len();
         let has_multiple_repositories = repository_count > 1;
         let custom_selection_available = repository_count == 1;
-        let repository = project_ref.active_repository(cx);
+        let repository = project_ref
+            .active_repository(cx)
+            .or_else(|| project_ref.repositories(cx).values().next().cloned());
         let repository_identity_path = repository.as_ref().and_then(|repository| {
             let repository = repository.read(cx);
             repo_identity_path_if_local(&repository.common_dir_abs_path, repository.path_style)

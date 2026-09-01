@@ -2183,11 +2183,20 @@ impl Render for MultiWorkspace {
                 .child(
                     div()
                         .relative()
+                        .flex()
                         .flex_col()
                         .flex_1()
                         .size_full()
                         .overflow_hidden()
-                        .child(self.workspace().clone())
+                        .child(
+                            div()
+                                .relative()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .overflow_hidden()
+                                .child(self.workspace().clone()),
+                        )
                         .children(self.window_root_host().cloned()),
                 )
                 .children(right_sidebar)

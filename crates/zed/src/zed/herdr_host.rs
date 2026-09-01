@@ -978,16 +978,18 @@ pub fn open_new_window(
 ) {
     let fixed_worktree = fixed_worktree_for(workspace, cx);
     let app_state = workspace.app_state().clone();
-    let open_task = Workspace::new_local(
-        vec![fixed_worktree.clone()],
-        app_state,
-        None,
-        None,
-        None,
-        OpenMode::NewWindow,
-        cx,
-    );
     cx.spawn_in(window, async move |_, cx| {
+        let open_task = cx.update(|_, cx| {
+            Workspace::new_local(
+                vec![fixed_worktree.clone()],
+                app_state,
+                None,
+                None,
+                None,
+                OpenMode::NewWindow,
+                cx,
+            )
+        })?;
         let result = open_task.await?;
         result.window.update(cx, |multi_workspace, window, cx| {
             install_host(
