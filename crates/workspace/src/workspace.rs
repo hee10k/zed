@@ -60,7 +60,7 @@ use futures::{
     future::{Shared, try_join_all},
 };
 use gpui::{
-    Action, AnyEntity, AnyView, AnyWeakView, App, AppContext, AsyncApp, AsyncWindowContext, Axis,
+    Action, AnyElement, AnyEntity, AnyView, AnyWeakView, App, AppContext, AsyncApp, AsyncWindowContext, Axis,
     Bounds, ClipboardItem, Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId,
     EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke,
     ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size,
@@ -8604,25 +8604,43 @@ impl Workspace {
     /// or intercepts mouse focus for other users.
     fn render_center(
         &self,
+        center_override: Option<AnyView>,
         render_cx: &PaneRenderContext,
         window: &mut Window,
         cx: &mut App,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
+        let herdr_visible = center_override.is_some();
+        let center = center_override
+            .map(|view| view.into_any_element())
+            .unwrap_or_else(|| {
+                self.center
+                    .render(
+                        self.zoomed.as_ref(),
+                        self.maximized_pane.as_ref(),
+                        render_cx,
+                        window,
+                        cx,
+                    )
+                    .into_any_element()
+            });
+
         div()
             .id("editor-region")
+            .debug_selector(move || {
+                if herdr_visible {
+                    "herdr-central-content".to_owned()
+                } else {
+                    "workspace-central-content".to_owned()
+                }
+            })
             .role(gpui::Role::Main)
             .aria_label("Editor")
             .when(window.is_a11y_active(), |this| {
                 this.track_focus(&self.region_focus_handles.editor)
             })
             .size_full()
-            .child(self.center.render(
-                self.zoomed.as_ref(),
-                self.maximized_pane.as_ref(),
-                render_cx,
-                window,
-                cx,
-            ))
+            .child(center)
+            .into_any_element()
     }
 
     pub fn for_window(window: &Window, cx: &App) -> Option<Entity<Workspace>> {
@@ -9293,6 +9311,15 @@ impl Render for Workspace {
         } else {
             (None, None)
         };
+        let center_override = self.multi_workspace.as_ref().and_then(|multi_workspace| {
+            let multi_workspace = multi_workspace.upgrade()?;
+            multi_workspace.read_with(cx, |multi_workspace, _| {
+                multi_workspace
+                    .herdr_visible()
+                    .then(|| multi_workspace.window_root_host().cloned())
+                    .flatten()
+            })
+        });
         let ui_font = theme_settings::setup_ui_font(window, cx);
 
         let theme = cx.theme().clone();
@@ -9496,6 +9523,7 @@ impl Render for Workspace {
                                                                     this.child(p.border_r_1())
                                                                 })
                                                                 .child(self.render_center(
+                                                                    center_override.clone(),
                                                                     &pane_render_context,
                                                                     window,
                                                                     cx,
@@ -9561,6 +9589,7 @@ impl Render for Workspace {
                                                                             },
                                                                         )
                                                                         .child(self.render_center(
+                                                                            center_override.clone(),
                                                                             &pane_render_context,
                                                                             window,
                                                                             cx,
@@ -9628,6 +9657,7 @@ impl Render for Workspace {
                                                                             },
                                                                         )
                                                                         .child(self.render_center(
+                                                                            center_override.clone(),
                                                                             &pane_render_context,
                                                                             window,
                                                                             cx,
@@ -9679,6 +9709,7 @@ impl Render for Workspace {
                                                             this.child(p.border_r_1())
                                                         })
                                                         .child(self.render_center(
+                                                            center_override.clone(),
                                                             &pane_render_context,
                                                             window,
                                                             cx,

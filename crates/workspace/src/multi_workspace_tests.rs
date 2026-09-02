@@ -6,7 +6,7 @@ use agent_settings::AgentSettings;
 use client::proto;
 use fs::{FakeFs, Fs};
 use gpui::{
-    AppContext, Context, EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Render,
+    App, AppContext, Context, EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Render,
     TestAppContext, VisualTestContext, Window, div, px,
     size,
 };
@@ -109,6 +109,157 @@ impl Render for TestWideHerdrCentralHost {
             .child(div().w(px(800.0)).h(px(32.0)))
     }
 }
+
+struct ProbeDockPanel {
+    position: DockPosition,
+    focus_handle: FocusHandle,
+}
+
+actions!(test_only, [ToggleProbeDockPanel]);
+
+impl ProbeDockPanel {
+    fn new(position: DockPosition, cx: &mut App) -> Self {
+        Self {
+            position,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
+impl EventEmitter<crate::dock::PanelEvent> for ProbeDockPanel {}
+
+impl Focusable for ProbeDockPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for ProbeDockPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let selector = match self.position {
+            DockPosition::Left => "probe-left-dock-panel",
+            DockPosition::Right => "probe-right-dock-panel",
+            DockPosition::Bottom => "probe-bottom-dock-panel",
+        };
+        div()
+            .id(selector)
+            .debug_selector(|| selector.to_owned())
+            .track_focus(&self.focus_handle(cx))
+            .size_full()
+    }
+}
+
+impl Panel for ProbeDockPanel {
+    fn persistent_name() -> &'static str {
+        "ProbeDockPanel"
+    }
+
+    fn panel_key() -> &'static str {
+        "ProbeDockPanel"
+    }
+
+    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
+        self.position
+    }
+
+    fn position_is_valid(&self, _position: DockPosition) -> bool {
+        true
+    }
+
+    fn set_position(&mut self, position: DockPosition, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.position = position;
+    }
+
+    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
+        px(100.0)
+    }
+
+    fn icon(&self, _window: &Window, _cx: &App) -> Option<ui::IconName> {
+        None
+    }
+
+    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+        None
+    }
+
+    fn toggle_action(&self) -> Box<dyn gpui::Action> {
+        ToggleProbeDockPanel.boxed_clone()
+    }
+    fn activation_priority(&self) -> u32 {
+        match self.position {
+            DockPosition::Left => 10,
+            DockPosition::Right => 20,
+            DockPosition::Bottom => 30,
+        }
+    }
+}
+
+#[gpui::test]
+async fn test_herdr_central_view_preserves_workspace_docks(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root", json!({ "file.txt": "" })).await;
+    let project = Project::test(fs, ["/root".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let (left, right, bottom, host) = cx.update(|_, cx| {
+        (
+            cx.new(|cx| ProbeDockPanel::new(DockPosition::Left, cx)),
+            cx.new(|cx| ProbeDockPanel::new(DockPosition::Right, cx)),
+            cx.new(|cx| ProbeDockPanel::new(DockPosition::Bottom, cx)),
+            cx.new(|_| TestHerdrCentralHost { collapsed: false }),
+        )
+    });
+    let editor_id = multi_workspace.read_with(cx, |multi_workspace, _| {
+        multi_workspace.workspace().entity_id()
+    });
+    let editor = multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    editor.update_in(cx, |workspace, window, cx| {
+        workspace.add_panel(left.clone(), window, cx);
+        workspace.add_panel(right.clone(), window, cx);
+        workspace.add_panel(bottom.clone(), window, cx);
+        for position in [DockPosition::Left, DockPosition::Right, DockPosition::Bottom] {
+            let dock = workspace.dock_at_position(position).clone();
+            dock.update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.set_open(true, window, cx);
+            });
+        }
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.set_window_root_host(Some(host.clone().into()), cx);
+    });
+    cx.run_until_parked();
+    let ids = (left.entity_id(), right.entity_id(), bottom.entity_id(), host.entity_id());
+    cx.simulate_resize(size(px(900.0), px(700.0)));
+    for visible in [false, true] {
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.set_herdr_visible(visible, cx)
+        });
+        let window = cx.windows().into_iter().next().expect("test window");
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        for selector in [
+            "probe-left-dock-panel",
+            "probe-right-dock-panel",
+            "probe-bottom-dock-panel",
+        ] {
+            let bounds = cx.debug_bounds(selector).expect("dock probe should render");
+            assert!(bounds.size.width > px(0.0) && bounds.size.height > px(0.0));
+        }
+        if visible {
+            let host_bounds = cx.debug_bounds("herdr-central-host").expect("HerdR host");
+            let central_bounds = cx.debug_bounds("herdr-central-content").expect("HerdR center");
+            assert_eq!(host_bounds.origin, central_bounds.origin);
+            assert_eq!(host_bounds.size, central_bounds.size);
+        }
+    }
+    assert_eq!(editor_id, multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().entity_id()));
+    assert_eq!(ids, (left.entity_id(), right.entity_id(), bottom.entity_id(), host.entity_id()));
+}
+
 
 #[gpui::test]
 async fn test_right_sidebar_stays_inside_narrow_viewport(cx: &mut TestAppContext) {

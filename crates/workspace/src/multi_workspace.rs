@@ -2206,32 +2206,7 @@ impl Render for MultiWorkspace {
                         .min_w_0()
                         .size_full()
                         .overflow_hidden()
-                        .child(
-                            div()
-                                .id("herdr-central-content")
-                                .relative()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_h_0()
-                                .min_w_0()
-                                .w_full()
-                                .overflow_hidden()
-                                .when(
-                                    self.herdr_visible && self.window_root_host.is_some(),
-                                    |this| {
-                                        this.debug_selector(|| "herdr-central-content".to_owned())
-                                            .children(self.window_root_host().cloned())
-                                    },
-                                )
-                                .when(
-                                    !self.herdr_visible || self.window_root_host.is_none(),
-                                    |this| {
-                                        this.debug_selector(|| "workspace-central-content".to_owned())
-                                            .child(self.workspace().clone())
-                                    },
-                                ),
-                        )
+                        .child(self.workspace().clone())
                         .when(self.workspace().read(cx).status_bar_visible(cx), |this| {
                             this.child(self.workspace().read(cx).status_bar().clone())
                         }),
