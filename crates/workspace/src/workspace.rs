@@ -8638,6 +8638,8 @@ impl Workspace {
             .when(window.is_a11y_active(), |this| {
                 this.track_focus(&self.region_focus_handles.editor)
             })
+            .flex()
+            .flex_col()
             .size_full()
             .child(center)
             .into_any_element()

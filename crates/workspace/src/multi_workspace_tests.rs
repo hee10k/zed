@@ -236,8 +236,8 @@ async fn test_herdr_central_view_preserves_workspace_docks(cx: &mut TestAppConte
         multi_workspace.update(cx, |multi_workspace, cx| {
             multi_workspace.set_herdr_visible(visible, cx)
         });
-        let window = cx.windows().into_iter().next().expect("test window");
-        cx.update_window(window, |_, window, cx| {
+        cx.update(|window, cx| {
+            window.refresh();
             window.draw(cx).clear(cx);
         });
         cx.run_until_parked();
