@@ -992,6 +992,7 @@ fn install_host(
         log::info!("HerdR session is already hosted by another Zed window");
         return;
     }
+    log::info!("HerdR host claimed session {session_endpoint:?} for window {session_owner}");
     let weak_multi_workspace = cx.weak_entity();
     let host = cx.new(|cx| {
         HerdRHost::new(
@@ -1061,6 +1062,7 @@ pub fn open_new_window(
 ) {
     let fixed_worktree = fixed_worktree_for(workspace, cx);
     let app_state = workspace.app_state().clone();
+    let previous_window = window.window_handle().downcast::<MultiWorkspace>();
     cx.spawn_in(window, async move |_, cx| {
         let open_task = cx.update(|_, cx| {
             Workspace::new_local(
@@ -1075,13 +1077,29 @@ pub fn open_new_window(
         })?;
         let result = open_task.await?;
         result.window.update(cx, |multi_workspace, window, cx| {
+            // A HerdR session can only be hosted by one window at a time, so
+            // hand ownership over from the previous window. Without this the
+            // claim inside install_host fails silently and the new window
+            // opens without HerdR.
+            if let Some(previous_window) = previous_window {
+                previous_window
+                    .update(cx, |previous, _, cx| {
+                        let Some(host) = host_from_multi_workspace(previous) else {
+                            return;
+                        };
+                        host.update(cx, |host, cx| host.terminate(cx));
+                        previous.set_window_root_host(None, cx);
+                        previous.set_herdr_visible(false, cx);
+                    })
+                    .log_err();
+            }
             install_host(
                 multi_workspace,
                 result.workspace,
                 fixed_worktree,
                 window,
                 cx,
-            )
+            );
         })?;
         anyhow::Ok(())
     })
@@ -1092,6 +1110,7 @@ pub fn open_new_window_from_app(cx: &mut App) {
         open_new_window(workspace, window, cx);
     });
 }
+
 fn with_active_multi_workspace(
     cx: &mut App,
     update: impl FnOnce(
