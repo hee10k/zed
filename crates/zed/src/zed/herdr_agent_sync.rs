@@ -396,6 +396,35 @@ mod tests {
     }
 
     #[test]
+    fn false_to_true_focus_transition_emits_focus() {
+        let mut state = AgentSyncState::default();
+        let identity = session("main");
+        let key = AgentKey::new(identity.clone(), "terminal-1");
+        assert!(matches!(
+            state.upsert(identity.clone(), pane("terminal-1", "pane-a", 1)).as_slice(),
+            [AgentSyncEffect::Open(_)]
+        ));
+
+        // A false→true transition at a newer revision emits exactly Focus.
+        let mut focused = pane("terminal-1", "pane-a", 2);
+        focused.focused = true;
+        assert!(matches!(
+            state.upsert(identity.clone(), focused).as_slice(),
+            [AgentSyncEffect::Focus(emitted)] if emitted == &key
+        ));
+
+        // A remaining true→true re-update at a newer revision emits nothing.
+        let mut still_focused = pane("terminal-1", "pane-a", 3);
+        still_focused.focused = true;
+        assert!(state.upsert(identity.clone(), still_focused).is_empty());
+
+        // Returning to false at a newer revision also never emits Focus.
+        let mut unfocused = pane("terminal-1", "pane-a", 4);
+        unfocused.focused = false;
+        assert!(state.upsert(identity, unfocused).is_empty());
+    }
+
+    #[test]
     fn dismissed_terminal_stays_closed_until_resync() {
         let mut state = AgentSyncState::default();
         let key = AgentKey::new(session("main"), "terminal-1");
