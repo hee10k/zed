@@ -3128,7 +3128,8 @@ impl ConversationView {
                         }
                         AgentPanelEvent::EntryChanged
                         | AgentPanelEvent::TerminalCloseRequested { .. }
-                        | AgentPanelEvent::ThreadInteracted { .. } => {}
+                        | AgentPanelEvent::ThreadInteracted { .. }
+                        | AgentPanelEvent::ExternalTerminalSpawnFinished { .. } => {}
                     },
                 ));
             }

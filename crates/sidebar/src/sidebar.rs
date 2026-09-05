@@ -1224,6 +1224,9 @@ impl Sidebar {
                     this.record_thread_interacted(thread_id, cx);
                     this.schedule_update_entries(false, cx);
                 }
+                // Spawn outcomes for external mirror terminals have no sidebar
+                // behavior; the herdr registry observes them directly.
+                AgentPanelEvent::ExternalTerminalSpawnFinished { .. } => {}
             },
         )
         .detach();

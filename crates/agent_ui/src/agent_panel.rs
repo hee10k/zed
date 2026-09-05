@@ -87,6 +87,7 @@ use settings::TerminalDockPosition;
 use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
+use task::{RevealStrategy, RevealTarget, Shell, SpawnInTerminal, TaskId};
 use terminal::{Event as TerminalEvent, terminal_settings::TerminalSettings};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use text::OffsetRangeExt;
@@ -986,6 +987,24 @@ pub struct CreateThreadOptions {
     pub work_dirs: Option<PathList>,
 }
 
+/// Structured input for opening an Agent Panel terminal thread spawned from
+/// outside the panel (e.g. a herdr agent mirror). The identity is the stable
+/// key the panel uses to deduplicate opens and to look the terminal up later;
+/// repeated opens with the same identity activate the existing terminal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalTerminalThread {
+    /// Stable identity shared by every open of the same external thread.
+    pub identity: SharedString,
+    /// Executable to spawn.
+    pub executable: String,
+    /// Arguments passed to the executable.
+    pub args: Vec<String>,
+    /// Title of the terminal thread's tab.
+    pub title: SharedString,
+    /// Directory the executable runs in.
+    pub working_directory: PathBuf,
+}
+
 pub(crate) struct AgentThread {
     conversation_view: Entity<ConversationView>,
 }
@@ -1000,6 +1019,13 @@ struct AgentTerminal {
     last_observed_program: Option<String>,
     working_directory: Option<PathBuf>,
     created_at: DateTime<Utc>,
+    /// Whether this terminal is persisted to the terminal metadata store and
+    /// eligible to become the restore target on reload. External mirror
+    /// terminals are transient and set this to `false`.
+    persistent: bool,
+    /// Stable external identity (e.g. a herdr mirror key) when this terminal
+    /// was spawned by `open_external_terminal_thread`.
+    external_identity: Option<SharedString>,
     has_notification: bool,
     search_bar: Option<Entity<BufferSearchBar>>,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
@@ -1168,6 +1194,10 @@ pub struct AgentPanel {
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
+    /// Stable external identity -> terminal id for terminals spawned via
+    /// `open_external_terminal_thread`. Removed on close so a concurrently
+    /// completing spawn cannot re-insert a closed terminal.
+    external_terminals: HashMap<SharedString, TerminalId>,
     pending_terminal_spawn: Option<TerminalId>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_panel_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1200,6 +1230,11 @@ impl AgentPanel {
         let last_created_entry_kind = self.last_created_entry_kind;
         let last_active_terminal_id = self
             .active_terminal_id()
+            .filter(|terminal_id| {
+                self.terminals
+                    .get(terminal_id)
+                    .is_some_and(|terminal| terminal.persistent)
+            })
             .map(|terminal_id| terminal_id.to_key_string());
 
         let last_active_thread = if last_active_terminal_id.is_some() {
@@ -1581,6 +1616,7 @@ impl AgentPanel {
             persist_selected_agent_task: Task::ready(()),
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
+            external_terminals: HashMap::default(),
             pending_terminal_spawn: None,
             new_thread_menu_handle: PopoverMenuHandle::default(),
             agent_panel_menu_handle: PopoverMenuHandle::default(),
@@ -2079,8 +2115,6 @@ impl AgentPanel {
             project.create_terminal_shell(working_directory, cx)
         });
         let workspace = self.workspace.clone();
-        let workspace_id = self.workspace_id;
-        let project = self.project.downgrade();
 
         cx.spawn_in(window, async move |this, cx| {
             let terminal = match terminal_task.await {
@@ -2101,27 +2135,22 @@ impl AgentPanel {
                 }
             };
             this.update_in(cx, |this, window, cx| {
-                let terminal_for_init_command = terminal.clone();
-                let terminal_view = cx.new(|cx| {
-                    let mut view =
-                        TerminalView::new(terminal, workspace, workspace_id, project, window, cx);
-                    view.set_show_workspace_actions(false, cx);
-                    view
-                });
-                this.insert_terminal(
+                this.complete_terminal_spawn(
+                    terminal,
                     terminal_id,
-                    terminal_view,
                     terminal_working_directory,
                     custom_title,
                     initial_title,
                     created_at,
                     select,
                     focus,
+                    true,
+                    None,
+                    init_command,
                     source,
                     window,
                     cx,
                 );
-                Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
             })?;
             anyhow::Ok(())
         })
@@ -2201,6 +2230,8 @@ impl AgentPanel {
         created_at: Option<DateTime<Utc>>,
         select: bool,
         focus: bool,
+        persistent: bool,
+        external_identity: Option<SharedString>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2256,6 +2287,8 @@ impl AgentPanel {
             last_observed_program: None,
             working_directory,
             created_at: created_at.unwrap_or_else(Utc::now),
+            persistent,
+            external_identity,
             has_notification: false,
             search_bar: None,
             notification_windows: Vec::new(),
@@ -2274,6 +2307,192 @@ impl AgentPanel {
             self.set_base_view(BaseView::Terminal { terminal_id }, focus, window, cx);
         }
         cx.emit(AgentPanelEvent::EntryChanged);
+        cx.notify();
+    }
+
+    /// Shared completion path for async terminal spawns: wraps the spawned
+    /// `Terminal` in a `TerminalView`, registers it with `insert_terminal`,
+    /// and writes any init command. Used by both ordinary shell spawns and
+    /// external mirror spawns so subscriptions and insertion behave the same.
+    fn complete_terminal_spawn(
+        &mut self,
+        terminal: Entity<terminal::Terminal>,
+        terminal_id: TerminalId,
+        working_directory: Option<PathBuf>,
+        custom_title: Option<SharedString>,
+        initial_title: Option<SharedString>,
+        created_at: Option<DateTime<Utc>>,
+        select: bool,
+        focus: bool,
+        persistent: bool,
+        external_identity: Option<SharedString>,
+        init_command: Option<String>,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal_for_init_command = terminal.clone();
+        let terminal_view = cx.new(|cx| {
+            let mut view = TerminalView::new(
+                terminal,
+                self.workspace.clone(),
+                self.workspace_id,
+                self.project.downgrade(),
+                window,
+                cx,
+            );
+            view.set_show_workspace_actions(false, cx);
+            view
+        });
+        self.insert_terminal(
+            terminal_id,
+            terminal_view,
+            working_directory,
+            custom_title,
+            initial_title,
+            created_at,
+            select,
+            focus,
+            persistent,
+            external_identity,
+            source,
+            window,
+            cx,
+        );
+        Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
+    }
+
+    /// Opens (or activates) an Agent Panel terminal thread spawned from
+    /// outside the panel, e.g. a herdr agent mirror. The identity is reserved
+    /// synchronously so repeated calls with the same identity never spawn a
+    /// second terminal; they activate the existing one instead.
+    pub fn open_external_terminal_thread(
+        &mut self,
+        spec: ExternalTerminalThread,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TerminalId {
+        if let Some(terminal_id) = self.external_terminals.get(&spec.identity).copied() {
+            self.activate_terminal(terminal_id, focus, window, cx);
+            return terminal_id;
+        }
+
+        let terminal_id = TerminalId::new();
+        self.external_terminals
+            .insert(spec.identity.clone(), terminal_id);
+        self.spawn_external_terminal(terminal_id, spec, focus, window, cx);
+        terminal_id
+    }
+
+    fn spawn_external_terminal(
+        &mut self,
+        terminal_id: TerminalId,
+        spec: ExternalTerminalThread,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let spawn = SpawnInTerminal {
+            id: TaskId(format!("agent-panel-external:{}", spec.identity)),
+            full_label: spec.title.to_string(),
+            label: spec.title.to_string(),
+            command: Some(spec.executable),
+            args: spec.args,
+            command_label: spec.title.to_string(),
+            cwd: Some(spec.working_directory.clone()),
+            use_new_terminal: true,
+            allow_concurrent_runs: true,
+            reveal: RevealStrategy::Never,
+            reveal_target: RevealTarget::Dock,
+            shell: Shell::System,
+            show_command: false,
+            show_summary: false,
+            ..Default::default()
+        };
+        let terminal_task = self.project.update(cx, |project, cx| {
+            project.create_terminal_task(spawn, cx)
+        });
+        let workspace = self.workspace.clone();
+        let identity = spec.identity.clone();
+        let working_directory = Some(spec.working_directory);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let terminal = match terminal_task.await {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    log::error!("failed to spawn agent panel terminal: {error:#}");
+                    this.update(cx, |this, cx| {
+                        // Release the reserved identity and report the outcome
+                        // before surfacing the workspace error, so the registry
+                        // never sees a reserved-but-dead terminal.
+                        this.external_terminals.remove(&identity);
+                        cx.emit(AgentPanelEvent::ExternalTerminalSpawnFinished {
+                            identity: identity.clone(),
+                            message: Some(format!("{error:#}").into()),
+                        });
+                        cx.notify();
+                    })
+                    .log_err();
+                    workspace
+                        .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                        .log_err();
+                    return anyhow::Ok(());
+                }
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.finish_external_terminal_spawn(
+                    terminal_id,
+                    identity,
+                    terminal,
+                    working_directory,
+                    focus,
+                    window,
+                    cx,
+                );
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Applies a successful external terminal spawn. The terminal is inserted
+    /// only while `external_terminals` still maps the identity to this
+    /// `TerminalId`; a close that raced the async spawn removed the entry, so
+    /// the completion must not resurrect the terminal. The spawn outcome is
+    /// still reported so the registry can clear any per-attempt state.
+    fn finish_external_terminal_spawn(
+        &mut self,
+        terminal_id: TerminalId,
+        identity: SharedString,
+        terminal: Entity<terminal::Terminal>,
+        working_directory: Option<PathBuf>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.external_terminals.get(&identity) == Some(&terminal_id) {
+            self.complete_terminal_spawn(
+                terminal,
+                terminal_id,
+                working_directory,
+                None,
+                None,
+                None,
+                true,
+                focus,
+                false,
+                Some(identity.clone()),
+                None,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+        }
+        cx.emit(AgentPanelEvent::ExternalTerminalSpawnFinished {
+            identity,
+            message: None,
+        });
         cx.notify();
     }
 
@@ -2330,6 +2549,8 @@ impl AgentPanel {
             self.pending_terminal_spawn = None;
         }
         self.dismiss_terminal_notifications(terminal_id, cx);
+        self.external_terminals
+            .retain(|_, indexed_terminal_id| *indexed_terminal_id != terminal_id);
         if self.terminals.remove(&terminal_id).is_none() {
             return;
         }
@@ -2348,6 +2569,34 @@ impl AgentPanel {
 
         cx.emit(AgentPanelEvent::EntryChanged);
         cx.notify();
+    }
+
+    /// Returns the stable external identity (e.g. a herdr mirror key) of the
+    /// given terminal, or `None` when it is not an external terminal thread.
+    pub fn external_terminal_identity(&self, terminal_id: TerminalId) -> Option<&str> {
+        self.terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.external_identity.as_deref())
+    }
+
+    /// Detaches an external terminal thread locally: removes the identity
+    /// mapping and closes the terminal. Never invokes herdr or any remote
+    /// agent stop path. Returns `false` when the identity is unknown.
+    ///
+    /// The index entry is removed before delegating to
+    /// `close_terminal_internal`, so a concurrently completing spawn cannot
+    /// re-insert the terminal and a second close returns `false`.
+    pub fn close_external_terminal_thread(
+        &mut self,
+        identity: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(terminal_id) = self.external_terminals.remove(&identity) else {
+            return false;
+        };
+        self.close_terminal_internal(terminal_id, true, window, cx);
+        true
     }
 
     fn request_close_terminal_from_terminal_event(
@@ -2408,6 +2657,14 @@ impl AgentPanel {
         let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
             return;
         };
+        let Some(terminal) = self.terminals.get(&terminal_id) else {
+            return;
+        };
+        // External mirror terminals are transient: never write metadata for
+        // them, so they can never become a restore target on reload.
+        if !terminal.persistent {
+            return;
+        }
         let Some(metadata) = self.terminal_metadata(terminal_id, cx) else {
             return;
         };
@@ -2798,7 +3055,8 @@ impl AgentPanel {
                 }
                 AgentPanelEvent::EntryChanged
                 | AgentPanelEvent::TerminalCloseRequested { .. }
-                | AgentPanelEvent::ThreadInteracted { .. } => {}
+                | AgentPanelEvent::ThreadInteracted { .. }
+                | AgentPanelEvent::ExternalTerminalSpawnFinished { .. } => {}
             }
         });
 
@@ -4992,6 +5250,14 @@ pub enum AgentPanelEvent {
     EntryChanged,
     TerminalCloseRequested { metadata: TerminalThreadMetadata },
     ThreadInteracted { thread_id: ThreadId },
+    /// Spawn outcome of an external terminal thread, one per spawn attempt.
+    /// `message: None` reports a successful spawn; `Some` carries the spawn
+    /// error. Consumers distinguish mirror spawns by reading
+    /// `AgentPanel::external_terminal_identity`.
+    ExternalTerminalSpawnFinished {
+        identity: SharedString,
+        message: Option<SharedString>,
+    },
 }
 
 impl EventEmitter<PanelEvent> for AgentPanel {}
@@ -6840,6 +7106,8 @@ impl AgentPanel {
             created_at,
             select,
             focus,
+            true,
+            None,
             source,
             window,
             cx,
@@ -9366,6 +9634,231 @@ mod tests {
         // Lines are 1-based and inclusive; the path is presented as
         // `<rel-path>:<start>-<end>`, with a trailing space.
         assert_eq!(pasted, "file.rs:2-3 ");
+    }
+
+    fn test_external_terminal(identity: &str) -> ExternalTerminalThread {
+        ExternalTerminalThread {
+            identity: identity.into(),
+            executable: std::env::current_exe()
+                .expect("test executable")
+                .to_string_lossy()
+                .into_owned(),
+            args: vec!["--help".into()],
+            title: "herdr · claude".into(),
+            working_directory: std::env::temp_dir(),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_external_terminal_thread_reuses_stable_identity(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.executor().allow_parking();
+        let (first, second) = panel.update_in(&mut cx, |panel, window, cx| {
+            let first = panel.open_external_terminal_thread(
+                test_external_terminal("session-a:terminal-1"),
+                true,
+                window,
+                cx,
+            );
+            let second = panel.open_external_terminal_thread(
+                test_external_terminal("session-a:terminal-1"),
+                true,
+                window,
+                cx,
+            );
+            (first, second)
+        });
+        assert_eq!(first, second);
+    }
+
+    #[gpui::test]
+    async fn test_external_terminal_thread_not_restored_on_reload(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            TerminalThreadMetadataStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        // The panel captures the workspace id at construction; set it before
+        // creating the panel so `serialize` can write the panel state.
+        workspace.update(cx, |workspace, _cx| {
+            workspace.set_random_database_id();
+        });
+
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            cx.new(|cx| AgentPanel::new(workspace, window, cx))
+        });
+
+        let terminal_id = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_external_terminal_thread(
+                test_external_terminal("session-a:terminal-1"),
+                true,
+                window,
+                cx,
+            )
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel.external_terminal_identity(terminal_id),
+                Some("session-a:terminal-1"),
+                "the spawned external terminal should be tracked under its identity"
+            );
+        });
+
+        panel.update(&mut cx, |panel, cx| panel.serialize(cx));
+        cx.run_until_parked();
+
+        let workspace_id = workspace
+            .read_with(&cx, |workspace, _cx| workspace.database_id())
+            .expect("workspace should have a database id");
+        let kvp = cx.update(|_window, cx| KeyValueStore::global(cx));
+        let serialized: SerializedAgentPanel = cx
+            .background_spawn(async move { read_serialized_panel(workspace_id, &kvp) })
+            .await
+            .expect("workspace should serialize panel state");
+        assert_eq!(
+            serialized.last_active_terminal_id, None,
+            "a non-persistent external terminal must not become the restore target"
+        );
+
+        let async_cx = cx.update(|window, cx| window.to_async(cx));
+        let loaded = AgentPanel::load(workspace.downgrade(), async_cx)
+            .await
+            .expect("panel load should succeed");
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        loaded.read_with(&cx, |panel, cx| {
+            assert!(
+                panel.terminals(cx).is_empty(),
+                "external mirror terminals must not be restored after reload"
+            );
+            assert_eq!(
+                panel.active_terminal_id(),
+                None,
+                "the external terminal must not be reactivated after reload"
+            );
+            assert_eq!(
+                panel.external_terminal_identity(terminal_id),
+                None,
+                "the original terminal id must not carry an external identity after reload"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_terminal_thread_explicit_close(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.executor().allow_parking();
+
+        let terminal_id = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_external_terminal_thread(
+                test_external_terminal("session-a:terminal-1"),
+                true,
+                window,
+                cx,
+            )
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel.external_terminal_identity(terminal_id),
+                Some("session-a:terminal-1"),
+                "external terminal should be tracked before closing"
+            );
+        });
+
+        let closed = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_external_terminal_thread("session-a:terminal-1".into(), window, cx)
+        });
+        assert!(
+            closed,
+            "closing a live external terminal should return true"
+        );
+
+        let closed_again = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_external_terminal_thread("session-a:terminal-1".into(), window, cx)
+        });
+        assert!(
+            !closed_again,
+            "closing a detached external terminal identity should return false"
+        );
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel.external_terminal_identity(terminal_id),
+                None,
+                "the closed terminal must have no external identity"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_terminal_thread_close_during_spawn(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.executor().allow_parking();
+
+        let terminal_id = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_external_terminal_thread(
+                test_external_terminal("session-a:terminal-1"),
+                true,
+                window,
+                cx,
+            )
+        });
+
+        // Close before the async spawn can settle: the reserved identity must
+        // be released so the spawn completion cannot resurrect the terminal.
+        let closed = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_external_terminal_thread("session-a:terminal-1".into(), window, cx)
+        });
+        assert!(
+            closed,
+            "closing a reserved-but-unspawned terminal should return true"
+        );
+
+        // Run the executor until the spawn completes.
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(
+                panel.external_terminal_identity(terminal_id),
+                None,
+                "a closed external terminal must never be resurrected by its spawn"
+            );
+            assert!(
+                !panel
+                    .terminals(cx)
+                    .into_iter()
+                    .any(|terminal| terminal.id == terminal_id),
+                "the closed terminal must not be re-inserted when its spawn completes"
+            );
+        });
     }
 
     async fn setup_panel(cx: &mut TestAppContext) -> (Entity<AgentPanel>, VisualTestContext) {
