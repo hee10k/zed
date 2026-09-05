@@ -37,53 +37,8 @@ impl Endpoint {
         Self::Namespaced(name.into())
     }
 
-    pub fn session(name: impl AsRef<str>) -> Self {
-        let name = name.as_ref();
-        #[cfg(windows)]
-        {
-            return Self::Filesystem(session_socket_path(name));
-        }
-        #[cfg(not(windows))]
-        Self::Filesystem(session_socket_path(name))
-    }
 
-    pub fn from_environment() -> Self {
-        if let Some(path) = std::env::var_os("HERDR_SOCKET_PATH") {
-            if !path.is_empty() {
-                return Self::Filesystem(PathBuf::from(path));
-            }
-        }
-        if let Ok(name) = std::env::var("HERDR_SESSION") {
-            let name = name.trim();
-            if !name.is_empty() {
-                return Self::session(name);
-            }
-        }
-        Self::session("default")
-    }
 }
-
-fn session_socket_path(name: &str) -> PathBuf {
-    let config_directory = dirs::home_dir()
-        .map(|path| path.join(".config"))
-        .or_else(dirs::config_dir)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|path| path.join(".config"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    let herdr_directory = config_directory.join("herdr");
-    if name == "default" {
-        herdr_directory.join("herdr.sock")
-    } else {
-        herdr_directory
-            .join("sessions")
-            .join(name)
-            .join("herdr.sock")
-    }
-}
-
 /// `herdr session list --json` result: the authoritative session catalog.
 /// Endpoint paths come from here; the UI never guesses the config layout.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -125,11 +80,6 @@ impl ClientConfig {
     }
 }
 
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self::new(Endpoint::from_environment())
-    }
-}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -1108,15 +1058,6 @@ mod tests {
         let path =
             canonical_checkout_path(Path::new("/repo/./worktree/../main/")).expect("absolute path");
         assert_eq!(path.as_str(), "/repo/main");
-    }
-    #[test]
-    fn resolves_named_session_socket_in_herdr_config_layout() {
-        let endpoint = Endpoint::session("named");
-        if let Endpoint::Filesystem(path) = endpoint {
-            assert!(path.ends_with(Path::new(".config/herdr/sessions/named/herdr.sock")));
-        } else {
-            assert!(false, "session endpoints must use filesystem paths");
-        }
     }
 
     #[test]
