@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result};
 use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
-    Addon, Editor, EditorEvent, EditorSettings, MultiBuffer, RestoreOnlyDiffHunkDelegate,
+    Addon, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer,
     SplittableEditor, hover_markdown_style, multibuffer_context_lines,
 };
 use futures_lite::future::yield_now;
@@ -437,7 +437,7 @@ impl CommitView {
                 window,
                 cx,
             );
-            editor.set_diff_hunk_delegate(Some(Arc::new(RestoreOnlyDiffHunkDelegate)), cx);
+            editor.set_diff_hunk_renderer(Some(Arc::new(HiddenDiffHunkRenderer)), cx);
 
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_show_bookmarks(false, cx);
@@ -528,7 +528,6 @@ impl CommitView {
                                 &snapshot,
                                 snapshot.language().cloned(),
                                 Some(language_registry.clone()),
-                                buffer_diff::DiffBaseKind::Oid,
                                 cx,
                             )
                         })
@@ -1267,7 +1266,7 @@ pub(crate) async fn build_buffer(
             line_ending,
             text,
         );
-        let mut buffer = Buffer::build(buffer, Some(blob), Capability::ReadWrite);
+        let mut buffer = Buffer::build(buffer, Some(blob), Capability::ReadWrite, cx);
         buffer.set_language_async(language, cx);
         buffer
     });
@@ -1287,15 +1286,8 @@ async fn build_buffer_diff(
     let language = cx.update(|_, cx| buffer.read(cx).language().cloned())?;
     let buffer = cx.update(|_, cx| buffer.read(cx).snapshot())?;
 
-    let diff = cx.new(|cx| {
-        BufferDiff::new(
-            &buffer.text,
-            language,
-            Some(language_registry.clone()),
-            buffer_diff::DiffBaseKind::Oid,
-            cx,
-        )
-    });
+    let diff =
+        cx.new(|cx| BufferDiff::new(&buffer.text, language, Some(language_registry.clone()), cx));
 
     diff.update(cx, |diff, cx| {
         diff.set_base_text(
@@ -1474,7 +1466,7 @@ impl Item for CommitView {
                         window,
                         cx,
                     );
-                    editor.set_diff_hunk_delegate(Some(Arc::new(RestoreOnlyDiffHunkDelegate)), cx);
+                    editor.set_diff_hunk_renderer(Some(Arc::new(HiddenDiffHunkRenderer)), cx);
                     editor.rhs_editor().update(cx, |editor, cx| {
                         editor.set_show_bookmarks(false, cx);
                         editor.set_show_breakpoints(false, cx);

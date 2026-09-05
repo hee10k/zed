@@ -522,7 +522,9 @@ message Envelope {
     GetIncomingCalls get_incoming_calls = 484;
     GetIncomingCallsResponse get_incoming_calls_response = 485;
     GetOutgoingCalls get_outgoing_calls = 486;
-    GetOutgoingCallsResponse get_outgoing_calls_response = 487; // current max
+    GetOutgoingCallsResponse get_outgoing_calls_response = 487;
+    LspExtExpandAbbreviation lsp_ext_expand_abbreviation = 488;
+    LspExtExpandAbbreviationResponse lsp_ext_expand_abbreviation_response = 489;
 
     GitCheckoutCommit git_checkout_commit = 499;
     GitCreateTag git_create_tag = 500;
@@ -537,7 +539,7 @@ message Envelope {
     GitDeleteRefsOnRemote git_delete_refs_on_remote = 509;
     GitDeleteTag git_delete_tag = 510;
     GitTagDetails git_tag_details = 511;
-    GitTagDetailsResponse git_tag_details_response = 512;
+    GitTagDetailsResponse git_tag_details_response = 512; // current max
   }
 
   reserved 87 to 88;
