@@ -10,8 +10,8 @@ use gpui::{
     div, px,
 };
 use herdr::{
-    CanonicalPath, ClientConfig, Endpoint, FocusEvent, Generation, HerdRClient, SessionSnapshot,
-    canonical_checkout_path,
+    CanonicalPath, ClientConfig, Endpoint, FocusEvent, Generation, HerdRClient, HerdrEvent,
+    SessionSnapshot, WorkspaceEvent, canonical_checkout_path,
 };
 use paths::home_dir;
 use project::{Event as ProjectEvent, ProjectPath};
@@ -407,7 +407,9 @@ impl HerdRHost {
                         break;
                     }
                     match subscription.next().await {
-                        Ok(Some(event)) => {
+                        Ok(Some(HerdrEvent::Workspace(WorkspaceEvent::Focused {
+                            workspace_id,
+                        }))) => {
                             let snapshot = match client.snapshot().await {
                                 Ok(snapshot) => snapshot,
                                 Err(error) => {
@@ -425,11 +427,17 @@ impl HerdRHost {
                             };
                             if let Err(error) = host.update_in(cx, |host, window, cx| {
                                 host.apply_snapshot(client.clone(), snapshot, window, cx);
-                                host.apply_herdr_focus(event, window, cx);
+                                host.apply_herdr_focus(FocusEvent { workspace_id }, window, cx);
                             }) {
                                 log::debug!("failed to apply HerdR focus event: {error}");
                                 break;
                             }
+                        }
+                        Ok(Some(_)) => {
+                            // Workspace and pane lifecycle events are not yet
+                            // consumed by the central view; later tasks route
+                            // them through the session registry and agent
+                            // synchronization.
                         }
                         Ok(None) => break,
                         Err(error) => {
