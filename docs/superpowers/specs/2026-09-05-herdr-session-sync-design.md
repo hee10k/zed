@@ -144,7 +144,7 @@ The Agent Panel receives a focused API for opening a terminal thread with:
 - working directory;
 - stable external identity.
 
-The stable mirrored-thread key is `(herdr session identity, pane_id)`. A pane update or repeated snapshot cannot create a second thread for the same key. Pane revisions merge snapshot and event data and reject stale updates.
+The stable mirrored-thread key is `(herdr session identity, terminal_id)`. `terminal_id` survives pane moves, while the mapping retains the latest `pane_id` for attach and focus commands. A pane update, move, or repeated snapshot cannot create a second thread for the same terminal. Pane revisions merge snapshot and event data and reject stale updates.
 
 ACP session import or resume is not used. It is not supported consistently by all detected agents and could create a second frontend or process for a session that is already live in herdr.
 
@@ -157,7 +157,7 @@ For mapped spaces and agents, focus is bidirectional:
 - focusing a herdr agent pane focuses its Zed window and mirrored terminal thread;
 - focusing a mirrored Zed terminal thread sends `agent.focus` for its herdr pane.
 
-Every focus transition records its origin and the latest `(session, workspace_id or pane_id, revision)`. The reflected event acknowledges the transition instead of initiating another one. This prevents Zed↔herdr feedback loops, repeated window activation, and focus flicker.
+Every agent focus transition records its origin and the latest `(session, terminal_id, pane_id, revision)`. Workspace focus, whose herdr event has no revision, uses a local focus generation tied to `(session, workspace_id)`. Reflected events acknowledge the transition instead of initiating another one. This prevents Zed↔herdr feedback loops, repeated window activation, and focus flicker.
 
 Unmapped space focus does not open a Zed window. Agent detection remains the trigger that opens a worktree and thread.
 
@@ -165,7 +165,7 @@ Unmapped space focus does not open a Zed window. Agent detection remains the tri
 
 Closing a mirrored terminal thread in Zed detaches only the Zed terminal client. It does not stop the herdr agent or close its pane.
 
-The registry records that `(session, pane_id)` was dismissed. Further updates for the same live pane do not reopen it automatically. The dismissal entry is removed when the pane exits.
+The registry records that `(session, terminal_id)` was dismissed. Further updates or pane moves for the same live terminal do not reopen it automatically. The dismissal entry is removed when the terminal exits.
 
 `herdr: Resync Agents` clears dismissal and retry suppression for the selected session, fetches a fresh snapshot, and reopens all currently running agents using the normal deduplicated synchronization path.
 
@@ -232,7 +232,7 @@ Add focused coverage for observable state and synchronization behavior:
 - use herdr's focused worktree as the initial source of truth;
 - synchronize every existing running agent from the initial snapshot;
 - open one mirrored terminal thread for a newly detected agent;
-- deduplicate repeated snapshots and pane revisions;
+- deduplicate repeated snapshots and pane revisions, and preserve one mirrored thread when a stable `terminal_id` moves to a new `pane_id`;
 - during agent synchronization, reuse a window by normalized worktree identity and create one only when needed;
 - synchronize worktree and agent focus in both directions without feedback loops;
 - suppress automatic reopening after a user closes a mirrored thread;
