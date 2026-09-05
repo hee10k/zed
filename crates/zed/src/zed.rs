@@ -2,6 +2,7 @@ mod app_menus;
 pub mod edit_prediction_registry;
 pub(crate) mod herdr_agent_sync;
 pub(crate) mod herdr_host;
+pub(crate) mod herdr_session_picker;
 pub(crate) mod herdr_session_registry;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
@@ -193,6 +194,11 @@ actions!(
 );
 pub fn init(cx: &mut App) {
     herdr_session_registry::HerdrSessionRegistry::init(cx);
+    let registry = herdr_session_registry::HerdrSessionRegistry::global(cx);
+    registry.update(cx, |registry, _| {
+        registry.set_host_sink(herdr_host::sink());
+        registry.set_picker_sink(herdr_session_picker::sink());
+    });
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &Hide, cx| cx.hide());
     #[cfg(target_os = "macos")]
@@ -200,28 +206,31 @@ pub fn init(cx: &mut App) {
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(quit);
-    cx.on_action(|_: &zed_actions::herdr::OpenHerdR, cx| {
-        herdr_host::open_current_from_app(cx);
+    cx.on_action(|_: &zed_actions::herdr::SelectOrCreateSession, cx| {
+        herdr_session_registry::HerdrSessionRegistry::select_or_create_from_app(cx);
     })
-    .on_action(|_: &zed_actions::herdr::OpenHerdRInNewWindow, cx| {
-        herdr_host::open_new_window_from_app(cx);
+    .on_action(|_: &zed_actions::herdr::ResyncAgents, cx| {
+        herdr_session_registry::HerdrSessionRegistry::resync_from_app(cx);
     })
-    .on_action(|_: &zed_actions::herdr::ToggleHerdR, cx| {
+    .on_action(|_: &zed_actions::herdr::DisconnectSession, cx| {
+        herdr_session_registry::HerdrSessionRegistry::disconnect_from_app(cx);
+    })
+    .on_action(|_: &zed_actions::herdr::ToggleHerdr, cx| {
         herdr_host::toggle_from_app(cx);
     })
-    .on_action(|_: &zed_actions::herdr::FocusHerdR, cx| {
+    .on_action(|_: &zed_actions::herdr::FocusHerdr, cx| {
         herdr_host::focus_from_app(cx);
     })
-    .on_action(|_: &zed_actions::herdr::ToggleHerdRMaximize, cx| {
+    .on_action(|_: &zed_actions::herdr::ToggleHerdrMaximize, cx| {
         herdr_host::toggle_maximize_from_app(cx);
     })
-    .on_action(|_: &zed_actions::herdr::ToggleHerdRCollapse, cx| {
+    .on_action(|_: &zed_actions::herdr::ToggleHerdrCollapse, cx| {
         herdr_host::toggle_collapse_from_app(cx);
     })
-    .on_action(|_: &zed_actions::herdr::CloseHerdR, cx| {
+    .on_action(|_: &zed_actions::herdr::CloseHerdr, cx| {
         herdr_host::close_from_app(cx);
     })
-    .on_action(|_: &zed_actions::herdr::ShowHerdRStatus, cx| {
+    .on_action(|_: &zed_actions::herdr::ShowHerdrStatus, cx| {
         herdr_host::status_from_app(cx);
     });
 
@@ -649,18 +658,22 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 lsp_button_menu_handle.toggle(window, cx);
             }
         });
-
         let cursor_position =
             cx.new(|_| go_to_line::cursor_position::CursorPosition::new(workspace));
         let line_ending_indicator =
             cx.new(|_| line_ending_selector::LineEndingIndicator::default());
+
         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
         let multi_workspace = window.root::<MultiWorkspace>().flatten();
         let herdr_status_button = multi_workspace.as_ref().map(|multi_workspace| {
             cx.new(|cx| {
-                herdr_host::HerdRStatusButton::new(Some(multi_workspace.downgrade()), cx)
+                herdr_host::HerdRStatusButton::new(
+                    Some(multi_workspace.downgrade()),
+                    Some(window.window_handle().window_id()),
+                    cx,
+                )
             })
         });
         workspace.status_bar().update(cx, |status_bar, cx| {

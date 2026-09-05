@@ -1428,7 +1428,7 @@ pub(crate) async fn restore_or_create_workspace(
                     restore_multiworkspace(multi_workspace, app_state.clone(), cx)
                         .await
                         .map(|window| {
-                            herdr_host::restore_if_visible(window, cx);
+                            herdr_host::restore_view_only_if_visible(window, cx);
                         })
                 }
                 SerializedWorkspaceLocation::Remote(connection_options) => {
@@ -1464,7 +1464,7 @@ pub(crate) async fn restore_or_create_workspace(
                             cx,
                         )
                         .await;
-                        herdr_host::restore_if_visible(window, cx);
+                        herdr_host::restore_view_only_if_visible(window, cx);
                         Ok::<(), anyhow::Error>(())
                     }
                     .await

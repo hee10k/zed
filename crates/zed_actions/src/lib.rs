@@ -1014,30 +1014,24 @@ pub mod herdr {
     actions!(
         herdr,
         [
-            /// Opens or focuses HerdR in the current window.
-            #[action(name = "Open HerdR")]
-            OpenHerdR,
-            /// Opens HerdR in a new window.
-            #[action(name = "Open HerdR in New Window")]
-            OpenHerdRInNewWindow,
-            /// Toggles the HerdR central view and its focus.
-            #[action(name = "Toggle HerdR")]
-            ToggleHerdR,
-            /// Shows HerdR and moves focus to it.
-            #[action(name = "Focus HerdR")]
-            FocusHerdR,
-            /// Toggles the maximized state of HerdR.
-            #[action(name = "Toggle HerdR Maximize")]
-            ToggleHerdRMaximize,
-            /// Toggles the collapsed state of HerdR.
-            #[action(name = "Toggle HerdR Collapse")]
-            ToggleHerdRCollapse,
-            /// Closes HerdR.
-            #[action(name = "Close HerdR")]
-            CloseHerdR,
-            /// Shows the current HerdR status.
-            #[action(name = "Show HerdR Status")]
-            ShowHerdRStatus,
+            #[action(name = "Select or Create Session")]
+            SelectOrCreateSession,
+            #[action(name = "Resync Agents")]
+            ResyncAgents,
+            #[action(name = "Disconnect Session")]
+            DisconnectSession,
+            #[action(name = "Toggle herdr")]
+            ToggleHerdr,
+            #[action(name = "Focus herdr")]
+            FocusHerdr,
+            #[action(name = "Toggle herdr Maximize")]
+            ToggleHerdrMaximize,
+            #[action(name = "Toggle herdr Collapse")]
+            ToggleHerdrCollapse,
+            #[action(name = "Close herdr")]
+            CloseHerdr,
+            #[action(name = "Show herdr Status")]
+            ShowHerdrStatus,
         ]
     );
 }
