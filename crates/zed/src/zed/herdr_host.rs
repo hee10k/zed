@@ -74,6 +74,7 @@ pub struct HerdRStatusButton {
     multi_workspace: Option<gpui::WeakEntity<MultiWorkspace>>,
     window_id: Option<gpui::WindowId>,
     _multi_workspace_subscription: Option<Subscription>,
+    _registry_subscription: Option<Subscription>,
 }
 
 impl HerdRStatusButton {
@@ -87,10 +88,13 @@ impl HerdRStatusButton {
                 .upgrade()
                 .map(|multi_workspace| cx.observe(&multi_workspace, |_, _, cx| cx.notify()))
         });
+        let registry_subscription = HerdrSessionRegistry::try_global(cx)
+            .map(|registry| cx.observe(&registry, |_, _, cx| cx.notify()));
         Self {
             multi_workspace,
             window_id,
             _multi_workspace_subscription: subscription,
+            _registry_subscription: registry_subscription,
         }
     }
 }
@@ -116,15 +120,13 @@ impl Render for HerdRStatusButton {
             .child(
                 IconButton::new("herdr-status-button", IconName::Terminal)
                     .icon_size(IconSize::Small)
-                    .tab_index(0isize)
-                    .aria_label(label.clone())
                     .toggle_state(selected)
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                     .tooltip(|_window, cx| {
-                        Tooltip::for_action("Toggle herdr", &zed_actions::herdr::ToggleHerdr, cx)
+                        Tooltip::for_action("Show herdr Status", &zed_actions::herdr::ShowHerdrStatus, cx)
                     })
                     .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(zed_actions::herdr::ToggleHerdr), cx);
+                        window.dispatch_action(Box::new(zed_actions::herdr::ShowHerdrStatus), cx);
                     }),
             )
             .child(Label::new(label).size(LabelSize::Small))
@@ -153,6 +155,7 @@ pub struct HerdRHost {
     launch: Option<HerdrLaunch>,
     terminal_view: Option<Entity<TerminalView>>,
     terminal_setup: Option<Task<anyhow::Result<()>>>,
+    terminal_completion: Option<Task<()>>,
     focus_handle: FocusHandle,
     _focus_subscription: Subscription,
     _registry_subscription: Subscription,
@@ -186,6 +189,7 @@ impl HerdRHost {
             launch,
             terminal_view: None,
             terminal_setup: None,
+            terminal_completion: None,
             focus_handle,
             _focus_subscription: focus_subscription,
             _registry_subscription: registry_subscription,
@@ -241,8 +245,27 @@ impl HerdRHost {
                         view
                     })?;
                     host.update(cx, |host, cx| {
+                        let completion = terminal_view
+                            .read(cx)
+                            .terminal()
+                            .read(cx)
+                            .wait_for_completed_task(cx);
+                        let completion_host = cx.weak_entity();
+                        let window_id = host.window_id;
                         host.terminal_view = Some(terminal_view);
                         host.terminal_setup = None;
+                        host.terminal_completion = Some(cx.spawn(async move |_, cx| {
+                            let _ = completion.await;
+                            let _ = completion_host.update(cx, |host, cx| {
+                                host.terminal_completion = None;
+                                host.terminal_view = None;
+                                host.launch = None;
+                                cx.notify();
+                            });
+                            let _ = cx.update(|cx| {
+                                HerdrSessionRegistry::note_host_exit_for_window(window_id, cx);
+                            });
+                        }));
                         cx.notify();
                     })?;
                 }
@@ -275,6 +298,7 @@ impl HerdRHost {
     fn detach(&mut self, cx: &mut Context<Self>) {
         self.launch = None;
         self.terminal_setup.take();
+        self.terminal_completion.take();
         if let Some(terminal_view) = self.terminal_view.take() {
             terminal_view.update(cx, |terminal_view, cx| {
                 terminal_view
@@ -284,7 +308,6 @@ impl HerdRHost {
         }
         cx.notify();
     }
-
     fn binding_state(&self, cx: &App) -> BindingState {
         self.registry.read(cx).binding_state(self.window_id)
     }
@@ -294,6 +317,7 @@ impl HerdRHost {
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
+
 
     fn toggle_collapse(&mut self, cx: &mut Context<Self>) {
         self.collapsed = !self.collapsed;
@@ -352,7 +376,7 @@ impl Render for HerdRHost {
         let collapsed = self.collapsed;
         let maximized = self.maximized;
         let terminal = self.terminal_view.clone();
-
+        let _action_labels = host_action_labels(&state);
         let controls = match state {
             BindingState::Unselected => h_flex().gap_2().child(
                 Button::new("herdr-choose-session", "Choose Session")
@@ -460,6 +484,14 @@ fn fixed_worktree_for(workspace: &Workspace, cx: &App) -> PathBuf {
         .unwrap_or_else(|| home_dir().clone())
 }
 
+fn host_action_labels(state: &BindingState) -> &'static [&'static str] {
+    match state {
+        BindingState::Unselected => &["Choose Session"],
+        BindingState::Starting { .. } | BindingState::Connected(_) => &[],
+        BindingState::Failed { .. } => &["Retry", "Choose Session"],
+    }
+}
+
 fn host_from_multi_workspace(multi_workspace: &MultiWorkspace) -> Option<Entity<HerdRHost>> {
     multi_workspace
         .window_root_host()
@@ -516,8 +548,15 @@ pub(crate) fn install_host(
     cx: &mut Context<MultiWorkspace>,
 ) {
     if let Some(host) = host_from_multi_workspace(multi_workspace) {
+        let fixed_worktree = fixed_worktree_for(workspace.read(cx), cx);
         multi_workspace.set_herdr_visible(true, cx);
-        host.update(cx, |host, cx| host.update_launch(launch, window, cx));
+        host.update(cx, |host, cx| {
+            // A restored/view-only host may retain the old workspace while
+            // the active workspace changed before the next selection.
+            host.backing_workspace = workspace.clone();
+            host.fixed_worktree = fixed_worktree;
+            host.update_launch(launch, window, cx);
+        });
         host.update(cx, |host, cx| host.focus_handle.focus(window, cx));
         return;
     }
@@ -644,7 +683,7 @@ pub fn status_from_app(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HerdRVisibilityTransition, binding_label, toggle_visibility};
+    use super::{HerdRVisibilityTransition, binding_label, host_action_labels, toggle_visibility};
     use crate::zed::herdr_agent_sync::SessionIdentity;
     use crate::zed::herdr_session_registry::BindingState;
     use std::path::PathBuf;
@@ -678,5 +717,19 @@ mod tests {
             }),
             "herdr: Could not connect to main"
         );
+    }
+    #[test]
+    fn failed_render_has_retry_and_choose_actions_but_starting_has_none() {
+        assert_eq!(
+            host_action_labels(&BindingState::Failed {
+                session_name: Arc::from("main"),
+                message: "socket closed".into(),
+            }),
+            ["Retry", "Choose Session"]
+        );
+        assert!(host_action_labels(&BindingState::Starting {
+            session_name: Arc::from("main")
+        })
+        .is_empty());
     }
 }

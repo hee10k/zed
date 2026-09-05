@@ -104,7 +104,10 @@ impl SessionPicker {
         let registry_for_confirm = registry.clone();
         let this = cx.weak_entity();
         let confirmations = cx.spawn(async move |_, cx: &mut AsyncApp| {
-            while let Some(selection) = selection_rx.next().await {
+            // A modal confirmation is one-shot. The picker may still have
+            // queued key events while dismissal is asynchronous, but none
+            // may create a second binding/window.
+            if let Some(selection) = selection_rx.next().await {
                 let _ = registry_for_confirm.update(cx, |registry, cx| {
                     registry.apply_selection_for_window(invoking, selection.clone(), cx);
                 });
@@ -154,6 +157,7 @@ pub(crate) struct SessionPickerDelegate {
     loading: bool,
     loaded: bool,
     selection_tx: mpsc::Sender<SessionSelection>,
+    confirmation_sent: bool,
     _refresh_task: Option<Task<()>>,
     _validation_task: Option<Task<()>>,
 }
@@ -177,6 +181,7 @@ impl SessionPickerDelegate {
             loading: false,
             loaded: false,
             selection_tx,
+            confirmation_sent: false,
             _refresh_task: None,
             _validation_task: None,
         }
@@ -257,6 +262,9 @@ impl SessionPickerDelegate {
     }
 
     fn validate_name(&mut self, name: String, cx: &mut Context<Picker<Self>>) {
+        if self.confirmation_sent {
+            return;
+        }
         let trimmed = name.trim().to_owned();
         if trimmed.is_empty() {
             self.validation_error = Some("Session name cannot be empty".into());
@@ -268,18 +276,23 @@ impl SessionPickerDelegate {
             cx.notify();
             return;
         };
+        self.confirmation_sent = true;
         self._validation_task = Some(cx.spawn(async move |picker, cx| {
             let result = gateway.validate_session_name(trimmed.clone()).await;
             let _ = picker.update(cx, |picker, cx| match result {
                 Ok(()) => {
                     picker.delegate.validation_error = None;
-                    picker
+                    if picker
                         .delegate
                         .selection_tx
                         .try_send(SessionSelection::New { name: trimmed })
-                        .ok();
+                        .is_err()
+                    {
+                        picker.delegate.confirmation_sent = false;
+                    }
                 }
                 Err(error) => {
+                    picker.delegate.confirmation_sent = false;
                     // The CLI's stderr is the source of truth for grammar;
                     // preserve its trimmed message in the open modal.
                     picker.delegate.validation_error =
@@ -378,15 +391,22 @@ impl PickerDelegate for SessionPickerDelegate {
         _window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
+        if self.confirmation_sent {
+            return;
+        }
         if self.list_error.is_some() && matches!(self.mode, PickerMode::Sessions) {
             self._refresh_task = Some(self.start_refresh(cx));
             return;
         }
         match (&self.mode, self.selected_entry()) {
             (PickerMode::Sessions, Some(PickerEntry::Session(session))) => {
-                self.selection_tx
+                if self
+                    .selection_tx
                     .try_send(SessionSelection::Existing(session.clone()))
-                    .ok();
+                    .is_ok()
+                {
+                    self.confirmation_sent = true;
+                }
             }
             (PickerMode::NewName { .. }, Some(PickerEntry::NewSession)) => {
                 self.validate_name(self.query.clone(), cx);
@@ -437,7 +457,6 @@ impl PickerDelegate for SessionPickerDelegate {
         )
     }
 }
-
 pub(crate) fn picker_entry_label(name: &str, running: bool) -> String {
     if running {
         name.to_owned()
@@ -458,7 +477,41 @@ fn suggested_session_name(workspace: &Workspace, cx: &App) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::picker_entry_label;
+    use super::{PickerEntry, SessionPickerDelegate, picker_entry_label};
+    use futures::channel::mpsc;
+    use picker::PickerDelegate;
+
+    fn session(name: &str, running: bool) -> herdr::SessionInfo {
+        herdr::SessionInfo {
+            name: name.to_owned(),
+            is_default: false,
+            running,
+            session_dir: std::path::PathBuf::from(format!("/sessions/{name}")),
+            socket_path: std::path::PathBuf::from(format!("/sessions/{name}/herdr.sock")),
+        }
+    }
+
+    #[test]
+    fn sessions_mode_keeps_running_stopped_and_new_entries() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut delegate = SessionPickerDelegate::new(None, "suggested".to_owned(), tx);
+        delegate.sessions = vec![session("running", true), session("stopped", false)];
+        delegate.rebuild_entries();
+        assert_eq!(delegate.match_count(), 3);
+        assert!(matches!(delegate.entries[0], PickerEntry::Session(_)));
+        assert!(matches!(delegate.entries[1], PickerEntry::Session(_)));
+        assert!(matches!(delegate.entries[2], PickerEntry::NewSession));
+    }
+
+    #[test]
+    fn list_error_exposes_one_retry_match() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut delegate = SessionPickerDelegate::new(None, "suggested".to_owned(), tx);
+        delegate.list_error = Some("list failed".into());
+        delegate.rebuild_entries();
+        assert_eq!(delegate.match_count(), 1);
+        assert_eq!(picker_entry_label("stopped", false), "stopped · stopped");
+    }
 
     #[test]
     fn stopped_sessions_have_a_visible_indicator() {
