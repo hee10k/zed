@@ -2,6 +2,7 @@ mod app_menus;
 pub mod edit_prediction_registry;
 pub(crate) mod herdr_agent_sync;
 pub(crate) mod herdr_host;
+pub(crate) mod herdr_session_registry;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
 mod migrate;
@@ -190,8 +191,8 @@ actions!(
         ShowWorkspaceError
     ]
 );
-
 pub fn init(cx: &mut App) {
+    herdr_session_registry::HerdrSessionRegistry::init(cx);
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &Hide, cx| cx.hide());
     #[cfg(target_os = "macos")]
