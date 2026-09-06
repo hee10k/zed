@@ -2471,6 +2471,28 @@ impl AgentPanel {
                 return anyhow::Ok(());
             };
             let status = completion.await;
+            let failed = match status.as_ref() {
+                Some(status) => !status.success(),
+                None => true,
+            };
+            let failed_output = if failed {
+                let mut output =
+                    terminal.update(cx, |terminal, _| terminal.last_n_non_empty_lines(3));
+                for _ in 0..10 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    let next_output =
+                        terminal.update(cx, |terminal, _| terminal.last_n_non_empty_lines(3));
+                    if next_output == output {
+                        break;
+                    }
+                    output = next_output;
+                }
+                output
+            } else {
+                Vec::new()
+            };
             this.update(cx, |this, cx| {
                 // The tab was closed by the user in the meantime; the
                 // close path already reported the mirror as gone.
@@ -2488,7 +2510,6 @@ impl AgentPanel {
                 // means the pane closed server-side, and the resulting
                 // ownership release untracks the mirror through its own
                 // path, so the mapping stays until then.
-                let failed = !status.is_some_and(|status| status.success());
                 if !failed {
                     return;
                 }
@@ -2497,9 +2518,7 @@ impl AgentPanel {
                 this.external_terminals.remove(&identity);
                 let message = match status {
                     Some(status) => {
-                        let output =
-                            terminal.update(cx, |terminal, _| terminal.last_n_non_empty_lines(3));
-                        let detail = output.join("\n");
+                        let detail = failed_output.join("\n");
                         Some(format!("herdr agent attach exited ({status}): {detail}").into())
                     }
                     None => Some("herdr agent attach ended unexpectedly".into()),
