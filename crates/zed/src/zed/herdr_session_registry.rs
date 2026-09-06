@@ -235,7 +235,7 @@ pub(crate) trait SessionPickerSink {
         &self,
         window: WindowHandle<MultiWorkspace>,
         registry: Entity<HerdrSessionRegistry>,
-        cx: &mut Context<HerdrSessionRegistry>,
+        cx: &mut AsyncApp,
     );
 }
 
@@ -247,7 +247,7 @@ impl SessionPickerSink for NoopSessionPickerSink {
         &self,
         _window: WindowHandle<MultiWorkspace>,
         _registry: Entity<HerdrSessionRegistry>,
-        _cx: &mut Context<HerdrSessionRegistry>,
+        _cx: &mut AsyncApp,
     ) {
     }
 }
@@ -1001,13 +1001,14 @@ impl HerdrSessionRegistry {
                 Some(BindingState::Unselected) | None => {}
                 Some(_) => return,
             }
-            let _ = registry.update(cx, |registry, cx| {
-                if !registry.prompt_pending.remove(&handle.window_id()) {
-                    return;
-                }
-                let picker_sink = registry.picker_sink.clone();
-                picker_sink.show(handle, cx.entity(), cx);
+            let should_show = registry.update(cx, |registry, _| {
+                registry.prompt_pending.remove(&handle.window_id())
             });
+            if !should_show {
+                return;
+            }
+            let picker_sink = registry.read_with(cx, |registry, _| registry.picker_sink.clone());
+            picker_sink.show(handle, registry, cx);
         })
         .detach();
 
@@ -1082,13 +1083,18 @@ impl HerdrSessionRegistry {
         }) else {
             return;
         };
-        registry.update(cx, |registry, cx| {
+        let picker_sink = registry.update(cx, |registry, _| {
             // Any explicit selection attempt is this window's once-prompted
             // interaction; the startup observer will not ask again.
             registry.prompt_completed(window_id);
-            let picker_sink = registry.picker_sink.clone();
-            picker_sink.show(handle, cx.entity(), cx);
+            registry.picker_sink.clone()
         });
+        let mut async_cx = cx.to_async();
+        cx.foreground_executor()
+            .spawn(async move {
+                picker_sink.show(handle, registry, &mut async_cx);
+            })
+            .detach();
     }
 
     /// `herdr: Resync Agents` from the active window.
@@ -4579,6 +4585,118 @@ mod tests {
             project::DisableAiSettings::register(cx);
         });
     }
+    #[gpui::test]
+    async fn startup_prompt_opens_picker_once_and_explicit_selection_cancels(
+        cx: &mut TestAppContext,
+    ) {
+        init_app(cx);
+        cx.update(|cx| editor::init(cx));
+        let project = test_project(cx).await;
+        let gateway = HerdrGateway::fake(
+            || async { Ok(Vec::new()) }.boxed_local(),
+            |_info| async { Err(anyhow::anyhow!("startup picker test never connects")) }
+                .boxed_local(),
+            |_name| async { Ok(()) }.boxed_local(),
+        );
+        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        registry.update(cx, |registry, _| {
+            registry.set_picker_sink(crate::zed::herdr_session_picker::sink());
+        });
+        cx.update(|cx| HerdrSessionRegistry::install_as_global(registry.clone(), cx));
+
+        let (multi_workspace, first_window, first_workspace) = {
+            let (multi_workspace, window_cx) =
+                cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+            let handle = window_cx.update(|window, _| {
+                window.window_handle().downcast::<MultiWorkspace>().unwrap()
+            });
+            let workspace =
+                multi_workspace.read_with(window_cx, |multi_workspace, _| multi_workspace.workspace().clone());
+            (multi_workspace, handle, workspace)
+        };
+        let first_window_id = registry.update(cx, |registry, cx| {
+            registry.handle_new_window(first_window, multi_workspace.entity_id(), cx);
+            first_window.window_id()
+        });
+        assert!(
+            registry.read_with(cx, |registry, _| registry.prompt_pending.contains(&first_window_id)),
+            "a newly observed unselected window must have a pending startup prompt"
+        );
+
+        cx.background_executor.advance_clock(PROMPT_SETTLE_DELAY);
+        cx.run_until_parked();
+        let first_picker = first_workspace
+            .update(cx, |workspace, cx| {
+                workspace.active_modal::<crate::zed::herdr_session_picker::SessionPicker>(cx)
+            })
+            .expect("startup settle must open the session picker");
+        let first_picker_id = first_picker.entity_id();
+        assert!(
+            registry.read_with(cx, |registry, _| !registry.prompt_pending.contains(&first_window_id)),
+            "showing the startup picker must consume its pending prompt"
+        );
+
+        cx.background_executor.advance_clock(PROMPT_SETTLE_DELAY);
+        cx.run_until_parked();
+        let second_picker_id = first_workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .active_modal::<crate::zed::herdr_session_picker::SessionPicker>(cx)
+                    .map(|picker| picker.entity_id())
+            })
+            .expect("the startup picker must remain open after its one-shot task");
+        assert_eq!(
+            second_picker_id, first_picker_id,
+            "the startup prompt must show exactly once"
+        );
+        let second_project = test_project(cx).await;
+
+        let (second_multi_workspace, second_window, second_workspace) = {
+            let (multi_workspace, window_cx) =
+                cx.add_window_view(|window, cx| MultiWorkspace::test_new(second_project, window, cx));
+            let handle = window_cx.update(|window, _| {
+                window.window_handle().downcast::<MultiWorkspace>().unwrap()
+            });
+            let workspace =
+                multi_workspace.read_with(window_cx, |multi_workspace, _| multi_workspace.workspace().clone());
+            (multi_workspace, handle, workspace)
+        };
+        let second_window_id = registry.update(cx, |registry, cx| {
+            registry.handle_new_window(second_window, second_multi_workspace.entity_id(), cx);
+            second_window.window_id()
+        });
+        assert!(
+            registry.read_with(cx, |registry, _| registry.prompt_pending.contains(&second_window_id)),
+            "the second unselected window must also defer its startup prompt"
+        );
+
+        cx.update(|cx| {
+            HerdrSessionRegistry::select_or_create_for_window(second_window_id, cx);
+        });
+        cx.run_until_parked();
+        let explicit_picker = second_workspace
+            .update(cx, |workspace, cx| {
+                workspace.active_modal::<crate::zed::herdr_session_picker::SessionPicker>(cx)
+            })
+            .expect("explicit selection must open the picker immediately");
+        let explicit_picker_id = explicit_picker.entity_id();
+        assert!(
+            !registry.read_with(cx, |registry, _| registry.prompt_pending.contains(&second_window_id)),
+            "explicit selection must cancel the delayed startup prompt"
+        );
+
+        cx.background_executor.advance_clock(PROMPT_SETTLE_DELAY);
+        cx.run_until_parked();
+        let after_cancel_picker_id = second_workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .active_modal::<crate::zed::herdr_session_picker::SessionPicker>(cx)
+                    .map(|picker| picker.entity_id())
+            })
+            .expect("the canceled startup task must not toggle off the explicit picker");
+        assert_eq!(after_cancel_picker_id, explicit_picker_id);
+    }
+
 
     /// A real `MultiWorkspace` window: `run_connection` refuses to bind
     /// through a dead window handle, so lifecycle tests need live ones.

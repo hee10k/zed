@@ -45,7 +45,7 @@ impl SessionPickerSink for PickerSink {
         &self,
         window: WindowHandle<MultiWorkspace>,
         registry: Entity<HerdrSessionRegistry>,
-        cx: &mut Context<HerdrSessionRegistry>,
+        cx: &mut AsyncApp,
     ) {
         let _ = window.update(cx, |multi_workspace, window, cx| {
             let workspace = multi_workspace.workspace().clone();
