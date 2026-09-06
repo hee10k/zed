@@ -477,14 +477,17 @@ fn suggested_session_name(workspace: &Workspace, cx: &App) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PickerEntry, PickerMode, SessionPickerDelegate, picker_entry_label};
-    use crate::zed::herdr_session_registry::HerdrGateway;
+    use super::{PickerEntry, PickerMode, SessionPicker, SessionPickerDelegate, picker_entry_label};
+    use crate::zed::herdr_session_registry::{
+        BindingState, HerdrGateway, HerdrSessionRegistry,
+    };
     use futures::FutureExt as _;
     use futures::channel::mpsc;
-    use gpui::TestAppContext;
+    use gpui::{AppContext as _, DismissEvent, TestAppContext, WindowHandle, WindowId};
     use picker::{Picker, PickerDelegate};
     use std::cell::Cell;
     use std::rc::Rc;
+    use workspace::MultiWorkspace;
 
     fn session(name: &str, running: bool) -> herdr::SessionInfo {
         herdr::SessionInfo {
@@ -603,6 +606,71 @@ mod tests {
         assert!(
             take_selection(&mut selection_rx).is_none(),
             "a second confirm must not emit a second selection"
+        );
+    }
+
+    #[gpui::test]
+    async fn confirming_a_stopped_session_emits_it_as_existing(cx: &mut TestAppContext) {
+        init(cx);
+        let (picker, cx, mut selection_rx) = add_picker(
+            cx,
+            fake_gateway(
+                Rc::new(|_| Ok(vec![session("running", true), session("stopped", false)])),
+                Rc::new(|_| Ok(())),
+            ),
+        );
+        cx.run_until_parked();
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.set_selected_index(1, window, cx);
+            picker.delegate.confirm(false, window, cx);
+        });
+        assert!(
+            matches!(
+                take_selection(&mut selection_rx).as_ref(),
+                Some(super::SessionSelection::Existing(info))
+                    if info.name == "stopped" && !info.running
+            ),
+            "a stopped catalog row must confirm as Existing rather than New"
+        );
+    }
+
+    #[gpui::test]
+    async fn dismissing_the_wrapper_leaves_registry_unselected(cx: &mut TestAppContext) {
+        init(cx);
+        let gateway = fake_gateway(
+            Rc::new(|_| Ok(Vec::new())),
+            Rc::new(|_| Ok(())),
+        );
+        let registry =
+            cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        let invoking = WindowHandle::<MultiWorkspace>::new(WindowId::from(77));
+        let window_id = registry.update(cx, |registry, _| {
+            registry.register_window_for_test(invoking, BindingState::Unselected, Vec::new())
+        });
+        let (wrapper, cx) = cx.add_window_view(|window, cx| {
+            SessionPicker::new(
+                registry.clone(),
+                invoking,
+                "suggested".to_owned(),
+                window,
+                cx,
+            )
+        });
+
+        wrapper.update_in(cx, |picker, _, cx| {
+            picker.picker.update(cx, |_, cx| cx.emit(DismissEvent));
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            registry.read_with(cx, |registry, _| registry.binding_state(window_id)),
+            BindingState::Unselected,
+            "picker dismissal must not create a registry binding"
+        );
+        assert_eq!(
+            registry.read_with(cx, |registry, _| registry.connection_tasks_started()),
+            0,
+            "picker dismissal must not start a connection"
         );
     }
 

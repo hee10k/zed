@@ -575,7 +575,12 @@ pub(crate) struct HerdrSessionRegistry {
     /// Bootstrap windows holding a session only until an inherited
     /// destination publishes `Connected`; the handoff is released
     /// event-driven inside `finish_connected`, never by polling.
-    inherited_handoffs: HashMap<SessionIdentity, WindowId>,
+    inherited_handoffs: HashMap<SessionIdentity, Vec<WindowId>>,
+    /// The source generation that installed each target slot. A stale
+    /// finalization must not tear down a newer shared attachment.
+    slot_generations: HashMap<(SessionIdentity, u64), u64>,
+    /// Finalization token for a target window awaiting its Connected gate.
+    finalize_tokens: HashMap<u64, u64>,
     /// Windows for which the host sink has completed installation.
     host_windows: HashSet<u64>,
     sync: AgentSyncState,
@@ -641,9 +646,11 @@ impl HerdrSessionRegistry {
             connections: HashMap::default(),
             attempts: HashMap::default(),
             in_flight: HashMap::default(),
+            slot_generations: HashMap::default(),
+            finalize_tokens: HashMap::default(),
+            host_windows: HashSet::default(),
             next_generation: 0,
             inherited_handoffs: HashMap::default(),
-            host_windows: HashSet::default(),
             sync: AgentSyncState::default(),
             effects: Rc::new(QueuedAgentEffectSink::default()),
             host_sink: Rc::new(NoopHerdrHostSink),
@@ -968,6 +975,7 @@ impl HerdrSessionRegistry {
         self.next_generation = self.next_generation.wrapping_add(1);
         let generation = self.next_generation;
         self.attempts.insert(window_id.as_u64(), generation);
+        self.finalize_tokens.remove(&window_id.as_u64());
         if let Some(binding) = self.windows.get_mut(&window_id.as_u64()) {
             binding.selection_target = Some(target);
         }
@@ -1132,6 +1140,7 @@ impl HerdrSessionRegistry {
             return;
         }
         self.attempts.remove(&window_id.as_u64());
+        self.finalize_tokens.remove(&window_id.as_u64());
         let identities: Vec<SessionIdentity> = self
             .connections
             .iter()
@@ -1166,6 +1175,8 @@ impl HerdrSessionRegistry {
         window_id: WindowId,
         cx: &mut Context<Self>,
     ) {
+        self.slot_generations
+            .remove(&(identity.clone(), window_id.as_u64()));
         let released = self
             .connections
             .get_mut(identity)
@@ -1254,7 +1265,7 @@ impl HerdrSessionRegistry {
                 if let Some(binding) = self.windows.get_mut(&bootstrap.as_u64()) {
                     binding.checkout_path = focused.clone();
                 }
-                self.install_binding_target(bootstrap, identity, cx);
+                self.install_binding_target(bootstrap, identity, generation, cx);
                 if target == SelectionTarget::NewWindow
                     && let Some(path) = focused
                 {
@@ -1302,7 +1313,7 @@ impl HerdrSessionRegistry {
                 {
                     let _ = handle.update(cx, |_, window, _| window.activate_window());
                 }
-                self.install_binding_target(other, identity, cx);
+                self.install_binding_target(other, identity, generation, cx);
                 if other != bootstrap {
                     self.detach_bootstrap(bootstrap, cx);
                     self.detach_window(identity, bootstrap, cx);
@@ -1326,7 +1337,9 @@ impl HerdrSessionRegistry {
                     return FinalizeResult::Ready(Some(bootstrap));
                 };
                 self.inherited_handoffs
-                    .insert(identity.clone(), bootstrap);
+                    .entry(identity.clone())
+                    .or_default()
+                    .push(bootstrap);
                 let registry_for_task = cx.entity();
                 let identity_for_task = identity.clone();
                 let session_name_for_task = session_name.to_owned();
@@ -1387,10 +1400,12 @@ impl HerdrSessionRegistry {
         message: String,
         cx: &mut Context<Self>,
     ) {
-        self.inherited_handoffs.remove(identity);
         if !self.attempt_is_current(window_id, generation, session_name) {
             return;
         }
+        self.remove_inherited_handoff(identity, window_id);
+        self.release_failed_connection(identity, generation, window_id, cx);
+        self.detach_window(identity, window_id, cx);
         self.apply_binding_event(
             window_id,
             BindingEvent::SessionStillRunning(message.into()),
@@ -1404,10 +1419,12 @@ impl HerdrSessionRegistry {
         &mut self,
         window_id: WindowId,
         identity: &SessionIdentity,
+        generation: u64,
         cx: &mut Context<Self>,
     ) {
         self.install_host(window_id, identity.name.clone(), cx);
-        if !self.attach_connection_window(identity, window_id) {
+        self.finalize_tokens.insert(window_id.as_u64(), generation);
+        if !self.attach_connection_window_for_generation(identity, window_id, generation) {
             log::error!(
                 "herdr connection for session {} was released during binding",
                 identity.name
@@ -1425,37 +1442,78 @@ impl HerdrSessionRegistry {
         &mut self,
         window_id: WindowId,
         identity: &SessionIdentity,
+        generation: u64,
         cx: &mut Context<Self>,
     ) {
         let owned = self
             .connections
             .get(identity)
             .is_some_and(|connection| connection.bound_windows.contains(&window_id.as_u64()));
-        if !owned {
+        let slot_generation = self
+            .slot_generations
+            .get(&(identity.clone(), window_id.as_u64()))
+            .copied();
+        let token_matches =
+            self.finalize_tokens.get(&window_id.as_u64()) == Some(&generation);
+        if !owned || !token_matches || slot_generation != Some(generation) {
             log::error!(
-                "herdr binding for session {} lost connection ownership before it connected",
+                "herdr binding for session {} changed before it connected; rolling back its stale slot",
                 identity.name
             );
-            self.inherited_handoffs.remove(identity);
+            self.finalize_tokens.remove(&window_id.as_u64());
+            if slot_generation == Some(generation) {
+                self.host_windows.remove(&window_id.as_u64());
+                if let Some(handle) = self
+                    .windows
+                    .get(&window_id.as_u64())
+                    .map(|binding| binding.window)
+                {
+                    self.host_sink.detach(handle, cx);
+                }
+                self.detach_window(identity, window_id, cx);
+            }
             return;
         }
-        let Some(binding) = self.windows.get_mut(&window_id.as_u64()) else {
-            return;
-        };
-        if !binding_accepts_connected(&binding.state, identity) {
-            log::error!(
-                "herdr binding for session {} changed before it connected; leaving it alone",
-                identity.name
-            );
-            return;
+        {
+            let Some(binding) = self.windows.get_mut(&window_id.as_u64()) else {
+                self.detach_window(identity, window_id, cx);
+                return;
+            };
+            if !binding_accepts_connected(&binding.state, identity) {
+                log::error!(
+                    "herdr binding for session {} changed before it connected; rolling back its stale slot",
+                    identity.name
+                );
+                self.finalize_tokens.remove(&window_id.as_u64());
+                self.host_windows.remove(&window_id.as_u64());
+                if let Some(handle) = self
+                    .windows
+                    .get(&window_id.as_u64())
+                    .map(|binding| binding.window)
+                {
+                    self.host_sink.detach(handle, cx);
+                }
+                self.detach_window(identity, window_id, cx);
+                return;
+            }
+            binding.state = BindingState::Connected(identity.clone());
+            binding.selection_target = None;
         }
-        binding.state = BindingState::Connected(identity.clone());
-        binding.selection_target = None;
-        let donor = self.inherited_handoffs.get(identity).copied();
+        self.finalize_tokens.remove(&window_id.as_u64());
+        let donor = self
+            .inherited_handoffs
+            .get_mut(identity)
+            .and_then(|donors| donors.pop());
         if let Some(bootstrap) = donor.filter(|bootstrap| *bootstrap != window_id) {
-            self.inherited_handoffs.remove(identity);
             self.detach_bootstrap(bootstrap, cx);
             self.detach_window(identity, bootstrap, cx);
+        }
+        if self
+            .inherited_handoffs
+            .get(identity)
+            .is_some_and(|donors| donors.is_empty())
+        {
+            self.inherited_handoffs.remove(identity);
         }
         cx.notify();
     }
@@ -1465,9 +1523,28 @@ impl HerdrSessionRegistry {
         identity: &SessionIdentity,
         window_id: WindowId,
     ) -> bool {
-        self.connections
-            .get_mut(identity)
-            .is_some_and(|connection| connection.bound_windows.insert(window_id.as_u64()))
+        let generation = self
+            .connections
+            .get(identity)
+            .map(|connection| connection.generation);
+        generation.is_some_and(|generation| {
+            self.attach_connection_window_for_generation(identity, window_id, generation)
+        })
+    }
+
+    fn attach_connection_window_for_generation(
+        &mut self,
+        identity: &SessionIdentity,
+        window_id: WindowId,
+        generation: u64,
+    ) -> bool {
+        let Some(connection) = self.connections.get_mut(identity) else {
+            return false;
+        };
+        connection.bound_windows.insert(window_id.as_u64());
+        self.slot_generations
+            .insert((identity.clone(), window_id.as_u64()), generation);
+        true
     }
 
     fn detach_bootstrap(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
@@ -1625,9 +1702,11 @@ impl HerdrSessionRegistry {
         self.prompt_pending.remove(&window_id);
         self.host_windows.remove(&window_id.as_u64());
         self.attempts.remove(&window_id.as_u64());
-        // A released window can no longer act as (or wait for) a handoff.
-        self.inherited_handoffs
-            .retain(|_, donor| *donor != window_id);
+        self.finalize_tokens.remove(&window_id.as_u64());
+        self.inherited_handoffs.retain(|_, donors| {
+            donors.retain(|donor| *donor != window_id);
+            !donors.is_empty()
+        });
         let identities: Vec<SessionIdentity> = self
             .connections
             .iter()
@@ -1698,16 +1777,36 @@ impl HerdrSessionRegistry {
         &mut self,
         identity: &SessionIdentity,
         generation: u64,
+        failed_window: WindowId,
         cx: &mut Context<Self>,
     ) {
         self.clear_in_flight(identity, generation);
-        self.inherited_handoffs.remove(identity);
-        if self.connection_matches(identity, generation) {
+        self.finalize_tokens.remove(&failed_window.as_u64());
+        self.remove_inherited_handoff(identity, failed_window);
+        let released = self
+            .connections
+            .get_mut(identity)
+            .filter(|connection| connection.generation == generation)
+            .is_some_and(|connection| {
+                connection.bound_windows.remove(&failed_window.as_u64());
+                connection.bound_windows.is_empty()
+            });
+        if released {
             self.connections.remove(identity);
             let effects = self.sync.forget_session(identity);
             self.dispatch_effects(identity, effects);
         }
         cx.notify();
+    }
+
+    fn remove_inherited_handoff(&mut self, identity: &SessionIdentity, donor: WindowId) {
+        let Some(donors) = self.inherited_handoffs.get_mut(identity) else {
+            return;
+        };
+        donors.retain(|candidate| *candidate != donor);
+        if donors.is_empty() {
+            self.inherited_handoffs.remove(identity);
+        }
     }
     // ------------------------------------------------------------ test seams
 
@@ -1723,6 +1822,8 @@ impl HerdrSessionRegistry {
             in_flight: HashMap::default(),
             next_generation: 0,
             inherited_handoffs: HashMap::default(),
+            slot_generations: HashMap::default(),
+            finalize_tokens: HashMap::default(),
             host_windows: HashSet::default(),
             sync: AgentSyncState::default(),
             effects: Rc::new(QueuedAgentEffectSink::default()),
@@ -1865,8 +1966,12 @@ impl HerdrSessionRegistry {
         identity: &SessionIdentity,
         cx: &mut Context<Self>,
     ) {
-        self.install_binding_target(window_id, identity, cx);
-        self.finish_connected(window_id, identity, cx);
+        let Some(generation) = self.connections.get(identity).map(|connection| connection.generation)
+        else {
+            return;
+        };
+        self.install_binding_target(window_id, identity, generation, cx);
+        self.finish_connected(window_id, identity, generation, cx);
     }
 
     /// Record `donor` as the bootstrap temporarily holding `identity` until
@@ -1880,7 +1985,9 @@ impl HerdrSessionRegistry {
         donor: WindowId,
     ) {
         self.inherited_handoffs
-            .insert(identity.clone(), donor);
+            .entry(identity.clone())
+            .or_default()
+            .push(donor);
     }
 }
 
@@ -2090,7 +2197,7 @@ async fn run_connection(
                 };
                 let final_window = match outcome {
                     FinalizeResult::Ready(window) => window,
-                    FinalizeResult::Handoff { window_id } => Some(window_id),
+                    FinalizeResult::Handoff { .. } => None,
                     FinalizeResult::Activate { window_id, task } => {
                         let Some(result) = await_before_deadline!(task, &mut cx, deadline) else {
                             abandon_failed_activation(
@@ -2119,18 +2226,18 @@ async fn run_connection(
                         Some(window_id)
                     }
                 };
-                if let Some(final_window) = final_window {
-                    let _ = registry.update(&mut cx, |registry, cx| {
-                        let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
-                        registry.dispatch_effects(&identity, effects);
+                let _ = registry.update(&mut cx, |registry, cx| {
+                    let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
+                    registry.dispatch_effects(&identity, effects);
+                    if let Some(final_window) = final_window {
                         if final_window == window_id
                             && !registry.attempt_is_current(final_window, generation, &session_name)
                         {
                             return;
                         }
-                        registry.finish_connected(final_window, &identity, cx);
-                    });
-                }
+                        registry.finish_connected(final_window, &identity, generation, cx);
+                    }
+                });
                 return;
             }
             if cx.background_executor().now() >= deadline {
@@ -2258,7 +2365,7 @@ async fn run_connection(
         };
         let final_window = match outcome {
             FinalizeResult::Ready(window) => window,
-            FinalizeResult::Handoff { window_id } => Some(window_id),
+            FinalizeResult::Handoff { .. } => None,
             FinalizeResult::Activate { window_id, task } => {
                 let Some(result) = await_before_deadline!(task, &mut cx, deadline) else {
                     abandon_failed_activation(
@@ -2287,18 +2394,18 @@ async fn run_connection(
                 Some(window_id)
             }
         };
-        if let Some(final_window) = final_window {
-            let _ = registry.update(&mut cx, |registry, cx| {
-                let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
-                registry.dispatch_effects(&identity, effects);
+        let _ = registry.update(&mut cx, |registry, cx| {
+            let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
+            registry.dispatch_effects(&identity, effects);
+            if let Some(final_window) = final_window {
                 if final_window == window_id
                     && !registry.attempt_is_current(final_window, generation, &session_name)
                 {
                     return;
                 }
-                registry.finish_connected(final_window, &identity, cx);
-            });
-        }
+                registry.finish_connected(final_window, &identity, generation, cx);
+            }
+        });
         return;
     }
 
@@ -2447,7 +2554,7 @@ async fn run_connection(
     });
     let final_window = match outcome {
         FinalizeResult::Ready(window) => window,
-        FinalizeResult::Handoff { window_id } => Some(window_id),
+        FinalizeResult::Handoff { .. } => None,
         FinalizeResult::Activate { window_id, task } => {
             let Some(result) = await_before_deadline!(task, &mut cx, deadline) else {
                 abandon_failed_activation(
@@ -2476,22 +2583,22 @@ async fn run_connection(
             Some(window_id)
         }
     };
-    if let Some(final_window) = final_window {
-        let _ = registry.update(&mut cx, |registry, cx| {
-            let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
+    let _ = registry.update(&mut cx, |registry, cx| {
+        let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
+        registry.dispatch_effects(&identity, effects);
+        for event in &buffered {
+            let effects = apply_event_effects(&mut registry.sync, &identity, event);
             registry.dispatch_effects(&identity, effects);
-            for event in &buffered {
-                let effects = apply_event_effects(&mut registry.sync, &identity, event);
-                registry.dispatch_effects(&identity, effects);
-            }
+        }
+        if let Some(final_window) = final_window {
             if final_window == window_id
                 && !registry.attempt_is_current(final_window, generation, &session_name)
             {
                 return;
             }
-            registry.finish_connected(final_window, &identity, cx);
-        });
-    }
+            registry.finish_connected(final_window, &identity, generation, cx);
+        }
+    });
 
     // 6. Steady state: further frames continue through the same channel.
     //    The ownership poll lets a last-window disconnect (which drops the
@@ -2568,11 +2675,11 @@ fn abandon_failed_activation(
     cx: &mut AsyncApp,
 ) {
     let _ = registry.update(cx, |registry, cx| {
-        registry.release_failed_connection(identity, generation, cx);
-        registry.detach_window(identity, window_id, cx);
         if !registry.attempt_is_current(window_id, generation, session_name) {
             return;
         }
+        registry.release_failed_connection(identity, generation, window_id, cx);
+        registry.detach_window(identity, window_id, cx);
         registry.apply_binding_event(
             window_id,
             BindingEvent::SessionStillRunning(message.into()),
@@ -2607,7 +2714,6 @@ fn fail(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn session(name: &str) -> SessionIdentity {
         SessionIdentity {
             name: Arc::from(name),
@@ -2640,6 +2746,8 @@ mod tests {
             in_flight: HashMap::default(),
             next_generation: 0,
             inherited_handoffs: HashMap::default(),
+            slot_generations: HashMap::default(),
+            finalize_tokens: HashMap::default(),
             host_windows: HashSet::default(),
             sync: AgentSyncState::default(),
             effects: Rc::new(QueuedAgentEffectSink::default()),
@@ -2750,7 +2858,7 @@ mod tests {
 
     use gpui::TestAppContext;
     use settings::Settings as _;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     struct FakeHandle;
 
@@ -2790,6 +2898,7 @@ mod tests {
     struct FakeConnection {
         snapshot: SessionSnapshot,
         dropped: Rc<Cell<usize>>,
+        subscribe_calls: Rc<Cell<usize>>,
         idle_stream: bool,
     }
 
@@ -2800,6 +2909,8 @@ mod tests {
     }
     impl HerdrSessionHandle for FakeConnection {
         fn subscribe(&self) -> LocalBoxFuture<'static, anyhow::Result<Box<dyn HerdrEventStream>>> {
+            self.subscribe_calls
+                .set(self.subscribe_calls.get().saturating_add(1));
             let idle = self.idle_stream;
             async move { Ok(Box::new(FakeStream { idle }) as Box<dyn HerdrEventStream>) }
                 .boxed_local()
@@ -2824,6 +2935,42 @@ mod tests {
             layouts: Vec::new(),
             agents: Vec::new(),
         }
+    }
+
+    struct RecordingEffects {
+        effects: Rc<RefCell<Vec<WorkspaceEffect>>>,
+    }
+
+    impl AgentEffectSink for RecordingEffects {
+        fn push(&self, _identity: &SessionIdentity, effect: WorkspaceEffect) {
+            self.effects.borrow_mut().push(effect);
+        }
+    }
+
+    fn agent_snapshot() -> SessionSnapshot {
+        let mut snapshot = empty_snapshot();
+        snapshot.focused_workspace_id = Some("workspace-1".to_owned());
+        snapshot.workspaces.push(herdr::WorkspaceInfo {
+            workspace_id: "workspace-1".to_owned(),
+            number: 1,
+            label: "test".to_owned(),
+            focused: true,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: Some("tab-1".to_owned()),
+            agent_status: "working".to_owned(),
+            worktree: None,
+        });
+        let mut agent = herdr::PaneInfo::default();
+        agent.workspace_id = "workspace-1".to_owned();
+        agent.tab_id = "tab-1".to_owned();
+        agent.pane_id = "pane-1".to_owned();
+        agent.terminal_id = "terminal-1".to_owned();
+        agent.focused = true;
+        agent.revision = 1;
+        agent.agent = Some("test-agent".to_owned());
+        snapshot.agents.push(agent);
+        snapshot
     }
 
     fn init_app(cx: &mut TestAppContext) {
@@ -2878,6 +3025,7 @@ mod tests {
                     Ok(Rc::new(FakeConnection {
                         snapshot: empty_snapshot(),
                         dropped: Rc::new(Cell::new(0)),
+                        subscribe_calls: Rc::new(Cell::new(0)),
                         idle_stream: false,
                     }) as Rc<dyn HerdrSessionHandle>)
                 }
@@ -2931,15 +3079,19 @@ mod tests {
         let connect_calls = Rc::new(Cell::new(0usize));
         let dropped_for_gateway = dropped.clone();
         let connect_calls_for_gateway = connect_calls.clone();
+        let subscribe_calls = Rc::new(Cell::new(0usize));
+        let subscribe_calls_for_gateway = subscribe_calls.clone();
         let gateway = HerdrGateway::fake(
             move || async { Ok(vec![session_info("main", true)]) }.boxed_local(),
             move |_info| {
                 connect_calls_for_gateway.set(connect_calls_for_gateway.get() + 1);
                 let dropped = dropped_for_gateway.clone();
+                let subscribe_calls = subscribe_calls_for_gateway.clone();
                 async move {
                     Ok(Rc::new(FakeConnection {
-                        snapshot: empty_snapshot(),
+                        snapshot: agent_snapshot(),
                         dropped,
+                        subscribe_calls,
                         idle_stream: true,
                     }) as Rc<dyn HerdrSessionHandle>)
                 }
@@ -2948,6 +3100,12 @@ mod tests {
             |_name| async { Ok(()) }.boxed_local(),
         );
         let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        let recorded_effects = Rc::new(RefCell::new(Vec::new()));
+        registry.update(cx, |registry, _| {
+            registry.set_effect_sink(Rc::new(RecordingEffects {
+                effects: recorded_effects.clone(),
+            }));
+        });
         let window_one = registry.update(cx, |registry, _| {
             registry.register_window_for_test(handle_one, BindingState::Unselected, Vec::new())
         });
@@ -2967,6 +3125,16 @@ mod tests {
         assert_eq!(
             registry.read_with(cx, |registry, _| registry.binding_state(window_one)),
             BindingState::Connected(identity.clone())
+        );
+        assert_eq!(subscribe_calls.get(), 1, "the owner installs one event stream");
+        assert_eq!(
+            recorded_effects
+                .borrow()
+                .iter()
+                .filter(|effect| matches!(effect, WorkspaceEffect::Open(_)))
+                .count(),
+            1,
+            "the initial agent revision must emit one Open effect"
         );
 
         registry.update(cx, |registry, cx| {
@@ -3010,6 +3178,16 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(connect_calls.get(), 2);
+        assert_eq!(subscribe_calls.get(), 2, "recreation subscribes a fresh stream");
+        assert_eq!(
+            recorded_effects
+                .borrow()
+                .iter()
+                .filter(|effect| matches!(effect, WorkspaceEffect::Open(_)))
+                .count(),
+            2,
+            "the same revision must reopen after the last owner forgets it"
+        );
         assert_eq!(
             registry.read_with(cx, |registry, _| registry.binding_state(window_one)),
             BindingState::Connected(identity)
@@ -3205,13 +3383,62 @@ mod tests {
         });
 
         registry.update(cx, |registry, cx| {
-            registry.release_failed_connection(&identity, 5, cx);
+            registry.release_failed_connection(&identity, 5, WindowId::from(99), cx);
         });
         assert!(
             !registry.read_with(cx, |registry, _| registry.has_connection(&identity)),
             "a Retry must not take a Shared role over an un-pumped connection"
         );
         assert!(registry.read_with(cx, |registry, _| registry.in_flight.is_empty()));
+    }
+
+    #[gpui::test]
+    fn failed_activation_keeps_a_shared_coowner_alive(cx: &mut TestAppContext) {
+        let gateway = HerdrGateway::fake(
+            || async { Ok(Vec::new()) }.boxed_local(),
+            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+            |_name| async { Ok(()) }.boxed_local(),
+        );
+        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        let identity = session("main");
+        let owner = WindowId::from(41);
+        let coowner = WindowId::from(42);
+        registry.update(cx, |registry, _| {
+            registry.register_window_for_test(
+                WindowHandle::new(owner),
+                BindingState::Starting {
+                    session_name: Arc::from("main"),
+                },
+                Vec::new(),
+            );
+            registry.register_window_for_test(
+                WindowHandle::new(coowner),
+                BindingState::Connected(identity.clone()),
+                Vec::new(),
+            );
+            registry.install_connection(
+                identity.clone(),
+                session_info("main", true),
+                Rc::new(FakeHandle),
+                Task::ready(()),
+                5,
+            );
+            registry.attach_connection_window(&identity, owner);
+            registry.attach_connection_window(&identity, coowner);
+        });
+
+        registry.update(cx, |registry, cx| {
+            registry.release_failed_connection(&identity, 5, owner, cx);
+        });
+
+        assert!(
+            registry.read_with(cx, |registry, _| registry.has_connection(&identity)),
+            "an activation failure must not remove a connection still owned by another window"
+        );
+        assert_eq!(
+            registry.read_with(cx, |registry, _| registry.bound_window_count(&identity)),
+            1
+        );
     }
 
     #[gpui::test]
@@ -3243,10 +3470,11 @@ mod tests {
                 1,
             );
             registry.attach_connection_window(&identity, target_id);
+            registry.finalize_tokens.insert(target_id.as_u64(), 1);
         });
 
         registry.update(cx, |registry, cx| {
-            registry.finish_connected(target_id, &identity, cx);
+            registry.finish_connected(target_id, &identity, 1, cx);
         });
         assert!(
             matches!(
@@ -3256,4 +3484,54 @@ mod tests {
             "a reuse target that changed state must not be published Connected"
         );
     }
+    #[gpui::test]
+    fn stale_reuse_completion_preserves_a_newer_same_session_slot(cx: &mut TestAppContext) {
+        let gateway = HerdrGateway::fake(
+            || async { Ok(Vec::new()) }.boxed_local(),
+            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+            |_name| async { Ok(()) }.boxed_local(),
+        );
+        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        let identity = session("main");
+        let target_id = registry.update(cx, |registry, _| {
+            registry.register_window_for_test(
+                WindowHandle::new(WindowId::from(32)),
+                BindingState::Starting {
+                    session_name: Arc::from("main"),
+                },
+                Vec::new(),
+            )
+        });
+        registry.update(cx, |registry, _| {
+            registry.install_connection(
+                identity.clone(),
+                session_info("main", true),
+                Rc::new(FakeHandle),
+                Task::ready(()),
+                1,
+            );
+            registry.attach_connection_window(&identity, target_id);
+            registry.finalize_tokens.insert(target_id.as_u64(), 2);
+            registry
+                .slot_generations
+                .insert((identity.clone(), target_id.as_u64()), 2);
+        });
+
+        registry.update(cx, |registry, cx| {
+            registry.finish_connected(target_id, &identity, 1, cx);
+        });
+
+        assert_eq!(
+            registry.read_with(cx, |registry, _| registry.binding_state(target_id)),
+            BindingState::Starting {
+                session_name: Arc::from("main"),
+            }
+        );
+        assert_eq!(
+            registry.read_with(cx, |registry, _| registry.bound_window_count(&identity)),
+            1,
+            "a stale reuse completion must not detach the newer slot"
+        );
+    }
+
 }
