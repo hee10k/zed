@@ -85,32 +85,32 @@ impl ClientConfig {
 pub enum Error {
     #[error("local transport error: {0}")]
     Io(#[from] io::Error),
-    #[error("invalid HerdR JSON frame: {0}")]
+    #[error("invalid herdr JSON frame: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("HerdR response was empty")]
+    #[error("herdr response was empty")]
     EmptyResponse,
-    #[error("HerdR response exceeded the {limit}-byte frame limit")]
+    #[error("herdr response exceeded the {limit}-byte frame limit")]
     FrameTooLarge { limit: usize },
-    #[error("HerdR response frame ended before a newline")]
+    #[error("herdr response frame ended before a newline")]
     UnterminatedFrame,
-    #[error("HerdR response id {actual:?} did not match request id {expected}")]
+    #[error("herdr response id {actual:?} did not match request id {expected}")]
     MismatchedResponseId {
         expected: String,
         actual: Option<String>,
     },
-    #[error("HerdR request failed ({code}): {message}")]
+    #[error("herdr request failed ({code}): {message}")]
     Remote {
         code: String,
         message: String,
         data: Option<Value>,
     },
-    #[error("HerdR response did not contain a result")]
+    #[error("herdr response did not contain a result")]
     MissingResult,
-    #[error("HerdR snapshot response had an invalid shape")]
+    #[error("herdr snapshot response had an invalid shape")]
     InvalidSnapshot,
-    #[error("HerdR protocol version {protocol} is unsupported; minimum is {minimum}")]
+    #[error("herdr protocol version {protocol} is unsupported; minimum is {minimum}")]
     UnsupportedProtocol { protocol: u32, minimum: u32 },
-    #[error("HerdR event had no workspace id")]
+    #[error("herdr event had no workspace id")]
     MissingWorkspaceId,
     #[error("invalid checkout path: {0}")]
     InvalidCheckoutPath(String),
@@ -324,7 +324,7 @@ impl SubscribeStream {
                 }
                 let mut reader = reader
                     .lock()
-                    .map_err(|_| io::Error::other("HerdR subscription reader was poisoned"))?;
+                    .map_err(|_| io::Error::other("herdr subscription reader was poisoned"))?;
                 match read_subscription_frame(&mut *reader, max_frame_bytes, &cancelled) {
                     Ok(None) => return Ok(None),
                     Ok(Some(frame)) if frame.is_empty() => continue,
@@ -598,7 +598,7 @@ fn connect_stream(endpoint: &Endpoint) -> Result<Stream> {
                 let _ = path;
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "HerdR transport is unsupported on this platform",
+                    "herdr transport is unsupported on this platform",
                 ))?
             }
         }
@@ -726,7 +726,7 @@ fn read_named_pipe_frame_until(
                 if now >= deadline {
                     return Err(Error::Io(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "timed out waiting for HerdR response",
+                        "timed out waiting for herdr response",
                     )));
                 }
                 std::thread::sleep((deadline - now).min(SUBSCRIPTION_POLL_INTERVAL));

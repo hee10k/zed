@@ -266,7 +266,6 @@ pub(crate) enum BindingState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BindingEvent {
     Selected { session_name: Arc<str> },
-    Connected(SessionIdentity),
     SessionNotRunning,
     SessionStillRunning(SharedString),
 }
@@ -326,7 +325,6 @@ struct WindowBinding {
 /// independent herdr server, so closing every local client never terminates
 /// it.
 struct SessionConnection {
-    info: SessionInfo,
     client: Rc<dyn HerdrSessionHandle>,
     bound_windows: HashSet<u64>,
     event_task: Task<()>,
@@ -353,7 +351,6 @@ struct MirrorTarget {
 fn transition(current: BindingState, event: BindingEvent) -> BindingState {
     match event {
         BindingEvent::Selected { session_name } => BindingState::Starting { session_name },
-        BindingEvent::Connected(session) => BindingState::Connected(session),
         BindingEvent::SessionNotRunning => BindingState::Unselected,
         BindingEvent::SessionStillRunning(message) => {
             let session_name = match current {
@@ -891,11 +888,6 @@ impl HerdrSessionRegistry {
             .unwrap_or(BindingState::Unselected)
     }
 
-    /// `Retry`/`Choose Session` availability for a window's binding.
-    pub(crate) fn can_retry(&self, window_id: WindowId) -> bool {
-        matches!(self.binding_state(window_id), BindingState::Failed { .. })
-    }
-
     /// Reserve the binding a window is created with, keyed by the new
     /// workspace entity id so the `MultiWorkspace` observer consumes it
     /// before it can schedule a startup picker.
@@ -1127,18 +1119,6 @@ impl HerdrSessionRegistry {
             return;
         };
         registry.update(cx, |registry, cx| registry.disconnect_session(window_id, cx));
-    }
-
-    /// `Retry` from a failed host surface: re-run the bounded connect loop.
-    pub(crate) fn retry_for_window(window_id: WindowId, cx: &mut App) {
-        let Some(registry) = Self::try_global(cx) else {
-            return;
-        };
-        registry.update(cx, |registry, cx| {
-            if let Err(error) = registry.retry(window_id, cx) {
-                log::error!("herdr retry failed: {error:#}");
-            }
-        });
     }
 
     /// The `herdr --session` central client terminal of a window exited
@@ -2754,7 +2734,6 @@ impl HerdrSessionRegistry {
     fn install_connection(
         &mut self,
         identity: SessionIdentity,
-        info: SessionInfo,
         client: Rc<dyn HerdrSessionHandle>,
         event_task: Task<()>,
         generation: u64,
@@ -2765,7 +2744,6 @@ impl HerdrSessionRegistry {
         self.connections.insert(
             identity,
             SessionConnection {
-                info,
                 client,
                 bound_windows: HashSet::default(),
                 event_task,
@@ -2781,15 +2759,12 @@ impl HerdrSessionRegistry {
             .map(|connection| connection.client.clone())
     }
 
-    fn connection_exists(&self, identity: &SessionIdentity) -> bool {
-        self.connections.contains_key(identity)
-    }
-
     fn connection_matches(&self, identity: &SessionIdentity, generation: u64) -> bool {
         self.connections
             .get(identity)
             .is_some_and(|connection| connection.generation == generation)
     }
+
     fn clear_in_flight(&mut self, identity: &SessionIdentity, generation: u64) {
         if self.in_flight.get(identity) == Some(&generation) {
             self.in_flight.remove(identity);
@@ -3098,16 +3073,8 @@ impl HerdrSessionRegistry {
         client: Rc<dyn HerdrSessionHandle>,
         generation: u64,
     ) {
-        let info = SessionInfo {
-            name: identity.name.to_string(),
-            is_default: false,
-            running: true,
-            session_dir: PathBuf::from(identity.session_dir.as_ref()),
-            socket_path: PathBuf::from(identity.session_dir.as_ref()),
-        };
         let installed = self.install_connection(
             identity.clone(),
-            info,
             client,
             Task::ready(()),
             generation,
@@ -3838,7 +3805,6 @@ async fn run_connection(
     let installed = registry.update(&mut cx, |registry, _| {
         registry.install_connection(
             identity.clone(),
-            info.clone(),
             client.clone(),
             pump,
             generation,
@@ -5320,7 +5286,6 @@ mod tests {
         registry.update(cx, |registry, _| {
             assert!(registry.install_connection(
                 identity.clone(),
-                session_info("main", true),
                 Rc::new(FakeHandle),
                 Task::ready(()),
                 1,
@@ -5387,7 +5352,6 @@ mod tests {
             );
             registry.install_connection(
                 identity.clone(),
-                session_info("main", true),
                 Rc::new(FakeHandle),
                 Task::ready(()),
                 1,
@@ -5458,7 +5422,6 @@ mod tests {
             registry.attempts.insert(window_id.as_u64(), 1);
             registry.install_connection(
                 identity.clone(),
-                session_info("main", true),
                 Rc::new(FakeHandle),
                 Task::ready(()),
                 1,
@@ -5515,7 +5478,6 @@ mod tests {
             registry.attempts.insert(donor.as_u64(), 1);
             registry.install_connection(
                 identity.clone(),
-                session_info("main", true),
                 Rc::new(FakeHandle),
                 Task::ready(()),
                 1,
@@ -5535,7 +5497,6 @@ mod tests {
                 .state = BindingState::Connected(identity.clone());
             assert!(registry.install_connection(
                 identity.clone(),
-                session_info("main", true),
                 Rc::new(FakeHandle),
                 Task::ready(()),
                 2,
@@ -5586,7 +5547,6 @@ mod tests {
         registry.update(cx, |registry, _| {
             registry.install_connection(
                 identity.clone(),
-                session_info("main", true),
                 Rc::new(FakeHandle),
                 Task::ready(()),
                 1,
@@ -5627,7 +5587,6 @@ mod tests {
         registry.update(cx, |registry, _| {
             registry.install_connection(
                 identity.clone(),
-                session_info("main", true),
                 Rc::new(FakeHandle),
                 Task::ready(()),
                 1,

@@ -250,8 +250,8 @@ async fn test_herdr_central_view_preserves_workspace_docks(cx: &mut TestAppConte
             assert!(bounds.size.width > px(0.0) && bounds.size.height > px(0.0));
         }
         if visible {
-            let host_bounds = cx.debug_bounds("herdr-central-host").expect("HerdR host");
-            let central_bounds = cx.debug_bounds("herdr-central-content").expect("HerdR center");
+            let host_bounds = cx.debug_bounds("herdr-central-host").expect("herdr host");
+            let central_bounds = cx.debug_bounds("herdr-central-content").expect("herdr center");
             assert_eq!(host_bounds.origin, central_bounds.origin);
             assert_eq!(host_bounds.size, central_bounds.size);
         }
@@ -306,7 +306,7 @@ async fn test_right_sidebar_stays_inside_narrow_viewport(cx: &mut TestAppContext
     cx.run_until_parked();
     let central_bounds = cx
         .debug_bounds("herdr-central-content")
-        .expect("the HerdR central content should be rendered");
+        .expect("the herdr central content should be rendered");
     let sidebar_bounds = cx
         .debug_bounds("sidebar-container")
         .expect("the right sidebar should be rendered");
@@ -455,7 +455,7 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
 
     let workspace_central_bounds = cx
         .debug_bounds("workspace-central-content")
-        .expect("the normal Workspace branch should be rendered while HerdR is hidden");
+        .expect("the normal Workspace branch should be rendered while herdr is hidden");
     assert!(
         workspace_central_bounds.size.width > px(0.0)
             && workspace_central_bounds.size.height > px(0.0),
@@ -466,11 +466,11 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
             multi_workspace.workspace().entity_id()
         }),
         editor_id,
-        "the normal workspace Entity should remain installed while HerdR is hidden"
+        "the normal workspace Entity should remain installed while herdr is hidden"
     );
     assert!(
         cx.debug_bounds("herdr-central-host").is_none(),
-        "the HerdR host should be hidden while HerdR is hidden"
+        "the herdr host should be hidden while herdr is hidden"
     );
 
     multi_workspace.update(cx, |multi_workspace, cx| {
@@ -485,28 +485,28 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
 
     let herdr_central_bounds = cx
         .debug_bounds("herdr-central-content")
-        .expect("the HerdR central branch should be rendered while HerdR is visible");
+        .expect("the herdr central branch should be rendered while herdr is visible");
     let host_bounds = cx
         .debug_bounds("herdr-central-host")
-        .expect("the visible HerdR host should be rendered");
+        .expect("the visible herdr host should be rendered");
     assert_eq!(
         host_bounds.origin, herdr_central_bounds.origin,
-        "the visible HerdR host should start at the central content origin"
+        "the visible herdr host should start at the central content origin"
     );
     assert_eq!(
         host_bounds.size, herdr_central_bounds.size,
-        "the visible HerdR host should fill the central content bounds"
+        "the visible herdr host should fill the central content bounds"
     );
     assert!(
         cx.debug_bounds("workspace-central-content").is_none(),
-        "the normal Workspace branch should be hidden while HerdR is visible"
+        "the normal Workspace branch should be hidden while herdr is visible"
     );
     assert_eq!(
         multi_workspace.read_with(cx, |multi_workspace, _cx| {
             multi_workspace.workspace().entity_id()
         }),
         editor_id,
-        "the normal workspace Entity should remain installed while HerdR is visible"
+        "the normal workspace Entity should remain installed while herdr is visible"
     );
 
     multi_workspace.update(cx, |multi_workspace, cx| {
@@ -528,11 +528,11 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
     );
     assert!(
         cx.debug_bounds("herdr-central-host").is_none(),
-        "the HerdR host should be absent when no host is installed"
+        "the herdr host should be absent when no host is installed"
     );
     assert!(
         cx.debug_bounds("herdr-central-content").is_none(),
-        "the HerdR central branch should be absent when no host is installed"
+        "the herdr central branch should be absent when no host is installed"
     );
     assert!(
         multi_workspace.read_with(cx, |multi_workspace, _cx| {
@@ -573,11 +573,11 @@ async fn test_herdr_collapsed_host_is_header_sized(cx: &mut TestAppContext) {
 
     let host_bounds = cx
         .debug_bounds("herdr-central-host")
-        .expect("the collapsed HerdR host should be rendered");
+        .expect("the collapsed herdr host should be rendered");
     assert_eq!(
         host_bounds.size.height,
         px(32.0),
-        "a collapsed HerdR host should remain header-sized instead of flex-filling the central slot"
+        "a collapsed herdr host should remain header-sized instead of flex-filling the central slot"
     );
 }
 
@@ -619,14 +619,14 @@ async fn test_herdr_central_view_keeps_status_bar_visible(cx: &mut TestAppContex
                 .entity_id()
         }),
         status_bar_id,
-        "the active Workspace status bar should remain installed while HerdR is visible"
+        "the active Workspace status bar should remain installed while herdr is visible"
     );
     let status_bounds = cx
         .debug_bounds("status-bar")
         .expect("the active Workspace status bar should be rendered outside the central switch");
     assert!(
         status_bounds.size.width > px(0.0) && status_bounds.size.height > px(0.0),
-        "the status bar should have visible bounds while HerdR is selected: {status_bounds:?}"
+        "the status bar should have visible bounds while herdr is selected: {status_bounds:?}"
     );
 }
 
@@ -669,14 +669,14 @@ async fn test_herdr_visibility_preserves_entities(cx: &mut TestAppContext) {
         );
         let stored_host = multi_workspace
             .window_root_host()
-            .expect("the HerdR host should remain installed")
+            .expect("the herdr host should remain installed")
             .clone()
             .downcast::<TestHerdrCentralHost>()
             .expect("the installed host should retain its test type");
         assert_eq!(
             stored_host.entity_id(),
             host_id,
-            "the HerdR host Entity should survive both visibility toggles"
+            "the herdr host Entity should survive both visibility toggles"
         );
     });
 }
