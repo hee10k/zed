@@ -33,7 +33,7 @@ enum PickerEntry {
 
 enum PickerMode {
     Sessions,
-    NewName { suggested_name: String },
+    NewName,
 }
 
 /// A small adapter installed into the registry by `zed::init`.
@@ -198,13 +198,15 @@ impl SessionPickerDelegate {
                 self.entries = self
                     .sessions
                     .iter()
-                    .filter(|session| query.is_empty() || session.name.to_lowercase().contains(&query))
+                    .filter(|session| {
+                        query.is_empty() || session.name.to_lowercase().contains(&query)
+                    })
                     .cloned()
                     .map(PickerEntry::Session)
                     .collect();
                 self.entries.push(PickerEntry::NewSession);
             }
-            PickerMode::NewName { .. } => {
+            PickerMode::NewName => {
                 self.entries = vec![PickerEntry::NewSession];
             }
         }
@@ -237,7 +239,8 @@ impl SessionPickerDelegate {
                     }
                     Err(error) => {
                         picker.delegate.sessions.clear();
-                        picker.delegate.list_error = Some(error.to_string().trim().to_owned().into());
+                        picker.delegate.list_error =
+                            Some(error.to_string().trim().to_owned().into());
                     }
                 }
                 picker.delegate.rebuild_entries();
@@ -248,9 +251,7 @@ impl SessionPickerDelegate {
 
     fn enter_new_name(&mut self) -> String {
         let suggested = self.suggested_name.clone();
-        self.mode = PickerMode::NewName {
-            suggested_name: suggested.clone(),
-        };
+        self.mode = PickerMode::NewName;
         self.list_error = None;
         self.validation_error = None;
         self.rebuild_entries();
@@ -332,19 +333,14 @@ impl PickerDelegate for SessionPickerDelegate {
         self.selected_index = ix.min(self.match_count().saturating_sub(1));
     }
 
-    fn can_select(
-        &self,
-        ix: usize,
-        _window: &mut Window,
-        _cx: &mut Context<Picker<Self>>,
-    ) -> bool {
+    fn can_select(&self, ix: usize, _window: &mut Window, _cx: &mut Context<Picker<Self>>) -> bool {
         ix < self.match_count()
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         match self.mode {
             PickerMode::Sessions => "Select a herdr session".into(),
-            PickerMode::NewName { .. } => "New herdr session name".into(),
+            PickerMode::NewName => "New herdr session name".into(),
         }
     }
 
@@ -385,12 +381,7 @@ impl PickerDelegate for SessionPickerDelegate {
         }
     }
 
-    fn confirm(
-        &mut self,
-        _secondary: bool,
-        _window: &mut Window,
-        cx: &mut Context<Picker<Self>>,
-    ) {
+    fn confirm(&mut self, _secondary: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
         if self.confirmation_sent {
             return;
         }
@@ -408,7 +399,7 @@ impl PickerDelegate for SessionPickerDelegate {
                     self.confirmation_sent = true;
                 }
             }
-            (PickerMode::NewName { .. }, Some(PickerEntry::NewSession)) => {
+            (PickerMode::NewName, Some(PickerEntry::NewSession)) => {
                 self.validate_name(self.query.clone(), cx);
             }
             _ => {}
@@ -470,17 +461,21 @@ fn suggested_session_name(workspace: &Workspace, cx: &App) -> String {
         .project()
         .read(cx)
         .first_project_directory(cx)
-        .and_then(|path| path.file_name().and_then(|name| name.to_str()).map(str::to_owned))
+        .and_then(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "session".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PickerEntry, PickerMode, SessionPicker, SessionPickerDelegate, picker_entry_label};
-    use crate::zed::herdr_session_registry::{
-        BindingState, HerdrGateway, HerdrSessionRegistry,
+    use super::{
+        PickerEntry, PickerMode, SessionPicker, SessionPickerDelegate, picker_entry_label,
     };
+    use crate::zed::herdr_session_registry::{BindingState, HerdrGateway, HerdrSessionRegistry};
     use futures::FutureExt as _;
     use futures::channel::mpsc;
     use gpui::{AppContext as _, DismissEvent, TestAppContext, WindowHandle, WindowId};
@@ -571,7 +566,6 @@ mod tests {
         (picker, cx, rx)
     }
 
-
     /// `futures`' `try_next` reports "nothing buffered" as `Err(Empty)`;
     /// normalize both empty and closed to `None`.
     fn take_selection(
@@ -637,12 +631,8 @@ mod tests {
     #[gpui::test]
     async fn dismissing_the_wrapper_leaves_registry_unselected(cx: &mut TestAppContext) {
         init(cx);
-        let gateway = fake_gateway(
-            Rc::new(|_| Ok(Vec::new())),
-            Rc::new(|_| Ok(())),
-        );
-        let registry =
-            cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        let gateway = fake_gateway(Rc::new(|_| Ok(Vec::new())), Rc::new(|_| Ok(())));
+        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
         let invoking = WindowHandle::<MultiWorkspace>::new(WindowId::from(77));
         let window_id = registry.update(cx, |registry, _| {
             registry.register_window_for_test(invoking, BindingState::Unselected, Vec::new())
@@ -724,14 +714,16 @@ mod tests {
         picker.update_in(cx, |picker, window, cx| {
             picker.delegate.set_selected_index(1, window, cx);
             picker.delegate.confirm_update_query(window, cx);
-            let _ = picker.delegate.update_matches("bad name".to_owned(), window, cx);
+            let _ = picker
+                .delegate
+                .update_matches("bad name".to_owned(), window, cx);
             picker.delegate.confirm(false, window, cx);
         });
         cx.run_until_parked();
         let (error, mode_is_new_name, retryable) = picker.read_with(cx, |picker, _| {
             (
                 picker.delegate.validation_error.clone(),
-                matches!(picker.delegate.mode, PickerMode::NewName { .. }),
+                matches!(picker.delegate.mode, PickerMode::NewName),
                 !picker.delegate.confirmation_sent,
             )
         });

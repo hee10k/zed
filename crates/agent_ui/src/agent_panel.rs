@@ -2410,10 +2410,9 @@ impl AgentPanel {
             show_summary: false,
             ..Default::default()
         };
-        let terminal_task = self.project.update(cx, |project, cx| {
-            project.create_terminal_task(spawn, cx)
-        });
-        let workspace = self.workspace.clone();
+        let terminal_task = self
+            .project
+            .update(cx, |project, cx| project.create_terminal_task(spawn, cx));
         let identity = spec.identity.clone();
         let working_directory = Some(spec.working_directory);
 
@@ -2424,8 +2423,13 @@ impl AgentPanel {
                     log::error!("failed to spawn agent panel terminal: {error:#}");
                     this.update(cx, |this, cx| {
                         // Release the reserved identity and report the outcome
-                        // before surfacing the workspace error, so the registry
-                        // never sees a reserved-but-dead terminal.
+                        // so the registry never sees a reserved-but-dead
+                        // terminal. Failure reporting is the registry's job: it
+                        // emits one per-agent composite-id notification from
+                        // `ExternalTerminalSpawnFinished`. The panel's generic
+                        // error slot is keyed per workspace, so showing it here
+                        // too would collapse two agents' failures into one
+                        // toast or double-report a single one.
                         this.external_terminals.remove(&identity);
                         cx.emit(AgentPanelEvent::ExternalTerminalSpawnFinished {
                             identity: identity.clone(),
@@ -2434,23 +2438,76 @@ impl AgentPanel {
                         cx.notify();
                     })
                     .log_err();
-                    workspace
-                        .update(cx, |workspace, cx| workspace.show_error(error, cx))
-                        .log_err();
                     return anyhow::Ok(());
                 }
             };
-            this.update_in(cx, |this, window, cx| {
-                this.finish_external_terminal_spawn(
-                    terminal_id,
-                    identity,
-                    terminal,
-                    working_directory,
-                    focus,
-                    window,
-                    cx,
-                );
-            })?;
+            let completion = this
+                .update_in(cx, |this, window, cx| {
+                    this.finish_external_terminal_spawn(
+                        terminal_id,
+                        identity.clone(),
+                        terminal.clone(),
+                        working_directory,
+                        focus,
+                        window,
+                        cx,
+                    );
+                    // Watch the attach process itself: a CLI that exits
+                    // immediately (e.g. `direct terminal attach is not
+                    // supported` on Windows) must report its outcome to the
+                    // owner exactly once. Only tracked spawns are watched;
+                    // a close that raced the spawn is the user's doing.
+                    let tracked = this
+                        .external_terminals
+                        .get(&identity)
+                        .is_some_and(|id| *id == terminal_id);
+                    tracked.then(|| {
+                        terminal.update(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+                    })
+                })
+                .ok()
+                .flatten();
+            let Some(completion) = completion else {
+                return anyhow::Ok(());
+            };
+            let status = completion.await;
+            this.update(cx, |this, cx| {
+                // The tab was closed by the user in the meantime; the
+                // close path already reported the mirror as gone.
+                let still_tracked = this
+                    .external_terminals
+                    .get(&identity)
+                    .is_some_and(|id| *id == terminal_id)
+                    && this.terminals.contains_key(&terminal_id);
+                if !still_tracked {
+                    return;
+                }
+                // A failed exit releases the identity mapping so a later
+                // revision or resync may open one fresh attempt; the tab and
+                // its output stay visible for the user to read. A clean exit
+                // means the pane closed server-side, and the resulting
+                // ownership release untracks the mirror through its own
+                // path, so the mapping stays until then.
+                let failed = !status.is_some_and(|status| status.success());
+                if !failed {
+                    return;
+                }
+                // A failed exit releases the identity mapping so a later
+                // revision or resync may open one fresh attempt.
+                this.external_terminals.remove(&identity);
+                let message = match status {
+                    Some(status) => {
+                        let output =
+                            terminal.update(cx, |terminal, _| terminal.last_n_non_empty_lines(3));
+                        let detail = output.join("\n");
+                        Some(format!("herdr agent attach exited ({status}): {detail}").into())
+                    }
+                    None => Some("herdr agent attach ended unexpectedly".into()),
+                };
+                cx.emit(AgentPanelEvent::ExternalTerminalAttachFinished { identity, message });
+                cx.notify();
+            })
+            .log_err();
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -3056,7 +3113,8 @@ impl AgentPanel {
                 AgentPanelEvent::EntryChanged
                 | AgentPanelEvent::TerminalCloseRequested { .. }
                 | AgentPanelEvent::ThreadInteracted { .. }
-                | AgentPanelEvent::ExternalTerminalSpawnFinished { .. } => {}
+                | AgentPanelEvent::ExternalTerminalSpawnFinished { .. }
+                | AgentPanelEvent::ExternalTerminalAttachFinished { .. } => {}
             }
         });
 
@@ -5105,7 +5163,12 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 let creation = window.update(cx, |_root, window, cx| {
                     workspace.update(cx, |workspace, cx| {
                         git_ui_core::worktree_service::create_worktree_workspace(
-                            workspace, &action, window, None, workspace::OpenMode::Add, cx,
+                            workspace,
+                            &action,
+                            window,
+                            None,
+                            workspace::OpenMode::Add,
+                            cx,
                         )
                     })
                 })?;
@@ -5248,13 +5311,26 @@ pub enum AgentPanelEvent {
     ActiveViewChanged,
     ActiveViewFocused,
     EntryChanged,
-    TerminalCloseRequested { metadata: TerminalThreadMetadata },
-    ThreadInteracted { thread_id: ThreadId },
+    TerminalCloseRequested {
+        metadata: TerminalThreadMetadata,
+    },
+    ThreadInteracted {
+        thread_id: ThreadId,
+    },
     /// Spawn outcome of an external terminal thread, one per spawn attempt.
     /// `message: None` reports a successful spawn; `Some` carries the spawn
     /// error. Consumers distinguish mirror spawns by reading
     /// `AgentPanel::external_terminal_identity`.
     ExternalTerminalSpawnFinished {
+        identity: SharedString,
+        message: Option<SharedString>,
+    },
+    /// The process behind a completed external terminal thread spawn has
+    /// exited. `message: None` is a clean exit; `Some` carries the exit
+    /// status and the terminal's last output lines. Emitted once per
+    /// tracked external terminal, regardless of whether the tab is still
+    /// open, so the owner can gate retries on the process outcome.
+    ExternalTerminalAttachFinished {
         identity: SharedString,
         message: Option<SharedString>,
     },

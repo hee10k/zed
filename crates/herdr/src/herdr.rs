@@ -36,8 +36,6 @@ impl Endpoint {
     pub fn namespaced(name: impl Into<String>) -> Self {
         Self::Namespaced(name.into())
     }
-
-
 }
 /// `herdr session list --json` result: the authoritative session catalog.
 /// Endpoint paths come from here; the UI never guesses the config layout.
@@ -79,7 +77,6 @@ impl ClientConfig {
         }
     }
 }
-
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -128,6 +125,9 @@ impl Error {
 
 /// Lists herdr sessions by running the CLI's own `session list --json`
 /// subcommand. The catalog is authoritative; endpoint paths come from here.
+// The disallowed `std::process::Command::output` runs inside `smol::unblock`,
+// so it never blocks an async thread.
+#[allow(clippy::disallowed_methods)]
 pub async fn list_sessions(program: PathBuf) -> Result<Vec<SessionInfo>> {
     smol::unblock(move || {
         let output = std::process::Command::new(program)
@@ -155,6 +155,8 @@ pub async fn list_sessions(program: PathBuf) -> Result<Vec<SessionInfo>> {
 /// one session-specific stderr line with a non-zero exit and creates no
 /// session directory. Zed therefore neither copies a version-sensitive name
 /// grammar nor starts a partial session.
+// Runs inside `smol::unblock`; never blocks an async thread.
+#[allow(clippy::disallowed_methods)]
 pub async fn validate_session_name(program: PathBuf, name: String) -> Result<()> {
     smol::unblock(move || {
         let output = std::process::Command::new(program)
@@ -325,7 +327,7 @@ impl SubscribeStream {
                 let mut reader = reader
                     .lock()
                     .map_err(|_| io::Error::other("herdr subscription reader was poisoned"))?;
-                match read_subscription_frame(&mut *reader, max_frame_bytes, &cancelled) {
+                match read_subscription_frame(&mut reader, max_frame_bytes, &cancelled) {
                     Ok(None) => return Ok(None),
                     Ok(Some(frame)) if frame.is_empty() => continue,
                     Ok(Some(frame)) => {
@@ -473,11 +475,26 @@ pub struct PaneEvent {
 pub enum PaneEventKind {
     Created(PaneInfo),
     Updated(PaneInfo),
-    Closed { pane_id: String, workspace_id: String },
-    Focused { pane_id: String, workspace_id: String },
-    Moved { previous_pane_id: String, pane: PaneInfo },
-    Exited { pane_id: String, workspace_id: String },
-    AgentDetected { pane_id: String, workspace_id: String },
+    Closed {
+        pane_id: String,
+        workspace_id: String,
+    },
+    Focused {
+        pane_id: String,
+        workspace_id: String,
+    },
+    Moved {
+        previous_pane_id: String,
+        pane: PaneInfo,
+    },
+    Exited {
+        pane_id: String,
+        workspace_id: String,
+    },
+    AgentDetected {
+        pane_id: String,
+        workspace_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -770,7 +787,7 @@ fn named_pipe_has_data(stream: &mut Stream) -> Result<bool> {
     use windows::Win32::System::Pipes::PeekNamedPipe;
 
     let Stream::NamedPipe(pipe) = stream;
-    let handle = HANDLE(pipe.as_handle().as_raw_handle() as *mut std::ffi::c_void);
+    let handle = HANDLE(pipe.as_handle().as_raw_handle());
     let mut available = 0;
     unsafe {
         PeekNamedPipe(handle, None, 0, None, Some(&mut available), None)
@@ -828,7 +845,6 @@ fn read_json_frame<R: Read>(reader: &mut R, max_frame_bytes: usize) -> Result<Va
     Ok(serde_json::from_slice(&frame)?)
 }
 #[cfg(any(not(windows), test))]
-
 fn read_frame<R: Read>(reader: &mut R, max_frame_bytes: usize) -> Result<Option<Vec<u8>>> {
     let mut frame = Vec::with_capacity(max_frame_bytes.min(4096));
     loop {
@@ -955,9 +971,7 @@ fn parse_event(value: Value) -> Result<Option<HerdrEvent>> {
         "pane_moved" => HerdrEvent::Pane(PaneEvent {
             kind: PaneEventKind::Moved {
                 previous_pane_id: event_id(&data, "previous_pane_id")?,
-                pane: serde_json::from_value(
-                    data.get("pane").cloned().unwrap_or(Value::Null),
-                )?,
+                pane: serde_json::from_value(data.get("pane").cloned().unwrap_or(Value::Null))?,
             },
         }),
         "pane_exited" => HerdrEvent::Pane(PaneEvent {
@@ -1222,10 +1236,11 @@ mod tests {
         assert_eq!(pane.revision, 10);
 
         let Some(HerdrEvent::Pane(PaneEvent {
-            kind: PaneEventKind::Closed {
-                pane_id,
-                workspace_id,
-            },
+            kind:
+                PaneEventKind::Closed {
+                    pane_id,
+                    workspace_id,
+                },
         })) = parse_event(serde_json::json!({
             "event": "pane_closed",
             "data": {"pane_id": "pane-7", "workspace_id": "workspace-1"}
@@ -1238,10 +1253,11 @@ mod tests {
         assert_eq!(workspace_id, "workspace-1");
 
         let Some(HerdrEvent::Pane(PaneEvent {
-            kind: PaneEventKind::Focused {
-                pane_id,
-                workspace_id,
-            },
+            kind:
+                PaneEventKind::Focused {
+                    pane_id,
+                    workspace_id,
+                },
         })) = parse_event(serde_json::json!({
             "event": "pane_focused",
             "data": {"pane_id": "pane-7", "workspace_id": "workspace-1"}
@@ -1254,10 +1270,11 @@ mod tests {
         assert_eq!(workspace_id, "workspace-1");
 
         let Some(HerdrEvent::Pane(PaneEvent {
-            kind: PaneEventKind::Moved {
-                previous_pane_id,
-                pane,
-            },
+            kind:
+                PaneEventKind::Moved {
+                    previous_pane_id,
+                    pane,
+                },
         })) = parse_event(serde_json::json!({
             "event": "pane_moved",
             "data": {
@@ -1290,10 +1307,11 @@ mod tests {
         assert_eq!(pane.workspace_id, "workspace-2");
 
         let Some(HerdrEvent::Pane(PaneEvent {
-            kind: PaneEventKind::Exited {
-                pane_id,
-                workspace_id,
-            },
+            kind:
+                PaneEventKind::Exited {
+                    pane_id,
+                    workspace_id,
+                },
         })) = parse_event(serde_json::json!({
             "event": "pane_exited",
             "data": {"pane_id": "pane-7", "workspace_id": "workspace-1"}
@@ -1306,10 +1324,11 @@ mod tests {
         assert_eq!(workspace_id, "workspace-1");
 
         let Some(HerdrEvent::Pane(PaneEvent {
-            kind: PaneEventKind::AgentDetected {
-                pane_id,
-                workspace_id,
-            },
+            kind:
+                PaneEventKind::AgentDetected {
+                    pane_id,
+                    workspace_id,
+                },
         })) = parse_event(serde_json::json!({
             "event": "pane_agent_detected",
             "data": {"pane_id": "pane-7", "workspace_id": "workspace-1"}

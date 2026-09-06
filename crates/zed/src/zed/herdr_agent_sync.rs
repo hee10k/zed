@@ -113,19 +113,24 @@ impl<T: Copy> MirrorIndex<T> {
     pub(crate) fn remove(&mut self, key: &AgentKey) -> Option<T> {
         self.entries.remove(key)
     }
+    /// Test-only inspection of the identity-to-terminal mapping.
+    #[cfg(test)]
     pub(crate) fn get(&self, key: &AgentKey) -> Option<T> {
         self.entries.get(key).copied()
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&AgentKey, T)> {
-        self.entries.iter().map(|(key, terminal_id)| (key, *terminal_id))
+        self.entries
+            .iter()
+            .map(|(key, terminal_id)| (key, *terminal_id))
     }
 
-
-    pub(crate) fn missing(
-        &self,
-        mut terminal_present: impl FnMut(T) -> bool,
-    ) -> Vec<AgentKey> {
+    /// Keys whose panel terminal is no longer present. Test-only close
+    /// reconciliation helper: production detection (`detect_closed_mirrors`)
+    /// walks the registry's own mirror map because it must scope to the
+    /// emitting panel.
+    #[cfg(test)]
+    pub(crate) fn missing(&self, mut terminal_present: impl FnMut(T) -> bool) -> Vec<AgentKey> {
         self.entries
             .iter()
             .filter_map(|(key, terminal_id)| {
@@ -203,6 +208,9 @@ impl<T: Clone + Eq + Hash> FocusEcho<T> {
         }
     }
 
+    /// Whether `token` still has a pending request. Test-only introspection;
+    /// production callers use `resolve`, which is token-current-checked.
+    #[cfg(test)]
     pub(crate) fn is_current(&self, token: FocusToken) -> bool {
         self.pending.values().any(|current| *current == token)
     }
@@ -394,7 +402,8 @@ impl AgentSyncState {
     /// session and replay an `Open` for every live record.
     pub(crate) fn resync(&mut self, session: &SessionIdentity) -> Vec<AgentSyncEffect> {
         self.dismissed.retain(|key| &key.session != session);
-        self.failed_revision.retain(|key, _| &key.session != session);
+        self.failed_revision
+            .retain(|key, _| &key.session != session);
         self.records
             .values()
             .filter(|record| &record.key.session == session)
@@ -402,28 +411,21 @@ impl AgentSyncState {
             .collect()
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.records.len()
-    }
-
-    /// Removes every trace of `key` (record, pane lookup, dismissal, failed
-    /// revision) and returns its `Forget` effect. `Forget` only drops
-
     pub(crate) fn record(&self, key: &AgentKey) -> Option<AgentRecord> {
         self.records.get(key).cloned()
     }
 
-    pub(crate) fn record_for_workspace(
+    /// The latest recorded checkout path for one herdr workspace, independent
+    /// of whether any agent is currently live in it. Window focus routing uses
+    /// this so a connected window with no detected agents is still reachable.
+    pub(crate) fn workspace_checkout(
         &self,
         session: &SessionIdentity,
         workspace_id: &str,
-    ) -> Option<AgentRecord> {
-        self.records
-            .values()
-            .find(|record| {
-                &record.key.session == session && record.workspace_id.as_ref() == workspace_id
-            })
-            .cloned()
+    ) -> Option<PathBuf> {
+        self.workspace_checkouts
+            .get(&(session.clone(), Arc::from(workspace_id)))
+            .and_then(|checkout| checkout.clone())
     }
 
     /// Resolve the herdr workspace id whose recorded checkout matches `path`
@@ -446,6 +448,8 @@ impl AgentSyncState {
                 (candidate == wanted).then(|| workspace_id.clone())
             })
     }
+    /// Removes every trace of `key` (record, pane lookup, dismissal, failed
+    /// revision) and returns its `Forget` effect. `Forget` only drops
     /// synchronization ownership; it never closes the Agent Panel terminal.
     fn forget_one(&mut self, key: &AgentKey) -> AgentSyncEffect {
         if let Some(record) = self.records.remove(key) {
@@ -544,7 +548,7 @@ mod tests {
                     && record.agent_name.as_ref() == "claude"
                     && record.effective_cwd.as_deref() == Some(Path::new("/repo/worktree"))
         ));
-        assert_eq!(state.len(), 1);
+        assert_eq!(state.records.len(), 1);
     }
 
     #[test]
@@ -554,13 +558,17 @@ mod tests {
         state.upsert(identity.clone(), pane("terminal-1", "pane-a", 5));
         // Older revisions, and even a different pane id at an equal revision,
         // are ignored.
-        assert!(state
-            .upsert(identity.clone(), pane("terminal-1", "pane-a", 4))
-            .is_empty());
-        assert!(state
-            .upsert(identity.clone(), pane("terminal-1", "pane-b", 5))
-            .is_empty());
-        assert_eq!(state.len(), 1);
+        assert!(
+            state
+                .upsert(identity.clone(), pane("terminal-1", "pane-a", 4))
+                .is_empty()
+        );
+        assert!(
+            state
+                .upsert(identity.clone(), pane("terminal-1", "pane-b", 5))
+                .is_empty()
+        );
+        assert_eq!(state.records.len(), 1);
     }
 
     #[test]
@@ -574,7 +582,7 @@ mod tests {
             moved.as_slice(),
             [AgentSyncEffect::PaneMoved { pane_id, .. }] if pane_id.as_ref() == "pane-b"
         ));
-        assert_eq!(state.len(), 1);
+        assert_eq!(state.records.len(), 1);
     }
 
     #[test]
@@ -583,7 +591,9 @@ mod tests {
         let identity = session("main");
         let key = AgentKey::new(identity.clone(), "terminal-1");
         assert!(matches!(
-            state.upsert(identity.clone(), pane("terminal-1", "pane-a", 1)).as_slice(),
+            state
+                .upsert(identity.clone(), pane("terminal-1", "pane-a", 1))
+                .as_slice(),
             [AgentSyncEffect::Open(_)]
         ));
 
@@ -611,9 +621,11 @@ mod tests {
         let mut state = AgentSyncState::default();
         let key = AgentKey::new(session("main"), "terminal-1");
         state.dismiss(key.clone());
-        assert!(state
-            .upsert(session("main"), pane("terminal-1", "pane-a", 3))
-            .is_empty());
+        assert!(
+            state
+                .upsert(session("main"), pane("terminal-1", "pane-a", 3))
+                .is_empty()
+        );
         assert_eq!(state.resync(&session("main")).len(), 1);
     }
 
@@ -628,7 +640,7 @@ mod tests {
             effects.as_slice(),
             [AgentSyncEffect::Forget(key)] if key.terminal_id.as_ref() == "terminal-1"
         ));
-        assert_eq!(state.len(), 0);
+        assert_eq!(state.records.len(), 0);
     }
 
     #[test]
@@ -637,16 +649,22 @@ mod tests {
         let identity = session("main");
         let key = AgentKey::new(identity.clone(), "terminal-1");
         assert!(matches!(
-            state.upsert(identity.clone(), pane("terminal-1", "pane-a", 1)).as_slice(),
+            state
+                .upsert(identity.clone(), pane("terminal-1", "pane-a", 1))
+                .as_slice(),
             [AgentSyncEffect::Open(_)]
         ));
         assert!(state.record_failure(&key, 1));
         assert!(!state.record_failure(&key, 1));
-        assert!(state
-            .upsert(identity.clone(), pane("terminal-1", "pane-a", 1))
-            .is_empty());
+        assert!(
+            state
+                .upsert(identity.clone(), pane("terminal-1", "pane-a", 1))
+                .is_empty()
+        );
         assert!(matches!(
-            state.upsert(identity, pane("terminal-1", "pane-a", 2)).as_slice(),
+            state
+                .upsert(identity, pane("terminal-1", "pane-a", 2))
+                .as_slice(),
             [AgentSyncEffect::Open(_)]
         ));
     }
@@ -664,11 +682,13 @@ mod tests {
             effects.as_slice(),
             [AgentSyncEffect::Forget(forgotten)] if forgotten == &key
         ));
-        assert_eq!(state.len(), 0);
+        assert_eq!(state.records.len(), 0);
 
         // Pane exit clears dismissal permanently, so a later update reopens.
         assert!(matches!(
-            state.upsert(identity.clone(), pane("terminal-1", "pane-b", 2)).as_slice(),
+            state
+                .upsert(identity.clone(), pane("terminal-1", "pane-b", 2))
+                .as_slice(),
             [AgentSyncEffect::Open(_)]
         ));
         // The pane-to-key lookup for the exited pane id is gone.
@@ -700,8 +720,12 @@ mod tests {
         let mut no_agent = pane("terminal-1", "pane-a", 1);
         no_agent.agent = None;
         assert!(state.upsert(identity.clone(), no_agent).is_empty());
-        assert!(state.upsert(identity.clone(), pane("", "pane-a", 1)).is_empty());
-        assert_eq!(state.len(), 0);
+        assert!(
+            state
+                .upsert(identity.clone(), pane("", "pane-a", 1))
+                .is_empty()
+        );
+        assert_eq!(state.records.len(), 0);
     }
 
     #[test]
