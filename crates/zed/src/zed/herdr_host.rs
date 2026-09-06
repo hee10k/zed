@@ -119,6 +119,8 @@ impl Render for HerdRStatusButton {
             .gap_1()
             .child(
                 IconButton::new("herdr-status-button", IconName::Terminal)
+                    .tab_index(0isize)
+                    .aria_label(label.clone())
                     .icon_size(IconSize::Small)
                     .toggle_state(selected)
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
@@ -376,25 +378,36 @@ impl Render for HerdRHost {
         let collapsed = self.collapsed;
         let maximized = self.maximized;
         let terminal = self.terminal_view.clone();
-        let _action_labels = host_action_labels(&state);
         let controls = match state {
             BindingState::Unselected => h_flex().gap_2().child(
-                Button::new("herdr-choose-session", "Choose Session")
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|host, _, window, cx| host.choose_session(window, cx))),
+                div()
+                    .debug_selector(|| "herdr-action-choose-session".to_owned())
+                    .child(
+                        Button::new("herdr-choose-session", "Choose Session")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|host, _, window, cx| host.choose_session(window, cx))),
+                    ),
             ),
             BindingState::Starting { .. } | BindingState::Connected(_) => h_flex(),
             BindingState::Failed { .. } => h_flex()
                 .gap_2()
                 .child(
-                    Button::new("herdr-retry", "Retry")
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|host, _, _, cx| host.retry(cx))),
+                    div()
+                        .debug_selector(|| "herdr-action-retry".to_owned())
+                        .child(
+                            Button::new("herdr-retry", "Retry")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|host, _, _, cx| host.retry(cx))),
+                        ),
                 )
                 .child(
-                    Button::new("herdr-choose-session", "Choose Session")
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|host, _, window, cx| host.choose_session(window, cx))),
+                    div()
+                        .debug_selector(|| "herdr-action-choose-session".to_owned())
+                        .child(
+                            Button::new("herdr-choose-session", "Choose Session")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|host, _, window, cx| host.choose_session(window, cx))),
+                        ),
                 ),
         };
         let host = div()
@@ -484,13 +497,6 @@ fn fixed_worktree_for(workspace: &Workspace, cx: &App) -> PathBuf {
         .unwrap_or_else(|| home_dir().clone())
 }
 
-fn host_action_labels(state: &BindingState) -> &'static [&'static str] {
-    match state {
-        BindingState::Unselected => &["Choose Session"],
-        BindingState::Starting { .. } | BindingState::Connected(_) => &[],
-        BindingState::Failed { .. } => &["Retry", "Choose Session"],
-    }
-}
 
 fn host_from_multi_workspace(multi_workspace: &MultiWorkspace) -> Option<Entity<HerdRHost>> {
     multi_workspace
@@ -683,9 +689,10 @@ pub fn status_from_app(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HerdRVisibilityTransition, binding_label, host_action_labels, toggle_visibility};
+    use super::{HerdRHost, HerdRVisibilityTransition, binding_label, toggle_visibility};
     use crate::zed::herdr_agent_sync::SessionIdentity;
-    use crate::zed::herdr_session_registry::BindingState;
+    use crate::zed::herdr_session_registry::{BindingState, HerdrSessionRegistry};
+    use gpui::TestAppContext;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -718,18 +725,98 @@ mod tests {
             "herdr: Could not connect to main"
         );
     }
-    #[test]
-    fn failed_render_has_retry_and_choose_actions_but_starting_has_none() {
-        assert_eq!(
-            host_action_labels(&BindingState::Failed {
-                session_name: Arc::from("main"),
-                message: "socket closed".into(),
-            }),
-            ["Retry", "Choose Session"]
+
+    #[gpui::test]
+    async fn rendered_failed_surface_has_retry_and_choose_session(cx: &mut TestAppContext) {
+        use crate::zed::herdr_session_registry::HerdrGateway;
+        use futures::FutureExt as _;
+        use gpui::{AppContext as _, WindowHandle, px, size};
+        use project::DisableAiSettings;
+        use settings::{Settings as _, SettingsStore};
+        use std::path::Path;
+        use workspace::MultiWorkspace;
+
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            DisableAiSettings::register(cx);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = project::Project::test(fs, [Path::new("/root")], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let gateway = HerdrGateway::fake(
+            || async { Ok(Vec::new()) }.boxed_local(),
+            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+            |_name| async { Ok(()) }.boxed_local(),
         );
-        assert!(host_action_labels(&BindingState::Starting {
-            session_name: Arc::from("main")
-        })
-        .is_empty());
+        let registry = cx.new(|cx| HerdrSessionRegistry::test(cx, gateway));
+        let window_id =
+            multi_workspace.update_in(cx, |_, window, _| window.window_handle().window_id());
+        let host = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            let workspace = multi_workspace.workspace().clone();
+            cx.new(|cx| {
+                HerdRHost::new(
+                    registry.clone(),
+                    window_id,
+                    workspace,
+                    PathBuf::from("/root"),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+        });
+        let handle = WindowHandle::<MultiWorkspace>::new(window_id);
+        registry.update(cx, |registry, _| {
+            registry.register_window_for_test(
+                handle,
+                BindingState::Failed {
+                    session_name: Arc::from("main"),
+                    message: "socket closed".into(),
+                },
+                Vec::new(),
+            );
+        });
+        multi_workspace.update_in(cx, |multi_workspace, _, cx| {
+            multi_workspace.set_window_root_host(Some(host.into()), cx);
+            multi_workspace.set_herdr_visible(true, cx);
+        });
+        cx.simulate_resize(size(px(900.0), px(700.0)));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("herdr-action-retry").is_some(),
+            "Failed surface must render the Retry action"
+        );
+        assert!(
+            cx.debug_bounds("herdr-action-choose-session").is_some(),
+            "Failed surface must render the Choose Session action"
+        );
+
+        registry.update(cx, |registry, _| {
+            registry.register_window_for_test(
+                handle,
+                BindingState::Starting {
+                    session_name: Arc::from("main"),
+                },
+                Vec::new(),
+            );
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("herdr-action-retry").is_none(),
+            "Starting surface must not render a Retry action"
+        );
     }
 }

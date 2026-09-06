@@ -477,9 +477,14 @@ fn suggested_session_name(workspace: &Workspace, cx: &App) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PickerEntry, SessionPickerDelegate, picker_entry_label};
+    use super::{PickerEntry, PickerMode, SessionPickerDelegate, picker_entry_label};
+    use crate::zed::herdr_session_registry::HerdrGateway;
+    use futures::FutureExt as _;
     use futures::channel::mpsc;
-    use picker::PickerDelegate;
+    use gpui::TestAppContext;
+    use picker::{Picker, PickerDelegate};
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     fn session(name: &str, running: bool) -> herdr::SessionInfo {
         herdr::SessionInfo {
@@ -517,5 +522,217 @@ mod tests {
     fn stopped_sessions_have_a_visible_indicator() {
         assert_eq!(picker_entry_label("main", false), "main · stopped");
         assert_eq!(picker_entry_label("main", true), "main");
+    }
+
+    fn fake_gateway(
+        list: Rc<dyn Fn(usize) -> anyhow::Result<Vec<herdr::SessionInfo>>>,
+        validate: Rc<dyn Fn(String) -> anyhow::Result<()>>,
+    ) -> HerdrGateway {
+        let calls = Rc::new(Cell::new(0usize));
+        HerdrGateway::fake(
+            move || {
+                let count = calls.get();
+                calls.set(count + 1);
+                let result = list(count);
+                async move { result }.boxed_local()
+            },
+            |_info| async { Err(anyhow::anyhow!("picker tests never connect")) }.boxed_local(),
+            move |name| {
+                let validate = validate.clone();
+                async move { validate(name) }.boxed_local()
+            },
+        )
+    }
+
+    fn init(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+    }
+
+    fn add_picker<'a>(
+        cx: &'a mut TestAppContext,
+        gateway: HerdrGateway,
+    ) -> (
+        gpui::Entity<Picker<SessionPickerDelegate>>,
+        &'a mut gpui::VisualTestContext,
+        mpsc::Receiver<super::SessionSelection>,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
+        let delegate = SessionPickerDelegate::new(Some(gateway), "suggested".to_owned(), tx);
+        let (picker, cx) =
+            cx.add_window_view(|window, cx| Picker::uniform_list(delegate, window, cx));
+        (picker, cx, rx)
+    }
+
+
+    /// `futures`' `try_next` reports "nothing buffered" as `Err(Empty)`;
+    /// normalize both empty and closed to `None`.
+    fn take_selection(
+        rx: &mut mpsc::Receiver<super::SessionSelection>,
+    ) -> Option<super::SessionSelection> {
+        rx.try_next().ok().flatten()
+    }
+
+    #[gpui::test]
+    async fn confirming_an_existing_session_emits_it_once(cx: &mut TestAppContext) {
+        init(cx);
+        let (picker, cx, mut selection_rx) = add_picker(
+            cx,
+            fake_gateway(
+                Rc::new(|_| Ok(vec![session("main", true)])),
+                Rc::new(|_| Ok(())),
+            ),
+        );
+        cx.run_until_parked();
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.set_selected_index(0, window, cx);
+            picker.delegate.confirm(false, window, cx);
+            picker.delegate.confirm(false, window, cx);
+        });
+        assert!(
+            matches!(
+                take_selection(&mut selection_rx).as_ref(),
+                Some(super::SessionSelection::Existing(info)) if info.name == "main"
+            ),
+            "confirming a running session row must emit exactly one Existing selection"
+        );
+        assert!(
+            take_selection(&mut selection_rx).is_none(),
+            "a second confirm must not emit a second selection"
+        );
+    }
+
+    #[gpui::test]
+    async fn edited_name_confirmation_validates_then_emits_new(cx: &mut TestAppContext) {
+        init(cx);
+        let (picker, cx, mut selection_rx) = add_picker(
+            cx,
+            fake_gateway(
+                Rc::new(|_| Ok(vec![session("main", true)])),
+                Rc::new(|_| Ok(())),
+            ),
+        );
+        cx.run_until_parked();
+        let query = picker.update_in(cx, |picker, window, cx| {
+            // Selecting "New session…" and confirming switches to the name
+            // editor with the suggested name pre-filled.
+            picker.delegate.set_selected_index(1, window, cx);
+            picker.delegate.confirm_update_query(window, cx)
+        });
+        assert_eq!(query.as_deref(), Some("suggested"));
+        picker.update_in(cx, |picker, window, cx| {
+            picker.update_matches("  edited  ".to_owned(), window, cx);
+            picker.delegate.confirm(false, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            matches!(
+                take_selection(&mut selection_rx).as_ref(),
+                Some(super::SessionSelection::New { name }) if name == "edited"
+            ),
+            "an accepted new name must reach the channel trimmed"
+        );
+    }
+
+    #[gpui::test]
+    async fn validation_rejection_keeps_modal_open_without_selection(cx: &mut TestAppContext) {
+        init(cx);
+        let (picker, cx, mut selection_rx) = add_picker(
+            cx,
+            fake_gateway(
+                Rc::new(|_| Ok(vec![session("main", true)])),
+                Rc::new(|name| {
+                    Err(anyhow::anyhow!(
+                        "  session name {name:?} rejected by grammar  "
+                    ))
+                }),
+            ),
+        );
+        cx.run_until_parked();
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.set_selected_index(1, window, cx);
+            picker.delegate.confirm_update_query(window, cx);
+            let _ = picker.delegate.update_matches("bad name".to_owned(), window, cx);
+            picker.delegate.confirm(false, window, cx);
+        });
+        cx.run_until_parked();
+        let (error, mode_is_new_name, retryable) = picker.read_with(cx, |picker, _| {
+            (
+                picker.delegate.validation_error.clone(),
+                matches!(picker.delegate.mode, PickerMode::NewName { .. }),
+                !picker.delegate.confirmation_sent,
+            )
+        });
+        assert_eq!(
+            error.map(|error| error.to_string()).as_deref(),
+            Some("session name \"bad name\" rejected by grammar"),
+            "the CLI message must be preserved trimmed"
+        );
+        assert!(mode_is_new_name, "rejection keeps the name editor open");
+        assert!(retryable, "a rejected name may be confirmed again");
+        assert!(take_selection(&mut selection_rx).is_none());
+    }
+
+    #[gpui::test]
+    async fn list_error_keeps_modal_with_one_retry_row(cx: &mut TestAppContext) {
+        init(cx);
+        let (picker, cx, mut selection_rx) = add_picker(
+            cx,
+            fake_gateway(
+                Rc::new(|count| {
+                    if count == 0 {
+                        Err(anyhow::anyhow!("list failed"))
+                    } else {
+                        Ok(vec![session("main", true)])
+                    }
+                }),
+                Rc::new(|_| Ok(())),
+            ),
+        );
+        cx.run_until_parked();
+        let (match_count, retry_label) = picker.update_in(cx, |picker, window, cx| {
+            let item = picker.delegate.render_match(0, true, window, cx);
+            (picker.delegate.match_count(), item.is_some())
+        });
+        assert_eq!(
+            match_count, 1,
+            "an errored list shows exactly one retry row"
+        );
+        assert!(retry_label, "the retry row renders");
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.confirm(false, window, cx);
+        });
+        assert!(
+            take_selection(&mut selection_rx).is_none(),
+            "confirming the retry row refreshes instead of selecting"
+        );
+        cx.run_until_parked();
+        let match_count = picker.read_with(cx, |picker, _| picker.delegate.match_count());
+        assert_eq!(match_count, 2, "after a successful retry the rows return");
+    }
+
+    #[gpui::test]
+    async fn cancel_produces_no_selection(cx: &mut TestAppContext) {
+        init(cx);
+        let (picker, cx, mut selection_rx) = add_picker(
+            cx,
+            fake_gateway(
+                Rc::new(|_| Ok(vec![session("main", true)])),
+                Rc::new(|_| Ok(())),
+            ),
+        );
+        cx.run_until_parked();
+        picker.update_in(cx, |picker, window, cx| {
+            picker.cancel(&menu::Cancel, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            take_selection(&mut selection_rx).is_none(),
+            "cancellation must never emit a selection"
+        );
     }
 }
