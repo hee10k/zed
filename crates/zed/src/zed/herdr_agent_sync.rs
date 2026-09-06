@@ -3,6 +3,7 @@ use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agent_ui::{ExternalTerminalThread, TerminalId};
 use herdr::{PaneInfo, SessionInfo, WorkspaceInfo};
 
 /// Stable identity of one herdr CLI session. The CLI session directory, not
@@ -54,6 +55,94 @@ pub(crate) struct AgentRecord {
     pub(crate) agent_name: Arc<str>,
 }
 
+/// Build the structured external terminal command for one live agent.
+///
+/// The terminal id is the stable identity while the pane id is deliberately
+/// read from the latest reducer record, so a moved agent keeps one Zed thread
+/// while subsequent opens/focuses target its current pane.
+pub(crate) fn external_terminal_spec(
+    record: &AgentRecord,
+    herdr_program: &Path,
+) -> ExternalTerminalThread {
+    ExternalTerminalThread {
+        identity: format!(
+            "herdr:{}:{}",
+            record.key.session.session_dir.display(),
+            record.key.terminal_id
+        )
+        .into(),
+        executable: herdr_program.to_string_lossy().into_owned(),
+        args: vec![
+            "--session".into(),
+            record.key.session.name.to_string(),
+            "agent".into(),
+            "attach".into(),
+            record.pane_id.to_string(),
+        ],
+        title: format!("herdr · {}", record.agent_name).into(),
+        working_directory: record
+            .checkout_path
+            .clone()
+            .or_else(|| record.effective_cwd.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// Pure index of live herdr agent keys and their Agent Panel terminal ids.
+///
+/// The registry owns the window/panel handles around this index. Keeping the
+/// identity-to-terminal mapping pure makes close reconciliation deterministic
+/// and keeps it independently testable.
+pub(crate) struct MirrorIndex<T = TerminalId> {
+    entries: HashMap<AgentKey, T>,
+}
+
+impl<T> Default for MirrorIndex<T> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::default(),
+        }
+    }
+}
+
+impl<T: Copy> MirrorIndex<T> {
+    pub(crate) fn insert(&mut self, key: AgentKey, terminal_id: T) {
+        self.entries.insert(key, terminal_id);
+    }
+
+    pub(crate) fn remove(&mut self, key: &AgentKey) -> Option<T> {
+        self.entries.remove(key)
+    }
+
+    pub(crate) fn get(&self, key: &AgentKey) -> Option<T> {
+        self.entries.get(key).copied()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&AgentKey, T)> {
+        self.entries.iter().map(|(key, terminal_id)| (key, *terminal_id))
+    }
+
+    pub(crate) fn key_for_terminal(&self, terminal_id: T) -> Option<AgentKey>
+    where
+        T: Eq,
+    {
+        self.entries
+            .iter()
+            .find_map(|(key, id)| (*id == terminal_id).then_some(key.clone()))
+    }
+
+    pub(crate) fn missing(
+        &self,
+        mut terminal_present: impl FnMut(T) -> bool,
+    ) -> Vec<AgentKey> {
+        self.entries
+            .iter()
+            .filter_map(|(key, terminal_id)| {
+                (!terminal_present(*terminal_id)).then_some(key.clone())
+            })
+            .collect()
+    }
+}
 /// Effects the driver applies after each reduction, in emitted order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentSyncEffect {
@@ -106,6 +195,10 @@ impl<T: Clone + Eq + Hash> FocusEcho<T> {
         let token = FocusToken(self.generation);
         self.pending.insert(target, token);
         token
+    }
+
+    pub(crate) fn has_pending(&self, target: &T) -> bool {
+        self.pending.contains_key(target)
     }
 
     pub(crate) fn is_current(&self, token: FocusToken) -> bool {
@@ -307,6 +400,23 @@ impl AgentSyncState {
 
     /// Removes every trace of `key` (record, pane lookup, dismissal, failed
     /// revision) and returns its `Forget` effect. `Forget` only drops
+
+    pub(crate) fn record(&self, key: &AgentKey) -> Option<AgentRecord> {
+        self.records.get(key).cloned()
+    }
+
+    pub(crate) fn record_for_workspace(
+        &self,
+        session: &SessionIdentity,
+        workspace_id: &str,
+    ) -> Option<AgentRecord> {
+        self.records
+            .values()
+            .find(|record| {
+                &record.key.session == session && record.workspace_id.as_ref() == workspace_id
+            })
+            .cloned()
+    }
     /// synchronization ownership; it never closes the Agent Panel terminal.
     fn forget_one(&mut self, key: &AgentKey) -> AgentSyncEffect {
         if let Some(record) = self.records.remove(key) {
@@ -345,6 +455,49 @@ mod tests {
             foreground_cwd: None,
             agent_session: None,
         }
+    }
+
+    fn test_session() -> SessionIdentity {
+        SessionIdentity {
+            name: Arc::from("main"),
+            session_dir: Arc::from(PathBuf::from(r"C:\sessions\main")),
+        }
+    }
+
+    fn agent_record(terminal_id: &str, pane_id: &str, worktree: &str) -> AgentRecord {
+        AgentRecord {
+            key: AgentKey::new(test_session(), terminal_id),
+            workspace_id: Arc::from("workspace-1"),
+            pane_id: Arc::from(pane_id),
+            revision: 4,
+            focused: true,
+            checkout_path: Some(PathBuf::from(worktree)),
+            effective_cwd: Some(PathBuf::from(worktree)),
+            agent_name: Arc::from("claude"),
+        }
+    }
+
+    #[test]
+    fn attach_spec_uses_latest_pane_and_structured_args() {
+        let record = agent_record("terminal-1", "pane-new", r"C:\repo\worktree");
+        let spec = external_terminal_spec(&record, Path::new("herdr.exe"));
+
+        assert_eq!(spec.executable, "herdr.exe");
+        assert_eq!(
+            spec.args,
+            vec!["--session", "main", "agent", "attach", "pane-new"]
+        );
+        assert_eq!(spec.working_directory, PathBuf::from(r"C:\repo\worktree"));
+    }
+
+    #[test]
+    fn missing_panel_terminal_returns_the_live_agent_key() {
+        let key = AgentKey::new(test_session(), "terminal-1");
+        let terminal_id = 7_u64;
+        let mut mirrors: MirrorIndex<u64> = MirrorIndex::default();
+        mirrors.insert(key.clone(), terminal_id);
+        assert_eq!(mirrors.missing(|_| false), vec![key]);
+        assert!(mirrors.missing(|id| id == terminal_id).is_empty());
     }
 
     #[test]

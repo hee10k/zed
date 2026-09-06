@@ -5,27 +5,31 @@
 //! an explicit picker confirmation or causal inheritance from a previously
 //! confirmed selection; nothing here connects to a session on installation.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_ui::{AgentPanel, AgentPanelEvent, TerminalId};
+use fs::Fs;
 use futures::channel::mpsc;
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EntityId, Global, SharedString, Subscription,
-    Task, Window, WindowHandle, WindowId,
+    Task, WeakEntity, Window, WindowHandle, WindowId,
 };
 use herdr::{
     ClientConfig, HerdRClient, HerdrEvent, PaneEvent, PaneEventKind, SessionInfo, SessionSnapshot,
     WorkspaceEvent, canonical_checkout_path,
 };
+use project::discover_root_repo_common_dir;
+use util::path_list::PathList;
 use workspace::{AppState, MultiWorkspace, OpenMode, Workspace};
-
 use super::herdr_agent_sync::{
-    AgentKey, AgentRecord, AgentSyncEffect, AgentSyncState, SessionIdentity,
+    AgentKey, AgentRecord, AgentSyncEffect, AgentSyncState, FocusEcho, FocusObservation, FocusTarget,
+    MirrorIndex, SessionIdentity,
 };
 
 /// How long a startup connection attempt may take in total (catalog polling,
@@ -197,6 +201,13 @@ struct SessionConnection {
     generation: u64,
 }
 
+#[derive(Clone)]
+struct AgentMirror {
+    window: WindowHandle<MultiWorkspace>,
+    panel: WeakEntity<AgentPanel>,
+    terminal_id: TerminalId,
+}
+
 /// Pure binding-state machine. `SessionNotRunning` is a normal exit: it
 /// returns to `Unselected` and starts no reconnect task.
 fn transition(current: BindingState, event: BindingEvent) -> BindingState {
@@ -337,39 +348,13 @@ fn plan_effects(effects: Vec<AgentSyncEffect>) -> Vec<WorkspaceEffect> {
         .collect()
 }
 
-/// The designated Agent Panel effect channel. Task 5 drains this queue into
-/// `AgentPanel::open_external_terminal_thread`, the mirror rename/move calls,
-/// and the focus echo. Until then the queue is the only consumer, and
-/// `Forget` never reaches it: dropping synchronization ownership must not
-/// close mirrored terminals.
+/// Test-only observation seam for reducer effects. Production applies effects
+/// directly to Agent Panel mirrors; no queued production path remains.
+#[cfg(test)]
 pub(crate) trait AgentEffectSink {
     fn push(&self, identity: &SessionIdentity, effect: WorkspaceEffect);
 }
 
-/// Production sink until Task 5 replaces its consumption with live Agent
-/// Panel wiring. TODO(Task 5): drain this queue in the Agent Panel effect
-/// application path (`herdr_session_registry` synchronization step).
-#[derive(Default)]
-pub(crate) struct QueuedAgentEffectSink {
-    queue: Rc<std::cell::RefCell<VecDeque<(SessionIdentity, WorkspaceEffect)>>>,
-}
-
-impl QueuedAgentEffectSink {
-    pub(crate) fn drain(&self) -> Vec<(SessionIdentity, WorkspaceEffect)> {
-        self.queue
-            .borrow_mut()
-            .drain(..)
-            .collect::<Vec<_>>()
-    }
-}
-
-impl AgentEffectSink for QueuedAgentEffectSink {
-    fn push(&self, identity: &SessionIdentity, effect: WorkspaceEffect) {
-        self.queue
-            .borrow_mut()
-            .push_back((identity.clone(), effect));
-    }
-}
 
 /// Pure initial-snapshot import: workspaces first (their checkout paths feed
 /// later records), then every running agent through the reducer's upsert so
@@ -444,6 +429,12 @@ pub(crate) fn herdr_program() -> Option<PathBuf> {
 pub(crate) trait HerdrSessionHandle {
     fn subscribe(&self) -> LocalBoxFuture<'static, anyhow::Result<Box<dyn HerdrEventStream>>>;
     fn snapshot(&self) -> LocalBoxFuture<'static, anyhow::Result<SessionSnapshot>>;
+    fn pane(
+        &self,
+        pane_id: String,
+    ) -> LocalBoxFuture<'static, anyhow::Result<herdr::PaneInfo>>;
+    fn focus_agent(&self, pane_id: String) -> LocalBoxFuture<'static, anyhow::Result<()>>;
+    fn focus_workspace(&self, workspace_id: String) -> LocalBoxFuture<'static, anyhow::Result<()>>;
 }
 
 pub(crate) trait HerdrEventStream {
@@ -547,8 +538,28 @@ impl HerdrSessionHandle for RealHerdrHandle {
         let client = self.client.clone();
         async move { Ok(client.snapshot().await?) }.boxed_local()
     }
-}
 
+    fn pane(
+        &self,
+        pane_id: String,
+    ) -> LocalBoxFuture<'static, anyhow::Result<herdr::PaneInfo>> {
+        let client = self.client.clone();
+        async move { Ok(client.pane(pane_id).await?) }.boxed_local()
+    }
+
+    fn focus_agent(&self, pane_id: String) -> LocalBoxFuture<'static, anyhow::Result<()>> {
+        let client = self.client.clone();
+        async move { Ok(client.focus_agent(pane_id).await?) }.boxed_local()
+    }
+
+    fn focus_workspace(
+        &self,
+        workspace_id: String,
+    ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
+        let client = self.client.clone();
+        async move { Ok(client.focus_workspace(workspace_id).await?) }.boxed_local()
+    }
+}
 struct RealHerdrStream {
     stream: herdr::SubscribeStream,
 }
@@ -599,7 +610,15 @@ pub(crate) struct HerdrSessionRegistry {
     /// Windows for which the host sink has completed installation.
     host_windows: HashSet<u64>,
     sync: AgentSyncState,
-    effects: Rc<dyn AgentEffectSink>,
+    mirror_index: MirrorIndex,
+    mirrors: HashMap<AgentKey, AgentMirror>,
+    /// Focus echoes are keyed by session and target so workspace and agent
+    /// transitions never overwrite one another.
+    focus_echoes: HashMap<SessionIdentity, FocusEcho<FocusTarget>>,
+    observed_panels: HashSet<EntityId>,
+    panel_subscriptions: Vec<Subscription>,
+    #[cfg(test)]
+    effects: Option<Rc<dyn AgentEffectSink>>,
     host_sink: Rc<dyn HerdrHostSink>,
     picker_sink: Rc<dyn SessionPickerSink>,
     gateway: Option<HerdrGateway>,
@@ -609,8 +628,8 @@ pub(crate) struct HerdrSessionRegistry {
     connection_tasks_started: u64,
     _window_observer: Option<Subscription>,
     _window_close_subscription: Option<Subscription>,
-}
 
+}
 impl HerdrSessionRegistry {
     pub(crate) fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalHerdrSessionRegistry>().0.clone()
@@ -673,7 +692,13 @@ impl HerdrSessionRegistry {
             #[cfg(test)]
             test_inherited_open_failures: HashSet::default(),
             sync: AgentSyncState::default(),
-            effects: Rc::new(QueuedAgentEffectSink::default()),
+            mirror_index: MirrorIndex::default(),
+            mirrors: HashMap::default(),
+            focus_echoes: HashMap::default(),
+            observed_panels: HashSet::default(),
+            panel_subscriptions: Vec::new(),
+            #[cfg(test)]
+            effects: None,
             host_sink: Rc::new(NoopHerdrHostSink),
             picker_sink: Rc::new(NoopSessionPickerSink),
             gateway: None,
@@ -1167,7 +1192,6 @@ impl HerdrSessionRegistry {
     /// presentation to the unselected surface. While another window stays
     /// bound, the shared client and event stream remain open; the last
     /// disconnect drops them. No agent-stop RPC is sent and the session
-    /// server is untouched.
     pub(crate) fn disconnect_session(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
         if !self.windows.contains_key(&window_id.as_u64()) {
             return;
@@ -1227,7 +1251,7 @@ impl HerdrSessionRegistry {
         if released {
             self.connections.remove(identity);
             let effects = self.sync.forget_session(identity);
-            self.dispatch_effects(identity, effects);
+            self.dispatch_effects(identity, effects, cx);
             cx.notify();
         }
     }
@@ -1246,7 +1270,7 @@ impl HerdrSessionRegistry {
             return;
         };
         let effects = self.sync.resync(&identity);
-        self.dispatch_effects(&identity, effects);
+        self.dispatch_effects(&identity, effects, cx);
         cx.notify();
         let registry = cx.entity();
         // A fresh snapshot through the existing shared connection keeps the
@@ -1257,17 +1281,539 @@ impl HerdrSessionRegistry {
             };
             let _ = registry.update(cx, |registry, cx| {
                 let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
-                registry.dispatch_effects(&identity, effects);
+                registry.dispatch_effects(&identity, effects, cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
-    fn dispatch_effects(&mut self, identity: &SessionIdentity, effects: Vec<AgentSyncEffect>) {
+    fn dispatch_effects(
+        &mut self,
+        identity: &SessionIdentity,
+        effects: Vec<AgentSyncEffect>,
+        cx: &mut Context<Self>,
+    ) {
         for effect in plan_effects(effects) {
-            self.effects.push(identity, effect);
+            #[cfg(test)]
+            if let Some(sink) = self.effects.as_ref() {
+                sink.push(identity, effect);
+                continue;
+            }
+            self.apply_workspace_effect(identity, effect, cx);
         }
+    }
+
+    fn window_for_root(&self, root: &herdr::CanonicalPath) -> Option<WindowHandle<MultiWorkspace>> {
+        let root_path = Path::new(root.as_str());
+        self.windows
+            .values()
+            .find(|binding| {
+                binding.roots.iter().any(|candidate| {
+                    let candidate_path = Path::new(candidate.as_str());
+                    candidate == root
+                        || root_path
+                            .strip_prefix(candidate_path)
+                            .is_ok_and(|suffix| !suffix.as_os_str().is_empty())
+                })
+            })
+            .map(|binding| binding.window)
+    }
+
+    fn source_window_for_session(
+        &self,
+        identity: &SessionIdentity,
+    ) -> Option<WindowHandle<MultiWorkspace>> {
+        self.windows
+            .values()
+            .find(|binding| {
+                matches!(
+                    &binding.state,
+                    BindingState::Connected(bound) if bound == identity
+                )
+            })
+            .map(|binding| binding.window)
+    }
+
+    pub(crate) fn reserve_inherited_workspace(
+        &mut self,
+        workspace_id: EntityId,
+        identity: SessionIdentity,
+    ) {
+        let Some((donor, donor_generation)) = self
+            .windows
+            .iter()
+            .find_map(|(window_id, binding)| {
+                matches!(
+                    &binding.state,
+                    BindingState::Connected(bound) if bound == &identity
+                )
+                .then_some((
+                    WindowId::from(*window_id),
+                    self.attempts.get(window_id).copied().unwrap_or_default(),
+                ))
+            })
+        else {
+            return;
+        };
+        self.reserve_pending(
+            workspace_id,
+            PendingBinding::Inherited {
+                identity,
+                donor,
+                donor_generation,
+            },
+        );
+    }
+
+    fn register_panel_observer(
+        &mut self,
+        panel: Entity<AgentPanel>,
+        window: WindowHandle<MultiWorkspace>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.observed_panels.insert(panel.entity_id()) {
+            return;
+        }
+        let subscription = cx.subscribe(
+            &panel,
+            move |registry: &mut HerdrSessionRegistry,
+                  panel: Entity<AgentPanel>,
+                  event: &AgentPanelEvent,
+                  cx: &mut Context<HerdrSessionRegistry>| {
+                match event {
+                    AgentPanelEvent::ActiveViewFocused
+                    | AgentPanelEvent::ActiveViewChanged => {
+                        let identity = panel
+                            .read(cx)
+                            .active_terminal_id()
+                            .and_then(|terminal_id| {
+                                panel
+                                    .read(cx)
+                                    .external_terminal_identity(terminal_id)
+                                    .map(str::to_owned)
+                            });
+                        if let Some(identity) = identity {
+                            if let Some(agent) = registry.agent_for_external_identity(&identity) {
+                                registry.focus_herdr_agent(agent, cx);
+                            }
+                        }
+                    }
+                    AgentPanelEvent::EntryChanged => {
+                        registry.detect_closed_mirrors(&panel, window, cx);
+                    }
+                    AgentPanelEvent::ExternalTerminalSpawnFinished { identity, message } => {
+                        registry.handle_external_spawn_finished(
+                            identity.clone(),
+                            message.clone(),
+                            &panel,
+                            window,
+                            cx,
+                        );
+                    }
+                    AgentPanelEvent::TerminalCloseRequested { .. }
+                    | AgentPanelEvent::ThreadInteracted { .. } => {}
+                }
+            },
+        );
+        self.panel_subscriptions.push(subscription);
+    }
+
+    fn external_identity(key: &AgentKey) -> String {
+        format!("herdr:{}:{}", key.session.session_dir.display(), key.terminal_id)
+    }
+
+    pub(crate) fn agent_for_external_identity(
+        &self,
+        identity: &str,
+    ) -> Option<AgentKey> {
+        self.mirror_index
+            .iter()
+            .find_map(|(key, _)| (Self::external_identity(key) == identity).then_some(key.clone()))
+    }
+
+    fn focus_local_agent(&mut self, key: &AgentKey, cx: &mut Context<Self>) {
+        let Some(mirror) = self.mirrors.get(key).cloned() else {
+            return;
+        };
+        let _ = mirror.window.update(cx, |_, window, cx| {
+            mirror
+                .panel
+                .upgrade()
+                .map(|panel| {
+                    panel.update(cx, |panel, cx| {
+                        panel.activate_terminal(mirror.terminal_id, true, window, cx);
+                    })
+                });
+            window.activate_window();
+        });
+    }
+
+    fn detect_closed_mirrors(
+        &mut self,
+        panel: &Entity<AgentPanel>,
+        _window: WindowHandle<MultiWorkspace>,
+        _cx: &mut Context<Self>,
+    ) {
+        let missing = self.mirror_index.missing(|terminal_id| {
+            panel.read(_cx).has_terminal(terminal_id)
+        });
+        for key in missing {
+            self.mirror_index.remove(&key);
+            self.mirrors.remove(&key);
+            self.sync.dismiss(key);
+        }
+    }
+
+    fn handle_external_spawn_finished(
+        &mut self,
+        identity: SharedString,
+        message: Option<SharedString>,
+        panel: &Entity<AgentPanel>,
+        _window: WindowHandle<MultiWorkspace>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = self.agent_for_external_identity(&identity) else {
+            return;
+        };
+        let Some(record) = self.sync.record(&key) else {
+            return;
+        };
+        match message {
+            None => {
+                if self
+                    .mirrors
+                    .get(&key)
+                    .is_some_and(|mirror| panel.read(cx).has_terminal(mirror.terminal_id))
+                {
+                    self.sync.clear_failure(&key);
+                }
+            }
+            Some(message) => {
+                self.report_mirror_failure(&key, record.revision, message.to_string(), cx);
+            }
+        }
+    }
+
+    pub(crate) fn focus_herdr_agent(&mut self, key: AgentKey, cx: &mut Context<Self>) {
+        let Some(record) = self.sync.record(&key) else {
+            return;
+        };
+        let Some(client) = self
+            .connections
+            .get(&key.session)
+            .map(|connection| connection.client.clone())
+        else {
+            return;
+        };
+        let target = FocusTarget::Agent(key.clone());
+        let echo = self.focus_echoes.entry(key.session.clone()).or_default();
+        if echo.observe(target.clone()) == FocusObservation::Echo {
+            return;
+        }
+        let token = echo.request(target);
+        let registry = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            if let Err(error) = client.focus_agent(record.pane_id.to_string()).await {
+                log::debug!("herdr agent focus failed: {error:#}");
+            }
+            let _ = registry.update(cx, |registry, _| {
+                if let Some(echo) = registry.focus_echoes.get(&key.session) {
+                    let _ = echo.is_current(token);
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn focus_herdr_workspace(
+        &mut self,
+        window_id: WindowId,
+        workspace_id: Arc<str>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(identity) = self
+            .windows
+            .get(&window_id.as_u64())
+            .and_then(|binding| match &binding.state {
+                BindingState::Connected(identity) => Some(identity.clone()),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let target = FocusTarget::Workspace {
+            session: identity.clone(),
+            workspace_id: workspace_id.clone(),
+        };
+        let echo = self.focus_echoes.entry(identity.clone()).or_default();
+        if echo.observe(target.clone()) == FocusObservation::Echo {
+            return;
+        }
+        let token = echo.request(target);
+        let Some(client) = self
+            .connections
+            .get(&identity)
+            .map(|connection| connection.client.clone())
+        else {
+            return;
+        };
+        let registry = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            if let Err(error) = client.focus_workspace(workspace_id.to_string()).await {
+                log::debug!("herdr workspace focus failed: {error:#}");
+            }
+            let _ = registry.update(cx, |registry, _| {
+                if let Some(echo) = registry.focus_echoes.get(&identity) {
+                    let _ = echo.is_current(token);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn focus_remote_workspace(
+        &mut self,
+        identity: &SessionIdentity,
+        workspace_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.sync.record_for_workspace(identity, workspace_id) else {
+            return;
+        };
+        if let Some(mirror) = self.mirrors.get(&record.key).cloned() {
+            let _ = mirror.window.update(cx, |_, window, _| window.activate_window());
+        }
+    }
+
+    fn apply_workspace_effect(
+        &mut self,
+        identity: &SessionIdentity,
+        effect: WorkspaceEffect,
+        cx: &mut Context<Self>,
+    ) {
+        match effect {
+            WorkspaceEffect::Open(record) => self.mirror_agent(record, cx),
+            WorkspaceEffect::PaneMoved { key, .. } => {
+                if let Some(record) = self.sync.record(&key) {
+                    self.mirror_agent(record, cx);
+                }
+            }
+            WorkspaceEffect::Focus(key) => self.focus_local_agent(&key, cx),
+        }
+        let _ = identity;
+    }
+
+    fn mirror_agent(&mut self, record: AgentRecord, cx: &mut Context<Self>) {
+        let Some(candidate) = record
+            .checkout_path
+            .clone()
+            .or_else(|| record.effective_cwd.clone())
+        else {
+            self.report_mirror_failure(
+                &record.key,
+                record.revision,
+                "herdr agent has no checkout path or current directory".into(),
+                cx,
+            );
+            return;
+        };
+        if !candidate.is_absolute() {
+            self.report_mirror_failure(
+                &record.key,
+                record.revision,
+                format!("herdr agent path is not absolute: {}", candidate.display()),
+                cx,
+            );
+            return;
+        }
+
+        let fs = <dyn Fs>::global(cx).clone();
+        let registry = cx.entity();
+        let herdr_program = self.program();
+        cx.spawn(async move |_this, mut cx| {
+            let metadata = fs.metadata(&candidate).await;
+            let valid_directory = metadata
+                .as_ref()
+                .is_ok_and(|metadata| metadata.as_ref().is_some_and(|metadata| metadata.is_dir));
+            if !valid_directory {
+                let message = match metadata {
+                    Ok(None) => format!("herdr agent worktree does not exist: {}", candidate.display()),
+                    Ok(Some(_)) => format!("herdr agent worktree is not a directory: {}", candidate.display()),
+                    Err(error) => format!("could not inspect herdr agent worktree: {error:#}"),
+                };
+                let _ = registry.update(cx, |registry, cx| {
+                    registry.report_mirror_failure(
+                        &record.key,
+                        record.revision,
+                        message,
+                        cx,
+                    );
+                });
+                return;
+            }
+            let root = discover_root_repo_common_dir(&candidate, fs.as_ref())
+                .await
+                .map(|path| path.to_path_buf())
+                .unwrap_or(candidate);
+            let Ok(root) = canonical_checkout_path(&root) else {
+                let _ = registry.update(cx, |registry, cx| {
+                    registry.report_mirror_failure(
+                        &record.key,
+                        record.revision,
+                        "herdr agent worktree could not be canonicalized".into(),
+                        cx,
+                    );
+                });
+                return;
+            };
+            let route = registry.read_with(cx, |registry, _| {
+                registry
+                    .mirrors
+                    .get(&record.key)
+                    .map(|mirror| (mirror.window, true))
+                    .or_else(|| registry.window_for_root(&root).map(|window| (window, false)))
+            });
+            if let Some((window, _existing_mirror)) = route {
+                let task = window.update(cx, |multi_workspace, window, cx| {
+                    let workspace = multi_workspace.workspace().clone();
+                    workspace.update(cx, |workspace, cx| {
+                        super::ensure_agent_panel_for_workspace(workspace, None, window, cx)
+                    })
+                });
+                let Ok(task) = task else {
+                    let _ = registry.update(cx, |registry, cx| {
+                        registry.report_mirror_failure(
+                            &record.key,
+                            record.revision,
+                            "could not initialize the Agent Panel for herdr agent".into(),
+                            cx,
+                        );
+                    });
+                    return;
+                };
+                if task.await.is_err() {
+                    let _ = registry.update(cx, |registry, cx| {
+                        registry.report_mirror_failure(
+                            &record.key,
+                            record.revision,
+                            "could not initialize the Agent Panel for herdr agent".into(),
+                            cx,
+                        );
+                    });
+                    return;
+                }
+                let _ = window.update(cx, |multi_workspace, window, cx| {
+                    let workspace = multi_workspace.workspace().clone();
+                    workspace.update(cx, |workspace, cx| {
+                        let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        let panel_weak = panel.downgrade();
+                        let target_window = window.window_handle().downcast::<MultiWorkspace>().unwrap();
+                        let terminal_id = panel.update(cx, |panel, cx| {
+                            panel.open_external_terminal_thread(
+                                super::herdr_agent_sync::external_terminal_spec(
+                                    &record,
+                                    &herdr_program,
+                                ),
+                                record.focused,
+                                window,
+                                cx,
+                            )
+                        });
+                        let _ = registry.update(cx, |registry, cx| {
+                            registry.register_panel_observer(panel.clone(), target_window, cx);
+                            registry.mirror_index.insert(record.key.clone(), terminal_id);
+                            registry.mirrors.insert(
+                                record.key.clone(),
+                                AgentMirror {
+                                    window: target_window,
+                                    panel: panel_weak,
+                                    terminal_id,
+                                },
+                            );
+                        });
+                    });
+                });
+            } else {
+                let source = registry.read_with(cx, |registry, _| {
+                    registry.source_window_for_session(&record.key.session)
+                });
+                let Some(source) = source else {
+                    let _ = registry.update(cx, |registry, cx| {
+                        registry.report_mirror_failure(
+                            &record.key,
+                            record.revision,
+                            "no Zed worktree window is available for herdr agent".into(),
+                            cx,
+                        );
+                    });
+                    return;
+                };
+                let identity = record.key.session.clone();
+                let open = source.update(cx, |multi_workspace, window, cx| {
+                    let init_registry = registry.clone();
+                    let init_identity = identity.clone();
+                    let init = Box::new(
+                        move |_workspace: &mut Workspace,
+                              _window: &mut Window,
+                              cx: &mut Context<Workspace>| {
+                            let workspace_id = cx.entity().entity_id();
+                            init_registry.update(cx, |registry, _| {
+                                registry.reserve_inherited_workspace(workspace_id, init_identity.clone());
+                            });
+                        },
+                    );
+                    multi_workspace.find_or_create_local_workspace(
+                        PathList::new(&[PathBuf::from(root.as_str())]),
+                        None,
+                        Some(init),
+                        OpenMode::NewWindow,
+                        None,
+                        window,
+                        cx,
+                    )
+                });
+                if let Ok(open) = open {
+                    let _ = open.await;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn report_mirror_failure(
+        &mut self,
+        key: &AgentKey,
+        revision: u64,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.sync.record_failure(key, revision) {
+            return;
+        }
+        if let Some(mirror) = self.mirrors.remove(key) {
+            self.mirror_index.remove(key);
+            self.closed_mirror(key.clone());
+            let _ = mirror.window.update(cx, |multi_workspace, _, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.show_error(anyhow::anyhow!(message), cx)
+                })
+            });
+        } else if let Some(window) = self.source_window_for_session(&key.session) {
+            let _ = window.update(cx, |multi_workspace, _, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.show_error(anyhow::anyhow!(message), cx)
+                })
+            });
+        } else {
+            log::error!("{message}");
+        }
+    }
+
+    fn closed_mirror(&mut self, key: AgentKey) {
+        self.sync.dismiss(key);
     }
 
     // --------------------------------------------------------- routing core
@@ -1706,7 +2252,7 @@ impl HerdrSessionRegistry {
             // Drops synchronization ownership only; the `Forget` effects stay
             // out of the workspace queue and no terminal is closed.
             let effects = self.sync.forget_session(identity);
-            self.dispatch_effects(identity, effects);
+            self.dispatch_effects(identity, effects, cx);
         }
         self.mark_state(identity, event, cx);
         self.connections.remove(identity);
@@ -1873,7 +2419,7 @@ impl HerdrSessionRegistry {
         if released {
             self.connections.remove(identity);
             let effects = self.sync.forget_session(identity);
-            self.dispatch_effects(identity, effects);
+            self.dispatch_effects(identity, effects, cx);
         }
         cx.notify();
     }
@@ -2008,7 +2554,12 @@ impl HerdrSessionRegistry {
             finalize_tokens: HashMap::default(),
             host_windows: HashSet::default(),
             sync: AgentSyncState::default(),
-            effects: Rc::new(QueuedAgentEffectSink::default()),
+            mirror_index: MirrorIndex::default(),
+            mirrors: HashMap::default(),
+            focus_echoes: HashMap::default(),
+            observed_panels: HashSet::default(),
+            panel_subscriptions: Vec::new(),
+            effects: None,
             host_sink: Rc::new(NoopHerdrHostSink),
             picker_sink: Rc::new(NoopSessionPickerSink),
             gateway: Some(gateway),
@@ -2057,12 +2608,15 @@ impl HerdrSessionRegistry {
 
     #[cfg(test)]
     pub(crate) fn effect_sink(&self) -> Rc<dyn AgentEffectSink> {
-        self.effects.clone()
+        self.effects
+            .as_ref()
+            .expect("test effect sink is installed before inspection")
+            .clone()
     }
 
     #[cfg(test)]
     pub(crate) fn set_effect_sink(&mut self, sink: Rc<dyn AgentEffectSink>) {
-        self.effects = sink;
+        self.effects = Some(sink);
     }
 
     #[cfg(test)]
@@ -2444,7 +2998,7 @@ async fn run_connection(
                 };
                 let _ = registry.update(&mut cx, |registry, cx| {
                     let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
-                    registry.dispatch_effects(&identity, effects);
+                    registry.dispatch_effects(&identity, effects, cx);
                     if let Some(final_window) = final_window {
                         if final_window == window_id
                             && !registry.attempt_is_current(final_window, generation, &session_name)
@@ -2612,7 +3166,7 @@ async fn run_connection(
         };
         let _ = registry.update(&mut cx, |registry, cx| {
             let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
-            registry.dispatch_effects(&identity, effects);
+                registry.dispatch_effects(&identity, effects, cx);
             if let Some(final_window) = final_window {
                 if final_window == window_id
                     && !registry.attempt_is_current(final_window, generation, &session_name)
@@ -2819,10 +3373,10 @@ async fn run_connection(
     };
     let _ = registry.update(&mut cx, |registry, cx| {
         let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
-        registry.dispatch_effects(&identity, effects);
+        registry.dispatch_effects(&identity, effects, cx);
         for event in &buffered {
             let effects = apply_event_effects(&mut registry.sync, &identity, event);
-            registry.dispatch_effects(&identity, effects);
+            registry.dispatch_effects(&identity, effects, cx);
         }
         if let Some(final_window) = final_window {
             if final_window == window_id
@@ -2833,6 +3387,7 @@ async fn run_connection(
             registry.finish_connected(final_window, &identity, generation, cx);
         }
     });
+    drop(client);
 
     // 6. Steady state: further frames continue through the same channel.
     //    The ownership poll lets a last-window disconnect (which drops the
@@ -2842,14 +3397,55 @@ async fn run_connection(
             event = rx.next().fuse() => {
                 match event {
                     Some(event) => {
-                        let effects = registry.update(&mut cx, |registry, _| {
-                            if !registry.connection_matches(&identity, generation) {
-                                return Vec::new();
+                        if let HerdrEvent::Workspace(WorkspaceEvent::Focused { workspace_id }) = &event {
+                            registry.update(&mut cx, |registry, cx| {
+                                registry.focus_remote_workspace(&identity, workspace_id, cx);
+                            });
+                        }
+                        let fetched = match &event {
+                            HerdrEvent::Pane(PaneEvent {
+                                kind: PaneEventKind::Focused { pane_id, .. }
+                                | PaneEventKind::AgentDetected { pane_id, .. },
+                            }) => {
+                                let client = registry.read_with(&mut cx, |registry, _| {
+                                    registry.shared_client(&identity)
+                                });
+                                match client {
+                                    Some(client) => Some(client.pane(pane_id.clone()).await),
+                                    None => None,
+                                }
                             }
-                            apply_event_effects(&mut registry.sync, &identity, &event)
-                        });
-                        registry.update(&mut cx, |registry, cx| {
-                            registry.dispatch_effects(&identity, effects);
+                            _ => None,
+                        };
+                        let _ = registry.update(&mut cx, |registry, cx| {
+                            if !registry.connection_matches(&identity, generation) {
+                                return;
+                            }
+                            let effects = match fetched {
+                                Some(Ok(pane)) => registry.sync.upsert(identity.clone(), pane),
+                                Some(Err(error)) => {
+                                    let missing = error.to_string().to_ascii_lowercase();
+                                    if missing.contains("not found")
+                                        || missing.contains("no such pane")
+                                        || missing.contains("does not exist")
+                                    {
+                                        if let HerdrEvent::Pane(PaneEvent {
+                                            kind: PaneEventKind::Focused { pane_id, .. }
+                                            | PaneEventKind::AgentDetected { pane_id, .. },
+                                        }) = &event
+                                        {
+                                            registry.sync.exit(&identity, pane_id)
+                                        } else {
+                                            Vec::new()
+                                        }
+                                    } else {
+                                        log::debug!("herdr pane refresh failed: {error:#}");
+                                        Vec::new()
+                                    }
+                                }
+                                None => apply_event_effects(&mut registry.sync, &identity, &event),
+                            };
+                            registry.dispatch_effects(&identity, effects, cx);
                             cx.notify();
                         });
                     }
@@ -3015,7 +3611,12 @@ mod tests {
             finalize_tokens: HashMap::default(),
             host_windows: HashSet::default(),
             sync: AgentSyncState::default(),
-            effects: Rc::new(QueuedAgentEffectSink::default()),
+            mirror_index: MirrorIndex::default(),
+            mirrors: HashMap::default(),
+            focus_echoes: HashMap::default(),
+            observed_panels: HashSet::default(),
+            panel_subscriptions: Vec::new(),
+            effects: None,
             host_sink: Rc::new(NoopHerdrHostSink),
             picker_sink: Rc::new(NoopSessionPickerSink),
             gateway: None,
@@ -3151,6 +3752,24 @@ mod tests {
             async { Err::<SessionSnapshot, _>(anyhow::anyhow!("unused fake snapshot")) }
                 .boxed_local()
         }
+
+        fn pane(
+            &self,
+            _pane_id: String,
+        ) -> LocalBoxFuture<'static, anyhow::Result<herdr::PaneInfo>> {
+            async { Err::<herdr::PaneInfo, _>(anyhow::anyhow!("unused fake pane")) }.boxed_local()
+        }
+
+        fn focus_agent(&self, _pane_id: String) -> LocalBoxFuture<'static, anyhow::Result<()>> {
+            async { Ok(()) }.boxed_local()
+        }
+
+        fn focus_workspace(
+            &self,
+            _workspace_id: String,
+        ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
+            async { Ok(()) }.boxed_local()
+        }
     }
 
     struct FakeStream {
@@ -3182,13 +3801,13 @@ mod tests {
         idle_stream: bool,
         event: Option<HerdrEvent>,
     }
-
-
     impl Drop for FakeConnection {
         fn drop(&mut self) {
             self.dropped.set(self.dropped.get() + 1);
         }
     }
+
+
     impl HerdrSessionHandle for FakeConnection {
         fn subscribe(&self) -> LocalBoxFuture<'static, anyhow::Result<Box<dyn HerdrEventStream>>> {
             self.subscribe_calls
@@ -3204,6 +3823,23 @@ mod tests {
         fn snapshot(&self) -> LocalBoxFuture<'static, anyhow::Result<SessionSnapshot>> {
             let snapshot = self.snapshot.clone();
             async move { Ok(snapshot) }.boxed_local()
+        }
+        fn pane(
+            &self,
+            _pane_id: String,
+        ) -> LocalBoxFuture<'static, anyhow::Result<herdr::PaneInfo>> {
+            async { Err::<herdr::PaneInfo, _>(anyhow::anyhow!("unused fake pane")) }.boxed_local()
+        }
+
+        fn focus_agent(&self, _pane_id: String) -> LocalBoxFuture<'static, anyhow::Result<()>> {
+            async { Ok(()) }.boxed_local()
+        }
+
+        fn focus_workspace(
+            &self,
+            _workspace_id: String,
+        ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
+            async { Ok(()) }.boxed_local()
         }
     }
 
