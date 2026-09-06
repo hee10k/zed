@@ -113,7 +113,6 @@ impl<T: Copy> MirrorIndex<T> {
     pub(crate) fn remove(&mut self, key: &AgentKey) -> Option<T> {
         self.entries.remove(key)
     }
-
     pub(crate) fn get(&self, key: &AgentKey) -> Option<T> {
         self.entries.get(key).copied()
     }
@@ -122,14 +121,6 @@ impl<T: Copy> MirrorIndex<T> {
         self.entries.iter().map(|(key, terminal_id)| (key, *terminal_id))
     }
 
-    pub(crate) fn key_for_terminal(&self, terminal_id: T) -> Option<AgentKey>
-    where
-        T: Eq,
-    {
-        self.entries
-            .iter()
-            .find_map(|(key, id)| (*id == terminal_id).then_some(key.clone()))
-    }
 
     pub(crate) fn missing(
         &self,
@@ -197,8 +188,19 @@ impl<T: Clone + Eq + Hash> FocusEcho<T> {
         token
     }
 
-    pub(crate) fn has_pending(&self, target: &T) -> bool {
-        self.pending.contains_key(target)
+    /// Completes the request `token` was issued for: the pending entry is
+    /// removed only when the token is still current, so a superseded
+    /// completion can never clear a newer request's echo. Returns whether the
+    /// token was current.
+    pub(crate) fn resolve(&mut self, token: FocusToken) -> bool {
+        let current = self
+            .pending
+            .iter()
+            .find_map(|(target, current)| (*current == token).then(|| target.clone()));
+        match current {
+            Some(target) => self.pending.remove(&target).is_some(),
+            None => false,
+        }
     }
 
     pub(crate) fn is_current(&self, token: FocusToken) -> bool {
@@ -365,6 +367,12 @@ impl AgentSyncState {
         self.dismissed.insert(key);
     }
 
+    /// Whether the mirrored terminal for this agent was closed by the user;
+    /// reopening is suppressed until resync or pane exit.
+    pub(crate) fn is_dismissed(&self, key: &AgentKey) -> bool {
+        self.dismissed.contains(key)
+    }
+
     /// Records a failed mirror open. Returns `true` only for the first failure
     /// at this revision so the driver emits exactly one actionable
     /// notification; a later revision or resync permits one new attempt.
@@ -416,6 +424,27 @@ impl AgentSyncState {
                 &record.key.session == session && record.workspace_id.as_ref() == workspace_id
             })
             .cloned()
+    }
+
+    /// Resolve the herdr workspace id whose recorded checkout matches `path`
+    /// canonically. Focus forwarding must address the server's identifier, so
+    /// callers never pass a Zed entity id here.
+    pub(crate) fn workspace_id_for_checkout(
+        &self,
+        session: &SessionIdentity,
+        path: &Path,
+    ) -> Option<Arc<str>> {
+        let wanted = herdr::canonical_checkout_path(path).ok()?;
+        self.workspace_checkouts
+            .iter()
+            .find_map(|((owner, workspace_id), checkout)| {
+                if owner != session {
+                    return None;
+                }
+                let checkout = checkout.as_ref()?;
+                let candidate = herdr::canonical_checkout_path(checkout).ok()?;
+                (candidate == wanted).then(|| workspace_id.clone())
+            })
     }
     /// synchronization ownership; it never closes the Agent Panel terminal.
     fn forget_one(&mut self, key: &AgentKey) -> AgentSyncEffect {

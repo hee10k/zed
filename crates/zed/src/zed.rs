@@ -550,12 +550,11 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 let active_workspace = this.workspace().clone();
                 let source_workspace = source_workspace.clone();
                 let window_id = window.window_handle().window_id();
-                let workspace_id: Arc<str> = Arc::from(active_workspace.entity_id().to_string());
                 let herdr_registry = herdr_session_registry::HerdrSessionRegistry::try_global(cx);
                 active_workspace.update(cx, |workspace, cx| {
                     if let Some(registry) = herdr_registry.clone() {
                         registry.update(cx, |registry, cx| {
-                            registry.focus_herdr_workspace(window_id, workspace_id.clone(), cx);
+                            registry.focus_herdr_workspace(window_id, cx);
                         });
                     }
                     if let Some(source) = &source_workspace {
