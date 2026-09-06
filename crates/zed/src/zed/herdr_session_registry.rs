@@ -1480,17 +1480,19 @@ impl HerdrSessionRegistry {
         ancestor
     }
 
+    /// During owner bootstrap the initial snapshot is dispatched before the
+    /// binding publishes `Connected`, so a routing failure must still target
+    /// the window whose `Starting` selection owns this session.
     fn source_window_for_session(
         &self,
         identity: &SessionIdentity,
     ) -> Option<WindowHandle<MultiWorkspace>> {
         self.windows
             .values()
-            .find(|binding| {
-                matches!(
-                    &binding.state,
-                    BindingState::Connected(bound) if bound == identity
-                )
+            .find(|binding| match &binding.state {
+                BindingState::Connected(bound) => bound == identity,
+                BindingState::Starting { session_name } => session_name == &identity.name,
+                _ => false,
             })
             .map(|binding| binding.window)
     }
@@ -4551,6 +4553,52 @@ mod tests {
             registry.read_with(cx, |registry, _| registry.connection_tasks_started()),
             1,
             "stream loss must not spawn a reconnect task"
+        );
+    }
+
+    #[gpui::test]
+    async fn owner_bootstrap_routing_failure_notifies_before_connected(
+        cx: &mut TestAppContext,
+    ) {
+        init_app(cx);
+        let project = test_project(cx).await;
+        let window = add_real_window(cx, &project).await;
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("test window remains open");
+        let gateway = HerdrGateway::fake(
+            || async { Ok(vec![session_info("main", true)]) }.boxed_local(),
+            |_info| {
+                async {
+                    Ok(Rc::new(FakeConnection {
+                        snapshot: agent_snapshot(),
+                        dropped: Rc::new(Cell::new(0)),
+                        subscribe_calls: Rc::new(Cell::new(0)),
+                        idle_stream: true,
+                        event: None,
+                    }) as Rc<dyn HerdrSessionHandle>)
+                }
+                .boxed_local()
+            },
+            |_name| async { Ok(()) }.boxed_local(),
+        );
+        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        let window_id = registry.update(cx, |registry, _| {
+            registry.register_window_for_test(window, BindingState::Unselected, Vec::new())
+        });
+        registry.update(cx, |registry, cx| {
+            registry.start_binding_for_test(
+                window_id,
+                Arc::from("main"),
+                SelectionTarget::InvokingWindow,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids().len()),
+            1,
+            "an owner-bootstrap routing failure must produce one actionable notification"
         );
     }
 
