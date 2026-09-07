@@ -2,8 +2,8 @@
 //!
 //! Owns at most one client connection and event stream per herdr session,
 //! shared by every Zed window bound to that session. Windows bind only after
-//! an explicit picker confirmation or causal inheritance from a previously
-//! confirmed selection; nothing here connects to a session on installation.
+//! an explicit picker confirmation; nothing here connects to a session on
+//! installation.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,14 +22,13 @@ use futures::future::LocalBoxFuture;
 use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EntityId, Global, SharedString, Subscription,
-    Task, WeakEntity, Window, WindowHandle, WindowId,
+    Task, WeakEntity, WindowHandle, WindowId,
 };
 use herdr::{
     ClientConfig, HerdRClient, HerdrEvent, PaneEvent, PaneEventKind, SessionInfo, SessionSnapshot,
     WorkspaceEvent, canonical_checkout_path,
 };
 use project::discover_root_repo_common_dir;
-use util::path_list::PathList;
 use workspace::notifications::{NotificationId, simple_message_notification::MessageNotification};
 use workspace::{AppState, MultiWorkspace, OpenMode, Workspace};
 
@@ -91,108 +90,6 @@ impl HerdrHostSink for NoopHerdrHostSink {
     ) {
     }
 }
-/// One inherited-root mirror open request.
-#[derive(Clone)]
-pub(crate) struct MirrorOpenRequest {
-    pub(crate) root: herdr::CanonicalPath,
-    pub(crate) source: WindowHandle<MultiWorkspace>,
-    pub(crate) identity: SessionIdentity,
-}
-
-/// The window-opening half of the unmatched-root mirror route. Production
-/// delegates to `MultiWorkspace::find_or_create_local_workspace`; the registry
-/// test constructor installs a recorder that resolves to a pre-created window
-/// so every step after the open stays production code.
-pub(crate) trait MirrorWindowRouter {
-    fn open_window(
-        &self,
-        request: MirrorOpenRequest,
-        registry: Entity<HerdrSessionRegistry>,
-        cx: AsyncApp,
-    ) -> LocalBoxFuture<'static, anyhow::Result<WindowHandle<MultiWorkspace>>>;
-}
-
-struct ProductionMirrorWindowRouter;
-
-impl MirrorWindowRouter for ProductionMirrorWindowRouter {
-    fn open_window(
-        &self,
-        request: MirrorOpenRequest,
-        registry: Entity<HerdrSessionRegistry>,
-        mut cx: AsyncApp,
-    ) -> LocalBoxFuture<'static, anyhow::Result<WindowHandle<MultiWorkspace>>> {
-        let MirrorOpenRequest {
-            root,
-            source,
-            identity,
-            ..
-        } = request;
-        async move {
-            let open = source.update(&mut cx, |multi_workspace, window, cx| {
-                let init_registry = registry.clone();
-                let init_identity = identity.clone();
-                let init = Box::new(
-                    move |_workspace: &mut Workspace,
-                          _window: &mut Window,
-                          cx: &mut Context<Workspace>| {
-                        let workspace_id = cx.entity().entity_id();
-                        init_registry.update(cx, |registry, _| {
-                            registry
-                                .reserve_inherited_workspace(workspace_id, init_identity.clone());
-                        });
-                    },
-                );
-                let source_workspace = multi_workspace.workspace().downgrade();
-                multi_workspace.find_or_create_local_workspace(
-                    PathList::new(&[PathBuf::from(root.as_str())]),
-                    None,
-                    Some(init),
-                    OpenMode::NewWindow,
-                    Some(source_workspace),
-                    window,
-                    cx,
-                )
-            })?;
-            let opened = open.await.map_err(|error| {
-                anyhow::anyhow!("could not open herdr agent worktree: {error:#}")
-            })?;
-            let window = find_window_for_workspace(&mut cx, &opened);
-            match window {
-                Some(window) => Ok(window),
-                None => Err(anyhow::anyhow!(
-                    "herdr agent worktree opened without a Zed window"
-                )),
-            }
-        }
-        .boxed_local()
-    }
-}
-
-/// Resolve the live `MultiWorkspace` window hosting a workspace entity.
-fn find_window_for_workspace(
-    cx: &mut AsyncApp,
-    workspace: &Entity<Workspace>,
-) -> Option<WindowHandle<MultiWorkspace>> {
-    let wanted = workspace.entity_id();
-    let handles: Vec<WindowHandle<MultiWorkspace>> = cx.update(|app| {
-        app.windows()
-            .into_iter()
-            .filter_map(|handle| handle.downcast::<MultiWorkspace>())
-            .collect()
-    });
-    for handle in handles {
-        let matched = handle
-            .read_with(cx, |multi_workspace, _| {
-                multi_workspace.workspace().entity_id() == wanted
-            })
-            .unwrap_or(false);
-        if matched {
-            return Some(handle);
-        }
-    }
-    None
-}
-
 /// Find the checkout root containing an agent's current directory. Git's
 /// common directory identifies the repository, but linked worktrees must keep
 /// their own checkout root for window routing; walking to the nearest `.git`
@@ -247,6 +144,7 @@ impl SessionPickerSink for NoopSessionPickerSink {
     }
 }
 
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BindingState {
     Unselected,
@@ -285,24 +183,6 @@ impl SessionSelection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SelectionTarget {
     InvokingWindow,
-    NewWindow,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PendingBinding {
-    ConfirmedSelection(SessionSelection),
-    Inherited {
-        identity: SessionIdentity,
-        donor: WindowId,
-        donor_generation: u64,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct InheritedHandoff {
-    donor: WindowId,
-    donor_generation: u64,
-    destination: Option<WindowId>,
 }
 
 struct WindowBinding {
@@ -311,9 +191,6 @@ struct WindowBinding {
     checkout_path: Option<herdr::CanonicalPath>,
     /// Canonical roots of every worktree this window currently holds.
     roots: Vec<herdr::CanonicalPath>,
-    /// Target policy captured when the selection started; survives into
-    /// `Failed` so `Retry` reruns the same route.
-    selection_target: Option<SelectionTarget>,
 }
 
 /// One shared connection per session identity. Dropping this entry releases
@@ -370,84 +247,14 @@ fn selection_target(_state: &BindingState) -> SelectionTarget {
     SelectionTarget::InvokingWindow
 }
 
-/// One candidate window for focused-worktree routing.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RoutingCandidate {
-    window_id: WindowId,
-    state: BindingState,
-    checkout_paths: Vec<herdr::CanonicalPath>,
-}
-
-/// Where the confirmed binding actually lands once the snapshot's focused
-/// worktree is known.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum Route {
-    /// Bind the bootstrap window as-is (exact root present, or no focused
-    /// worktree to guess).
-    BindBootstrap,
-    /// Move the binding to an existing eligible window with the exact root.
-    ReuseExact(WindowId),
-    /// Open a new window for the focused worktree with an inherited binding.
-    OpenInherited,
-}
 enum FinalizeResult {
     Ready(Option<WindowId>),
-    /// An inherited destination window is being created for this session.
-    /// The bootstrap becomes `Connected` (it holds the live connection) and
-    /// stays registered as the handoff donor until the destination's own
-    /// `finish_connected` detaches it inside the same update.
-    Handoff {
-        window_id: WindowId,
-    },
     Activate {
         window_id: WindowId,
         task: Task<anyhow::Result<()>>,
     },
 }
 
-/// Pure focused-worktree routing policy:
-/// - a `NewWindow` selection keeps its already-created target window even
-///   when another window already has the same root;
-/// - an `InvokingWindow` selection reuses an exact eligible window (same
-///   root, `Unselected` or already bound to the same session);
-/// - a mismatched invoking window remains `Unselected` and the session moves
-///   to a new focused-worktree window with an inherited binding;
-/// - with no focused worktree, bind the bootstrap window without guessing.
-fn route_focused_worktree(
-    target: SelectionTarget,
-    bootstrap_id: WindowId,
-    bootstrap_paths: &[herdr::CanonicalPath],
-    focused: Option<&herdr::CanonicalPath>,
-    identity: Option<&SessionIdentity>,
-    candidates: &[RoutingCandidate],
-) -> Route {
-    let Some(focused) = focused else {
-        return Route::BindBootstrap;
-    };
-    match target {
-        SelectionTarget::NewWindow => Route::BindBootstrap,
-        SelectionTarget::InvokingWindow => {
-            if bootstrap_paths.iter().any(|path| path == focused) {
-                return Route::BindBootstrap;
-            }
-            let exact = candidates
-                .iter()
-                .filter(|candidate| candidate.window_id != bootstrap_id)
-                .filter(|candidate| candidate.checkout_paths.iter().any(|path| path == focused))
-                .find(|candidate| match &candidate.state {
-                    BindingState::Unselected => true,
-                    BindingState::Connected(bound) => {
-                        identity.is_some_and(|identity| bound == identity)
-                    }
-                    _ => false,
-                });
-            match exact {
-                Some(candidate) => Route::ReuseExact(candidate.window_id),
-                None => Route::OpenInherited,
-            }
-        }
-    }
-}
 
 /// The Agent Panel work the reducer asked for. `Forget` releases
 /// synchronization ownership for one agent: the mirrored terminal itself
@@ -699,7 +506,6 @@ pub(crate) struct HerdrSessionRegistry {
     prompted: HashSet<WindowId>,
     /// Prompts scheduled by the restoration observer but not shown yet.
     prompt_pending: HashSet<WindowId>,
-    pending: HashMap<EntityId, PendingBinding>,
     connections: HashMap<SessionIdentity, SessionConnection>,
     /// A generation per window invalidates detached connection work after a
     /// disconnect, re-selection, or retry.
@@ -708,15 +514,10 @@ pub(crate) struct HerdrSessionRegistry {
     /// identity before a client or stream is installed.
     in_flight: HashMap<SessionIdentity, u64>,
     next_generation: u64,
-    /// Bootstrap windows holding a session only until an inherited
-    /// destination publishes `Connected`; the handoff is released
-    inherited_handoffs: HashMap<SessionIdentity, Vec<InheritedHandoff>>,
     #[cfg(test)]
     test_activation_failures: HashSet<u64>,
     #[cfg(test)]
     test_activation_failure_delays: HashMap<u64, Duration>,
-    #[cfg(test)]
-    test_inherited_open_failures: HashSet<u64>,
     /// finalization must not tear down a newer shared attachment.
     slot_generations: HashMap<(SessionIdentity, u64), u64>,
     /// Finalization token for a target window awaiting its Connected gate.
@@ -731,11 +532,6 @@ pub(crate) struct HerdrSessionRegistry {
     /// move arriving mid-flight is remembered here and replayed the moment
     /// the running attempt completes, so an update is never silently lost.
     pending_mirror_replay: HashMap<AgentKey, AgentRecord>,
-    /// The window-opening half of the unmatched-root route. Production
-    /// delegates to `MultiWorkspace::find_or_create_local_workspace`; the
-    /// registry test constructor installs a recorder so every step after the
-    /// open stays production code.
-    mirror_router: Rc<dyn MirrorWindowRouter>,
     /// Focus echoes are keyed by session and target so workspace and agent
     /// transitions never overwrite one another.
     focus_echoes: HashMap<SessionIdentity, FocusEcho<FocusTarget>>,
@@ -783,36 +579,30 @@ impl HerdrSessionRegistry {
 
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         let registry = cx.entity();
-        let observer = cx.observe_new(move |multi_workspace: &mut MultiWorkspace, window, cx| {
+        let observer = cx.observe_new(move |_multi_workspace: &mut MultiWorkspace, window, cx| {
             let Some(window) = window else {
                 return;
             };
             let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() else {
                 return;
             };
-            let workspace_entity_id = multi_workspace.workspace().entity_id();
-            registry.update(cx, |registry, cx| {
-                registry.handle_new_window(handle, workspace_entity_id, cx)
-            });
+            registry.update(cx, |registry, cx| registry.handle_new_window(handle, cx));
         });
         Self {
             windows: HashMap::default(),
             prompted: HashSet::default(),
             prompt_pending: HashSet::default(),
-            pending: HashMap::default(),
             connections: HashMap::default(),
             attempts: HashMap::default(),
             in_flight: HashMap::default(),
             slot_generations: HashMap::default(),
             finalize_tokens: HashMap::default(),
             next_generation: 0,
-            inherited_handoffs: HashMap::default(),
             #[cfg(test)]
             test_activation_failures: HashSet::default(),
             #[cfg(test)]
             test_activation_failure_delays: HashMap::default(),
             #[cfg(test)]
-            test_inherited_open_failures: HashSet::default(),
             sync: AgentSyncState::default(),
             mirror_index: MirrorIndex::default(),
             mirrors: HashMap::default(),
@@ -825,7 +615,6 @@ impl HerdrSessionRegistry {
             program_override: None,
             mirroring_in_flight: HashSet::default(),
             pending_mirror_replay: HashMap::default(),
-            mirror_router: Rc::new(ProductionMirrorWindowRouter),
             host_sink: Rc::new(NoopHerdrHostSink),
             picker_sink: Rc::new(NoopSessionPickerSink),
             gateway: None,
@@ -862,29 +651,10 @@ impl HerdrSessionRegistry {
             .unwrap_or(BindingState::Unselected)
     }
 
-    /// Reserve the binding a window is created with, keyed by the new
-    /// workspace entity id so the `MultiWorkspace` observer consumes it
-    /// before it can schedule a startup picker.
-    pub(crate) fn reserve_pending(
-        &mut self,
-        workspace_entity_id: EntityId,
-        pending: PendingBinding,
-    ) {
-        self.pending.insert(workspace_entity_id, pending);
-    }
-
-    /// Consume a reserved binding; returns its session exactly once.
-    pub(crate) fn consume_pending(
-        &mut self,
-        workspace_entity_id: EntityId,
-    ) -> Option<PendingBinding> {
-        self.pending.remove(&workspace_entity_id)
-    }
 
     fn handle_new_window(
         &mut self,
         handle: WindowHandle<MultiWorkspace>,
-        workspace_entity_id: EntityId,
         cx: &mut Context<Self>,
     ) {
         let window_id = self.register_window(handle);
@@ -896,38 +666,7 @@ impl HerdrSessionRegistry {
             let _ = registry.update(cx, |registry, cx| registry.refresh_window_roots(cx));
         })
         .detach();
-        match self.consume_pending(workspace_entity_id) {
-            Some(PendingBinding::ConfirmedSelection(selection)) => {
-                // The bootstrap target exists *because of* a confirmed
-                // selection: it keeps its own window (NewWindow route).
-                self.start_binding_for_window(
-                    window_id,
-                    selection.name().into(),
-                    SelectionTarget::NewWindow,
-                    cx,
-                );
-            }
-            Some(PendingBinding::Inherited {
-                identity,
-                donor,
-                donor_generation,
-            }) => {
-                // Causal inheritance: bind silently, no picker. The exact
-                // donor/generation is carried with the pending workspace so
-                // concurrent handoffs cannot steal one another's donor.
-                self.prompt_completed(window_id);
-                self.claim_inherited_destination(&identity, donor, donor_generation, window_id);
-                self.start_binding_for_window(
-                    window_id,
-                    identity.name.clone(),
-                    SelectionTarget::NewWindow,
-                    cx,
-                );
-            }
-            None => {
-                self.schedule_startup_prompt(handle, cx);
-            }
-        }
+        self.schedule_startup_prompt(handle, cx);
     }
 
     fn register_window(&mut self, handle: WindowHandle<MultiWorkspace>) -> WindowId {
@@ -939,7 +678,6 @@ impl HerdrSessionRegistry {
                 state: BindingState::Unselected,
                 checkout_path: None,
                 roots: Vec::new(),
-                selection_target: None,
             });
         window_id
     }
@@ -1003,9 +741,6 @@ impl HerdrSessionRegistry {
             return;
         };
         binding.state = transition(binding.state.clone(), event);
-        if matches!(binding.state, BindingState::Connected(_)) {
-            binding.selection_target = None;
-        }
         cx.notify();
     }
 
@@ -1134,33 +869,29 @@ impl HerdrSessionRegistry {
         cx: &mut Context<Self>,
     ) {
         let window_id = invoking.window_id();
-        let target = selection_target(&self.binding_state(window_id));
         self.prompt_completed(window_id);
-        match target {
-            SelectionTarget::InvokingWindow => {
-                let name: Arc<str> = Arc::from(selection.name());
-                self.start_binding_for_window(window_id, name, target, cx);
-            }
-            SelectionTarget::NewWindow => {
-                self.create_bootstrap_window(selection, cx);
-            }
+        if matches!(
+            self.binding_state(window_id),
+            BindingState::Starting { .. }
+                | BindingState::Connected(_)
+                | BindingState::Failed { .. }
+        ) {
+            self.disconnect_session(window_id, cx);
         }
+        let name: Arc<str> = Arc::from(selection.name());
+        self.start_binding_for_window(window_id, name, cx);
     }
 
     fn start_binding_for_window(
         &mut self,
         window_id: WindowId,
         session_name: Arc<str>,
-        target: SelectionTarget,
         cx: &mut Context<Self>,
     ) {
         self.next_generation = self.next_generation.wrapping_add(1);
         let generation = self.next_generation;
         self.attempts.insert(window_id.as_u64(), generation);
         self.finalize_tokens.remove(&window_id.as_u64());
-        if let Some(binding) = self.windows.get_mut(&window_id.as_u64()) {
-            binding.selection_target = Some(target);
-        }
         let name = session_name.clone();
         self.apply_binding_event(
             window_id,
@@ -1198,44 +929,6 @@ impl HerdrSessionRegistry {
         });
     }
 
-    /// `SelectionTarget::NewWindow` creates one blank target with
-    /// `Workspace::new_local`. Its init closure obtains the workspace entity
-    /// id and reserves the pending binding before the `MultiWorkspace`
-    /// observer can schedule a startup picker. The picker stays in the
-    /// invoking window throughout.
-    fn create_bootstrap_window(&mut self, selection: SessionSelection, cx: &mut Context<Self>) {
-        let Some(app_state) = AppState::try_global(cx) else {
-            return;
-        };
-        let registry = cx.entity();
-        cx.spawn(async move |_this, cx| {
-            let pending = PendingBinding::ConfirmedSelection(selection);
-            let init = move |_workspace: &mut Workspace,
-                             _window: &mut Window,
-                             cx: &mut Context<Workspace>| {
-                let entity_id = cx.entity().entity_id();
-                let registry = registry.clone();
-                registry.update(cx, |registry, _| {
-                    registry.reserve_pending(entity_id, pending);
-                });
-            };
-            let open_task = cx.update(|cx| {
-                Workspace::new_local(
-                    Vec::new(),
-                    app_state,
-                    None,
-                    None,
-                    Some(Box::new(init)),
-                    OpenMode::NewWindow,
-                    cx,
-                )
-            });
-            if open_task.await.is_err() {
-                log::error!("failed to open the herdr target window");
-            }
-        })
-        .detach();
-    }
 
     // ---------------------------------------------------------- connection
 
@@ -1282,8 +975,7 @@ impl HerdrSessionRegistry {
             )
     }
 
-    /// `Retry` re-runs the bounded connect loop for the failed session with
-    /// the same target policy the selection started with.
+    /// `Retry` re-runs the bounded connect loop for the failed session.
     pub(crate) fn retry(
         &mut self,
         window_id: WindowId,
@@ -1292,13 +984,8 @@ impl HerdrSessionRegistry {
         let BindingState::Failed { session_name, .. } = self.binding_state(window_id) else {
             return Ok(());
         };
-        let target = self
-            .windows
-            .get(&window_id.as_u64())
-            .and_then(|binding| binding.selection_target)
-            .unwrap_or(SelectionTarget::NewWindow);
         let _ = self.gateway()?;
-        self.start_binding_for_window(window_id, session_name, target, cx);
+        self.start_binding_for_window(window_id, session_name, cx);
         Ok(())
     }
 
@@ -1313,13 +1000,6 @@ impl HerdrSessionRegistry {
         }
         self.attempts.remove(&window_id.as_u64());
         self.finalize_tokens.remove(&window_id.as_u64());
-        self.remove_inherited_handoffs_for_window(window_id);
-        self.pending.retain(|_, pending| {
-            !matches!(
-                pending,
-                PendingBinding::Inherited { donor, .. } if *donor == window_id
-            )
-        });
         let identities: Vec<SessionIdentity> = self
             .connections
             .iter()
@@ -1352,7 +1032,6 @@ impl HerdrSessionRegistry {
         if let Some(binding) = self.windows.get_mut(&window_id.as_u64()) {
             binding.state = BindingState::Unselected;
             binding.checkout_path = None;
-            binding.selection_target = None;
         }
         let handle = self
             .windows
@@ -1536,34 +1215,6 @@ impl HerdrSessionRegistry {
         })
     }
 
-    pub(crate) fn reserve_inherited_workspace(
-        &mut self,
-        workspace_id: EntityId,
-        identity: SessionIdentity,
-    ) {
-        let Some((donor, donor_generation)) =
-            self.windows.iter().find_map(|(window_id, binding)| {
-                matches!(
-                    &binding.state,
-                    BindingState::Connected(bound) if bound == &identity
-                )
-                .then_some((
-                    WindowId::from(*window_id),
-                    self.attempts.get(window_id).copied().unwrap_or_default(),
-                ))
-            })
-        else {
-            return;
-        };
-        self.reserve_pending(
-            workspace_id,
-            PendingBinding::Inherited {
-                identity,
-                donor,
-                donor_generation,
-            },
-        );
-    }
 
     fn register_panel_observer(
         &mut self,
@@ -1981,7 +1632,6 @@ impl HerdrSessionRegistry {
 
         let fs = <dyn Fs>::global(cx).clone();
         let registry = cx.entity();
-        let router = self.mirror_router.clone();
         cx.spawn(async move |_this, mut cx| {
             let fail =
                 |registry: &Entity<HerdrSessionRegistry>, cx: &mut AsyncApp, message: String| {
@@ -2038,40 +1688,15 @@ impl HerdrSessionRegistry {
             if !owned {
                 return;
             }
-            let route = registry.update(cx, |registry, cx| registry.window_for_root(&root, cx));
-            let window = match route {
+            let window = match registry.update(cx, |registry, cx| registry.window_for_root(&root, cx)) {
                 Some(window) => window,
                 None => {
-                    let source = registry.read_with(cx, |registry, _| {
-                        target
-                            .and_then(|target| registry.mirror_target_window(&record.key, target))
-                            .or_else(|| {
-                                registry.source_window_for_session(&record.key.session, generation)
-                            })
-                    });
-                    let Some(source) = source else {
-                        fail(
-                            &registry,
-                            &mut cx,
-                            "no Zed worktree window is available for herdr agent".into(),
-                        );
-                        return;
-                    };
-                    let request = MirrorOpenRequest {
-                        root: root.clone(),
-                        source,
-                        identity: record.key.session.clone(),
-                    };
-                    let opened = router
-                        .open_window(request, registry.clone(), cx.clone())
-                        .await;
-                    match opened {
-                        Ok(window) => window,
-                        Err(message) => {
-                            fail(&registry, &mut cx, message.to_string());
-                            return;
-                        }
-                    }
+                    fail(
+                        &registry,
+                        &mut cx,
+                        "no Zed worktree window is available for herdr agent".into(),
+                    );
+                    return;
                 }
             };
             let _ = registry.update(cx, |registry, cx| {
@@ -2323,236 +1948,82 @@ impl HerdrSessionRegistry {
 
     // --------------------------------------------------------- routing core
 
-    /// Resolve the snapshot's focused worktree into the final binding and
-    /// install the host there before detaching the local bootstrap client.
-    /// Returns the window the binding landed on.
+    /// Resolve the snapshot's focused worktree into the invoking window and
+    /// install the host there before publishing `Connected`.
     fn finalize_binding(
         &mut self,
         bootstrap: WindowId,
-        target: SelectionTarget,
         identity: &SessionIdentity,
-        session_name: &str,
+        _session_name: &str,
         generation: u64,
         snapshot: &SessionSnapshot,
         cx: &mut Context<Self>,
     ) -> FinalizeResult {
         self.refresh_window_roots(cx);
         let focused = focused_checkout_path(snapshot);
-        let bootstrap_paths = self
+        if let Some(binding) = self.windows.get_mut(&bootstrap.as_u64()) {
+            binding.checkout_path = focused.clone();
+        }
+        self.install_binding_target(bootstrap, identity, generation, cx);
+        let Some(path) = focused else {
+            return FinalizeResult::Ready(Some(bootstrap));
+        };
+        let Some(handle) = self
             .windows
             .get(&bootstrap.as_u64())
-            .map(|binding| binding.roots.clone())
-            .unwrap_or_default();
-        let route = route_focused_worktree(
-            target,
-            bootstrap,
-            &bootstrap_paths,
-            focused.as_ref(),
-            Some(identity),
-            &self.candidates(),
-        );
-        match route {
-            Route::BindBootstrap => {
-                if let Some(binding) = self.windows.get_mut(&bootstrap.as_u64()) {
-                    binding.checkout_path = focused.clone();
-                }
-                self.install_binding_target(bootstrap, identity, generation, cx);
-                if target == SelectionTarget::NewWindow
-                    && let Some(path) = focused
-                {
-                    let Some(handle) = self
-                        .windows
-                        .get(&bootstrap.as_u64())
-                        .map(|binding| binding.window)
-                    else {
-                        return FinalizeResult::Ready(Some(bootstrap));
-                    };
-                    let Some(app_state) = AppState::try_global(cx) else {
-                        return FinalizeResult::Ready(Some(bootstrap));
-                    };
-                    #[cfg(test)]
-                    if self.test_activation_failures.remove(&bootstrap.as_u64()) {
-                        let task: Task<anyhow::Result<()>> =
-                            Task::ready(Err(anyhow::anyhow!("injected activation failure")));
-                        return FinalizeResult::Activate {
-                            window_id: bootstrap,
-                            task,
-                        };
-                    }
-                    #[cfg(test)]
-                    if let Some(delay) = self
-                        .test_activation_failure_delays
-                        .remove(&bootstrap.as_u64())
-                    {
-                        let executor = cx.background_executor().clone();
-                        let task = cx.spawn(async move |_this, _cx| {
-                            executor.timer(delay).await;
-                            Err(anyhow::anyhow!("injected activation failure"))
-                        });
-                        return FinalizeResult::Activate {
-                            window_id: bootstrap,
-                            task,
-                        };
-                    }
-                    // Add/activate the focused worktree inside that same
-                    // target window; Connected is emitted only after this
-                    // task completes successfully.
-                    let task = cx.spawn(async move |_this, cx| {
-                        let open = cx.update(|cx| {
-                            Workspace::new_local(
-                                vec![PathBuf::from(path.as_str())],
-                                app_state,
-                                Some(handle),
-                                None,
-                                None,
-                                OpenMode::Activate,
-                                cx,
-                            )
-                        });
-                        open.await.map(|_| ())
-                    });
-                    return FinalizeResult::Activate {
-                        window_id: bootstrap,
-                        task,
-                    };
-                }
-                FinalizeResult::Ready(Some(bootstrap))
-            }
-            Route::ReuseExact(other) => {
-                // Bring the reused destination to the foreground before
-                // showing/focusing its central host.
-                if let Some(handle) = self
-                    .windows
-                    .get(&other.as_u64())
-                    .map(|binding| binding.window)
-                {
-                    let _ = handle.update(cx, |_, window, _| window.activate_window());
-                }
-                self.install_binding_target(other, identity, generation, cx);
-                if other != bootstrap {
-                    self.detach_bootstrap(bootstrap, cx);
-                    self.detach_window(identity, bootstrap, cx);
-                }
-                FinalizeResult::Ready(Some(other))
-            }
-            Route::OpenInherited => {
-                // The invoking bootstrap keeps the session as a temporary
-                // owner while the inherited destination window is created.
-                // Carry the donor generation through the pending workspace
-                // so concurrent destinations cannot detach the wrong donor.
-                let Some(path) = focused else {
-                    return FinalizeResult::Ready(None);
-                };
-                let _ = self.attach_connection_window(identity, bootstrap);
-                let Some(app_state) = AppState::try_global(cx) else {
-                    return FinalizeResult::Ready(Some(bootstrap));
-                };
-                let donor_generation = self
-                    .attempts
-                    .get(&bootstrap.as_u64())
-                    .copied()
-                    .unwrap_or(generation);
-                self.inherited_handoffs
-                    .entry(identity.clone())
-                    .or_default()
-                    .push(InheritedHandoff {
-                        donor: bootstrap,
-                        donor_generation,
-                        destination: None,
-                    });
-                let registry_for_task = cx.entity();
-                let identity_for_task = identity.clone();
-                let session_name_for_task = session_name.to_owned();
-                #[cfg(test)]
-                let force_failure = self
-                    .test_inherited_open_failures
-                    .remove(&bootstrap.as_u64());
-                #[cfg(not(test))]
-                let force_failure = false;
-                cx.spawn(async move |_this, cx| {
-                    let registry_for_init = registry_for_task.clone();
-                    let identity_for_init = identity_for_task.clone();
-                    let donor_for_init = bootstrap;
-                    let donor_generation_for_init = donor_generation;
-                    let init = move |_workspace: &mut Workspace,
-                                     _window: &mut Window,
-                                     cx: &mut Context<Workspace>| {
-                        let entity_id = cx.entity().entity_id();
-                        registry_for_init.update(cx, |registry, _| {
-                            if registry.has_inherited_handoff(
-                                &identity_for_init,
-                                donor_for_init,
-                                donor_generation_for_init,
-                            ) {
-                                registry.reserve_pending(
-                                    entity_id,
-                                    PendingBinding::Inherited {
-                                        identity: identity_for_init.clone(),
-                                        donor: donor_for_init,
-                                        donor_generation: donor_generation_for_init,
-                                    },
-                                );
-                            }
-                        });
-                    };
-                    let result = if force_failure {
-                        Err(anyhow::anyhow!("injected inherited open failure"))
-                    } else {
-                        let open = cx.update(|cx| {
-                            Workspace::new_local(
-                                vec![PathBuf::from(path.as_str())],
-                                app_state,
-                                None,
-                                None,
-                                Some(Box::new(init)),
-                                OpenMode::NewWindow,
-                                cx,
-                            )
-                        });
-                        open.await.map(|_| ())
-                    };
-                    finish_inherited_open(
-                        registry_for_task,
-                        bootstrap,
-                        &session_name_for_task,
-                        generation,
-                        &identity_for_task,
-                        result,
-                        cx,
-                    );
-                })
-                .detach();
-                FinalizeResult::Handoff {
-                    window_id: bootstrap,
-                }
-            }
+            .map(|binding| binding.window)
+        else {
+            return FinalizeResult::Ready(Some(bootstrap));
+        };
+        let Some(app_state) = AppState::try_global(cx) else {
+            return FinalizeResult::Ready(Some(bootstrap));
+        };
+        #[cfg(test)]
+        if self.test_activation_failures.remove(&bootstrap.as_u64()) {
+            let task: Task<anyhow::Result<()>> =
+                Task::ready(Err(anyhow::anyhow!("injected activation failure")));
+            return FinalizeResult::Activate {
+                window_id: bootstrap,
+                task,
+            };
+        }
+        #[cfg(test)]
+        if let Some(delay) = self
+            .test_activation_failure_delays
+            .remove(&bootstrap.as_u64())
+        {
+            let executor = cx.background_executor().clone();
+            let task = cx.spawn(async move |_this, _cx| {
+                executor.timer(delay).await;
+                Err(anyhow::anyhow!("injected activation failure"))
+            });
+            return FinalizeResult::Activate {
+                window_id: bootstrap,
+                task,
+            };
+        }
+        // Add/activate the focused worktree inside the invoking window;
+        // Connected is emitted only after this task completes successfully.
+        let task = cx.spawn(async move |_this, cx| {
+            let open = cx.update(|cx| {
+                Workspace::new_local(
+                    vec![PathBuf::from(path.as_str())],
+                    app_state,
+                    Some(handle),
+                    None,
+                    None,
+                    OpenMode::Activate,
+                    cx,
+                )
+            });
+            open.await.map(|_| ())
+        });
+        FinalizeResult::Activate {
+            window_id: bootstrap,
+            task,
         }
     }
 
-    /// Fail a bootstrap binding whose inherited destination never arrived
-    /// and which never reached `Connected`; a donor that is already
-    /// `Connected` keeps its working binding instead.
-    fn fail_bootstrap_without_destination(
-        &mut self,
-        window_id: WindowId,
-        session_name: &str,
-        generation: u64,
-        identity: &SessionIdentity,
-        message: String,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.attempt_is_current(window_id, generation, session_name) {
-            return;
-        }
-        self.remove_inherited_handoff(identity, window_id);
-        self.release_failed_connection(identity, generation, window_id, cx);
-        self.detach_window(identity, window_id, cx);
-        self.apply_binding_event(
-            window_id,
-            BindingEvent::SessionStillRunning(message.into()),
-            cx,
-        );
-    }
 
     /// Install host presentation and connection ownership without publishing
     /// Connected. The state transition is a separate final lifecycle gate.
@@ -2630,16 +2101,8 @@ impl HerdrSessionRegistry {
                 self.detach_window(identity, window_id, cx);
                 return;
             }
-            binding.state = BindingState::Connected(identity.clone());
-            binding.selection_target = None;
         }
         self.finalize_tokens.remove(&window_id.as_u64());
-        if let Some(handoff) = self.take_inherited_handoff_for_destination(identity, window_id) {
-            if handoff.donor != window_id && self.donor_generation_is_current(identity, &handoff) {
-                self.detach_bootstrap(handoff.donor, cx);
-                self.detach_window(identity, handoff.donor, cx);
-            }
-        }
         cx.notify();
     }
 
@@ -2672,31 +2135,7 @@ impl HerdrSessionRegistry {
         true
     }
 
-    fn detach_bootstrap(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
-        let handle = self
-            .windows
-            .get(&window_id.as_u64())
-            .map(|binding| binding.window);
-        if let Some(binding) = self.windows.get_mut(&window_id.as_u64()) {
-            binding.state = BindingState::Unselected;
-            binding.checkout_path = None;
-            binding.selection_target = None;
-        }
-        if let Some(handle) = handle {
-            self.host_sink.detach(handle, cx);
-        }
-    }
 
-    fn candidates(&self) -> Vec<RoutingCandidate> {
-        self.windows
-            .iter()
-            .map(|(window_id, binding)| RoutingCandidate {
-                window_id: WindowId::from(*window_id),
-                state: binding.state.clone(),
-                checkout_paths: binding.roots.clone(),
-            })
-            .collect()
-    }
 
     /// Re-read every window's checkout roots from its live worktree set.
     /// `roots` is the union of all projects in the window (routing input);
@@ -2762,7 +2201,6 @@ impl HerdrSessionRegistry {
         cx: &mut Context<Self>,
     ) {
         let event = stream_loss_event(identity, message, &sessions);
-        self.remove_inherited_handoffs_for_identity(identity);
         if matches!(event, BindingEvent::SessionNotRunning) {
             // Drops synchronization ownership only; the `Forget` effects stay
             // out of the workspace queue and no terminal is closed.
@@ -2781,7 +2219,6 @@ impl HerdrSessionRegistry {
         message: SharedString,
         cx: &mut Context<Self>,
     ) {
-        self.remove_inherited_handoffs_for_identity(identity);
         self.mark_state(identity, BindingEvent::SessionStillRunning(message), cx);
         self.connections.remove(identity);
         self.focus_echoes.remove(identity);
@@ -2834,13 +2271,6 @@ impl HerdrSessionRegistry {
         self.prompt_pending.remove(&window_id);
         self.attempts.remove(&window_id.as_u64());
         self.finalize_tokens.remove(&window_id.as_u64());
-        self.remove_inherited_handoffs_for_window(window_id);
-        self.pending.retain(|_, pending| {
-            !matches!(
-                pending,
-                PendingBinding::Inherited { donor, .. } if *donor == window_id
-            )
-        });
         let identities: Vec<SessionIdentity> = self
             .connections
             .iter()
@@ -2922,7 +2352,6 @@ impl HerdrSessionRegistry {
     ) {
         self.clear_in_flight(identity, generation);
         self.finalize_tokens.remove(&failed_window.as_u64());
-        self.remove_inherited_handoff(identity, failed_window);
         let released = self
             .connections
             .get_mut(identity)
@@ -2941,9 +2370,9 @@ impl HerdrSessionRegistry {
     }
 
     /// Prune every mirror that lived in a window that is gone, then replay an
-    /// Open for each still-live record so routing reroutes it to another
-    /// window holding the same root (or opens one). A closed window is never a
-    /// user dismissal.
+    /// Open for each still-live record so existing-root routing can place it
+    /// in another live window. A missing root is reported as a mirror failure;
+    /// a closed window is never a user dismissal.
     fn prune_mirrors_for_window(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
         let reroute: Vec<AgentRecord> = self
             .mirrors
@@ -2985,113 +2414,6 @@ impl HerdrSessionRegistry {
         }
     }
 
-    fn has_inherited_handoff(
-        &self,
-        identity: &SessionIdentity,
-        donor: WindowId,
-        donor_generation: u64,
-    ) -> bool {
-        self.inherited_handoffs
-            .get(identity)
-            .is_some_and(|handoffs| {
-                handoffs.iter().any(|handoff| {
-                    handoff.donor == donor
-                        && handoff.donor_generation == donor_generation
-                        && handoff.destination.is_none()
-                })
-            })
-    }
-
-    fn claim_inherited_destination(
-        &mut self,
-        identity: &SessionIdentity,
-        donor: WindowId,
-        donor_generation: u64,
-        destination: WindowId,
-    ) -> bool {
-        let Some(handoffs) = self.inherited_handoffs.get_mut(identity) else {
-            return false;
-        };
-        let Some(handoff) = handoffs.iter_mut().find(|handoff| {
-            handoff.donor == donor
-                && handoff.donor_generation == donor_generation
-                && handoff.destination.is_none()
-        }) else {
-            return false;
-        };
-        handoff.destination = Some(destination);
-        true
-    }
-
-    fn take_inherited_handoff_for_destination(
-        &mut self,
-        identity: &SessionIdentity,
-        destination: WindowId,
-    ) -> Option<InheritedHandoff> {
-        let handoffs = self.inherited_handoffs.get_mut(identity)?;
-        let index = handoffs
-            .iter()
-            .position(|handoff| handoff.destination == Some(destination))?;
-        let handoff = handoffs.remove(index);
-        let empty = handoffs.is_empty();
-        if empty {
-            self.inherited_handoffs.remove(identity);
-        }
-        Some(handoff)
-    }
-
-    fn donor_generation_is_current(
-        &self,
-        identity: &SessionIdentity,
-        handoff: &InheritedHandoff,
-    ) -> bool {
-        self.attempts.get(&handoff.donor.as_u64()) == Some(&handoff.donor_generation)
-            && self
-                .windows
-                .get(&handoff.donor.as_u64())
-                .is_some_and(|binding| {
-                    matches!(
-                        &binding.state,
-                        BindingState::Starting { session_name }
-                            if session_name.as_ref() == identity.name.as_ref()
-                    ) || matches!(
-                        &binding.state,
-                        BindingState::Connected(bound) if bound == identity
-                    )
-                })
-    }
-
-    fn remove_inherited_handoff(&mut self, identity: &SessionIdentity, window_id: WindowId) {
-        let Some(handoffs) = self.inherited_handoffs.get_mut(identity) else {
-            return;
-        };
-        handoffs
-            .retain(|handoff| handoff.donor != window_id && handoff.destination != Some(window_id));
-        if handoffs.is_empty() {
-            self.inherited_handoffs.remove(identity);
-        }
-    }
-
-    fn remove_inherited_handoffs_for_window(&mut self, window_id: WindowId) {
-        self.inherited_handoffs.retain(|_, handoffs| {
-            handoffs.retain(|handoff| {
-                handoff.donor != window_id && handoff.destination != Some(window_id)
-            });
-            !handoffs.is_empty()
-        });
-    }
-    fn remove_inherited_handoffs_for_identity(&mut self, identity: &SessionIdentity) {
-        self.inherited_handoffs.remove(identity);
-        self.pending.retain(|_, pending| {
-            !matches!(
-                pending,
-                PendingBinding::Inherited {
-                    identity: pending_identity,
-                    ..
-                } if pending_identity == identity
-            )
-        });
-    }
     // ------------------------------------------------------------ test seams
 
     #[cfg(test)]
@@ -3100,18 +2422,15 @@ impl HerdrSessionRegistry {
             windows: HashMap::default(),
             prompted: HashSet::default(),
             prompt_pending: HashSet::default(),
-            pending: HashMap::default(),
             connections: HashMap::default(),
             attempts: HashMap::default(),
             in_flight: HashMap::default(),
             next_generation: 0,
-            inherited_handoffs: HashMap::default(),
             #[cfg(test)]
             test_activation_failures: HashSet::default(),
             #[cfg(test)]
             test_activation_failure_delays: HashMap::default(),
             #[cfg(test)]
-            test_inherited_open_failures: HashSet::default(),
             slot_generations: HashMap::default(),
             finalize_tokens: HashMap::default(),
             sync: AgentSyncState::default(),
@@ -3119,7 +2438,6 @@ impl HerdrSessionRegistry {
             mirrors: HashMap::default(),
             mirroring_in_flight: HashSet::default(),
             pending_mirror_replay: HashMap::default(),
-            mirror_router: Rc::new(ProductionMirrorWindowRouter),
             focus_echoes: HashMap::default(),
             observed_panels: HashSet::default(),
             panel_subscriptions: Vec::new(),
@@ -3153,10 +2471,6 @@ impl HerdrSessionRegistry {
         self.test_activation_failure_delays
             .insert(window_id.as_u64(), delay);
     }
-    #[cfg(test)]
-    pub(crate) fn fail_next_inherited_open_for_test(&mut self, window_id: WindowId) {
-        self.test_inherited_open_failures.insert(window_id.as_u64());
-    }
 
     #[cfg(test)]
     pub(crate) fn register_window_for_test(
@@ -3186,12 +2500,6 @@ impl HerdrSessionRegistry {
         self.sink_effects = Some(sink);
     }
 
-    /// Install a recorder for the unmatched-root window route so routing
-    /// tests exercise every production step around the open.
-    #[cfg(test)]
-    pub(crate) fn set_mirror_router_for_test(&mut self, router: Rc<dyn MirrorWindowRouter>) {
-        self.mirror_router = router;
-    }
 
     #[cfg(test)]
     pub(crate) fn set_program_for_test(&mut self, program: PathBuf) {
@@ -3211,10 +2519,6 @@ impl HerdrSessionRegistry {
         let installed =
             self.install_connection(identity.clone(), client, Task::ready(()), generation);
         assert!(installed, "test connection is installed exactly once");
-    }
-    #[cfg(test)]
-    pub(crate) fn pending_count(&self) -> usize {
-        self.pending.len()
     }
 
     #[cfg(test)]
@@ -3261,17 +2565,14 @@ impl HerdrSessionRegistry {
         &mut self,
         window_id: WindowId,
         session_name: Arc<str>,
-        target: SelectionTarget,
         cx: &mut Context<Self>,
     ) {
-        self.start_binding_for_window(window_id, session_name, target, cx);
+        self.start_binding_for_window(window_id, session_name, cx);
     }
 
-    #[cfg(test)]
     pub(crate) fn finalize_binding_for_test(
         &mut self,
         bootstrap: WindowId,
-        target: SelectionTarget,
         identity: &SessionIdentity,
         session_name: &str,
         generation: u64,
@@ -3280,7 +2581,6 @@ impl HerdrSessionRegistry {
     ) -> Option<WindowId> {
         match self.finalize_binding(
             bootstrap,
-            target,
             identity,
             session_name,
             generation,
@@ -3289,7 +2589,6 @@ impl HerdrSessionRegistry {
         ) {
             FinalizeResult::Ready(window) => window,
             FinalizeResult::Activate { window_id, .. } => Some(window_id),
-            FinalizeResult::Handoff { window_id } => Some(window_id),
         }
     }
 
@@ -3318,40 +2617,10 @@ impl HerdrSessionRegistry {
         else {
             return;
         };
-        if let Some(handoffs) = self.inherited_handoffs.get_mut(identity)
-            && let Some(handoff) = handoffs
-                .iter_mut()
-                .find(|handoff| handoff.destination.is_none())
-        {
-            handoff.destination = Some(window_id);
-        }
         self.install_binding_target(window_id, identity, generation, cx);
         self.finish_connected(window_id, identity, generation, cx);
     }
 
-    /// Record `donor` as the bootstrap temporarily holding `identity` until
-    /// an inherited destination publishes `Connected` — the state
-    /// `finalize_binding`'s `OpenInherited` route installs before the
-    /// destination window exists.
-    #[cfg(test)]
-    pub(crate) fn reserve_inherited_handoff_for_test(
-        &mut self,
-        identity: &SessionIdentity,
-        donor: WindowId,
-    ) {
-        let donor_generation = self.attempts.get(&donor.as_u64()).copied().unwrap_or(1);
-        self.attempts
-            .entry(donor.as_u64())
-            .or_insert(donor_generation);
-        self.inherited_handoffs
-            .entry(identity.clone())
-            .or_default()
-            .push(InheritedHandoff {
-                donor,
-                donor_generation,
-                destination: None,
-            });
-    }
 }
 
 fn snapshot_checkout_paths(snapshot: &SessionSnapshot) -> Vec<herdr::CanonicalPath> {
@@ -3382,13 +2651,9 @@ fn focused_checkout_path(snapshot: &SessionSnapshot) -> Option<herdr::CanonicalP
     canonical_checkout_path(checkout).ok()
 }
 
-/// Pure gate for `finish_connected`: a window may only be published
-/// `Connected` for a session while its current binding still describes a
-/// window this routing decision may complete. An `Unselected` target is the
-/// reused-destination case (the slot it owns was attached in the same update
-/// that installed its host; a disconnect in between removes that slot and
-/// the ownership gate rejects). A window that failed or started a different
-/// session in the meantime keeps its newer state.
+/// `Connected` for a session while its current binding still describes the
+/// window this routing decision may complete. A window that failed or started
+/// a different session in the meantime keeps its newer state.
 fn binding_accepts_connected(state: &BindingState, identity: &SessionIdentity) -> bool {
     match state {
         BindingState::Unselected => true,
@@ -3446,17 +2711,12 @@ async fn run_connection(
     mut cx: AsyncApp,
 ) {
     let deadline = cx.background_executor().now() + CONNECTION_DEADLINE;
-    let start = registry.read_with(&mut cx, |registry, _| {
-        let starting = registry.attempt_is_current(window_id, generation, &session_name);
-        let target = registry
-            .windows
-            .get(&window_id.as_u64())
-            .and_then(|binding| binding.selection_target);
-        (starting, target)
+    let starting = registry.read_with(&mut cx, |registry, _| {
+        registry.attempt_is_current(window_id, generation, &session_name)
     });
-    let (true, Some(target)) = start else {
+    if !starting {
         return;
-    };
+    }
 
     // 1. Refresh the session list until the selected entry and its reported
     //    socket appear — inside the single 15-second deadline.
@@ -3578,7 +2838,6 @@ async fn run_connection(
                     }
                     Some(registry.finalize_binding(
                         window_id,
-                        target,
                         &identity,
                         &session_name,
                         generation,
@@ -3593,13 +2852,6 @@ async fn run_connection(
                     FinalizeResult::Ready(window) => (
                         window,
                         window.map(|window_id| MirrorTarget {
-                            window_id,
-                            generation: owner_generation,
-                        }),
-                    ),
-                    FinalizeResult::Handoff { window_id } => (
-                        None,
-                        Some(MirrorTarget {
                             window_id,
                             generation: owner_generation,
                         }),
@@ -3775,7 +3027,6 @@ async fn run_connection(
             }
             Some(registry.finalize_binding(
                 window_id,
-                target,
                 &identity,
                 &session_name,
                 generation,
@@ -3790,13 +3041,6 @@ async fn run_connection(
             FinalizeResult::Ready(window) => (
                 window,
                 window.map(|window_id| MirrorTarget {
-                    window_id,
-                    generation: *owner_generation,
-                }),
-            ),
-            FinalizeResult::Handoff { window_id } => (
-                None,
-                Some(MirrorTarget {
                     window_id,
                     generation: *owner_generation,
                 }),
@@ -3984,7 +3228,6 @@ async fn run_connection(
     let outcome = registry.update(&mut cx, |registry, cx| {
         registry.finalize_binding(
             window_id,
-            target,
             &identity,
             &session_name,
             generation,
@@ -3996,13 +3239,6 @@ async fn run_connection(
         FinalizeResult::Ready(window) => (
             window,
             window.map(|window_id| MirrorTarget {
-                window_id,
-                generation,
-            }),
-        ),
-        FinalizeResult::Handoff { window_id } => (
-            None,
-            Some(MirrorTarget {
                 window_id,
                 generation,
             }),
@@ -4137,30 +3373,6 @@ async fn run_connection(
     });
 }
 
-fn finish_inherited_open(
-    registry: Entity<HerdrSessionRegistry>,
-    bootstrap: WindowId,
-    session_name: &str,
-    generation: u64,
-    identity: &SessionIdentity,
-    result: anyhow::Result<()>,
-    cx: &mut AsyncApp,
-) {
-    if result.is_ok() {
-        return;
-    }
-    log::error!("failed to open inherited herdr target window");
-    let _ = registry.update(cx, |registry, cx| {
-        registry.fail_bootstrap_without_destination(
-            bootstrap,
-            session_name,
-            generation,
-            identity,
-            "failed to open inherited herdr target window".to_owned(),
-            cx,
-        );
-    });
-}
 
 /// Release the connection and bound-window slot an activating attempt
 /// installed, then fail its binding, so a later `Retry` never takes a Shared
@@ -4313,18 +3525,14 @@ mod tests {
             windows: HashMap::default(),
             prompted: HashSet::default(),
             prompt_pending: HashSet::default(),
-            pending: HashMap::default(),
             connections: HashMap::default(),
             attempts: HashMap::default(),
             in_flight: HashMap::default(),
             next_generation: 0,
-            inherited_handoffs: HashMap::default(),
             #[cfg(test)]
             test_activation_failures: HashSet::default(),
             #[cfg(test)]
             test_activation_failure_delays: HashMap::default(),
-            #[cfg(test)]
-            test_inherited_open_failures: HashSet::default(),
             slot_generations: HashMap::default(),
             finalize_tokens: HashMap::default(),
             sync: AgentSyncState::default(),
@@ -4332,7 +3540,6 @@ mod tests {
             mirrors: HashMap::default(),
             mirroring_in_flight: HashSet::default(),
             pending_mirror_replay: HashMap::default(),
-            mirror_router: Rc::new(ProductionMirrorWindowRouter),
             focus_echoes: HashMap::default(),
             observed_panels: HashSet::default(),
             panel_subscriptions: Vec::new(),
@@ -4389,108 +3596,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn invoking_selection_reuses_exact_eligible_window() {
-        let focused = checkout("C:/repo/worktree");
-        let route = route_focused_worktree(
-            SelectionTarget::InvokingWindow,
-            WindowId::from(1),
-            &[],
-            Some(&focused),
-            Some(&session("main")),
-            &[RoutingCandidate {
-                window_id: WindowId::from(2),
-                state: BindingState::Unselected,
-                checkout_paths: vec![focused.clone()],
-            }],
-        );
-        assert_eq!(route, Route::ReuseExact(WindowId::from(2)));
-    }
-
-    #[test]
-    fn source_window_for_session_rejects_stale_starting_attempt() {
-        let identity = session("main");
-        let handle = WindowHandle::<MultiWorkspace>::new(WindowId::from(90));
-        let mut registry = empty_registry();
-        let window_id = registry.register_window_for_test(
-            handle,
-            BindingState::Starting {
-                session_name: Arc::from("main"),
-            },
-            Vec::new(),
-        );
-        registry.attempts.insert(window_id.as_u64(), 2);
-
-        assert!(
-            registry.source_window_for_session(&identity, 1).is_none(),
-            "a stale generation must not target a restarted Starting binding"
-        );
-        assert_eq!(
-            registry.source_window_for_session(&identity, 2),
-            Some(handle),
-            "the current Starting attempt remains a valid pre-Connected fallback"
-        );
-    }
-
-    #[test]
-    fn mismatched_invoking_window_inherits_into_new_focused_window() {
-        let focused = checkout("C:/repo/worktree");
-        let route = route_focused_worktree(
-            SelectionTarget::InvokingWindow,
-            WindowId::from(1),
-            &[checkout("C:/repo/other")],
-            Some(&focused),
-            Some(&session("main")),
-            &[],
-        );
-        assert_eq!(route, Route::OpenInherited);
-    }
-
-    #[test]
-    fn connected_selection_keeps_its_new_target_window() {
-        let focused = checkout("C:/repo/worktree");
-        let route = route_focused_worktree(
-            SelectionTarget::NewWindow,
-            WindowId::from(1),
-            &[],
-            Some(&focused),
-            Some(&session("main")),
-            &[RoutingCandidate {
-                window_id: WindowId::from(2),
-                state: BindingState::Connected(session("main")),
-                checkout_paths: vec![focused.clone()],
-            }],
-        );
-        assert_eq!(route, Route::BindBootstrap);
-    }
-
-    #[test]
-    fn pending_binding_is_consumed_once_and_inherited_is_silent() {
-        let mut registry = empty_registry();
-        let workspace_id = EntityId::from(7);
-        let identity = session("main");
-        let donor = WindowId::from(0);
-        registry.reserve_pending(
-            workspace_id,
-            PendingBinding::Inherited {
-                identity: identity.clone(),
-                donor,
-                donor_generation: 1,
-            },
-        );
-
-        assert_eq!(registry.pending_count(), 1);
-        assert_eq!(
-            registry.consume_pending(workspace_id),
-            Some(PendingBinding::Inherited {
-                identity,
-                donor,
-                donor_generation: 1,
-            })
-        );
-        assert_eq!(registry.consume_pending(workspace_id), None);
-        assert_eq!(registry.pending_count(), 0);
-    }
 
     use agent::ThreadStore;
     use gpui::TestAppContext;
@@ -4678,35 +3783,6 @@ mod tests {
         }
     }
 
-    struct RecordingMirrorRouter {
-        requests: Rc<RefCell<Vec<MirrorOpenRequest>>>,
-        destination: WindowHandle<MultiWorkspace>,
-    }
-
-    impl MirrorWindowRouter for RecordingMirrorRouter {
-        fn open_window(
-            &self,
-            request: MirrorOpenRequest,
-            registry: Entity<HerdrSessionRegistry>,
-            mut cx: AsyncApp,
-        ) -> LocalBoxFuture<'static, anyhow::Result<WindowHandle<MultiWorkspace>>> {
-            let requests = self.requests.clone();
-            let destination = self.destination;
-            async move {
-                let workspace_id = destination
-                    .read_with(&mut cx, |multi_workspace, _| {
-                        multi_workspace.workspace().entity_id()
-                    })
-                    .map_err(|error| anyhow::anyhow!("destination window unavailable: {error}"))?;
-                requests.borrow_mut().push(request.clone());
-                registry.update(&mut cx, |registry, _| {
-                    registry.reserve_inherited_workspace(workspace_id, request.identity);
-                });
-                Ok(destination)
-            }
-            .boxed_local()
-        }
-    }
 
     fn test_agent(
         identity: &SessionIdentity,
@@ -4829,7 +3905,7 @@ mod tests {
             (multi_workspace, handle, workspace)
         };
         let first_window_id = registry.update(cx, |registry, cx| {
-            registry.handle_new_window(first_window, multi_workspace.entity_id(), cx);
+            registry.handle_new_window(first_window, cx);
             first_window.window_id()
         });
         assert!(
@@ -4880,7 +3956,7 @@ mod tests {
             (multi_workspace, handle, workspace)
         };
         let second_window_id = registry.update(cx, |registry, cx| {
-            registry.handle_new_window(second_window, second_multi_workspace.entity_id(), cx);
+            registry.handle_new_window(second_window, cx);
             second_window.window_id()
         });
         assert!(
@@ -4974,6 +4050,49 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn connected_selection_reuses_invoking_window(cx: &mut TestAppContext) {
+        init_app(cx);
+        let project = test_project(cx).await;
+        let invoking = add_real_window(cx, &project).await;
+        let old_identity = session("old");
+        let gateway = HerdrGateway::fake(
+            || async { Ok(Vec::new()) }.boxed_local(),
+            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+            |_name| async { Ok(()) }.boxed_local(),
+        );
+        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        let window_id = registry.update(cx, |registry, _| {
+            let window_id = registry.register_window_for_test(
+                invoking,
+                BindingState::Connected(old_identity.clone()),
+                Vec::new(),
+            );
+            registry.install_connection_for_test(old_identity.clone(), Rc::new(FakeHandle), 1);
+            registry.attach_connection_window(&old_identity, window_id);
+            window_id
+        });
+
+        registry.update(cx, |registry, cx| {
+            registry.confirm_selection_for_test(
+                invoking,
+                SessionSelection::New {
+                    name: "new".to_owned(),
+                },
+                cx,
+            );
+            assert_eq!(
+                registry.binding_state(window_id),
+                BindingState::Starting {
+                    session_name: Arc::from("new"),
+                }
+            );
+            assert_eq!(registry.bound_window_count(&old_identity), 0);
+            assert!(!registry.has_connection(&old_identity));
+        });
+        assert_eq!(cx.windows().len(), 1);
+    }
+
+    #[gpui::test]
     async fn stream_loss_refresh_classifies_missing_session_without_reconnect(
         cx: &mut TestAppContext,
     ) {
@@ -5017,7 +4136,6 @@ mod tests {
             registry.start_binding_for_test(
                 window_id,
                 Arc::from("main"),
-                SelectionTarget::InvokingWindow,
                 cx,
             );
         });
@@ -5044,7 +4162,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn owner_bootstrap_routing_failure_notifies_before_connected(cx: &mut TestAppContext) {
+    async fn owner_bootstrap_failure_notifies_before_connected(cx: &mut TestAppContext) {
         init_app(cx);
         let project = test_project(cx).await;
         let window = add_real_window(cx, &project).await;
@@ -5075,7 +4193,6 @@ mod tests {
             registry.start_binding_for_test(
                 window_id,
                 Arc::from("main"),
-                SelectionTarget::InvokingWindow,
                 cx,
             );
         });
@@ -5083,91 +4200,7 @@ mod tests {
         assert_eq!(
             workspace.read_with(cx, |workspace, _| workspace.notification_ids().len()),
             1,
-            "an owner-bootstrap routing failure must produce one actionable notification"
-        );
-    }
-
-    #[gpui::test]
-    async fn owner_bootstrap_reuse_exact_routing_failure_notifies_destination(
-        cx: &mut TestAppContext,
-    ) {
-        init_app(cx);
-        let source_project = test_project_at(cx, "C:/herdr-source").await;
-        let source = add_real_window(cx, &source_project).await;
-        let destination_project = test_project_at(cx, "C:/herdr-destination").await;
-        let destination = add_real_window(cx, &destination_project).await;
-        let source_workspace = source
-            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
-            .expect("source window remains open");
-        let destination_workspace = destination
-            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
-            .expect("destination window remains open");
-
-        let mut snapshot = agent_snapshot();
-        snapshot.focused_workspace_id = Some("focused-workspace".to_owned());
-        snapshot.workspaces[0].workspace_id = "focused-workspace".to_owned();
-        snapshot.workspaces[0].worktree = Some(herdr::WorkspaceWorktreeInfo {
-            checkout_path: "C:/herdr-destination".to_owned(),
-            repo_root: None,
-            repo_key: None,
-            repo_name: None,
-            is_linked_worktree: false,
-        });
-        snapshot.agents[0].workspace_id = "agent-without-checkout".to_owned();
-        snapshot.agents[0].cwd = Some("relative-agent-path".to_owned());
-        snapshot.agents[0].foreground_cwd = None;
-
-        let gateway = HerdrGateway::fake(
-            || async { Ok(vec![session_info("main", true)]) }.boxed_local(),
-            move |_info| {
-                let snapshot = snapshot.clone();
-                async move {
-                    Ok(Rc::new(FakeConnection {
-                        snapshot,
-                        dropped: Rc::new(Cell::new(0)),
-                        subscribe_calls: Rc::new(Cell::new(0)),
-                        idle_stream: true,
-                        event: None,
-                    }) as Rc<dyn HerdrSessionHandle>)
-                }
-                .boxed_local()
-            },
-            |_name| async { Ok(()) }.boxed_local(),
-        );
-        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
-        let source_id = registry.update(cx, |registry, _| {
-            registry.register_window_for_test(
-                source,
-                BindingState::Unselected,
-                vec![checkout("C:/herdr-source")],
-            )
-        });
-        let _destination_id = registry.update(cx, |registry, _| {
-            registry.register_window_for_test(
-                destination,
-                BindingState::Unselected,
-                vec![checkout("C:/herdr-destination")],
-            )
-        });
-        registry.update(cx, |registry, cx| {
-            registry.start_binding_for_test(
-                source_id,
-                Arc::from("main"),
-                SelectionTarget::InvokingWindow,
-                cx,
-            );
-        });
-        cx.run_until_parked();
-
-        assert_eq!(
-            source_workspace.read_with(cx, |workspace, _| workspace.notification_ids().len()),
-            0,
-            "the detached bootstrap must not receive the destination failure"
-        );
-        assert_eq!(
-            destination_workspace.read_with(cx, |workspace, _| workspace.notification_ids().len()),
-            1,
-            "a ReuseExact routing failure must notify the final destination"
+            "an owner-bootstrap failure must produce one actionable notification"
         );
     }
 
@@ -5308,7 +4341,6 @@ mod tests {
             registry.start_binding_for_test(
                 window_one,
                 Arc::from("main"),
-                SelectionTarget::NewWindow,
                 cx,
             );
         });
@@ -5336,7 +4368,6 @@ mod tests {
             registry.start_binding_for_test(
                 window_two,
                 Arc::from("main"),
-                SelectionTarget::NewWindow,
                 cx,
             );
         });
@@ -5386,7 +4417,6 @@ mod tests {
             registry.start_binding_for_test(
                 window_one,
                 Arc::from("main"),
-                SelectionTarget::InvokingWindow,
                 cx,
             );
         });
@@ -5441,7 +4471,6 @@ mod tests {
             registry.start_binding_for_test(
                 window_id,
                 Arc::from("main"),
-                SelectionTarget::InvokingWindow,
                 cx,
             );
         });
@@ -5461,7 +4490,6 @@ mod tests {
             registry.start_binding_for_test(
                 window_id,
                 Arc::from("main"),
-                SelectionTarget::InvokingWindow,
                 cx,
             );
         });
@@ -5524,7 +4552,6 @@ mod tests {
             registry.start_binding_for_test(
                 window_id,
                 Arc::from("main"),
-                SelectionTarget::NewWindow,
                 cx,
             );
         });
@@ -5601,7 +4628,6 @@ mod tests {
             registry.start_binding_for_test(
                 owner,
                 Arc::from("main"),
-                SelectionTarget::NewWindow,
                 cx,
             );
         });
@@ -5626,268 +4652,6 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn inherited_handoff_releases_the_donor_when_destination_connects(cx: &mut TestAppContext) {
-        let gateway = HerdrGateway::fake(
-            || async { Ok(Vec::new()) }.boxed_local(),
-            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
-            |_name| async { Ok(()) }.boxed_local(),
-        );
-        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
-
-        let identity = session("main");
-        let donor = WindowHandle::<MultiWorkspace>::new(WindowId::from(11));
-        let destination = WindowHandle::<MultiWorkspace>::new(WindowId::from(12));
-        let (donor_id, destination_id) = registry.update(cx, |registry, _| {
-            let donor = registry.register_window_for_test(
-                donor,
-                BindingState::Connected(identity.clone()),
-                Vec::new(),
-            );
-            let destination = registry.register_window_for_test(
-                destination,
-                BindingState::Unselected,
-                Vec::new(),
-            );
-            (donor, destination)
-        });
-        registry.update(cx, |registry, _| {
-            assert!(registry.install_connection(
-                identity.clone(),
-                Rc::new(FakeHandle),
-                Task::ready(()),
-                1,
-            ));
-            registry.attach_connection_window(&identity, donor_id);
-            registry.reserve_inherited_handoff_for_test(&identity, donor_id);
-        });
-
-        registry.update(cx, |registry, cx| {
-            registry.bind_connected_for_test(destination_id, &identity, cx);
-        });
-
-        assert_eq!(
-            registry.read_with(cx, |registry, _| registry.binding_state(destination_id)),
-            BindingState::Connected(identity.clone())
-        );
-        assert_eq!(
-            registry.read_with(cx, |registry, _| registry.binding_state(donor_id)),
-            BindingState::Unselected,
-            "the destination's Connected transition must detach the donor"
-        );
-        assert_eq!(
-            registry.read_with(cx, |registry, _| registry.bound_window_count(&identity)),
-            1
-        );
-        assert!(
-            registry.read_with(cx, |registry, _| registry.inherited_handoffs.is_empty()),
-            "the handoff record must be consumed"
-        );
-    }
-
-    #[gpui::test]
-    fn concurrent_handoffs_keep_their_exact_donors(cx: &mut TestAppContext) {
-        let gateway = HerdrGateway::fake(
-            || async { Ok(Vec::new()) }.boxed_local(),
-            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
-            |_name| async { Ok(()) }.boxed_local(),
-        );
-        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
-        let identity = session("main");
-        let (donor_a, donor_b, destination_a, destination_b) =
-            registry.update(cx, |registry, _| {
-                let donor_a = registry.register_window_for_test(
-                    WindowHandle::new(WindowId::from(51)),
-                    BindingState::Starting {
-                        session_name: Arc::from("main"),
-                    },
-                    Vec::new(),
-                );
-                let donor_b = registry.register_window_for_test(
-                    WindowHandle::new(WindowId::from(52)),
-                    BindingState::Starting {
-                        session_name: Arc::from("main"),
-                    },
-                    Vec::new(),
-                );
-                registry.attempts.insert(donor_a.as_u64(), 11);
-                registry.attempts.insert(donor_b.as_u64(), 22);
-                let destination_a = registry.register_window_for_test(
-                    WindowHandle::new(WindowId::from(61)),
-                    BindingState::Unselected,
-                    Vec::new(),
-                );
-                let destination_b = registry.register_window_for_test(
-                    WindowHandle::new(WindowId::from(62)),
-                    BindingState::Unselected,
-                    Vec::new(),
-                );
-                registry.install_connection(
-                    identity.clone(),
-                    Rc::new(FakeHandle),
-                    Task::ready(()),
-                    1,
-                );
-                registry.attach_connection_window(&identity, donor_a);
-                registry.attach_connection_window(&identity, donor_b);
-                registry.reserve_inherited_handoff_for_test(&identity, donor_a);
-                registry.reserve_inherited_handoff_for_test(&identity, donor_b);
-                (donor_a, donor_b, destination_a, destination_b)
-            });
-
-        registry.update(cx, |registry, cx| {
-            assert!(registry.claim_inherited_destination(&identity, donor_a, 11, destination_a));
-            assert!(registry.claim_inherited_destination(&identity, donor_b, 22, destination_b));
-            registry.install_binding_target(destination_b, &identity, 22, cx);
-            registry.finish_connected(destination_b, &identity, 22, cx);
-        });
-        assert_eq!(
-            registry.read_with(cx, |registry, _| registry.binding_state(donor_a)),
-            BindingState::Starting {
-                session_name: Arc::from("main")
-            }
-        );
-        assert_eq!(
-            registry.read_with(cx, |registry, _| registry.binding_state(donor_b)),
-            BindingState::Unselected
-        );
-        assert_eq!(
-            registry.read_with(cx, |registry, _| registry.binding_state(destination_b)),
-            BindingState::Connected(identity.clone())
-        );
-
-        registry.update(cx, |registry, cx| {
-            registry.install_binding_target(destination_a, &identity, 11, cx);
-            registry.finish_connected(destination_a, &identity, 11, cx);
-        });
-        assert_eq!(
-            registry.read_with(cx, |registry, _| registry.binding_state(donor_a)),
-            BindingState::Unselected
-        );
-        assert!(registry.read_with(cx, |registry, _| registry.inherited_handoffs.is_empty()));
-    }
-
-    #[gpui::test]
-    async fn inherited_open_failure_uses_real_handoff_callback(cx: &mut TestAppContext) {
-        init_app(cx);
-        cx.update(|cx| {
-            let app_state = AppState::test(cx);
-            AppState::set_global(app_state, cx);
-        });
-        let project = test_project(cx).await;
-        let handle = add_real_window(cx, &project).await;
-        let gateway = HerdrGateway::fake(
-            || async { Ok(Vec::new()) }.boxed_local(),
-            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
-            |_name| async { Ok(()) }.boxed_local(),
-        );
-        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
-        let identity = session("main");
-        let window_id = registry.update(cx, |registry, _| {
-            let window_id = registry.register_window_for_test(
-                handle,
-                BindingState::Starting {
-                    session_name: Arc::from("main"),
-                },
-                vec![checkout("C:/other")],
-            );
-            registry.attempts.insert(window_id.as_u64(), 1);
-            registry.install_connection(identity.clone(), Rc::new(FakeHandle), Task::ready(()), 1);
-            registry.attach_connection_window(&identity, window_id);
-            registry.fail_next_inherited_open_for_test(window_id);
-            window_id
-        });
-        let outcome = registry.update(cx, |registry, cx| {
-            registry.finalize_binding_for_test(
-                window_id,
-                SelectionTarget::InvokingWindow,
-                &identity,
-                "main",
-                1,
-                &activation_snapshot(),
-                cx,
-            )
-        });
-        assert_eq!(
-            outcome,
-            Some(window_id),
-            "the real route must be OpenInherited"
-        );
-        cx.run_until_parked();
-        assert!(
-            matches!(
-                registry.read_with(cx, |registry, _| registry.binding_state(window_id)),
-                BindingState::Failed { .. }
-            ),
-            "a failed inherited open must fail the still-Starting donor"
-        );
-        assert!(!registry.read_with(cx, |registry, _| registry.has_connection(&identity)));
-    }
-
-    #[gpui::test]
-    fn canceled_donor_rebind_cannot_be_detached_by_old_destination(cx: &mut TestAppContext) {
-        let gateway = HerdrGateway::fake(
-            || async { Ok(Vec::new()) }.boxed_local(),
-            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
-            |_name| async { Ok(()) }.boxed_local(),
-        );
-        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
-        let identity = session("main");
-        let (donor, destination) = registry.update(cx, |registry, _| {
-            let donor = registry.register_window_for_test(
-                WindowHandle::new(WindowId::from(71)),
-                BindingState::Starting {
-                    session_name: Arc::from("main"),
-                },
-                Vec::new(),
-            );
-            let destination = registry.register_window_for_test(
-                WindowHandle::new(WindowId::from(72)),
-                BindingState::Unselected,
-                Vec::new(),
-            );
-            registry.attempts.insert(donor.as_u64(), 1);
-            registry.install_connection(identity.clone(), Rc::new(FakeHandle), Task::ready(()), 1);
-            registry.attach_connection_window(&identity, donor);
-            registry.reserve_inherited_handoff_for_test(&identity, donor);
-            (donor, destination)
-        });
-
-        registry.update(cx, |registry, cx| {
-            registry.disconnect_session(donor, cx);
-            registry.attempts.insert(donor.as_u64(), 2);
-            registry
-                .windows
-                .get_mut(&donor.as_u64())
-                .expect("donor remains a live window")
-                .state = BindingState::Connected(identity.clone());
-            assert!(registry.install_connection(
-                identity.clone(),
-                Rc::new(FakeHandle),
-                Task::ready(()),
-                2,
-            ));
-            registry.attach_connection_window(&identity, donor);
-            registry.attach_connection_window(&identity, destination);
-            registry.finalize_tokens.insert(destination.as_u64(), 1);
-            registry
-                .slot_generations
-                .insert((identity.clone(), destination.as_u64()), 1);
-        });
-        assert!(
-            registry.read_with(cx, |registry, _| registry.inherited_handoffs.is_empty()),
-            "disconnect must remove the canceled donor's handoff"
-        );
-
-        registry.update(cx, |registry, cx| {
-            registry.finish_connected(destination, &identity, 1, cx);
-        });
-        assert_eq!(
-            registry.read_with(cx, |registry, _| registry.binding_state(donor)),
-            BindingState::Connected(identity),
-            "an old destination must not detach the rebound donor"
-        );
-    }
 
     #[gpui::test]
     fn finish_connected_rejects_a_stale_target_binding(cx: &mut TestAppContext) {
@@ -6038,160 +4802,6 @@ mod tests {
             registry.read_with(cx, |registry, _| registry.sync.record(&key).is_none()),
             "exit stream event should remove the live agent through process_stream_event"
         );
-    }
-
-    #[gpui::test]
-    async fn mirror_routes_exact_nested_and_unmatched_roots_through_production_effects(
-        cx: &mut TestAppContext,
-    ) {
-        init_agent_app(cx);
-        let fs = fs::FakeFs::new(cx.executor());
-        let route_base = std::env::temp_dir().join("herdr-task5-route");
-        let route_root = route_base.join("root");
-        let route_nested = route_root.join("nested");
-        let route_other = route_base.join("other");
-        let route_new = route_base.join("new");
-        std::fs::create_dir_all(&route_nested).expect("route root should be writable");
-        std::fs::create_dir_all(&route_other).expect("route destination should be writable");
-        std::fs::create_dir_all(&route_new).expect("route new root should be writable");
-        let root_text = route_root.to_string_lossy().to_string();
-        let nested_text = route_nested.to_string_lossy().to_string();
-        let other_text = route_other.to_string_lossy().to_string();
-        let new_text = route_new.to_string_lossy().to_string();
-        fs.insert_tree(
-            &root_text,
-            serde_json::json!({
-                ".git": {},
-                "nested": {"agent.txt": ""},
-            }),
-        )
-        .await;
-        fs.insert_tree(&other_text, serde_json::json!({"file.txt": ""}))
-            .await;
-        fs.insert_tree(&new_text, serde_json::json!({"file.txt": ""}))
-            .await;
-        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
-        let project_one = project::Project::test(fs.clone(), [route_root.as_path()], cx).await;
-        let project_two = project::Project::test(fs, [route_other.as_path()], cx).await;
-        let (source_workspace, source, source_panel, _) = add_agent_window(cx, &project_one).await;
-        let (destination_workspace, destination, destination_panel, _) =
-            add_agent_window(cx, &project_two).await;
-        let source_workspace_entity = source_workspace
-            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
-        let destination_workspace_entity = destination_workspace
-            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
-        assert!(
-            source_workspace_entity.read_with(cx, |workspace, cx| workspace
-                .panel::<AgentPanel>(cx)
-                .is_some()),
-            "the source window must have the explicitly installed Agent Panel"
-        );
-        assert!(
-            destination_workspace_entity.read_with(cx, |workspace, cx| workspace
-                .panel::<AgentPanel>(cx)
-                .is_some()),
-            "the destination window must have the explicitly installed Agent Panel"
-        );
-
-        let requests = Rc::new(RefCell::new(Vec::new()));
-        let router = Rc::new(RecordingMirrorRouter {
-            requests: requests.clone(),
-            destination,
-        });
-        let identity = session("main");
-        let exact = test_agent(&identity, "terminal-exact", "pane-exact", &root_text);
-        let nested = test_agent(&identity, "terminal-nested", "pane-nested", &nested_text);
-        let unmatched = test_agent(&identity, "terminal-new", "pane-new", &new_text);
-        let root = checkout(&root_text);
-        let other = checkout(&other_text);
-        let registry = cx.update(|cx| {
-            cx.new(|cx| {
-                HerdrSessionRegistry::test(
-                    cx,
-                    HerdrGateway::fake(
-                        || async { Ok(Vec::new()) }.boxed_local(),
-                        |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
-                        |_name| async { Ok(()) }.boxed_local(),
-                    ),
-                )
-            })
-        });
-        registry.update(cx, |registry, _| {
-            registry.set_mirror_router_for_test(router);
-            registry.set_program_for_test(
-                std::env::current_exe().expect("test executable should be available"),
-            );
-            registry.install_connection_for_test(identity.clone(), Rc::new(FakeHandle), 1);
-            registry.register_window_for_test(
-                source,
-                BindingState::Connected(identity.clone()),
-                vec![root.clone()],
-            );
-            for record in [&exact, &nested, &unmatched] {
-                registry.sync.upsert(
-                    identity.clone(),
-                    test_pane(
-                        &record.key.terminal_id,
-                        &record.pane_id,
-                        1,
-                        record
-                            .checkout_path
-                            .as_ref()
-                            .unwrap()
-                            .to_string_lossy()
-                            .as_ref(),
-                    ),
-                );
-            }
-        });
-        cx.executor().allow_parking();
-
-        for record in [&exact, &nested, &unmatched] {
-            registry.update(cx, |registry, cx| {
-                registry.dispatch_effects(
-                    &identity,
-                    vec![AgentSyncEffect::Open(record.clone())],
-                    None,
-                    cx,
-                );
-            });
-            cx.run_until_parked();
-        }
-        for _ in 0..5 {
-            cx.run_until_parked();
-        }
-        let requests = requests.borrow();
-        assert_eq!(
-            requests.len(),
-            1,
-            "exact and nested roots reuse the source window; only the unmatched root opens one"
-        );
-        assert_eq!(requests[0].root, checkout(&new_text));
-        assert_eq!(requests[0].source, source);
-        assert_eq!(requests[0].identity, identity);
-        let destination_workspace_id = destination_workspace.read_with(cx, |multi_workspace, _| {
-            multi_workspace.workspace().entity_id()
-        });
-        assert!(registry.read_with(cx, |registry, _| matches!(registry.pending.get(&destination_workspace_id), Some(PendingBinding::Inherited { identity: pending_identity, .. }) if pending_identity == &identity)));
-        for (record, panel) in [
-            (&exact, &source_panel),
-            (&nested, &source_panel),
-            (&unmatched, &destination_panel),
-        ] {
-            let terminal_id = registry
-                .read_with(cx, |registry, _| registry.mirror_index.get(&record.key))
-                .expect("production open must register the mirrored terminal");
-            let expected = HerdrSessionRegistry::external_identity(&record.key);
-            assert!(
-                panel.read_with(cx, |panel, _| {
-                    panel.external_terminal_identity(terminal_id) == Some(expected.as_str())
-                }),
-                "production open must retain the stable external identity"
-            );
-        }
-        drop(requests);
-        let _ = source_panel;
-        let _ = destination_panel;
     }
 
     #[gpui::test]
