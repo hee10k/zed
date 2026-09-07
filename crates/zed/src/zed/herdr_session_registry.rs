@@ -602,7 +602,6 @@ impl HerdrSessionRegistry {
             test_activation_failures: HashSet::default(),
             #[cfg(test)]
             test_activation_failure_delays: HashMap::default(),
-            #[cfg(test)]
             sync: AgentSyncState::default(),
             mirror_index: MirrorIndex::default(),
             mirrors: HashMap::default(),
@@ -2101,6 +2100,7 @@ impl HerdrSessionRegistry {
                 self.detach_window(identity, window_id, cx);
                 return;
             }
+            binding.state = BindingState::Connected(identity.clone());
         }
         self.finalize_tokens.remove(&window_id.as_u64());
         cx.notify();
