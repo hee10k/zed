@@ -366,15 +366,8 @@ fn transition(current: BindingState, event: BindingEvent) -> BindingState {
     }
 }
 
-/// A selection made from a window that already has a binding always lands in
-/// a freshly created window; an unselected window binds itself.
-fn selection_target(state: &BindingState) -> SelectionTarget {
-    match state {
-        BindingState::Unselected => SelectionTarget::InvokingWindow,
-        BindingState::Starting { .. }
-        | BindingState::Connected(_)
-        | BindingState::Failed { .. } => SelectionTarget::NewWindow,
-    }
+fn selection_target(_state: &BindingState) -> SelectionTarget {
+    SelectionTarget::InvokingWindow
 }
 
 /// One candidate window for focused-worktree routing.
@@ -3361,6 +3354,23 @@ impl HerdrSessionRegistry {
     }
 }
 
+fn snapshot_checkout_paths(snapshot: &SessionSnapshot) -> Vec<herdr::CanonicalPath> {
+    let mut seen = HashSet::<herdr::CanonicalPath>::default();
+    let mut checkout_paths = Vec::new();
+    for workspace in &snapshot.workspaces {
+        let Some(checkout_path) = workspace.checkout_path() else {
+            continue;
+        };
+        let Ok(checkout_path) = canonical_checkout_path(checkout_path) else {
+            continue;
+        };
+        if seen.insert(checkout_path.clone()) {
+            checkout_paths.push(checkout_path);
+        }
+    }
+    checkout_paths
+}
+
 fn focused_checkout_path(snapshot: &SessionSnapshot) -> Option<herdr::CanonicalPath> {
     let workspace = snapshot.workspaces.iter().find(|workspace| {
         snapshot
@@ -4358,15 +4368,25 @@ mod tests {
     }
 
     #[test]
-    fn selection_from_connected_window_always_targets_new_window() {
-        assert_eq!(
-            selection_target(&BindingState::Connected(session("main"))),
-            SelectionTarget::NewWindow
-        );
-        assert_eq!(
-            selection_target(&BindingState::Unselected),
-            SelectionTarget::InvokingWindow
-        );
+    fn every_binding_state_selects_the_invoking_window() {
+        let states = [
+            BindingState::Unselected,
+            BindingState::Starting {
+                session_name: Arc::from("main"),
+            },
+            BindingState::Connected(session("main")),
+            BindingState::Failed {
+                session_name: Arc::from("main"),
+                message: "failed".into(),
+            },
+        ];
+
+        for state in states {
+            assert_eq!(
+                selection_target(&state),
+                SelectionTarget::InvokingWindow
+            );
+        }
     }
 
     #[test]
@@ -4604,6 +4624,48 @@ mod tests {
             layouts: Vec::new(),
             agents: Vec::new(),
         }
+    }
+
+    fn workspace_without_checkout() -> herdr::WorkspaceInfo {
+        herdr::WorkspaceInfo {
+            workspace_id: "workspace".to_owned(),
+            number: 1,
+            label: "test".to_owned(),
+            focused: false,
+            pane_count: 0,
+            tab_count: 0,
+            active_tab_id: None,
+            agent_status: "idle".to_owned(),
+            worktree: None,
+        }
+    }
+
+    fn workspace_with_checkout(path: &str) -> herdr::WorkspaceInfo {
+        let mut workspace = workspace_without_checkout();
+        workspace.worktree = Some(herdr::WorkspaceWorktreeInfo {
+            checkout_path: path.to_owned(),
+            repo_root: None,
+            repo_key: None,
+            repo_name: None,
+            is_linked_worktree: false,
+        });
+        workspace
+    }
+
+    #[test]
+    fn snapshot_checkout_paths_preserve_order_and_deduplicate() {
+        let mut snapshot = empty_snapshot();
+        snapshot.workspaces = vec![
+            workspace_with_checkout("C:/repo/one"),
+            workspace_with_checkout("C:/repo/two"),
+            workspace_with_checkout("c:/repo/one"),
+            workspace_without_checkout(),
+        ];
+
+        assert_eq!(
+            snapshot_checkout_paths(&snapshot),
+            vec![checkout("C:/repo/one"), checkout("C:/repo/two")]
+        );
     }
 
     struct RecordingEffects {
