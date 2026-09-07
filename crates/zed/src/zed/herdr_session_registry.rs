@@ -18,6 +18,7 @@ use super::herdr_agent_sync::{
 use agent_ui::{AgentPanel, AgentPanelEvent, TerminalId};
 use fs::Fs;
 use futures::channel::mpsc;
+use futures::lock::Mutex;
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
 use gpui::{
@@ -519,6 +520,9 @@ pub(crate) struct HerdrSessionRegistry {
     slot_generations: HashMap<(SessionIdentity, u64), u64>,
     /// Finalization token for a target window awaiting its Connected gate.
     finalize_tokens: HashMap<u64, u64>,
+    /// Per-window/root gates serialize unmatched workspace additions. Entries
+    /// are intentionally retained so a waiter can never race a removed lock.
+    workspace_root_locks: HashMap<(u64, herdr::CanonicalPath), Arc<Mutex<()>>>,
     sync: AgentSyncState,
     mirror_index: MirrorIndex,
     mirrors: HashMap<AgentKey, AgentMirror>,
@@ -594,6 +598,7 @@ impl HerdrSessionRegistry {
             in_flight: HashMap::default(),
             slot_generations: HashMap::default(),
             finalize_tokens: HashMap::default(),
+            workspace_root_locks: HashMap::default(),
             next_generation: 0,
             sync: AgentSyncState::default(),
             mirror_index: MirrorIndex::default(),
@@ -1545,6 +1550,17 @@ impl HerdrSessionRegistry {
         let _ = identity;
     }
 
+    fn workspace_root_lock(
+        &mut self,
+        window_id: WindowId,
+        root: &herdr::CanonicalPath,
+    ) -> Arc<Mutex<()>> {
+        self.workspace_root_locks
+            .entry((window_id.as_u64(), root.clone()))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// Open (or re-activate) the mirrored Agent Panel terminal for one live
     /// agent record. The captured connection generation invalidates the
     /// whole attempt once its session connection is superseded or released.
@@ -1643,7 +1659,7 @@ impl HerdrSessionRegistry {
                 );
                 return;
             };
-            let Some((window, needs_add)) = registry.update(&mut cx, |registry, cx| {
+            let Some((window, root_lock)) = registry.update(&mut cx, |registry, cx| {
                 if !registry.connection_matches(&record.key.session, generation) {
                     return None;
                 }
@@ -1663,7 +1679,9 @@ impl HerdrSessionRegistry {
                         })
                     })
                     .unwrap_or(true);
-                Some((window, needs_add))
+                let root_lock =
+                    needs_add.then(|| registry.workspace_root_lock(window.window_id(), &root));
+                Some((window, root_lock))
             }) else {
                 fail(
                     &registry,
@@ -1672,7 +1690,8 @@ impl HerdrSessionRegistry {
                 );
                 return;
             };
-            if needs_add {
+            if let Some(root_lock) = root_lock {
+                let _root_lock = root_lock.lock().await;
                 if let Err(error) = add_workspace_root(window, root.clone(), &mut cx).await {
                     fail(
                         &registry,
@@ -2363,6 +2382,7 @@ impl HerdrSessionRegistry {
             #[cfg(test)]
             slot_generations: HashMap::default(),
             finalize_tokens: HashMap::default(),
+            workspace_root_locks: HashMap::default(),
             sync: AgentSyncState::default(),
             mirror_index: MirrorIndex::default(),
             mirrors: HashMap::default(),
@@ -2864,9 +2884,10 @@ async fn run_connection(
                                 );
                             }
                             None => {
-                                fail(
+                                fail_after_finalize(
                                     registry,
                                     window_id,
+                                    &identity,
                                     &session_name,
                                     generation,
                                     "herdr snapshot workspace import timed out before agent effects"
@@ -3040,13 +3061,13 @@ async fn run_connection(
                         log::warn!("herdr snapshot workspace import had failures: {error:#}");
                     }
                     None => {
-                        fail(
+                        fail_after_finalize(
                             registry,
                             window_id,
+                            &identity,
                             &session_name,
                             generation,
-                            "herdr snapshot workspace import timed out before agent effects"
-                                .into(),
+                            "herdr snapshot workspace import timed out before agent effects".into(),
                             &mut cx,
                         );
                         return;
@@ -3225,9 +3246,10 @@ async fn run_connection(
                     log::warn!("herdr snapshot workspace import had failures: {error:#}");
                 }
                 None => {
-                    fail(
+                    fail_after_finalize(
                         registry,
                         window_id,
+                        &identity,
                         &session_name,
                         generation,
                         "herdr snapshot workspace import timed out before agent effects".into(),
@@ -3324,6 +3346,44 @@ async fn run_connection(
 }
 
 
+
+/// Fail a finalized snapshot-import attempt and release only its window.
+///
+/// Unlike `fail`, this path runs after the target was attached to a shared
+/// connection and a finalize token was installed. The attempt and token
+/// generations must still match before any cleanup so an older timeout cannot
+/// detach a newer retry or shared binding.
+fn fail_after_finalize(
+    registry: Entity<HerdrSessionRegistry>,
+    window_id: WindowId,
+    identity: &SessionIdentity,
+    session_name: &str,
+    generation: u64,
+    message: String,
+    cx: &mut AsyncApp,
+) {
+    let _ = registry.update(cx, |registry, cx| {
+        if !registry.attempt_is_current(window_id, generation, session_name)
+            || registry.finalize_tokens.get(&window_id.as_u64()) != Some(&generation)
+        {
+            return;
+        }
+        registry.apply_binding_event(
+            window_id,
+            BindingEvent::SessionStillRunning(message.into()),
+            cx,
+        );
+        if let Some(handle) = registry
+            .windows
+            .get(&window_id.as_u64())
+            .map(|binding| binding.window)
+        {
+            registry.host_sink.detach(handle, cx);
+        }
+        registry.finalize_tokens.remove(&window_id.as_u64());
+        registry.detach_window(identity, window_id, cx);
+    });
+}
 
 /// Transition the binding to `Failed`, but only while this exact attempt is
 /// still current: a stale `run_connection` whose deadline fires after a
@@ -3456,6 +3516,7 @@ mod tests {
             next_generation: 0,
             slot_generations: HashMap::default(),
             finalize_tokens: HashMap::default(),
+            workspace_root_locks: HashMap::default(),
             sync: AgentSyncState::default(),
             mirror_index: MirrorIndex::default(),
             mirrors: HashMap::default(),
@@ -3703,6 +3764,105 @@ mod tests {
             self.effects.borrow_mut().push(effect.clone());
         }
     }
+    struct RecordingHost {
+        detached: Rc<RefCell<Vec<WindowId>>>,
+    }
+
+    impl HerdrHostSink for RecordingHost {
+        fn install(
+            &self,
+            _window: WindowHandle<MultiWorkspace>,
+            _launch: HerdrLaunch,
+            _cx: &mut Context<HerdrSessionRegistry>,
+        ) {
+        }
+
+        fn detach(
+            &self,
+            window: WindowHandle<MultiWorkspace>,
+            _cx: &mut Context<HerdrSessionRegistry>,
+        ) {
+            self.detached.borrow_mut().push(window.window_id());
+        }
+    }
+
+    #[gpui::test]
+    fn finalized_timeout_detaches_only_timed_out_window(cx: &mut TestAppContext) {
+        let gateway = HerdrGateway::fake(
+            || async { Ok(Vec::new()) }.boxed_local(),
+            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+            |_name| async { Ok(()) }.boxed_local(),
+        );
+        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        let identity = session("main");
+        let target = WindowHandle::<MultiWorkspace>::new(WindowId::from(41));
+        let owner = WindowHandle::<MultiWorkspace>::new(WindowId::from(42));
+        let detached = Rc::new(RefCell::new(Vec::new()));
+        let effects = Rc::new(RefCell::new(Vec::new()));
+        let target_id = registry.update(cx, |registry, _| {
+            registry.set_host_sink(Rc::new(RecordingHost {
+                detached: detached.clone(),
+            }));
+            registry.set_effect_sink(Rc::new(RecordingEffects {
+                effects: effects.clone(),
+            }));
+            let target_id = registry.register_window_for_test(
+                target,
+                BindingState::Starting {
+                    session_name: Arc::from("main"),
+                },
+                Vec::new(),
+            );
+            let owner_id = registry.register_window_for_test(
+                owner,
+                BindingState::Connected(identity.clone()),
+                Vec::new(),
+            );
+            registry.attempts.insert(target_id.as_u64(), 2);
+            registry.install_connection(identity.clone(), Rc::new(FakeHandle), Task::ready(()), 1);
+            assert!(registry.attach_connection_window(&identity, owner_id));
+            assert!(registry.attach_connection_window(&identity, target_id));
+            registry
+                .slot_generations
+                .insert((identity.clone(), target_id.as_u64()), 2);
+            registry.finalize_tokens.insert(target_id.as_u64(), 2);
+            target_id
+        });
+
+        let mut async_cx = cx.to_async();
+        fail_after_finalize(
+            registry.clone(),
+            target_id,
+            &identity,
+            "main",
+            2,
+            "snapshot workspace import timed out".into(),
+            &mut async_cx,
+        );
+        drop(async_cx);
+
+        assert!(matches!(
+            registry.read_with(cx, |registry, _| registry.binding_state(target_id)),
+            BindingState::Failed { .. }
+        ));
+        assert_eq!(
+            registry.read_with(cx, |registry, _| {
+                registry.finalize_tokens.get(&target_id.as_u64()).copied()
+            }),
+            None
+        );
+        assert_eq!(
+            registry.read_with(cx, |registry, _| registry.bound_window_count(&identity)),
+            1,
+            "timing out a shared window must preserve the owner's connection"
+        );
+        assert_eq!(&*detached.borrow(), &[target_id]);
+        assert!(
+            effects.borrow().is_empty(),
+            "timeout cleanup must not dispatch agent effects"
+        );
+    }
+
 
 
     fn test_agent(
