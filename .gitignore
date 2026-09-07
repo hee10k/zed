@@ -61,3 +61,6 @@ crates/docs_preprocessor/actions.json
 
 .local*
 .cache
+
+# Superpowers plan-execution artifacts (ledgers, briefs, reports, review packages)
+/.superpowers/

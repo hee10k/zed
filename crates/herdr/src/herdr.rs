@@ -36,51 +36,28 @@ impl Endpoint {
     pub fn namespaced(name: impl Into<String>) -> Self {
         Self::Namespaced(name.into())
     }
-
-    pub fn session(name: impl AsRef<str>) -> Self {
-        let name = name.as_ref();
-        #[cfg(windows)]
-        {
-            return Self::Filesystem(session_socket_path(name));
-        }
-        #[cfg(not(windows))]
-        Self::Filesystem(session_socket_path(name))
-    }
-
-    pub fn from_environment() -> Self {
-        if let Some(path) = std::env::var_os("HERDR_SOCKET_PATH") {
-            if !path.is_empty() {
-                return Self::Filesystem(PathBuf::from(path));
-            }
-        }
-        if let Ok(name) = std::env::var("HERDR_SESSION") {
-            let name = name.trim();
-            if !name.is_empty() {
-                return Self::session(name);
-            }
-        }
-        Self::session("default")
-    }
+}
+/// `herdr session list --json` result: the authoritative session catalog.
+/// Endpoint paths come from here; the UI never guesses the config layout.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct SessionList {
+    #[serde(default)]
+    pub sessions: Vec<SessionInfo>,
 }
 
-fn session_socket_path(name: &str) -> PathBuf {
-    let config_directory = dirs::home_dir()
-        .map(|path| path.join(".config"))
-        .or_else(dirs::config_dir)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|path| path.join(".config"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    let herdr_directory = config_directory.join("herdr");
-    if name == "default" {
-        herdr_directory.join("herdr.sock")
-    } else {
-        herdr_directory
-            .join("sessions")
-            .join(name)
-            .join("herdr.sock")
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct SessionInfo {
+    pub name: String,
+    #[serde(rename = "default")]
+    pub is_default: bool,
+    pub running: bool,
+    pub session_dir: PathBuf,
+    pub socket_path: PathBuf,
+}
+
+impl SessionInfo {
+    pub fn endpoint(&self) -> Endpoint {
+        Endpoint::Filesystem(self.socket_path.clone())
     }
 }
 
@@ -101,51 +78,105 @@ impl ClientConfig {
     }
 }
 
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self::new(Endpoint::from_environment())
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("local transport error: {0}")]
     Io(#[from] io::Error),
-    #[error("invalid HerdR JSON frame: {0}")]
+    #[error("invalid herdr JSON frame: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("HerdR response was empty")]
+    #[error("herdr response was empty")]
     EmptyResponse,
-    #[error("HerdR response exceeded the {limit}-byte frame limit")]
+    #[error("herdr response exceeded the {limit}-byte frame limit")]
     FrameTooLarge { limit: usize },
-    #[error("HerdR response frame ended before a newline")]
+    #[error("herdr response frame ended before a newline")]
     UnterminatedFrame,
-    #[error("HerdR response id {actual:?} did not match request id {expected}")]
+    #[error("herdr response id {actual:?} did not match request id {expected}")]
     MismatchedResponseId {
         expected: String,
         actual: Option<String>,
     },
-    #[error("HerdR request failed ({code}): {message}")]
+    #[error("herdr request failed ({code}): {message}")]
     Remote {
         code: String,
         message: String,
         data: Option<Value>,
     },
-    #[error("HerdR response did not contain a result")]
+    #[error("herdr response did not contain a result")]
     MissingResult,
-    #[error("HerdR snapshot response had an invalid shape")]
+    #[error("herdr snapshot response had an invalid shape")]
     InvalidSnapshot,
-    #[error("HerdR protocol version {protocol} is unsupported; minimum is {minimum}")]
+    #[error("herdr protocol version {protocol} is unsupported; minimum is {minimum}")]
     UnsupportedProtocol { protocol: u32, minimum: u32 },
-    #[error("HerdR event had no workspace id")]
+    #[error("herdr event had no workspace id")]
     MissingWorkspaceId,
     #[error("invalid checkout path: {0}")]
     InvalidCheckoutPath(String),
+    #[error("herdr session list exited unsuccessfully: {message}")]
+    SessionListCommand { message: String },
+    #[error("herdr rejected the session name: {message}")]
+    SessionNameRejected { message: String },
 }
 
 impl Error {
     pub fn is_timeout(&self) -> bool {
         matches!(self, Self::Io(error) if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
     }
+}
+
+/// Lists herdr sessions by running the CLI's own `session list --json`
+/// subcommand. The catalog is authoritative; endpoint paths come from here.
+// The disallowed `std::process::Command::output` runs inside `smol::unblock`,
+// so it never blocks an async thread.
+#[allow(clippy::disallowed_methods)]
+pub async fn list_sessions(program: PathBuf) -> Result<Vec<SessionInfo>> {
+    smol::unblock(move || {
+        let output = std::process::Command::new(program)
+            .args(["session", "list", "--json"])
+            .output()?;
+        if !output.status.success() {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(Error::SessionListCommand {
+                message: if message.is_empty() {
+                    "herdr session list exited unsuccessfully".to_owned()
+                } else {
+                    message
+                },
+            });
+        }
+        let list: SessionList = serde_json::from_slice(&output.stdout)?;
+        Ok(list.sessions)
+    })
+    .await
+}
+
+/// Validates a new session name with the CLI's own parser without starting a
+/// session: `herdr` checks `--session` in `configure_from_args` before the
+/// side-effect-free `session list` subcommand runs, so a rejected name yields
+/// one session-specific stderr line with a non-zero exit and creates no
+/// session directory. Zed therefore neither copies a version-sensitive name
+/// grammar nor starts a partial session.
+// Runs inside `smol::unblock`; never blocks an async thread.
+#[allow(clippy::disallowed_methods)]
+pub async fn validate_session_name(program: PathBuf, name: String) -> Result<()> {
+    smol::unblock(move || {
+        let output = std::process::Command::new(program)
+            .arg("--session")
+            .arg(&name)
+            .args(["session", "list", "--json"])
+            .output()?;
+        if !output.status.success() {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(Error::SessionNameRejected {
+                message: if message.is_empty() {
+                    "herdr rejected the session name".to_owned()
+                } else {
+                    message
+                },
+            });
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[derive(Clone, Debug)]
@@ -172,6 +203,20 @@ impl HerdRClient {
     pub async fn snapshot(&self) -> Result<SessionSnapshot> {
         let client = self.clone();
         smol::unblock(move || client.snapshot_sync()).await
+    }
+
+    /// Fetches the current full pane info for a pane id.
+    pub async fn pane(&self, pane_id: impl Into<String>) -> Result<PaneInfo> {
+        let client = self.clone();
+        let pane_id = pane_id.into();
+        smol::unblock(move || client.pane_sync(&pane_id)).await
+    }
+
+    /// Focuses the agent attached to a pane.
+    pub async fn focus_agent(&self, pane_id: impl Into<String>) -> Result<()> {
+        let client = self.clone();
+        let pane_id = pane_id.into();
+        smol::unblock(move || client.focus_agent_sync(&pane_id)).await
     }
 
     pub async fn focus_workspace(&self, workspace_id: impl Into<String>) -> Result<()> {
@@ -209,17 +254,29 @@ impl HerdRClient {
         Ok(())
     }
 
+    fn pane_sync(&self, pane_id: &str) -> Result<PaneInfo> {
+        let result = self.request_sync("pane.get", serde_json::json!({"pane_id": pane_id}))?;
+        parse_pane_result(result)
+    }
+
+    fn focus_agent_sync(&self, pane_id: &str) -> Result<()> {
+        self.request_sync("agent.focus", serde_json::json!({"target": pane_id}))?;
+        Ok(())
+    }
+
     fn subscribe_sync(&self) -> Result<SubscribeStream> {
         let mut stream = connect_stream(&self.config.endpoint)?;
         set_request_timeouts(&stream, self.config.request_timeout)?;
         let request_id = next_request_id();
+        let subscriptions: Vec<Value> = EVENT_TYPES
+            .iter()
+            .map(|event_type| serde_json::json!({"type": event_type}))
+            .collect();
         write_request(
             &mut stream,
             &request_id,
             "events.subscribe",
-            serde_json::json!({
-                "subscriptions": [{"type": "workspace.focused"}]
-            }),
+            serde_json::json!({ "subscriptions": subscriptions }),
         )?;
         let mut reader = BufReader::new(stream);
         let response = read_json_frame_with_timeout(
@@ -258,7 +315,7 @@ pub struct SubscribeStream {
 }
 
 impl SubscribeStream {
-    pub async fn next(&mut self) -> Result<Option<FocusEvent>> {
+    pub async fn next(&mut self) -> Result<Option<HerdrEvent>> {
         let reader = Arc::clone(&self.reader);
         let cancelled = Arc::clone(&self.cancelled);
         let max_frame_bytes = self.max_frame_bytes;
@@ -269,13 +326,13 @@ impl SubscribeStream {
                 }
                 let mut reader = reader
                     .lock()
-                    .map_err(|_| io::Error::other("HerdR subscription reader was poisoned"))?;
-                match read_subscription_frame(&mut *reader, max_frame_bytes, &cancelled) {
+                    .map_err(|_| io::Error::other("herdr subscription reader was poisoned"))?;
+                match read_subscription_frame(&mut reader, max_frame_bytes, &cancelled) {
                     Ok(None) => return Ok(None),
                     Ok(Some(frame)) if frame.is_empty() => continue,
                     Ok(Some(frame)) => {
                         let value = serde_json::from_slice::<Value>(&frame)?;
-                        if let Some(event) = parse_focus_event(value)? {
+                        if let Some(event) = parse_event(value)? {
                             return Ok(Some(event));
                         }
                     }
@@ -308,11 +365,11 @@ pub struct SessionSnapshot {
     #[serde(default)]
     pub tabs: Vec<Value>,
     #[serde(default)]
-    pub panes: Vec<Value>,
+    pub panes: Vec<PaneInfo>,
     #[serde(default)]
     pub layouts: Vec<Value>,
     #[serde(default)]
-    pub agents: Vec<Value>,
+    pub agents: Vec<AgentInfo>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -353,6 +410,91 @@ impl WorkspaceInfo {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct FocusEvent {
     pub workspace_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentSessionKind {
+    Id,
+    Path,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct AgentSessionInfo {
+    pub agent: String,
+    pub kind: AgentSessionKind,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct PaneInfo {
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub focused: bool,
+    pub revision: u64,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub agent_status: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub foreground_cwd: Option<String>,
+    #[serde(default)]
+    pub agent_session: Option<AgentSessionInfo>,
+}
+
+/// A mirrored herdr agent is identified by its stable terminal id; the pane
+/// id is the current attach/focus target.
+pub type AgentInfo = PaneInfo;
+
+/// Typed event stream envelope. Mirrors herdr's `EventEnvelope` + `EventData`:
+/// `event` is the snake_case kind, `data` is the tagged payload.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HerdrEvent {
+    Workspace(WorkspaceEvent),
+    Pane(PaneEvent),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorkspaceEvent {
+    Created(WorkspaceInfo),
+    Updated(WorkspaceInfo),
+    Closed { workspace_id: String },
+    Focused { workspace_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneEvent {
+    pub kind: PaneEventKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PaneEventKind {
+    Created(PaneInfo),
+    Updated(PaneInfo),
+    Closed {
+        pane_id: String,
+        workspace_id: String,
+    },
+    Focused {
+        pane_id: String,
+        workspace_id: String,
+    },
+    Moved {
+        previous_pane_id: String,
+        pane: PaneInfo,
+    },
+    Exited {
+        pane_id: String,
+        workspace_id: String,
+    },
+    AgentDetected {
+        pane_id: String,
+        workspace_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -473,7 +615,7 @@ fn connect_stream(endpoint: &Endpoint) -> Result<Stream> {
                 let _ = path;
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "HerdR transport is unsupported on this platform",
+                    "herdr transport is unsupported on this platform",
                 ))?
             }
         }
@@ -601,7 +743,7 @@ fn read_named_pipe_frame_until(
                 if now >= deadline {
                     return Err(Error::Io(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "timed out waiting for HerdR response",
+                        "timed out waiting for herdr response",
                     )));
                 }
                 std::thread::sleep((deadline - now).min(SUBSCRIPTION_POLL_INTERVAL));
@@ -645,7 +787,7 @@ fn named_pipe_has_data(stream: &mut Stream) -> Result<bool> {
     use windows::Win32::System::Pipes::PeekNamedPipe;
 
     let Stream::NamedPipe(pipe) = stream;
-    let handle = HANDLE(pipe.as_handle().as_raw_handle() as *mut std::ffi::c_void);
+    let handle = HANDLE(pipe.as_handle().as_raw_handle());
     let mut available = 0;
     unsafe {
         PeekNamedPipe(handle, None, 0, None, Some(&mut available), None)
@@ -703,7 +845,6 @@ fn read_json_frame<R: Read>(reader: &mut R, max_frame_bytes: usize) -> Result<Va
     Ok(serde_json::from_slice(&frame)?)
 }
 #[cfg(any(not(windows), test))]
-
 fn read_frame<R: Read>(reader: &mut R, max_frame_bytes: usize) -> Result<Option<Vec<u8>>> {
     let mut frame = Vec::with_capacity(max_frame_bytes.min(4096));
     loop {
@@ -755,20 +896,99 @@ fn parse_response(value: Value, expected_id: &str) -> Result<Value> {
     response.result.ok_or(Error::MissingResult)
 }
 
-fn parse_focus_event(value: Value) -> Result<Option<FocusEvent>> {
-    let event_name = value.get("event").and_then(Value::as_str);
-    if event_name != Some("workspace_focused") {
-        return Ok(None);
-    }
-    let workspace_id = value
-        .get("data")
-        .and_then(|data| data.get("workspace_id"))
+/// The fixed multi-event subscription for a herdr session stream.
+///
+/// `pane.agent_status_changed` is deliberately absent: in herdr 0.8.2 that
+/// subscription requires a `pane_id`, so an unscoped entry fails the whole
+/// `events.subscribe` request and the event stream never starts. Status is
+/// not consumed by any mirror decision.
+const EVENT_TYPES: &[&str] = &[
+    "workspace.created",
+    "workspace.updated",
+    "workspace.closed",
+    "workspace.focused",
+    "pane.created",
+    "pane.updated",
+    "pane.closed",
+    "pane.focused",
+    "pane.moved",
+    "pane.exited",
+    "pane.agent_detected",
+];
+
+fn parse_pane_result(result: Value) -> Result<PaneInfo> {
+    let pane = result.get("pane").cloned().ok_or(Error::MissingResult)?;
+    Ok(serde_json::from_value(pane)?)
+}
+
+fn event_id(data: &Value, field: &str) -> Result<String> {
+    data.get(field)
         .and_then(Value::as_str)
-        .or_else(|| value.get("workspace_id").and_then(Value::as_str))
-        .ok_or(Error::MissingWorkspaceId)?;
-    Ok(Some(FocusEvent {
-        workspace_id: workspace_id.to_owned(),
-    }))
+        .map(String::from)
+        .ok_or(Error::MissingWorkspaceId)
+}
+
+/// Parses one subscription frame: the envelope `{"event": "<snake_case>",
+/// "data": …}`. Unknown event kinds are skipped so the stream can carry
+/// future event types without breaking the consumer.
+fn parse_event(value: Value) -> Result<Option<HerdrEvent>> {
+    let event_name = match value.get("event").and_then(Value::as_str) {
+        Some(name) => name,
+        None => return Ok(None),
+    };
+    let data = value.get("data").cloned().unwrap_or(Value::Null);
+    let event = match event_name {
+        "workspace_created" => {
+            HerdrEvent::Workspace(WorkspaceEvent::Created(serde_json::from_value(data)?))
+        }
+        "workspace_updated" => {
+            HerdrEvent::Workspace(WorkspaceEvent::Updated(serde_json::from_value(data)?))
+        }
+        "workspace_closed" => HerdrEvent::Workspace(WorkspaceEvent::Closed {
+            workspace_id: event_id(&data, "workspace_id")?,
+        }),
+        "workspace_focused" => HerdrEvent::Workspace(WorkspaceEvent::Focused {
+            workspace_id: event_id(&data, "workspace_id")?,
+        }),
+        "pane_created" => HerdrEvent::Pane(PaneEvent {
+            kind: PaneEventKind::Created(serde_json::from_value(data)?),
+        }),
+        "pane_updated" => HerdrEvent::Pane(PaneEvent {
+            kind: PaneEventKind::Updated(serde_json::from_value(data)?),
+        }),
+        "pane_closed" => HerdrEvent::Pane(PaneEvent {
+            kind: PaneEventKind::Closed {
+                pane_id: event_id(&data, "pane_id")?,
+                workspace_id: event_id(&data, "workspace_id")?,
+            },
+        }),
+        "pane_focused" => HerdrEvent::Pane(PaneEvent {
+            kind: PaneEventKind::Focused {
+                pane_id: event_id(&data, "pane_id")?,
+                workspace_id: event_id(&data, "workspace_id")?,
+            },
+        }),
+        "pane_moved" => HerdrEvent::Pane(PaneEvent {
+            kind: PaneEventKind::Moved {
+                previous_pane_id: event_id(&data, "previous_pane_id")?,
+                pane: serde_json::from_value(data.get("pane").cloned().unwrap_or(Value::Null))?,
+            },
+        }),
+        "pane_exited" => HerdrEvent::Pane(PaneEvent {
+            kind: PaneEventKind::Exited {
+                pane_id: event_id(&data, "pane_id")?,
+                workspace_id: event_id(&data, "workspace_id")?,
+            },
+        }),
+        "pane_agent_detected" => HerdrEvent::Pane(PaneEvent {
+            kind: PaneEventKind::AgentDetected {
+                pane_id: event_id(&data, "pane_id")?,
+                workspace_id: event_id(&data, "workspace_id")?,
+            },
+        }),
+        _ => return Ok(None),
+    };
+    Ok(Some(event))
 }
 
 #[cfg(test)]
@@ -819,16 +1039,20 @@ mod tests {
 
     #[test]
     fn parses_workspace_focus_event_and_ignores_other_events() {
-        let event = parse_focus_event(serde_json::json!({
+        let event = parse_event(serde_json::json!({
             "event": "workspace_focused",
             "data": {"workspace_id": "workspace-2"}
         }))
         .expect("focus event")
         .expect("workspace focus");
-        assert_eq!(event.workspace_id, "workspace-2");
         assert_eq!(
-            parse_focus_event(serde_json::json!({"event": "pane_focused", "data": {}}))
-                .expect("event"),
+            event,
+            HerdrEvent::Workspace(WorkspaceEvent::Focused {
+                workspace_id: "workspace-2".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_event(serde_json::json!({"event": "space_created", "data": {}})).expect("event"),
             None
         );
     }
@@ -849,15 +1073,6 @@ mod tests {
             canonical_checkout_path(Path::new("/repo/./worktree/../main/")).expect("absolute path");
         assert_eq!(path.as_str(), "/repo/main");
     }
-    #[test]
-    fn resolves_named_session_socket_in_herdr_config_layout() {
-        let endpoint = Endpoint::session("named");
-        if let Endpoint::Filesystem(path) = endpoint {
-            assert!(path.ends_with(Path::new(".config/herdr/sessions/named/herdr.sock")));
-        } else {
-            assert!(false, "session endpoints must use filesystem paths");
-        }
-    }
 
     #[test]
     fn generation_advances_without_losing_equality() {
@@ -867,5 +1082,290 @@ mod tests {
         assert!(second.current() > first.current());
         assert!(second.matches(generation));
         assert!(!first.matches(second));
+    }
+
+    #[test]
+    fn parses_cli_session_list_with_reported_windows_socket() {
+        let list: SessionList = serde_json::from_str(
+            r#"{"sessions":[{"name":"main","default":false,"running":true,"session_dir":"C:\\Users\\me\\AppData\\Roaming\\herdr\\sessions\\main","socket_path":"C:\\Users\\me\\AppData\\Roaming\\herdr\\sessions\\main\\herdr.sock"}]}"#,
+        )
+        .expect("session list");
+
+        let session = &list.sessions[0];
+        assert_eq!(session.name, "main");
+        assert!(session.running);
+        assert_eq!(
+            session.endpoint(),
+            Endpoint::Filesystem(PathBuf::from(
+                r"C:\Users\me\AppData\Roaming\herdr\sessions\main\herdr.sock"
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_pane_identity_and_revision() {
+        let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "pane_id": "pane-7",
+            "terminal_id": "terminal-stable",
+            "focused": true,
+            "revision": 9,
+            "agent": "claude",
+            "agent_status": "working",
+            "cwd": "/repo/worktree",
+            "foreground_cwd": "/repo/worktree/src",
+            "agent_session": {"agent": "claude", "kind": "id", "value": "session-42"}
+        }))
+        .expect("pane");
+
+        assert_eq!(pane.terminal_id, "terminal-stable");
+        assert_eq!(pane.pane_id, "pane-7");
+        assert_eq!(pane.revision, 9);
+    }
+
+    fn pane_payload(
+        workspace_id: &str,
+        tab_id: &str,
+        pane_id: &str,
+        revision: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "workspace_id": workspace_id,
+            "tab_id": tab_id,
+            "pane_id": pane_id,
+            "terminal_id": "terminal-stable",
+            "focused": true,
+            "revision": revision,
+            "agent": "claude",
+            "agent_status": "working",
+            "cwd": "/repo/worktree",
+            "foreground_cwd": "/repo/worktree/src",
+            "agent_session": {"agent": "claude", "kind": "id", "value": "session-42"}
+        })
+    }
+
+    #[test]
+    fn parses_herdr_event_kinds_from_subscription_frames() {
+        let Some(HerdrEvent::Workspace(WorkspaceEvent::Created(workspace))) =
+            parse_event(serde_json::json!({
+                "event": "workspace_created",
+                "data": {
+                    "workspace_id": "workspace-1",
+                    "number": 1,
+                    "label": "main",
+                    "focused": true,
+                    "pane_count": 1,
+                    "tab_count": 1,
+                    "active_tab_id": "tab-1",
+                    "agent_status": "idle"
+                }
+            }))
+            .expect("workspace created event")
+        else {
+            panic!("expected a created workspace event");
+        };
+        assert_eq!(workspace.workspace_id, "workspace-1");
+
+        let Some(HerdrEvent::Workspace(WorkspaceEvent::Updated(workspace))) =
+            parse_event(serde_json::json!({
+                "event": "workspace_updated",
+                "data": {
+                    "workspace_id": "workspace-1",
+                    "number": 1,
+                    "label": "main",
+                    "focused": false,
+                    "pane_count": 2,
+                    "tab_count": 3,
+                    "active_tab_id": "tab-2",
+                    "agent_status": "working"
+                }
+            }))
+            .expect("workspace updated event")
+        else {
+            panic!("expected an updated workspace event");
+        };
+        assert_eq!(workspace.workspace_id, "workspace-1");
+
+        let Some(HerdrEvent::Workspace(WorkspaceEvent::Closed { workspace_id })) =
+            parse_event(serde_json::json!({
+                "event": "workspace_closed",
+                "data": {"workspace_id": "workspace-1"}
+            }))
+            .expect("workspace closed event")
+        else {
+            panic!("expected a closed workspace event");
+        };
+        assert_eq!(workspace_id, "workspace-1");
+
+        let Some(HerdrEvent::Workspace(WorkspaceEvent::Focused { workspace_id })) =
+            parse_event(serde_json::json!({
+                "event": "workspace_focused",
+                "data": {"workspace_id": "workspace-2"}
+            }))
+            .expect("workspace focused event")
+        else {
+            panic!("expected a focused workspace event");
+        };
+        assert_eq!(workspace_id, "workspace-2");
+
+        let Some(HerdrEvent::Pane(PaneEvent {
+            kind: PaneEventKind::Created(pane),
+        })) = parse_event(serde_json::json!({
+            "event": "pane_created",
+            "data": pane_payload("workspace-1", "tab-1", "pane-7", 9)
+        }))
+        .expect("pane created event")
+        else {
+            panic!("expected a created pane event");
+        };
+        assert_eq!(pane.pane_id, "pane-7");
+        assert_eq!(pane.revision, 9);
+
+        let Some(HerdrEvent::Pane(PaneEvent {
+            kind: PaneEventKind::Updated(pane),
+        })) = parse_event(serde_json::json!({
+            "event": "pane_updated",
+            "data": pane_payload("workspace-1", "tab-1", "pane-7", 10)
+        }))
+        .expect("pane updated event")
+        else {
+            panic!("expected an updated pane event");
+        };
+        assert_eq!(pane.pane_id, "pane-7");
+        assert_eq!(pane.revision, 10);
+
+        let Some(HerdrEvent::Pane(PaneEvent {
+            kind:
+                PaneEventKind::Closed {
+                    pane_id,
+                    workspace_id,
+                },
+        })) = parse_event(serde_json::json!({
+            "event": "pane_closed",
+            "data": {"pane_id": "pane-7", "workspace_id": "workspace-1"}
+        }))
+        .expect("pane closed event")
+        else {
+            panic!("expected a closed pane event");
+        };
+        assert_eq!(pane_id, "pane-7");
+        assert_eq!(workspace_id, "workspace-1");
+
+        let Some(HerdrEvent::Pane(PaneEvent {
+            kind:
+                PaneEventKind::Focused {
+                    pane_id,
+                    workspace_id,
+                },
+        })) = parse_event(serde_json::json!({
+            "event": "pane_focused",
+            "data": {"pane_id": "pane-7", "workspace_id": "workspace-1"}
+        }))
+        .expect("pane focused event")
+        else {
+            panic!("expected a focused pane event");
+        };
+        assert_eq!(pane_id, "pane-7");
+        assert_eq!(workspace_id, "workspace-1");
+
+        let Some(HerdrEvent::Pane(PaneEvent {
+            kind:
+                PaneEventKind::Moved {
+                    previous_pane_id,
+                    pane,
+                },
+        })) = parse_event(serde_json::json!({
+            "event": "pane_moved",
+            "data": {
+                "previous_pane_id": "pane-old",
+                "previous_workspace_id": "workspace-1",
+                "previous_tab_id": "tab-1",
+                "pane": {
+                    "workspace_id": "workspace-2",
+                    "tab_id": "tab-2",
+                    "pane_id": "pane-new",
+                    "terminal_id": "terminal-stable",
+                    "focused": true,
+                    "revision": 10,
+                    "agent": "claude",
+                    "agent_status": "working",
+                    "cwd": "/repo/worktree",
+                    "foreground_cwd": "/repo/worktree/src",
+                    "agent_session": {"agent": "claude", "kind": "id", "value": "session-42"}
+                }
+            }
+        }))
+        .expect("pane moved event")
+        else {
+            panic!("expected a moved pane event");
+        };
+        assert_eq!(previous_pane_id, "pane-old");
+        assert_eq!(pane.pane_id, "pane-new");
+        assert_eq!(pane.terminal_id, "terminal-stable");
+        assert_eq!(pane.revision, 10);
+        assert_eq!(pane.workspace_id, "workspace-2");
+
+        let Some(HerdrEvent::Pane(PaneEvent {
+            kind:
+                PaneEventKind::Exited {
+                    pane_id,
+                    workspace_id,
+                },
+        })) = parse_event(serde_json::json!({
+            "event": "pane_exited",
+            "data": {"pane_id": "pane-7", "workspace_id": "workspace-1"}
+        }))
+        .expect("pane exited event")
+        else {
+            panic!("expected an exited pane event");
+        };
+        assert_eq!(pane_id, "pane-7");
+        assert_eq!(workspace_id, "workspace-1");
+
+        let Some(HerdrEvent::Pane(PaneEvent {
+            kind:
+                PaneEventKind::AgentDetected {
+                    pane_id,
+                    workspace_id,
+                },
+        })) = parse_event(serde_json::json!({
+            "event": "pane_agent_detected",
+            "data": {"pane_id": "pane-7", "workspace_id": "workspace-1"}
+        }))
+        .expect("pane agent detected event")
+        else {
+            panic!("expected an agent detected pane event");
+        };
+        assert_eq!(pane_id, "pane-7");
+        assert_eq!(workspace_id, "workspace-1");
+    }
+
+    #[test]
+    fn parses_pane_get_response() {
+        let response = serde_json::json!({
+            "id": "request-1",
+            "result": {
+                "type": "pane_info",
+                "pane": {
+                    "workspace_id": "workspace-1",
+                    "tab_id": "tab-1",
+                    "pane_id": "pane-7",
+                    "terminal_id": "terminal-stable",
+                    "focused": true,
+                    "revision": 9,
+                    "agent": "claude",
+                    "agent_status": "working",
+                    "cwd": "/repo/worktree",
+                    "foreground_cwd": "/repo/worktree/src",
+                    "agent_session": {"agent": "claude", "kind": "id", "value": "session-42"}
+                }
+            }
+        });
+        let result = parse_response(response, "request-1").expect("response result");
+        let pane = parse_pane_result(result).expect("pane result");
+        assert_eq!(pane.pane_id, "pane-7");
+        assert_eq!(pane.terminal_id, "terminal-stable");
+        assert_eq!(pane.revision, 9);
     }
 }
