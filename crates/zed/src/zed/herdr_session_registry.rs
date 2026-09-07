@@ -2864,7 +2864,16 @@ async fn run_connection(
                                 );
                             }
                             None => {
-                                log::warn!("herdr snapshot workspace import timed out");
+                                fail(
+                                    registry,
+                                    window_id,
+                                    &session_name,
+                                    generation,
+                                    "herdr snapshot workspace import timed out before agent effects"
+                                        .into(),
+                                    &mut cx,
+                                );
+                                return;
                             }
                         }
                         (
@@ -3031,7 +3040,16 @@ async fn run_connection(
                         log::warn!("herdr snapshot workspace import had failures: {error:#}");
                     }
                     None => {
-                        log::warn!("herdr snapshot workspace import timed out");
+                        fail(
+                            registry,
+                            window_id,
+                            &session_name,
+                            generation,
+                            "herdr snapshot workspace import timed out before agent effects"
+                                .into(),
+                            &mut cx,
+                        );
+                        return;
                     }
                 }
                 (
@@ -3207,7 +3225,15 @@ async fn run_connection(
                     log::warn!("herdr snapshot workspace import had failures: {error:#}");
                 }
                 None => {
-                    log::warn!("herdr snapshot workspace import timed out");
+                    fail(
+                        registry,
+                        window_id,
+                        &session_name,
+                        generation,
+                        "herdr snapshot workspace import timed out before agent effects".into(),
+                        &mut cx,
+                    );
+                    return;
                 }
             }
             (
@@ -4092,14 +4118,14 @@ mod tests {
             roots_in_window(window, cx).contains(&checkout("C:/agent-root")),
             "the unmatched agent checkout should be added to the invoking window"
         );
+        let expected_key = AgentKey::new(session("main"), "terminal-1");
         assert!(
             registry.read_with(cx, |registry, _| {
-                registry
-                    .mirrors
-                    .values()
-                    .all(|mirror| mirror.window.window_id() == window.window_id())
+                registry.mirrors.get(&expected_key).is_some_and(|mirror| {
+                    mirror.window.window_id() == window.window_id()
+                })
             }),
-            "the mirror should remain associated with the invoking window"
+            "the expected agent mirror should belong to the invoking window"
         );
     }
 
