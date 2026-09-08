@@ -971,6 +971,26 @@ impl HerdrSessionRegistry {
                 Some(BindingState::Starting { session_name: current }) if current.as_ref() == session_name
             )
     }
+    /// A snapshot import may mutate a window only while this exact binding
+    /// attempt still owns its finalize token, connection slot, and window.
+    fn snapshot_import_is_current(
+        &self,
+        window_id: WindowId,
+        identity: &SessionIdentity,
+        session_name: &str,
+        generation: u64,
+    ) -> bool {
+        self.attempt_is_current(window_id, generation, session_name)
+            && self.finalize_tokens.get(&window_id.as_u64()) == Some(&generation)
+            && self
+                .slot_generations
+                .get(&(identity.clone(), window_id.as_u64()))
+                == Some(&generation)
+            && self.connections.get(identity).is_some_and(|connection| {
+                connection.bound_windows.contains(&window_id.as_u64())
+            })
+    }
+
 
     /// `Retry` re-runs the bounded connect loop for the failed session.
     pub(crate) fn retry(
@@ -1967,7 +1987,7 @@ impl HerdrSessionRegistry {
         &mut self,
         bootstrap: WindowId,
         identity: &SessionIdentity,
-        _session_name: &str,
+        session_name: &str,
         generation: u64,
         snapshot: &SessionSnapshot,
         cx: &mut Context<Self>,
@@ -1985,10 +2005,29 @@ impl HerdrSessionRegistry {
             .map(|binding| binding.window)
             .map(|window| {
                 let registry = cx.entity();
+                let identity = identity.clone();
+                let session_name: Arc<str> = Arc::from(session_name);
                 cx.spawn(async move |_this, mut cx| {
-                    let result = import_snapshot_workspaces(window, roots, &mut cx).await;
-                    registry.update(&mut cx, |registry, cx| {
-                        registry.refresh_window_roots(cx);
+                    let result = import_snapshot_workspaces_for_binding(
+                        registry.clone(),
+                        window,
+                        bootstrap,
+                        identity.clone(),
+                        session_name.clone(),
+                        generation,
+                        roots,
+                        &mut cx,
+                    )
+                    .await;
+                    let _ = registry.update(&mut cx, |registry, cx| {
+                        if registry.snapshot_import_is_current(
+                            bootstrap,
+                            &identity,
+                            &session_name,
+                            generation,
+                        ) {
+                            registry.refresh_window_roots(cx);
+                        }
                     });
                     result
                 })
@@ -2676,6 +2715,60 @@ async fn import_snapshot_workspaces(
     }
 }
 
+/// Sequential snapshot import for a binding. Stale attempts stop before the
+/// next root and never report a failure from an old session selection.
+async fn import_snapshot_workspaces_for_binding(
+    registry: Entity<HerdrSessionRegistry>,
+    window: WindowHandle<MultiWorkspace>,
+    window_id: WindowId,
+    identity: SessionIdentity,
+    session_name: Arc<str>,
+    generation: u64,
+    roots: Vec<herdr::CanonicalPath>,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<()> {
+    let mut first_error = None;
+    for root in roots {
+        let current = registry.read_with(cx, |registry, _| {
+            registry.snapshot_import_is_current(window_id, &identity, &session_name, generation)
+        });
+        if !current {
+            return Ok(());
+        }
+        match add_workspace_root(window, root.clone(), cx).await {
+            Ok(()) => {}
+            Err(error) => {
+                let current = registry.read_with(cx, |registry, _| {
+                    registry.snapshot_import_is_current(
+                        window_id,
+                        &identity,
+                        &session_name,
+                        generation,
+                    )
+                });
+                if !current {
+                    return Ok(());
+                }
+                report_workspace_import_failure(window, &root, &error, cx);
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        let current = registry.read_with(cx, |registry, _| {
+            registry.snapshot_import_is_current(window_id, &identity, &session_name, generation)
+        });
+        if !current {
+            return Ok(());
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+
 
 /// `Connected` for a session while its current binding still describes the
 /// window this routing decision may complete. A window that failed or started
@@ -2907,17 +3000,19 @@ async fn run_connection(
                     }
                 };
                 let _ = registry.update(&mut cx, |registry, cx| {
-                    if !registry.connection_matches(&identity, owner_generation) {
+                    if !registry.connection_matches(&identity, owner_generation)
+                        || !registry.snapshot_import_is_current(
+                            window_id,
+                            &identity,
+                            &session_name,
+                            generation,
+                        )
+                    {
                         return;
                     }
                     let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
                     registry.dispatch_effects(&identity, effects, mirror_target_window, cx);
                     if let Some(final_window) = final_window {
-                        if final_window == window_id
-                            && !registry.attempt_is_current(final_window, generation, &session_name)
-                        {
-                            return;
-                        }
                         registry.finish_connected(final_window, &identity, generation, cx);
                     }
                 });
@@ -3083,17 +3178,19 @@ async fn run_connection(
             }
         };
         let _ = registry.update(&mut cx, |registry, cx| {
-            if !registry.connection_matches(&identity, *owner_generation) {
+            if !registry.connection_matches(&identity, *owner_generation)
+                || !registry.snapshot_import_is_current(
+                    window_id,
+                    &identity,
+                    &session_name,
+                    generation,
+                )
+            {
                 return;
             }
             let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
             registry.dispatch_effects(&identity, effects, mirror_target_window, cx);
             if let Some(final_window) = final_window {
-                if final_window == window_id
-                    && !registry.attempt_is_current(final_window, generation, &session_name)
-                {
-                    return;
-                }
                 registry.finish_connected(final_window, &identity, generation, cx);
             }
         });
@@ -3238,16 +3335,31 @@ async fn run_connection(
             cx,
         )
     });
-    let (final_window, mirror_target_window) = match outcome {
+    let (final_window, mirror_target_window, import_effects) = match outcome {
         FinalizeResult::Ready { window_id, task } => {
             match await_before_deadline!(task, &mut cx, deadline) {
-                Some(Ok(())) => {}
+                Some(Ok(())) => (
+                    Some(window_id),
+                    Some(MirrorTarget {
+                        window_id,
+                        generation,
+                    }),
+                    true,
+                ),
                 Some(Err(error)) => {
                     log::warn!("herdr snapshot workspace import had failures: {error:#}");
+                    (
+                        Some(window_id),
+                        Some(MirrorTarget {
+                            window_id,
+                            generation,
+                        }),
+                        true,
+                    )
                 }
                 None => {
                     fail_after_finalize(
-                        registry,
+                        registry.clone(),
                         window_id,
                         &identity,
                         &session_name,
@@ -3255,25 +3367,36 @@ async fn run_connection(
                         "herdr snapshot workspace import timed out before agent effects".into(),
                         &mut cx,
                     );
-                    return;
+                    let connection_survives = registry.read_with(&mut cx, |registry, _| {
+                        registry.connections.get(&identity).is_some_and(|connection| {
+                            connection.generation == generation
+                                && !connection.bound_windows.is_empty()
+                        })
+                    });
+                    if !connection_survives {
+                        return;
+                    }
+                    (None, None, false)
                 }
             }
-            (
-                Some(window_id),
-                Some(MirrorTarget {
-                    window_id,
-                    generation,
-                }),
-            )
         }
     };
-    let _ = registry.update(&mut cx, |registry, cx| {
-        if !registry.connection_matches(&identity, generation) {
-            return;
-        }
-        let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
-        registry.dispatch_effects(&identity, effects, mirror_target_window, cx);
-    });
+    if import_effects {
+        let _ = registry.update(&mut cx, |registry, cx| {
+            if !registry.connection_matches(&identity, generation)
+                || !registry.snapshot_import_is_current(
+                    window_id,
+                    &identity,
+                    &session_name,
+                    generation,
+                )
+            {
+                return;
+            }
+            let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
+            registry.dispatch_effects(&identity, effects, mirror_target_window, cx);
+        });
+    }
     for event in buffered {
         process_stream_event(&registry, &identity, generation, event, &mut cx).await;
     }
