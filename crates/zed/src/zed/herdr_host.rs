@@ -20,15 +20,14 @@ const HOST_HEADER_HEIGHT: gpui::Pixels = px(32.0);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HerdRVisibilityTransition {
     ShowAndFocus,
-    FocusOnly,
     HideAndRestoreEditor,
 }
 
-pub(crate) fn toggle_visibility(visible: bool, herdr_focused: bool) -> HerdRVisibilityTransition {
-    match (visible, herdr_focused) {
-        (false, _) => HerdRVisibilityTransition::ShowAndFocus,
-        (true, false) => HerdRVisibilityTransition::FocusOnly,
-        (true, true) => HerdRVisibilityTransition::HideAndRestoreEditor,
+pub(crate) fn toggle_visibility(visible: bool) -> HerdRVisibilityTransition {
+    if visible {
+        HerdRVisibilityTransition::HideAndRestoreEditor
+    } else {
+        HerdRVisibilityTransition::ShowAndFocus
     }
 }
 
@@ -108,23 +107,31 @@ impl Render for HerdRStatusButton {
             })
             .unwrap_or_else(|| "herdr: Select a session".to_owned());
 
-        h_flex()
-            .gap_1()
-            .child(
-                IconButton::new("herdr-status-button", IconName::Terminal)
-                    .tab_index(0isize)
-                    .aria_label(label.clone())
-                    .icon_size(IconSize::Small)
-                    .toggle_state(selected)
-                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                    .tooltip(|_window, cx| {
-                        Tooltip::for_action("Toggle herdr", &zed_actions::herdr::ToggleHerdr, cx)
-                    })
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(zed_actions::herdr::ToggleHerdr), cx);
-                    }),
-            )
-            .child(Label::new(label).size(LabelSize::Small))
+        h_flex().child(
+            div()
+                .debug_selector(|| "herdr-status-button".to_owned())
+                .child(
+                    IconButton::new("herdr-status-button", IconName::Terminal)
+                        .tab_index(0isize)
+                        .aria_label(label)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(selected)
+                        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                        .tooltip(|_window, cx| {
+                            Tooltip::for_action(
+                                "Toggle herdr",
+                                &zed_actions::herdr::ToggleHerdr,
+                                cx,
+                            )
+                        })
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(
+                                Box::new(zed_actions::herdr::ToggleHerdr),
+                                cx,
+                            );
+                        }),
+                ),
+        )
     }
 }
 
@@ -155,7 +162,6 @@ pub struct HerdRHost {
     _focus_subscription: Subscription,
     _registry_subscription: Subscription,
     collapsed: bool,
-    maximized: bool,
 }
 
 impl HerdRHost {
@@ -189,7 +195,6 @@ impl HerdRHost {
             _focus_subscription: focus_subscription,
             _registry_subscription: registry_subscription,
             collapsed: false,
-            maximized: false,
         }
     }
 
@@ -302,24 +307,9 @@ impl HerdRHost {
         self.registry.read(cx).binding_state(self.window_id)
     }
 
-    fn toggle_maximize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.maximized = !self.maximized;
-        self.focus_handle.focus(window, cx);
-        cx.notify();
-    }
-
     fn toggle_collapse(&mut self, cx: &mut Context<Self>) {
         self.collapsed = !self.collapsed;
         cx.notify();
-    }
-
-    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(multi_workspace) = window.window_handle().downcast::<MultiWorkspace>() {
-            let _ = multi_workspace.update(cx, |multi_workspace, _window, cx| {
-                multi_workspace.set_herdr_visible(false, cx);
-                multi_workspace.focus_active_workspace(window, cx);
-            });
-        }
     }
 
     fn choose_session(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -335,10 +325,6 @@ impl HerdRHost {
                 }
             });
         }
-    }
-
-    fn is_focused(&self, window: &Window, cx: &App) -> bool {
-        self.focus_handle.contains_focused(window, cx)
     }
 }
 
@@ -360,7 +346,6 @@ impl Render for HerdRHost {
         let state = self.binding_state(cx);
         let label = binding_label(&state);
         let collapsed = self.collapsed;
-        let maximized = self.maximized;
         let terminal = self.terminal_view.clone();
         let controls = match state {
             BindingState::Unselected => h_flex().gap_2().child(
@@ -411,8 +396,7 @@ impl Render for HerdRHost {
             .bg(cx.theme().colors().panel_background)
             .border_t_1()
             .border_color(cx.theme().colors().border)
-            .when(maximized, |this| this.absolute().inset_0().h_full())
-            .when(!maximized && collapsed, |this| this.h(HOST_HEADER_HEIGHT))
+            .when(collapsed, |this| this.h(HOST_HEADER_HEIGHT))
             .child(
                 h_flex()
                     .h(HOST_HEADER_HEIGHT)
@@ -435,20 +419,18 @@ impl Render for HerdRHost {
                         .on_click(cx.listener(|host, _, _, cx| host.toggle_collapse(cx))),
                     )
                     .child(
-                        Button::new(
-                            "herdr-maximize",
-                            if maximized { "Restore" } else { "Maximize" },
-                        )
-                        .label_size(LabelSize::Small)
-                        .style(ButtonStyle::Subtle)
-                        .on_click(
-                            cx.listener(|host, _, window, cx| host.toggle_maximize(window, cx)),
-                        ),
-                    )
-                    .child(
-                        Button::new("herdr-close", "Close")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|host, _, window, cx| host.close(window, cx))),
+                        div()
+                            .debug_selector(|| "herdr-close".to_owned())
+                            .child(
+                                Button::new("herdr-close", "Close")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(zed_actions::herdr::ToggleHerdr),
+                                            cx,
+                                        );
+                                    }),
+                            ),
                     ),
             )
             .when(!collapsed && self.launch.is_some(), |this| {
@@ -583,14 +565,27 @@ pub(crate) fn install_host(
     host.update(cx, |host, cx| host.focus_handle.focus(window, cx));
 }
 
-pub fn toggle_from_app(cx: &mut App) {
+fn with_active_window(
+    cx: &mut App,
+    action: impl FnOnce(
+        &mut MultiWorkspace,
+        &mut Window,
+        &mut Context<MultiWorkspace>,
+    ) + 'static,
+) {
     let Some(window) = cx
         .active_window()
         .and_then(|window| window.downcast::<MultiWorkspace>())
     else {
         return;
     };
-    let _ = window.update(cx, |multi_workspace, window, cx| {
+    cx.defer(move |cx| {
+        let _ = window.update(cx, action);
+    });
+}
+
+pub fn toggle_from_app(cx: &mut App) {
+    with_active_window(cx, |multi_workspace, window, cx| {
         let window_id = window.window_handle().window_id();
         let state = HerdrSessionRegistry::try_global(cx)
             .map(|registry| registry.read(cx).binding_state(window_id))
@@ -602,11 +597,8 @@ pub fn toggle_from_app(cx: &mut App) {
         let Some(host) = host_from_multi_workspace(multi_workspace) else {
             return;
         };
-        match toggle_visibility(
-            multi_workspace.herdr_visible(),
-            host.read(cx).is_focused(window, cx),
-        ) {
-            HerdRVisibilityTransition::ShowAndFocus | HerdRVisibilityTransition::FocusOnly => {
+        match toggle_visibility(multi_workspace.herdr_visible()) {
+            HerdRVisibilityTransition::ShowAndFocus => {
                 multi_workspace.set_herdr_visible(true, cx);
                 host.update(cx, |host, cx| host.focus_handle.focus(window, cx));
             }
@@ -619,13 +611,7 @@ pub fn toggle_from_app(cx: &mut App) {
 }
 
 pub fn focus_from_app(cx: &mut App) {
-    let Some(window) = cx
-        .active_window()
-        .and_then(|window| window.downcast::<MultiWorkspace>())
-    else {
-        return;
-    };
-    let _ = window.update(cx, |multi_workspace, window, cx| {
+    with_active_window(cx, |multi_workspace, window, cx| {
         let window_id = window.window_handle().window_id();
         let state = HerdrSessionRegistry::try_global(cx)
             .map(|registry| registry.read(cx).binding_state(window_id))
@@ -643,21 +629,11 @@ fn with_active_host(
     cx: &mut App,
     action: impl FnOnce(&mut HerdRHost, &mut Window, &mut Context<HerdRHost>) + 'static,
 ) {
-    let Some(window) = cx
-        .active_window()
-        .and_then(|window| window.downcast::<MultiWorkspace>())
-    else {
-        return;
-    };
-    let _ = window.update(cx, move |multi_workspace, window, cx| {
+    with_active_window(cx, move |multi_workspace, window, cx| {
         if let Some(host) = host_from_multi_workspace(multi_workspace) {
             host.update(cx, |host, cx| action(host, window, cx));
         }
     });
-}
-
-pub fn toggle_maximize_from_app(cx: &mut App) {
-    with_active_host(cx, |host, window, cx| host.toggle_maximize(window, cx));
 }
 
 pub fn toggle_collapse_from_app(cx: &mut App) {
@@ -665,26 +641,14 @@ pub fn toggle_collapse_from_app(cx: &mut App) {
 }
 
 pub fn close_from_app(cx: &mut App) {
-    let Some(window) = cx
-        .active_window()
-        .and_then(|window| window.downcast::<MultiWorkspace>())
-    else {
-        return;
-    };
-    let _ = window.update(cx, |multi_workspace, window, cx| {
+    with_active_window(cx, |multi_workspace, window, cx| {
         multi_workspace.set_herdr_visible(false, cx);
         multi_workspace.focus_active_workspace(window, cx);
     });
 }
 
 pub fn status_from_app(cx: &mut App) {
-    let Some(window) = cx
-        .active_window()
-        .and_then(|window| window.downcast::<MultiWorkspace>())
-    else {
-        return;
-    };
-    let _ = window.update(cx, |multi_workspace, window, cx| {
+    with_active_window(cx, |multi_workspace, window, cx| {
         let window_id = window.window_handle().window_id();
         let state = HerdrSessionRegistry::try_global(cx)
             .map(|registry| registry.read(cx).binding_state(window_id))
@@ -700,7 +664,10 @@ pub fn status_from_app(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HerdRHost, HerdRVisibilityTransition, binding_label, toggle_visibility};
+    use super::{
+        HerdRHost, HerdRStatusButton, HerdRVisibilityTransition, binding_label, toggle_from_app,
+        toggle_visibility,
+    };
     use crate::zed::herdr_agent_sync::SessionIdentity;
     use crate::zed::herdr_session_registry::{BindingState, HerdrSessionRegistry};
     use gpui::TestAppContext;
@@ -710,15 +677,11 @@ mod tests {
     #[test]
     fn herdr_toggle_visibility() {
         assert_eq!(
-            toggle_visibility(false, false),
+            toggle_visibility(false),
             HerdRVisibilityTransition::ShowAndFocus
         );
         assert_eq!(
-            toggle_visibility(true, false),
-            HerdRVisibilityTransition::FocusOnly
-        );
-        assert_eq!(
-            toggle_visibility(true, true),
+            toggle_visibility(true),
             HerdRVisibilityTransition::HideAndRestoreEditor
         );
     }
@@ -816,6 +779,14 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
+            cx.debug_bounds("herdr-maximize").is_none(),
+            "Herdr host must not render a maximize control"
+        );
+        assert!(
+            cx.debug_bounds("herdr-close").is_some(),
+            "Herdr host must keep rendering the close control"
+        );
+        assert!(
             cx.debug_bounds("herdr-action-retry").is_some(),
             "Failed surface must render the Retry action"
         );
@@ -842,6 +813,113 @@ mod tests {
         assert!(
             cx.debug_bounds("herdr-action-retry").is_none(),
             "Starting surface must not render a Retry action"
+        );
+    }
+
+    #[gpui::test]
+    async fn toggle_action_updates_visibility_after_deferred_work(cx: &mut TestAppContext) {
+        use crate::zed::herdr_session_registry::HerdrGateway;
+        use futures::FutureExt as _;
+        use gpui::{AppContext as _, WindowHandle};
+        use project::DisableAiSettings;
+        use settings::{Settings as _, SettingsStore};
+        use std::path::Path;
+        use workspace::MultiWorkspace;
+
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            DisableAiSettings::register(cx);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = project::Project::test(fs, [Path::new("/root")], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let gateway = HerdrGateway::fake(
+            || async { Ok(Vec::new()) }.boxed_local(),
+            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+            |_name| async { Ok(()) }.boxed_local(),
+        );
+        let registry = cx.new(|cx| HerdrSessionRegistry::test(cx, gateway));
+        let window_id =
+            multi_workspace.update_in(cx, |_, window, _| window.window_handle().window_id());
+        let handle = WindowHandle::<MultiWorkspace>::new(window_id);
+        registry.update(cx, |registry, _| {
+            registry.register_window_for_test(
+                handle,
+                BindingState::Connected(SessionIdentity {
+                    name: Arc::from("main"),
+                    session_dir: Arc::from(PathBuf::from("/sessions/main")),
+                }),
+                Vec::new(),
+            );
+        });
+        let host = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            let workspace = multi_workspace.workspace().clone();
+            cx.new(|cx| {
+                HerdRHost::new(
+                    registry.clone(),
+                    window_id,
+                    workspace,
+                    PathBuf::from("/root"),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+        });
+        multi_workspace.update_in(cx, |multi_workspace, _, cx| {
+            multi_workspace.set_window_root_host(Some(host.into()), cx);
+            multi_workspace.set_herdr_visible(true, cx);
+        });
+        cx.update(|_, cx| {
+            HerdrSessionRegistry::install_as_global(registry.clone(), cx);
+            cx.on_action(move |_: &zed_actions::herdr::ToggleHerdr, cx| toggle_from_app(cx));
+        });
+
+        cx.dispatch_action(zed_actions::herdr::ToggleHerdr);
+        cx.run_until_parked();
+        assert!(
+            !multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.herdr_visible()),
+            "ToggleHerdr should hide a visible selected host after deferred work drains"
+        );
+
+        cx.dispatch_action(zed_actions::herdr::ToggleHerdr);
+        cx.run_until_parked();
+        assert!(
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.herdr_visible()),
+            "ToggleHerdr should show a hidden selected host after deferred work drains"
+        );
+    }
+
+    #[gpui::test]
+    fn rendered_status_button_is_icon_only(cx: &mut TestAppContext) {
+        use gpui::{px, size};
+        use project::DisableAiSettings;
+        use settings::{Settings as _, SettingsStore};
+
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            DisableAiSettings::register(cx);
+        });
+        let (_status_button, cx) =
+            cx.add_window_view(|_, cx| HerdRStatusButton::new(None, None, cx));
+        cx.simulate_resize(size(px(900.0), px(700.0)));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+
+        let status_bounds = cx
+            .debug_bounds("herdr-status-button")
+            .expect("Herdr status icon button should render");
+        assert!(
+            status_bounds.size.width < px(40.0),
+            "icon-only Herdr status button should not include its binding label: {status_bounds:?}"
         );
     }
 }

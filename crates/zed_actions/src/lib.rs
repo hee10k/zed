@@ -1024,8 +1024,6 @@ pub mod herdr {
             ToggleHerdr,
             #[action(name = "Focus herdr")]
             FocusHerdr,
-            #[action(name = "Toggle herdr Maximize")]
-            ToggleHerdrMaximize,
             #[action(name = "Toggle herdr Collapse")]
             ToggleHerdrCollapse,
             #[action(name = "Close herdr")]

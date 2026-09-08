@@ -221,9 +221,6 @@ pub fn init(cx: &mut App) {
     .on_action(|_: &zed_actions::herdr::FocusHerdr, cx| {
         herdr_host::focus_from_app(cx);
     })
-    .on_action(|_: &zed_actions::herdr::ToggleHerdrMaximize, cx| {
-        herdr_host::toggle_maximize_from_app(cx);
-    })
     .on_action(|_: &zed_actions::herdr::ToggleHerdrCollapse, cx| {
         herdr_host::toggle_collapse_from_app(cx);
     })
