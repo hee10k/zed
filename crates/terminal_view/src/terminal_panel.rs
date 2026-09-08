@@ -606,6 +606,42 @@ impl TerminalPanel {
         })
     }
 
+    pub fn open_or_activate_terminal(
+        &mut self,
+        working_directory: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
+        let existing_terminal = self.center.panes().into_iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .enumerate()
+                .find_map(|(item_index, item)| {
+                    let terminal_view = item.downcast::<TerminalView>()?;
+                    let terminal = terminal_view.read(cx).terminal().clone();
+                    if terminal.read(cx).working_directory().as_ref() == Some(&working_directory) {
+                        Some((pane.clone(), item_index, terminal.downgrade()))
+                    } else {
+                        None
+                    }
+                })
+        });
+
+        if let Some((pane, item_index, terminal)) = existing_terminal {
+            self.active_pane = pane.clone();
+            self.activate_terminal_view(&pane, item_index, true, window, cx);
+            Task::ready(Ok(terminal))
+        } else {
+            self.add_terminal_shell(
+                false,
+                Some(working_directory),
+                RevealStrategy::Always,
+                window,
+                cx,
+            )
+        }
+    }
+
     pub fn open_terminal(
         workspace: &mut Workspace,
         action: &workspace::OpenTerminal,
@@ -1949,6 +1985,125 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_open_or_activate_terminal_reuses_matching_shell(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let working_directory = terminal_test_working_directory("repo");
+
+        let first_terminal = window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.add_terminal_shell(
+                        false,
+                        Some(working_directory.clone()),
+                        RevealStrategy::Always,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let reused_terminal = window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.open_or_activate_terminal(working_directory.clone(), window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+
+        cx.run_until_parked();
+        terminal_panel.update(cx, |panel, cx| {
+            assert_eq!(panel.active_pane.read(cx).items_len(), 1);
+            let active_terminal = panel
+                .active_pane
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<TerminalView>())
+                .expect("matching shell should be active")
+                .read(cx)
+                .terminal()
+                .clone();
+            assert_eq!(
+                active_terminal.entity_id(),
+                first_terminal.entity_id(),
+                "reusing a shell should return and activate the existing terminal"
+            );
+        });
+        assert_eq!(reused_terminal.entity_id(), first_terminal.entity_id());
+    }
+
+    #[gpui::test]
+    async fn test_open_or_activate_terminal_creates_shell_for_new_working_directory(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let repo_directory = terminal_test_working_directory("repo");
+        let other_directory = terminal_test_working_directory("other");
+
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.open_or_activate_terminal(repo_directory.clone(), window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+
+        let other_terminal = window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.open_or_activate_terminal(other_directory.clone(), window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+
+        cx.run_until_parked();
+        terminal_panel.update(cx, |panel, cx| {
+            let terminals = panel
+                .active_pane
+                .read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<TerminalView>())
+                .map(|terminal_view| {
+                    terminal_view
+                        .read(cx)
+                        .terminal()
+                        .read(cx)
+                        .working_directory()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(terminals.len(), 2);
+            assert!(terminals.contains(&Some(repo_directory.clone())));
+            assert!(terminals.contains(&Some(other_directory.clone())));
+
+            let active_terminal = panel
+                .active_pane
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<TerminalView>())
+                .expect("new shell should be active")
+                .read(cx)
+                .terminal()
+                .clone();
+            assert_eq!(active_terminal.entity_id(), other_terminal.entity_id());
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_prepare_script_like_task() {
@@ -2868,6 +3023,15 @@ mod tests {
             cx.debug_bounds("KEY_BINDING-enter").is_some(),
             "tooltip should show the InlineAssist keybinding resolved in the terminal's context"
         );
+    }
+
+    fn terminal_test_working_directory(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "zed-terminal-panel-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 
     // On Windows `echo` is a shell builtin rather than an executable, so spawning it directly fails.
