@@ -118,14 +118,10 @@ impl Render for HerdRStatusButton {
                     .toggle_state(selected)
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                     .tooltip(|_window, cx| {
-                        Tooltip::for_action(
-                            "Show herdr Status",
-                            &zed_actions::herdr::ShowHerdrStatus,
-                            cx,
-                        )
+                        Tooltip::for_action("Toggle herdr", &zed_actions::herdr::ToggleHerdr, cx)
                     })
                     .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(zed_actions::herdr::ShowHerdrStatus), cx);
+                        window.dispatch_action(Box::new(zed_actions::herdr::ToggleHerdr), cx);
                     }),
             )
             .child(Label::new(label).size(LabelSize::Small))
