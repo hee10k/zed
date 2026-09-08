@@ -998,7 +998,7 @@ impl HerdrSessionRegistry {
                         && self
                             .slot_generations
                             .get(&(identity.clone(), window_id.as_u64()))
-                            == Some(&connection.generation)
+                            == Some(&generation)
                 })
     }
     fn abort_snapshot_import(&mut self, window_id: WindowId) {
