@@ -107,31 +107,29 @@ impl Render for HerdRStatusButton {
             })
             .unwrap_or_else(|| "herdr: Select a session".to_owned());
 
-        h_flex().child(
-            div()
-                .debug_selector(|| "herdr-status-button".to_owned())
-                .child(
-                    IconButton::new("herdr-status-button", IconName::Terminal)
-                        .tab_index(0isize)
-                        .aria_label(label)
-                        .icon_size(IconSize::Small)
-                        .toggle_state(selected)
-                        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                        .tooltip(|_window, cx| {
-                            Tooltip::for_action(
-                                "Toggle herdr",
-                                &zed_actions::herdr::ToggleHerdr,
-                                cx,
-                            )
-                        })
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(
-                                Box::new(zed_actions::herdr::ToggleHerdr),
-                                cx,
-                            );
-                        }),
-                ),
-        )
+        h_flex()
+            .debug_selector(|| "herdr-status-button".to_owned())
+            .child(
+                IconButton::new("herdr-status-button", IconName::Terminal)
+                    .tab_index(0isize)
+                    .aria_label(label)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(selected)
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                    .tooltip(|_window, cx| {
+                        Tooltip::for_action(
+                            "Toggle herdr",
+                            &zed_actions::herdr::ToggleHerdr,
+                            cx,
+                        )
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(
+                            Box::new(zed_actions::herdr::ToggleHerdr),
+                            cx,
+                        );
+                    }),
+            )
     }
 }
 
@@ -670,9 +668,27 @@ mod tests {
     };
     use crate::zed::herdr_agent_sync::SessionIdentity;
     use crate::zed::herdr_session_registry::{BindingState, HerdrSessionRegistry};
-    use gpui::TestAppContext;
+    use gpui::{
+        AppContext as _, IntoElement, ParentElement as _, Render, Styled as _, TestAppContext,
+    };
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    struct StatusButtonRoot(gpui::Entity<HerdRStatusButton>);
+
+    impl Render for StatusButtonRoot {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            gpui::div()
+                .size_full()
+                .flex()
+                .items_start()
+                .child(self.0.clone())
+        }
+    }
 
     #[test]
     fn herdr_toggle_visibility() {
@@ -905,8 +921,9 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             DisableAiSettings::register(cx);
         });
-        let (_status_button, cx) =
-            cx.add_window_view(|_, cx| HerdRStatusButton::new(None, None, cx));
+        let (_root, cx) = cx.add_window_view(|_, cx| {
+            StatusButtonRoot(cx.new(|cx| HerdRStatusButton::new(None, None, cx)))
+        });
         cx.simulate_resize(size(px(900.0), px(700.0)));
         cx.update(|window, cx| {
             window.refresh();
