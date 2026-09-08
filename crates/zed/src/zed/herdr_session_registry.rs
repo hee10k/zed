@@ -544,6 +544,8 @@ pub(crate) struct HerdrSessionRegistry {
     sink_effects: Option<Rc<dyn AgentEffectSink>>,
     #[cfg(test)]
     program_override: Option<PathBuf>,
+    #[cfg(test)]
+    mirror_target_sink: Option<Rc<std::cell::RefCell<Vec<(AgentKey, WindowId)>>>>,
     host_sink: Rc<dyn HerdrHostSink>,
     picker_sink: Rc<dyn SessionPickerSink>,
     gateway: Option<HerdrGateway>,
@@ -613,6 +615,8 @@ impl HerdrSessionRegistry {
             sink_effects: None,
             #[cfg(test)]
             program_override: None,
+            #[cfg(test)]
+            mirror_target_sink: None,
             mirroring_in_flight: HashSet::default(),
             pending_mirror_replay: HashMap::default(),
             host_sink: Rc::new(NoopHerdrHostSink),
@@ -1713,7 +1717,7 @@ impl HerdrSessionRegistry {
                 );
                 return;
             };
-            let Some((window, root_lock)) = registry.update(&mut cx, |registry, cx| {
+            let Some((window, root_lock)) = registry.update(cx, |registry, cx| {
                 if !registry.connection_matches(&record.key.session, generation) {
                     return None;
                 }
@@ -1757,13 +1761,13 @@ impl HerdrSessionRegistry {
                     );
                     return;
                 }
-                let _ = registry.update(&mut cx, |registry, cx| {
+                let _ = registry.update(cx, |registry, cx| {
                     if registry.connection_matches(&record.key.session, generation) {
                         registry.refresh_window_roots(cx);
                     }
                 });
             }
-            let _ = registry.update(&mut cx, |registry, cx| {
+            let _ = registry.update(cx, |registry, cx| {
                 if registry.connection_matches(&record.key.session, generation) {
                     registry.open_mirror_in_window(record, window, generation, target, cx);
                 }
@@ -1796,6 +1800,11 @@ impl HerdrSessionRegistry {
                 }
             }
             return;
+        }
+        #[cfg(test)]
+        if let Some(sink) = &self.mirror_target_sink {
+            sink.borrow_mut()
+                .push((record.key.clone(), window.window_id()));
         }
         let registry = cx.entity();
         let herdr_program = self.program();
@@ -2060,7 +2069,7 @@ impl HerdrSessionRegistry {
                         Ok(result) => result,
                         Err(_) => Ok(()),
                     };
-                    let _ = registry.update(&mut cx, |registry, cx| {
+                    let _ = registry.update(cx, |registry, cx| {
                         registry.clear_snapshot_import_abort_if_current(bootstrap, generation);
                         if registry.snapshot_import_is_current(
                             bootstrap,
@@ -2480,6 +2489,8 @@ impl HerdrSessionRegistry {
             sink_effects: None,
             #[cfg(test)]
             program_override: None,
+            #[cfg(test)]
+            mirror_target_sink: None,
             host_sink: Rc::new(NoopHerdrHostSink),
             picker_sink: Rc::new(NoopSessionPickerSink),
             gateway: Some(gateway),
@@ -2526,6 +2537,14 @@ impl HerdrSessionRegistry {
     #[cfg(test)]
     pub(crate) fn set_program_for_test(&mut self, program: PathBuf) {
         self.program_override = Some(program);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_mirror_target_sink_for_test(
+        &mut self,
+        sink: Rc<std::cell::RefCell<Vec<(AgentKey, WindowId)>>>,
+    ) {
+        self.mirror_target_sink = Some(sink);
     }
 
     /// Register an established connection for a session exactly once, the
@@ -2721,7 +2740,9 @@ fn report_workspace_import_failure(
     error: &anyhow::Error,
     cx: &mut AsyncApp,
 ) {
-    let id = NotificationId::composite::<HerdrWorkspaceImportFailureNotification>(root.as_str());
+    let id = NotificationId::composite::<HerdrWorkspaceImportFailureNotification>(
+        root.as_str().to_owned(),
+    );
     let message: SharedString = format!(
         "could not import herdr workspace {}: {error:#}",
         root.as_str()
@@ -3700,6 +3721,8 @@ mod tests {
             sink_effects: None,
             #[cfg(test)]
             program_override: None,
+            #[cfg(test)]
+            mirror_target_sink: None,
             host_sink: Rc::new(NoopHerdrHostSink),
             picker_sink: Rc::new(NoopSessionPickerSink),
             gateway: None,
@@ -4397,6 +4420,12 @@ mod tests {
         init_app(cx);
         init_agent_app(cx);
         let app_state = import_test_app(cx).await;
+        let agent_root = PathBuf::from("C:/space-a");
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(&agent_root, serde_json::json!({ "file.txt": "" }))
+            .await;
         let project = project::Project::test(
             app_state.fs.clone(),
             [std::path::Path::new("C:/existing")],
@@ -4415,7 +4444,7 @@ mod tests {
         agent.focused = true;
         agent.revision = 1;
         agent.agent = Some("test-agent".to_owned());
-        agent.cwd = Some("C:/agent-root".to_owned());
+        agent.cwd = Some(agent_root.to_string_lossy().into_owned());
         snapshot.agents.push(agent);
         let gateway = HerdrGateway::fake(
             || async { Ok(vec![session_info("main", true)]) }.boxed_local(),
@@ -4438,25 +4467,25 @@ mod tests {
         let window_id = registry.update(cx, |registry, _| {
             registry.register_window_for_test(window, BindingState::Unselected, Vec::new())
         });
+        let mirror_targets = Rc::new(RefCell::new(Vec::new()));
         registry.update(cx, |registry, cx| {
-            registry.set_program_for_test(PathBuf::from("herdr"));
+            registry.set_mirror_target_sink_for_test(mirror_targets.clone());
             registry.start_binding_for_test(window_id, Arc::from("main"), cx);
         });
         cx.run_until_parked();
 
         assert_eq!(cx.windows().len(), 1);
+        let expected_root =
+            canonical_checkout_path(&agent_root).expect("temporary agent root canonicalizes");
         assert!(
-            roots_in_window(window, cx).contains(&checkout("C:/agent-root")),
+            roots_in_window(window, cx).contains(&expected_root),
             "the unmatched agent checkout should be added to the invoking window"
         );
         let expected_key = AgentKey::new(session("main"), "terminal-1");
-        assert!(
-            registry.read_with(cx, |registry, _| {
-                registry.mirrors.get(&expected_key).is_some_and(|mirror| {
-                    mirror.window.window_id() == window.window_id()
-                })
-            }),
-            "the expected agent mirror should belong to the invoking window"
+        assert_eq!(
+            mirror_targets.borrow().as_slice(),
+            &[(expected_key, window.window_id())],
+            "the unmatched agent mirror should target the invoking window"
         );
     }
 
