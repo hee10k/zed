@@ -983,12 +983,15 @@ impl HerdrSessionRegistry {
         self.attempt_is_current(window_id, generation, session_name)
             && self.finalize_tokens.get(&window_id.as_u64()) == Some(&generation)
             && self
-                .slot_generations
-                .get(&(identity.clone(), window_id.as_u64()))
-                == Some(&generation)
-            && self.connections.get(identity).is_some_and(|connection| {
-                connection.bound_windows.contains(&window_id.as_u64())
-            })
+                .connections
+                .get(identity)
+                .is_some_and(|connection| {
+                    connection.bound_windows.contains(&window_id.as_u64())
+                        && self
+                            .slot_generations
+                            .get(&(identity.clone(), window_id.as_u64()))
+                            == Some(&connection.generation)
+                })
     }
 
 
