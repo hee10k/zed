@@ -18,8 +18,8 @@ use super::herdr_agent_sync::{
 use agent_ui::{AgentPanel, AgentPanelEvent, TerminalId};
 use fs::Fs;
 use futures::channel::mpsc;
+use futures::future::{AbortHandle, Abortable, LocalBoxFuture};
 use futures::lock::Mutex;
-use futures::future::LocalBoxFuture;
 use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EntityId, Global, SharedString, Subscription,
@@ -520,6 +520,8 @@ pub(crate) struct HerdrSessionRegistry {
     slot_generations: HashMap<(SessionIdentity, u64), u64>,
     /// Finalization token for a target window awaiting its Connected gate.
     finalize_tokens: HashMap<u64, u64>,
+    /// Abort handles for snapshot imports currently finalizing each target.
+    snapshot_import_abort_handles: HashMap<u64, AbortHandle>,
     /// Per-window/root gates serialize unmatched workspace additions. Entries
     /// are intentionally retained so a waiter can never race a removed lock.
     workspace_root_locks: HashMap<(u64, herdr::CanonicalPath), Arc<Mutex<()>>>,
@@ -598,6 +600,7 @@ impl HerdrSessionRegistry {
             in_flight: HashMap::default(),
             slot_generations: HashMap::default(),
             finalize_tokens: HashMap::default(),
+            snapshot_import_abort_handles: HashMap::default(),
             workspace_root_locks: HashMap::default(),
             next_generation: 0,
             sync: AgentSyncState::default(),
@@ -734,6 +737,10 @@ impl HerdrSessionRegistry {
         event: BindingEvent,
         cx: &mut Context<Self>,
     ) {
+        if !matches!(&event, BindingEvent::Selected { .. }) {
+            self.abort_snapshot_import(window_id);
+            self.finalize_tokens.remove(&window_id.as_u64());
+        }
         let Some(binding) = self.windows.get_mut(&window_id.as_u64()) else {
             return;
         };
@@ -885,6 +892,7 @@ impl HerdrSessionRegistry {
         session_name: Arc<str>,
         cx: &mut Context<Self>,
     ) {
+        self.abort_snapshot_import(window_id);
         self.next_generation = self.next_generation.wrapping_add(1);
         let generation = self.next_generation;
         self.attempts.insert(window_id.as_u64(), generation);
@@ -993,6 +1001,28 @@ impl HerdrSessionRegistry {
                             == Some(&connection.generation)
                 })
     }
+    fn abort_snapshot_import(&mut self, window_id: WindowId) {
+        if let Some(handle) = self
+            .snapshot_import_abort_handles
+            .remove(&window_id.as_u64())
+        {
+            handle.abort();
+        }
+    }
+
+    fn clear_snapshot_import_abort_if_current(
+        &mut self,
+        window_id: WindowId,
+        generation: u64,
+    ) {
+        if self.attempts.get(&window_id.as_u64()) == Some(&generation)
+            && self.finalize_tokens.get(&window_id.as_u64()) == Some(&generation)
+        {
+            self.snapshot_import_abort_handles
+                .remove(&window_id.as_u64());
+        }
+    }
+
 
 
     /// `Retry` re-runs the bounded connect loop for the failed session.
@@ -1018,6 +1048,7 @@ impl HerdrSessionRegistry {
         if !self.windows.contains_key(&window_id.as_u64()) {
             return;
         }
+        self.abort_snapshot_import(window_id);
         self.attempts.remove(&window_id.as_u64());
         self.finalize_tokens.remove(&window_id.as_u64());
         let identities: Vec<SessionIdentity> = self
@@ -2002,16 +2033,20 @@ impl HerdrSessionRegistry {
         }
         self.install_binding_target(bootstrap, identity, generation, cx);
         let roots = snapshot_checkout_paths(snapshot);
+        self.abort_snapshot_import(bootstrap);
         let task = self
             .windows
             .get(&bootstrap.as_u64())
             .map(|binding| binding.window)
             .map(|window| {
+                let (abort_handle, abort_registration) = AbortHandle::new_pair();
+                self.snapshot_import_abort_handles
+                    .insert(bootstrap.as_u64(), abort_handle);
                 let registry = cx.entity();
                 let identity = identity.clone();
                 let session_name: Arc<str> = Arc::from(session_name);
                 cx.spawn(async move |_this, mut cx| {
-                    let result = import_snapshot_workspaces_for_binding(
+                    let import = import_snapshot_workspaces_for_binding(
                         registry.clone(),
                         window,
                         bootstrap,
@@ -2020,9 +2055,13 @@ impl HerdrSessionRegistry {
                         generation,
                         roots,
                         &mut cx,
-                    )
-                    .await;
+                    );
+                    let result = match Abortable::new(import, abort_registration).await {
+                        Ok(result) => result,
+                        Err(_) => Ok(()),
+                    };
                     let _ = registry.update(&mut cx, |registry, cx| {
+                        registry.clear_snapshot_import_abort_if_current(bootstrap, generation);
                         if registry.snapshot_import_is_current(
                             bootstrap,
                             &identity,
@@ -2278,6 +2317,8 @@ impl HerdrSessionRegistry {
             }
         }
         for window_id in window_ids {
+            self.abort_snapshot_import(window_id);
+            self.finalize_tokens.remove(&window_id.as_u64());
             if let Some(binding) = self.windows.get_mut(&window_id.as_u64()) {
                 binding.state = transition(binding.state.clone(), event.clone());
                 if matches!(event, BindingEvent::SessionNotRunning) {
@@ -2289,6 +2330,7 @@ impl HerdrSessionRegistry {
     }
 
     fn note_window_released(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
+        self.abort_snapshot_import(window_id);
         self.windows.remove(&window_id.as_u64());
         self.prompted.remove(&window_id);
         self.prompt_pending.remove(&window_id);
@@ -2424,6 +2466,7 @@ impl HerdrSessionRegistry {
             #[cfg(test)]
             slot_generations: HashMap::default(),
             finalize_tokens: HashMap::default(),
+            snapshot_import_abort_handles: HashMap::default(),
             workspace_root_locks: HashMap::default(),
             sync: AgentSyncState::default(),
             mirror_index: MirrorIndex::default(),
@@ -3494,6 +3537,7 @@ fn fail_after_finalize(
         {
             return;
         }
+        registry.abort_snapshot_import(window_id);
         registry.apply_binding_event(
             window_id,
             BindingEvent::SessionStillRunning(message.into()),
@@ -3642,6 +3686,7 @@ mod tests {
             next_generation: 0,
             slot_generations: HashMap::default(),
             finalize_tokens: HashMap::default(),
+            snapshot_import_abort_handles: HashMap::default(),
             workspace_root_locks: HashMap::default(),
             sync: AgentSyncState::default(),
             mirror_index: MirrorIndex::default(),
