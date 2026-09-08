@@ -551,12 +551,17 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 let source_workspace = source_workspace.clone();
                 let window_id = window.window_handle().window_id();
                 let herdr_registry = herdr_session_registry::HerdrSessionRegistry::try_global(cx);
-                active_workspace.update(cx, |workspace, cx| {
-                    if let Some(registry) = herdr_registry.clone() {
+                if let Some(registry) = herdr_registry {
+                    // The event is emitted while the MultiWorkspace update is on the window
+                    // stack. The registry refresh reads window handles, so it must run after
+                    // this callback returns.
+                    cx.defer(move |cx| {
                         registry.update(cx, |registry, cx| {
                             registry.focus_herdr_workspace(window_id, cx);
                         });
-                    }
+                    });
+                }
+                active_workspace.update(cx, |workspace, cx| {
                     if let Some(source) = &source_workspace {
                         if let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx) {
                             panel.update(cx, |panel, cx| {
@@ -2982,6 +2987,67 @@ mod tests {
             .unwrap();
 
         futures::future::join_all(all_tasks).await;
+    }
+
+    #[gpui::test]
+    async fn test_active_workspace_change_does_not_reenter_herdr_window_read(
+        cx: &mut TestAppContext,
+    ) {
+        use workspace::{OpenMode, Workspace};
+
+        let app_state = init_test(cx);
+        cx.update(|cx| herdr_session_registry::HerdrSessionRegistry::init(cx));
+
+        let first_root = path!("/herdr-active-root");
+        let second_root = path!("/herdr-next-root");
+        let fake_fs = app_state.fs.as_fake();
+        fake_fs.insert_tree(first_root, json!({})).await;
+        fake_fs.insert_tree(second_root, json!({})).await;
+
+        let workspace::OpenResult {
+            window: window_handle,
+            ..
+        } = cx
+            .update(|cx| {
+                Workspace::new_local(
+                    vec![first_root.into()],
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    OpenMode::Activate,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to open initial workspace");
+        cx.run_until_parked();
+
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.open_project(
+                    vec![second_root.into()],
+                    OpenMode::Activate,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap()
+            .await
+            .expect("failed to activate second workspace");
+        cx.run_until_parked();
+
+        let active_roots = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .worktrees(cx)
+                    .map(|worktree| worktree.read(cx).abs_path())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert_eq!(active_roots, vec![Path::new(second_root).into()]);
     }
 
     #[gpui::test]
