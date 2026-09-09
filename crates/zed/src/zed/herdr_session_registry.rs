@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::herdr_agent_sync::{
     AgentKey, AgentRecord, AgentSyncEffect, AgentSyncState, FocusEcho, FocusObservation,
@@ -46,6 +46,10 @@ const PROMPT_SETTLE_DELAY: Duration = Duration::from_millis(50);
 /// How often the steady-state loop re-checks whether its connection entry is
 /// still registered (the last bound window may have disconnected).
 const OWNERSHIP_POLL: Duration = Duration::from_millis(250);
+/// Bounded wait for panel initialization when another consumer has taken the
+/// workspace's one-shot panel task.
+const PANEL_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const PANEL_READY_POLL: Duration = Duration::from_millis(25);
 
 /// Explicit launch parameters passed to the central host adapter.
 ///
@@ -1362,6 +1366,13 @@ impl HerdrSessionRegistry {
             return;
         };
         let target = target.filter(|target| target.generation == generation);
+        if let Some(target) = target
+            && self
+                .mirror_target_window(&record.key, target)
+                .is_some()
+        {
+            self.agent_window_targets.insert(record.key.clone(), target);
+        }
         let target = target.or_else(|| {
             self.agent_window_targets
                 .get(&record.key)
@@ -1425,6 +1436,7 @@ impl HerdrSessionRegistry {
                     let _ = registry.update(cx, |registry, cx| {
                         registry.mirroring_in_flight.remove(&flight_key);
                         if !registry.connection_matches(&key.session, generation) {
+                            registry.pending_mirror_replay.remove(&flight_key);
                             return;
                         }
                         registry.report_mirror_failure(&key, revision, message, target, cx);
@@ -2337,11 +2349,22 @@ async fn wait_for_workspace_panels(
     let panels_task = window.update(cx, |_, _, cx| {
         workspace.update(cx, |workspace, _| workspace.take_panels_task())
     })?;
-    let Some(panels_task) = panels_task else {
-        return Ok(());
-    };
-    panels_task.await?;
-    Ok(())
+    if let Some(panels_task) = panels_task {
+        panels_task.await?;
+    }
+
+    let started = Instant::now();
+    loop {
+        let panel_ready =
+            workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx).is_some());
+        if panel_ready {
+            return Ok(());
+        }
+        if started.elapsed() >= PANEL_READY_TIMEOUT {
+            return Err(anyhow::anyhow!("terminal panel did not finish initializing"));
+        }
+        cx.background_executor().timer(PANEL_READY_POLL).await;
+    }
 }
 
 
