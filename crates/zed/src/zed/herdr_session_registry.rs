@@ -1527,9 +1527,13 @@ impl HerdrSessionRegistry {
                     record.revision,
                     target,
                 );
-                let window = target
-                    .and_then(|target| registry.mirror_target_window(&record.key, target))
-                    .or_else(|| registry.source_window_for_session(&record.key.session, generation))?;
+                // An explicit or remembered target is authoritative. If it
+                // was detached while the async open was waiting, drop this
+                // effect instead of silently rerouting the stale attempt.
+                let window = match target {
+                    Some(target) => registry.mirror_target_window(&record.key, target)?,
+                    None => registry.source_window_for_session(&record.key.session, generation)?,
+                };
                 registry.remember_agent_window_target(
                     &record.key,
                     record.revision,
