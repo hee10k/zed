@@ -518,13 +518,15 @@ pub(crate) struct HerdrSessionRegistry {
     /// are intentionally retained so a waiter can never race a removed lock.
     workspace_root_locks: HashMap<(u64, herdr::CanonicalPath), Arc<Mutex<()>>>,
     sync: AgentSyncState,
-    /// Agents whose mirror open is still in flight; a second Open for the
-    /// same key while one is running cannot add a second terminal.
-    mirroring_in_flight: HashSet<AgentKey>,
-    /// Latest record seen for an in-flight mirror key. A newer Open or pane
-    /// move arriving mid-flight is remembered here and replayed the moment
-    /// the running attempt completes, so an update is never silently lost.
-    pending_mirror_replay: HashMap<AgentKey, AgentRecord>,
+    /// Agents whose regular terminal open is still in flight, scoped to the
+    /// connection generation so stale completion cannot clear a successor.
+    mirroring_in_flight: HashSet<(AgentKey, u64)>,
+    /// Latest record seen for an in-flight mirror key and generation.
+    pending_mirror_replay: HashMap<(AgentKey, u64), AgentRecord>,
+    /// Last window selected for each agent in its current connection generation.
+    /// This lightweight route preserves pane-move targeting without Agent Panel
+    /// ownership.
+    agent_window_targets: HashMap<AgentKey, MirrorTarget>,
     /// Focus echoes are keyed by session and target so workspace and agent
     /// transitions never overwrite one another.
     focus_echoes: HashMap<SessionIdentity, FocusEcho<FocusTarget>>,
@@ -601,6 +603,7 @@ impl HerdrSessionRegistry {
             program_override: None,
             #[cfg(test)]
             mirror_target_sink: None,
+            agent_window_targets: HashMap::default(),
             mirroring_in_flight: HashSet::default(),
             pending_mirror_replay: HashMap::default(),
             host_sink: Rc::new(NoopHerdrHostSink),
@@ -1320,7 +1323,10 @@ impl HerdrSessionRegistry {
             // Regular shells are independent of Herdr focus and lifecycle
             // effects. In particular, these effects never touch Agent Panel
             // threads or close shells on a session disconnect.
-            WorkspaceEffect::Focus(_) | WorkspaceEffect::Forget(_) => {}
+            WorkspaceEffect::Focus(_) => {}
+            WorkspaceEffect::Forget(key) => {
+                self.agent_window_targets.remove(&key);
+            }
         }
     }
 
@@ -1356,6 +1362,12 @@ impl HerdrSessionRegistry {
             return;
         };
         let target = target.filter(|target| target.generation == generation);
+        let target = target.or_else(|| {
+            self.agent_window_targets
+                .get(&record.key)
+                .copied()
+                .filter(|target| target.generation == generation)
+        });
         let candidate = record
             .checkout_path
             .clone()
@@ -1380,15 +1392,16 @@ impl HerdrSessionRegistry {
             );
             return;
         }
-        if !self.mirroring_in_flight.insert(record.key.clone()) {
+        let flight_key = (record.key.clone(), generation);
+        if !self.mirroring_in_flight.insert(flight_key.clone()) {
             // A newer Open/pane move arriving mid-flight replaces the
             // pending replay (highest revision wins) instead of opening a
             // second regular shell.
-            match self.pending_mirror_replay.get(&record.key) {
+            match self.pending_mirror_replay.get(&flight_key) {
                 Some(pending) if pending.revision >= record.revision => {}
                 _ => {
                     self.pending_mirror_replay
-                        .insert(record.key.clone(), record.clone());
+                        .insert(flight_key, record.clone());
                 }
             }
             return;
@@ -1398,18 +1411,19 @@ impl HerdrSessionRegistry {
         let registry = cx.entity();
         cx.spawn(async move |_this, mut cx| {
             let done = |registry: &Entity<HerdrSessionRegistry>, cx: &mut AsyncApp| {
-                let key = record.key.clone();
+                let flight_key = (record.key.clone(), generation);
                 let _ = registry.update(cx, |registry, cx| {
-                    registry.mirroring_in_flight.remove(&key);
-                    registry.drain_mirror_replay(&key, generation, target, cx);
+                    registry.mirroring_in_flight.remove(&flight_key);
+                    registry.drain_mirror_replay(&record.key, generation, target, cx);
                 });
             };
             let fail =
                 |registry: &Entity<HerdrSessionRegistry>, cx: &mut AsyncApp, message: String| {
                     let key = record.key.clone();
                     let revision = record.revision;
+                    let flight_key = (key.clone(), generation);
                     let _ = registry.update(cx, |registry, cx| {
-                        registry.mirroring_in_flight.remove(&key);
+                        registry.mirroring_in_flight.remove(&flight_key);
                         if !registry.connection_matches(&key.session, generation) {
                             return;
                         }
@@ -1463,6 +1477,13 @@ impl HerdrSessionRegistry {
                 let window = target
                     .and_then(|target| registry.mirror_target_window(&record.key, target))
                     .or_else(|| registry.source_window_for_session(&record.key.session, generation))?;
+                registry.agent_window_targets.insert(
+                    record.key.clone(),
+                    MirrorTarget {
+                        window_id: window.window_id(),
+                        generation,
+                    },
+                );
                 let root_lock = registry.workspace_root_lock(window.window_id(), &root);
                 #[cfg(test)]
                 if let Some(sink) = &registry.mirror_target_sink {
@@ -1510,11 +1531,22 @@ impl HerdrSessionRegistry {
                 done(&registry, &mut cx);
                 return;
             }
+            if let Err(error) =
+                wait_for_workspace_panels(workspace.clone(), window, &mut cx).await
+            {
+                fail(
+                    &registry,
+                    &mut cx,
+                    format!("could not initialize herdr workspace panels: {error:#}"),
+                );
+                return;
+            }
             let opened = window.update(cx, |_, window, cx| {
                 workspace.update(cx, |workspace, cx| {
                     let panel = workspace
                         .panel::<TerminalPanel>(cx)
                         .ok_or_else(|| anyhow::anyhow!("terminal panel is unavailable"))?;
+                    workspace.focus_panel::<TerminalPanel>(window, cx);
                     Ok(panel.update(cx, |panel, cx| {
                         panel.open_or_activate_terminal(
                             PathBuf::from(root.as_str()),
@@ -1570,11 +1602,12 @@ impl HerdrSessionRegistry {
         target: Option<MirrorTarget>,
         cx: &mut Context<Self>,
     ) {
+        let flight_key = (key.clone(), generation);
         if !self.connection_matches(&key.session, generation) {
-            self.pending_mirror_replay.remove(key);
+            self.pending_mirror_replay.remove(&flight_key);
             return;
         }
-        let Some(replay) = self.pending_mirror_replay.remove(key) else {
+        let Some(replay) = self.pending_mirror_replay.remove(&flight_key) else {
             return;
         };
         self.open_agent_terminal(replay, target, cx);
@@ -2038,6 +2071,7 @@ impl HerdrSessionRegistry {
             sync: AgentSyncState::default(),
             mirroring_in_flight: HashSet::default(),
             pending_mirror_replay: HashMap::default(),
+            agent_window_targets: HashMap::default(),
             focus_echoes: HashMap::default(),
             #[cfg(test)]
             sink_effects: None,
@@ -2280,15 +2314,6 @@ async fn activate_or_add_agent_workspace(
     let Some(app_state) = cx.update(|cx| AppState::try_global(cx)) else {
         return Err(anyhow::anyhow!("Zed app state is unavailable"));
     };
-    #[cfg(test)]
-    let init = Some(Box::new(
-        |workspace: &mut Workspace, window: &mut gpui::Window, cx: &mut Context<Workspace>| {
-            let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
-            workspace.add_panel(panel, window, cx);
-        },
-    ) as Box<dyn FnOnce(&mut Workspace, &mut gpui::Window, &mut Context<Workspace>) + Send>);
-    #[cfg(not(test))]
-    let init = None;
     let opened = cx
         .update(|cx| {
             Workspace::new_local(
@@ -2296,7 +2321,7 @@ async fn activate_or_add_agent_workspace(
                 app_state,
                 Some(window),
                 None,
-                init,
+                None,
                 OpenMode::Activate,
                 cx,
             )
@@ -2304,6 +2329,21 @@ async fn activate_or_add_agent_workspace(
         .await?;
     Ok(opened.workspace)
 }
+async fn wait_for_workspace_panels(
+    workspace: Entity<Workspace>,
+    window: WindowHandle<MultiWorkspace>,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<()> {
+    let panels_task = window.update(cx, |_, _, cx| {
+        workspace.update(cx, |workspace, _| workspace.take_panels_task())
+    })?;
+    let Some(panels_task) = panels_task else {
+        return Ok(());
+    };
+    panels_task.await?;
+    Ok(())
+}
+
 
 
 async fn add_workspace_root(
@@ -3330,6 +3370,7 @@ mod tests {
             sync: AgentSyncState::default(),
             mirroring_in_flight: HashSet::default(),
             pending_mirror_replay: HashMap::default(),
+            agent_window_targets: HashMap::default(),
             focus_echoes: HashMap::default(),
             #[cfg(test)]
             sink_effects: None,
@@ -3861,27 +3902,31 @@ mod tests {
         vcx.update(|window, _| window.window_handle().downcast::<MultiWorkspace>().unwrap())
     }
 
+    fn install_test_terminal_panel_observer(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.observe_new(
+                |workspace: &mut Workspace, window: Option<&mut gpui::Window>, cx| {
+                    let Some(window) = window else {
+                        return;
+                    };
+                    let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+                    workspace.add_panel(panel, window, cx);
+                    workspace.set_panels_task(Task::ready(Ok(())));
+                },
+            )
+            .detach();
+        });
+    }
+
     async fn add_terminal_window(
         cx: &mut TestAppContext,
         project: &Entity<project::Project>,
-    ) -> (
-        Entity<MultiWorkspace>,
-        WindowHandle<MultiWorkspace>,
-        Entity<TerminalPanel>,
-    ) {
+    ) -> (Entity<MultiWorkspace>, WindowHandle<MultiWorkspace>) {
         let (multi_workspace, vcx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(vcx, |multi_workspace, _| {
-            multi_workspace.workspace().clone()
-        });
-        let panel = workspace.update_in(vcx, |workspace, window, cx| {
-            let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
-            workspace.add_panel(panel.clone(), window, cx);
-            panel
-        });
         let handle =
             vcx.update(|window, _| window.window_handle().downcast::<MultiWorkspace>().unwrap());
-        (multi_workspace, handle, panel)
+        (multi_workspace, handle)
     }
 
     async fn test_project(cx: &mut TestAppContext) -> Entity<project::Project> {
@@ -4016,6 +4061,7 @@ mod tests {
         init_app(cx);
         cx.executor().allow_parking();
         cx.update(|cx| editor::init(cx));
+        install_test_terminal_panel_observer(cx);
         let app_state = import_test_app(cx).await;
         let agent_root = PathBuf::from("C:/space-a");
         app_state
@@ -4029,8 +4075,7 @@ mod tests {
             cx,
         )
         .await;
-        let (multi_workspace, window, _terminal_panel) =
-            add_terminal_window(cx, &project).await;
+        let (multi_workspace, window) = add_terminal_window(cx, &project).await;
         let mut snapshot = empty_snapshot();
         snapshot.workspaces = vec![workspace_without_checkout()];
         let mut agent = herdr::PaneInfo::default();
@@ -4083,6 +4128,19 @@ mod tests {
         );
         let active_workspace = multi_workspace
             .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        assert!(
+            active_workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .worktrees(cx)
+                        .filter_map(|worktree| worktree.read(cx).root_dir())
+                        .filter_map(|root| canonical_checkout_path(root.as_ref()).ok())
+                        .any(|root| root == expected_root)
+                }),
+            "the agent checkout must be active in the invoking window"
+        );
         assert!(
             active_workspace
                 .read_with(cx, |workspace, cx| {
