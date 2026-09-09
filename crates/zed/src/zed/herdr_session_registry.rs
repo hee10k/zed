@@ -1556,8 +1556,15 @@ impl HerdrSessionRegistry {
             };
 
             let _root_lock = root_lock.lock().await;
+            let target_window = MirrorTarget {
+                window_id: window.window_id(),
+                generation,
+            };
             let owned = registry.read_with(cx, |registry, _| {
                 registry.connection_matches(&record.key.session, generation)
+                    && registry
+                        .mirror_target_window(&record.key, target_window)
+                        .is_some()
             });
             if !owned {
                 done(&registry, &mut cx);
@@ -1580,6 +1587,9 @@ impl HerdrSessionRegistry {
             };
             let owned = registry.read_with(cx, |registry, _| {
                 registry.connection_matches(&record.key.session, generation)
+                    && registry
+                        .mirror_target_window(&record.key, target_window)
+                        .is_some()
             });
             if !owned {
                 done(&registry, &mut cx);
@@ -1597,6 +1607,9 @@ impl HerdrSessionRegistry {
             }
             let live = registry.read_with(cx, |registry, _| {
                 registry.connection_matches(&record.key.session, generation)
+                    && registry
+                        .mirror_target_window(&record.key, target_window)
+                        .is_some()
                     && registry.sync.record(&record.key).is_some_and(|live| {
                         live.revision == record.revision && !registry.sync.is_dismissed(&record.key)
                     })
@@ -2345,26 +2358,51 @@ fn focused_checkout_path(snapshot: &SessionSnapshot) -> Option<herdr::CanonicalP
     let checkout = workspace.checkout_path()?;
     canonical_checkout_path(checkout).ok()
 }
+fn workspace_root_matches_agent_root(
+    workspace_root: &herdr::CanonicalPath,
+    agent_root: &herdr::CanonicalPath,
+) -> bool {
+    workspace_root == agent_root
+        || Path::new(agent_root.as_str()).starts_with(Path::new(workspace_root.as_str()))
+}
 async fn activate_or_add_agent_workspace(
+
     window: WindowHandle<MultiWorkspace>,
     root: herdr::CanonicalPath,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<Entity<Workspace>> {
     let existing = window
         .read_with(cx, |multi_workspace, cx| {
-            multi_workspace.workspaces().find_map(|workspace| {
-                workspace
+            let mut ancestor = None;
+            for workspace in multi_workspace.workspaces() {
+                let mut exact = false;
+                let mut contains = false;
+                for candidate in workspace
                     .read(cx)
                     .project()
                     .read(cx)
                     .worktrees(cx)
                     .filter_map(|worktree| worktree.read(cx).root_dir())
-                    .any(|candidate| {
-                        canonical_checkout_path(candidate.as_ref())
-                            .is_ok_and(|candidate| candidate == root)
-                    })
-                    .then_some(workspace.clone())
-            })
+                {
+                    let Ok(candidate) = canonical_checkout_path(candidate.as_ref()) else {
+                        continue;
+                    };
+                    if candidate == root {
+                        exact = true;
+                        break;
+                    }
+                    if workspace_root_matches_agent_root(&candidate, &root) {
+                        contains = true;
+                    }
+                }
+                if exact {
+                    return Some(workspace.clone());
+                }
+                if contains && ancestor.is_none() {
+                    ancestor = Some(workspace.clone());
+                }
+            }
+            ancestor
         })
         .map_err(|error| anyhow::anyhow!("could not inspect invoking workspace: {error:#}"))?;
 
@@ -3482,6 +3520,17 @@ mod tests {
             registry.agent_window_targets.get(&key),
             Some(&(2, newer))
         );
+    }
+
+    #[test]
+    fn workspace_root_matching_accepts_ancestors_without_prefix_collisions() {
+        let root = checkout("C:/repo/agent");
+        let ancestor = checkout("C:/repo");
+        let sibling = checkout("C:/repository");
+
+        assert!(workspace_root_matches_agent_root(&ancestor, &root));
+        assert!(workspace_root_matches_agent_root(&root, &root));
+        assert!(!workspace_root_matches_agent_root(&sibling, &root));
     }
 
     #[test]
