@@ -525,8 +525,11 @@ pub(crate) struct HerdrSessionRegistry {
     /// Agents whose regular terminal open is still in flight, scoped to the
     /// connection generation so stale completion cannot clear a successor.
     mirroring_in_flight: HashSet<(AgentKey, u64)>,
-    /// Latest record seen for an in-flight mirror key and generation.
-    pending_mirror_replay: HashMap<(AgentKey, u64), AgentRecord>,
+    /// Latest record and target seen for an in-flight mirror key and generation.
+    pending_mirror_replay: HashMap<
+        (AgentKey, u64),
+        (AgentRecord, Option<MirrorTarget>),
+    >,
     /// Last window selected for each agent in its current connection generation.
     /// This lightweight route preserves pane-move targeting without Agent Panel
     /// ownership.
@@ -1365,12 +1368,9 @@ impl HerdrSessionRegistry {
             );
             return;
         };
-        let target = target.filter(|target| target.generation == generation);
-        if let Some(target) = target
-            && self
-                .mirror_target_window(&record.key, target)
-                .is_some()
-        {
+        let target = target
+            .filter(|target| self.mirror_target_window(&record.key, *target).is_some());
+        if let Some(target) = target {
             self.agent_window_targets.insert(record.key.clone(), target);
         }
         let target = target.or_else(|| {
@@ -1409,10 +1409,10 @@ impl HerdrSessionRegistry {
             // pending replay (highest revision wins) instead of opening a
             // second regular shell.
             match self.pending_mirror_replay.get(&flight_key) {
-                Some(pending) if pending.revision >= record.revision => {}
+                Some((pending, _)) if pending.revision >= record.revision => {}
                 _ => {
                     self.pending_mirror_replay
-                        .insert(flight_key, record.clone());
+                        .insert(flight_key, (record.clone(), target));
                 }
             }
             return;
@@ -1425,7 +1425,7 @@ impl HerdrSessionRegistry {
                 let flight_key = (record.key.clone(), generation);
                 let _ = registry.update(cx, |registry, cx| {
                     registry.mirroring_in_flight.remove(&flight_key);
-                    registry.drain_mirror_replay(&record.key, generation, target, cx);
+                    registry.drain_mirror_replay(&record.key, generation, cx);
                 });
             };
             let fail =
@@ -1440,7 +1440,7 @@ impl HerdrSessionRegistry {
                             return;
                         }
                         registry.report_mirror_failure(&key, revision, message, target, cx);
-                        registry.drain_mirror_replay(&key, generation, target, cx);
+                        registry.drain_mirror_replay(&key, generation, cx);
                     });
                 };
             let owned = registry.read_with(cx, |registry, _| {
@@ -1553,7 +1553,18 @@ impl HerdrSessionRegistry {
                 );
                 return;
             }
-            let opened = window.update(cx, |_, window, cx| {
+            let live = registry.read_with(cx, |registry, _| {
+                registry.connection_matches(&record.key.session, generation)
+                    && registry.sync.record(&record.key).is_some_and(|live| {
+                        live.revision == record.revision && !registry.sync.is_dismissed(&record.key)
+                    })
+            });
+            if !live {
+                done(&registry, &mut cx);
+                return;
+            }
+            let opened = window.update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate(workspace.clone(), None, window, cx);
                 workspace.update(cx, |workspace, cx| {
                     let panel = workspace
                         .panel::<TerminalPanel>(cx)
@@ -1611,7 +1622,6 @@ impl HerdrSessionRegistry {
         &mut self,
         key: &AgentKey,
         generation: u64,
-        target: Option<MirrorTarget>,
         cx: &mut Context<Self>,
     ) {
         let flight_key = (key.clone(), generation);
@@ -1619,10 +1629,10 @@ impl HerdrSessionRegistry {
             self.pending_mirror_replay.remove(&flight_key);
             return;
         }
-        let Some(replay) = self.pending_mirror_replay.remove(&flight_key) else {
+        let Some((replay, replay_target)) = self.pending_mirror_replay.remove(&flight_key) else {
             return;
         };
-        self.open_agent_terminal(replay, target, cx);
+        self.open_agent_terminal(replay, replay_target, cx);
     }
 
     fn record_mirror_failure(&mut self, key: &AgentKey, revision: u64) -> bool {
