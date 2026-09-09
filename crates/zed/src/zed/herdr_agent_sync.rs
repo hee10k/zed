@@ -24,9 +24,9 @@ impl SessionIdentity {
     }
 }
 
-/// Stable identity of one mirrored herdr agent: the owning session plus the
-/// terminal id. Pane ids change as the agent moves between panes; the terminal
-/// id never does.
+/// Stable identity of one synchronized herdr agent: the owning session plus
+/// the terminal id. Pane ids change as the agent moves between panes; the
+/// terminal id never does.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct AgentKey {
     pub(crate) session: SessionIdentity,
@@ -42,7 +42,7 @@ impl AgentKey {
     }
 }
 
-/// The latest mirrored facts about one agent, captured at upsert time.
+/// The latest synchronized facts about one agent, captured at upsert time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AgentRecord {
     pub(crate) key: AgentKey,
@@ -55,11 +55,9 @@ pub(crate) struct AgentRecord {
     pub(crate) agent_name: Arc<str>,
 }
 
-/// Build the structured external terminal command for one live agent.
-///
-/// The terminal id is the stable identity while the pane id is deliberately
-/// read from the latest reducer record, so a moved agent keeps one Zed thread
-/// while subsequent opens/focuses target its current pane.
+/// Build structured launch parameters for a host integration that explicitly
+/// requests an agent attach. Herdr event handling does not invoke this helper;
+/// regular Zed terminals are opened directly by the session registry.
 pub(crate) fn external_terminal_spec(
     record: &AgentRecord,
     herdr_program: &Path,
@@ -88,11 +86,11 @@ pub(crate) fn external_terminal_spec(
     }
 }
 
-/// Pure index of live herdr agent keys and their Agent Panel terminal ids.
+/// Pure index of live herdr agent keys and consumer terminal ids.
 ///
-/// The registry owns the window/panel handles around this index. Keeping the
-/// identity-to-terminal mapping pure makes close reconciliation deterministic
-/// and keeps it independently testable.
+/// The registry owns any window/panel handles around this index. Keeping the
+/// identity-to-terminal mapping pure makes synchronization reconciliation
+/// deterministic and keeps it independently testable.
 pub(crate) struct MirrorIndex<T = TerminalId> {
     entries: HashMap<AgentKey, T>,
 }
@@ -125,10 +123,9 @@ impl<T: Copy> MirrorIndex<T> {
             .map(|(key, terminal_id)| (key, *terminal_id))
     }
 
-    /// Keys whose panel terminal is no longer present. Test-only close
-    /// reconciliation helper: production detection (`detect_closed_mirrors`)
-    /// walks the registry's own mirror map because it must scope to the
-    /// emitting panel.
+    /// Keys whose consumer terminal is no longer present. Test-only
+    /// reconciliation helper: a production consumer scopes detection to its
+    /// own terminal collection.
     #[cfg(test)]
     pub(crate) fn missing(&self, mut terminal_present: impl FnMut(T) -> bool) -> Vec<AgentKey> {
         self.entries
@@ -231,15 +228,15 @@ impl<T: Clone + Eq + Hash> FocusEcho<T> {
 pub(crate) struct AgentSyncState {
     /// Latest workspace checkout paths, keyed by (session identity, workspace id).
     workspace_checkouts: HashMap<(SessionIdentity, Arc<str>), Option<PathBuf>>,
-    /// Live mirrored agents.
+    /// Live synchronized agents.
     records: HashMap<AgentKey, AgentRecord>,
     /// Maps (session identity, current pane id) to the owning agent key so
     /// exit events, which carry no terminal id, resolve to their agent.
     pane_lookup: HashMap<(SessionIdentity, Arc<str>), AgentKey>,
-    /// Agents whose mirrored terminal was closed locally; reopening is
+    /// Agents whose synchronized terminal was closed locally; reopening is
     /// suppressed until resync or pane exit.
     dismissed: HashSet<AgentKey>,
-    /// Last failed mirror-open revision per agent.
+    /// Last failed terminal-open revision per agent.
     failed_revision: HashMap<AgentKey, u64>,
 }
 
@@ -368,21 +365,20 @@ impl AgentSyncState {
         keys.into_iter().map(|key| self.forget_one(&key)).collect()
     }
 
-    /// Suppress automatic reopening of one agent until resync or pane exit.
-    /// Used when the mirrored terminal is closed locally: the herdr agent
-    /// keeps running; we just stop mirroring it.
+    /// Used when the synchronized terminal is closed locally: the herdr agent
+    /// keeps running; we just stop reopening its Zed terminal.
     pub(crate) fn dismiss(&mut self, key: AgentKey) {
         self.dismissed.insert(key);
     }
 
-    /// Whether the mirrored terminal for this agent was closed by the user;
+    /// Whether the synchronized terminal for this agent was closed by the user;
     /// reopening is suppressed until resync or pane exit.
     pub(crate) fn is_dismissed(&self, key: &AgentKey) -> bool {
         self.dismissed.contains(key)
     }
 
-    /// Records a failed mirror open. Returns `true` only for the first failure
-    /// at this revision so the driver emits exactly one actionable
+    /// Records a failed terminal open. Returns `true` only for the first
+    /// failure at this revision so the driver emits exactly one actionable
     /// notification; a later revision or resync permits one new attempt.
     pub(crate) fn record_failure(&mut self, key: &AgentKey, revision: u64) -> bool {
         if self.failed_revision.get(key) == Some(&revision) {
@@ -393,7 +389,7 @@ impl AgentSyncState {
         }
     }
 
-    /// Clears the failed-open record after a successful mirror open.
+    /// Clears the failed-open record after a successful terminal open.
     pub(crate) fn clear_failure(&mut self, key: &AgentKey) {
         self.failed_revision.remove(key);
     }
@@ -450,7 +446,7 @@ impl AgentSyncState {
     }
     /// Removes every trace of `key` (record, pane lookup, dismissal, failed
     /// revision) and returns its `Forget` effect. `Forget` only drops
-    /// synchronization ownership; it never closes the Agent Panel terminal.
+    /// synchronization ownership; it never closes the Zed terminal.
     fn forget_one(&mut self, key: &AgentKey) -> AgentSyncEffect {
         if let Some(record) = self.records.remove(key) {
             self.pane_lookup
