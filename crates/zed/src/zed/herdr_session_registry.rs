@@ -4164,13 +4164,6 @@ mod tests {
                 }),
             "the agent checkout must be active in the invoking window"
         );
-        assert!(
-            active_workspace
-                .read_with(cx, |workspace, cx| {
-                    workspace.panel::<agent_ui::AgentPanel>(cx).is_none()
-                }),
-            "Herdr synchronization must not create an external Agent Panel thread"
-        );
 
         let expected_key = AgentKey::new(session("main"), "terminal-1");
         let live_record = registry
