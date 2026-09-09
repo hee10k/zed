@@ -306,6 +306,18 @@ fn import_snapshot(
     effects
 }
 
+/// Imports a snapshot after reconciling agents that disappeared while the
+/// previous connection generation was unavailable.
+fn import_snapshot_for_new_generation(
+    sync: &mut AgentSyncState,
+    identity: &SessionIdentity,
+    snapshot: &SessionSnapshot,
+) -> Vec<AgentSyncEffect> {
+    let mut effects = sync.reconcile_snapshot(identity, &snapshot.agents);
+    effects.extend(import_snapshot(sync, identity, snapshot));
+    effects
+}
+
 /// Pure steady-state event reduction.
 fn apply_event_effects(
     sync: &mut AgentSyncState,
@@ -1153,6 +1165,35 @@ impl HerdrSessionRegistry {
             self.apply_workspace_effect(identity, effect, target, cx);
         }
     }
+    /// Snapshot bootstrap can deduplicate a live record already seen by an
+    /// older connection generation. Schedule such records explicitly while
+    /// avoiding duplicate opens for keys already represented by an effect.
+    fn dispatch_snapshot_effects(
+        &mut self,
+        identity: &SessionIdentity,
+        effects: Vec<AgentSyncEffect>,
+        target: Option<MirrorTarget>,
+        cx: &mut Context<Self>,
+    ) {
+        let routed_keys: HashSet<AgentKey> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                AgentSyncEffect::Open(record) => Some(record.key.clone()),
+                AgentSyncEffect::PaneMoved { key, .. } => Some(key.clone()),
+                AgentSyncEffect::Focus(_) | AgentSyncEffect::Forget(_) => None,
+            })
+            .collect();
+        self.dispatch_effects(identity, effects, target, cx);
+        for record in self
+            .sync
+            .live_records(identity)
+            .into_iter()
+            .filter(|record| !routed_keys.contains(&record.key))
+        {
+            self.open_agent_terminal(record, target, target.is_some(), cx);
+        }
+    }
+
 
 
     fn mirror_target_window(
@@ -1433,7 +1474,7 @@ impl HerdrSessionRegistry {
                 &record.key,
                 generation,
                 record.revision,
-                requested_target,
+                target_is_explicit.then_some(requested_target).flatten(),
             )
         };
         if target_is_explicit && target.is_none() {
@@ -1483,12 +1524,16 @@ impl HerdrSessionRegistry {
         let fs = <dyn Fs>::global(cx).clone();
         let registry = cx.entity();
         cx.spawn(async move |_this, mut cx| {
-            let done = |registry: &Entity<HerdrSessionRegistry>, cx: &mut AsyncApp| {
+            let done = |registry: &Entity<HerdrSessionRegistry>,
+                        cx: &mut AsyncApp,
+                        target: Option<MirrorTarget>| {
                 let _ = registry.update(cx, |registry, cx| {
                     registry.finish_mirror_flight(
                         &record.key,
                         generation,
                         record.revision,
+                        target_is_explicit,
+                        target,
                         cx,
                     );
                 });
@@ -1501,13 +1546,27 @@ impl HerdrSessionRegistry {
                 let revision = record.revision;
                 let _ = registry.update(cx, |registry, cx| {
                     if !registry.connection_matches(&key.session, generation) {
-                        registry.finish_mirror_flight(&key, generation, revision, cx);
+                        registry.finish_mirror_flight(
+                            &key,
+                            generation,
+                            revision,
+                            target_is_explicit,
+                            target,
+                            cx,
+                        );
                         return;
                     }
                     if let Some(target) = target {
                         if registry.mirror_target_window(&key, target).is_none() {
                             registry.forget_agent_window_target_if_matches(&key, target);
-                            registry.finish_mirror_flight(&key, generation, revision, cx);
+                            registry.finish_mirror_flight(
+                                &key,
+                                generation,
+                                revision,
+                                target_is_explicit,
+                                Some(target),
+                                cx,
+                            );
                             return;
                         }
                     }
@@ -1516,18 +1575,32 @@ impl HerdrSessionRegistry {
                         .record(&key)
                         .is_some_and(|live| live.revision > revision)
                     {
-                        registry.finish_mirror_flight(&key, generation, revision, cx);
+                        registry.finish_mirror_flight(
+                            &key,
+                            generation,
+                            revision,
+                            target_is_explicit,
+                            target,
+                            cx,
+                        );
                         return;
                     }
                     registry.report_mirror_failure(&key, revision, message, target, cx);
-                    registry.finish_mirror_flight(&key, generation, revision, cx);
+                    registry.finish_mirror_flight(
+                        &key,
+                        generation,
+                        revision,
+                        target_is_explicit,
+                        target,
+                        cx,
+                    );
                 });
             };
             let owned = registry.read_with(cx, |registry, _| {
                 registry.connection_matches(&record.key.session, generation)
             });
             if !owned {
-                done(&registry, &mut cx);
+                done(&registry, &mut cx, None);
                 return;
             }
             let metadata = fs.metadata(&candidate).await;
@@ -1567,14 +1640,21 @@ impl HerdrSessionRegistry {
                 if !registry.connection_matches(&record.key.session, generation) {
                     return None;
                 }
-                let target = if target_is_explicit && target.is_none() {
-                    None
+                let target = if target_is_explicit {
+                    target.and_then(|target| {
+                        registry.select_agent_window_target(
+                            &record.key,
+                            generation,
+                            record.revision,
+                            Some(target),
+                        )
+                    })
                 } else {
                     registry.select_agent_window_target(
                         &record.key,
                         generation,
                         record.revision,
-                        target,
+                        None,
                     )
                 };
                 // An explicit or remembered target is authoritative. If it
@@ -1587,14 +1667,6 @@ impl HerdrSessionRegistry {
                         registry.source_window_for_session(&record.key.session, generation)?
                     }
                 };
-                registry.remember_agent_window_target(
-                    &record.key,
-                    record.revision,
-                    MirrorTarget {
-                        window_id: window.window_id(),
-                        generation,
-                    },
-                );
                 let root_lock = registry.workspace_root_lock(window.window_id(), &root);
                 #[cfg(test)]
                 if let Some(sink) = &registry.mirror_target_sink {
@@ -1623,11 +1695,21 @@ impl HerdrSessionRegistry {
                     && registry
                         .mirror_target_window(&record.key, target_window)
                         .is_some()
+                    && registry.sync.record(&record.key).is_some_and(|live| {
+                        live.revision == record.revision && !registry.sync.is_dismissed(&record.key)
+                    })
             });
             if !owned {
-                done(&registry, &mut cx);
+                done(&registry, &mut cx, Some(target_window));
                 return;
             }
+            registry.update(cx, |registry, _| {
+                registry.remember_agent_window_target(
+                    &record.key,
+                    record.revision,
+                    target_window,
+                );
+            });
             let workspace = match activate_or_add_agent_workspace(window, root.clone(), &mut cx).await
             {
                 Ok(workspace) => workspace,
@@ -1649,9 +1731,12 @@ impl HerdrSessionRegistry {
                     && registry
                         .mirror_target_window(&record.key, target_window)
                         .is_some()
+                    && registry.sync.record(&record.key).is_some_and(|live| {
+                        live.revision == record.revision && !registry.sync.is_dismissed(&record.key)
+                    })
             });
             if !owned {
-                done(&registry, &mut cx);
+                done(&registry, &mut cx, Some(target_window));
                 return;
             }
             if let Err(error) =
@@ -1675,7 +1760,7 @@ impl HerdrSessionRegistry {
                     })
             });
             if !live {
-                done(&registry, &mut cx);
+                done(&registry, &mut cx, Some(target_window));
                 return;
             }
             let opened = window.update(cx, |multi_workspace, window, cx| {
@@ -1709,7 +1794,7 @@ impl HerdrSessionRegistry {
                     })
             });
             if !live {
-                done(&registry, &mut cx);
+                done(&registry, &mut cx, Some(target_window));
                 return;
             }
             match result {
@@ -1719,7 +1804,7 @@ impl HerdrSessionRegistry {
                             registry.sync.clear_failure(&record.key);
                         }
                     });
-                    done(&registry, &mut cx);
+                    done(&registry, &mut cx, Some(target_window));
                 }
                 Err(error) => {
                     fail(
@@ -1739,18 +1824,71 @@ impl HerdrSessionRegistry {
         key: &AgentKey,
         generation: u64,
         revision: u64,
+        target_is_explicit: bool,
+        target: Option<MirrorTarget>,
         cx: &mut Context<Self>,
     ) {
         let flight_key = (key.clone(), generation);
         self.mirroring_in_flight.remove(&flight_key);
+        if self.sync.record(key).is_none() || self.sync.is_dismissed(key) {
+            self.agent_window_targets.remove(key);
+            self.pending_mirror_replay.remove(&flight_key);
+            return;
+        }
         if !self.connection_matches(&key.session, generation) {
             self.pending_mirror_replay.remove(&flight_key);
             return;
         }
-        if self.pending_mirror_replay.contains_key(&flight_key) {
+        if let Some((pending_revision, pending_target, pending_target_is_explicit)) = self
+            .pending_mirror_replay
+            .get(&flight_key)
+            .map(|(record, target, target_is_explicit)| {
+                (record.revision, *target, *target_is_explicit)
+            })
+        {
             self.drain_mirror_replay(key, generation, cx);
+            if !self.mirroring_in_flight.contains(&flight_key) {
+                if self
+                    .sync
+                    .record(key)
+                    .is_some_and(|record| record.revision > pending_revision)
+                {
+                    self.requeue_latest_mirror_record(key, generation, revision, cx);
+                } else if !pending_target_is_explicit
+                    && pending_target.is_some_and(|target| {
+                        self.mirror_target_window(key, target).is_none()
+                    })
+                {
+                    let stale_target = pending_target.expect("checked above");
+                    self.forget_agent_window_target_if_matches(key, stale_target);
+                    self.requeue_latest_mirror_record(
+                        key,
+                        generation,
+                        pending_revision.saturating_sub(1),
+                        cx,
+                    );
+                }
+            }
             return;
         }
+        if !target_is_explicit
+            && target.is_some_and(|target| self.mirror_target_window(key, target).is_none())
+        {
+            let stale_target = target.expect("checked above");
+            self.forget_agent_window_target_if_matches(key, stale_target);
+            self.requeue_latest_mirror_record(key, generation, revision.saturating_sub(1), cx);
+            return;
+        }
+        self.requeue_latest_mirror_record(key, generation, revision, cx);
+    }
+
+    fn requeue_latest_mirror_record(
+        &mut self,
+        key: &AgentKey,
+        generation: u64,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) {
         let Some(record) = self
             .sync
             .record(key)
@@ -3327,8 +3465,9 @@ async fn run_connection(
             {
                 return;
             }
-            let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
-            registry.dispatch_effects(&identity, effects, mirror_target_window, cx);
+            let effects =
+                import_snapshot_for_new_generation(&mut registry.sync, &identity, &snapshot);
+            registry.dispatch_snapshot_effects(&identity, effects, mirror_target_window, cx);
         });
     }
     for event in buffered {
@@ -3999,12 +4138,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn path_change_emits_open_effect_for_unchanged_pane() {
+        let root = if cfg!(windows) { "C:/root" } else { "/root" };
+        let other = if cfg!(windows) {
+            "C:/other-root"
+        } else {
+            "/other-root"
+        };
+        let identity = session("main");
+        let mut sync = AgentSyncState::default();
+
+        assert_eq!(
+            sync.upsert(identity.clone(), test_pane("terminal-1", "pane-1", 1, root))
+                .len(),
+            1
+        );
+        let effects = sync.upsert(
+            identity,
+            test_pane("terminal-1", "pane-1", 2, other),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [AgentSyncEffect::Open(record)] if record.revision == 2
+        ));
+    }
+
     #[gpui::test]
     async fn newer_live_revision_requeues_after_in_flight_open(cx: &mut TestAppContext) {
         init_app(cx);
         let _app_state = import_test_app(cx).await;
         let project = test_project(cx).await;
         let window = add_terminal_window(cx, &project).await.1;
+        let root = if cfg!(windows) { "C:/root" } else { "/root" };
         let identity = session("main");
         let gateway = HerdrGateway::fake(
             || async { Ok(Vec::new()) }.boxed_local(),
@@ -4026,25 +4192,69 @@ mod tests {
             assert_eq!(
                 registry
                     .sync
-                    .upsert(identity.clone(), test_pane("terminal-1", "pane-1", 1, "C:/root"))
+                    .upsert(identity.clone(), test_pane("terminal-1", "pane-1", 1, root))
                     .len(),
                 1
             );
             assert!(
                 registry
                     .sync
-                    .upsert(identity.clone(), test_pane("terminal-1", "pane-1", 2, "C:/root"))
+                    .upsert(identity.clone(), test_pane("terminal-1", "pane-1", 2, root))
                     .is_empty()
             );
             registry.mirroring_in_flight.insert((key.clone(), 1));
         });
 
         registry.update(cx, |registry, cx| {
-            registry.finish_mirror_flight(&key, 1, 1, cx);
+            registry.finish_mirror_flight(&key, 1, 1, false, None, cx);
         });
 
         assert!(registry.read_with(cx, |registry, _| {
             registry.mirroring_in_flight.contains(&(key, 1))
+        }));
+        let pending_key = AgentKey::new(identity.clone(), "terminal-2");
+        registry.update(cx, |registry, _| {
+            assert_eq!(
+                registry
+                    .sync
+                    .upsert(identity.clone(), test_pane("terminal-2", "pane-2", 1, root))
+                    .len(),
+                1
+            );
+            assert!(
+                registry
+                    .sync
+                    .upsert(identity.clone(), test_pane("terminal-2", "pane-2", 2, root))
+                    .is_empty()
+            );
+            let pending_record = registry
+                .sync
+                .record(&pending_key)
+                .expect("pending replay record is live");
+            assert!(
+                registry
+                    .sync
+                    .upsert(identity.clone(), test_pane("terminal-2", "pane-2", 3, root))
+                    .is_empty()
+            );
+            registry.mirroring_in_flight.insert((pending_key.clone(), 1));
+            registry.pending_mirror_replay.insert(
+                (pending_key.clone(), 1),
+                (
+                    pending_record,
+                    Some(MirrorTarget {
+                        window_id: WindowId::from(999),
+                        generation: 1,
+                    }),
+                    true,
+                ),
+            );
+        });
+        registry.update(cx, |registry, cx| {
+            registry.finish_mirror_flight(&pending_key, 1, 1, false, None, cx);
+        });
+        assert!(registry.read_with(cx, |registry, _| {
+            registry.mirroring_in_flight.contains(&(pending_key, 1))
         }));
     }
 

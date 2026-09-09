@@ -295,14 +295,20 @@ impl AgentSyncState {
             effective_cwd: pane.foreground_cwd.or(pane.cwd).map(PathBuf::from),
             agent_name: Arc::from(pane.agent.as_deref().expect("agent guard above")),
         };
-        let previous = self
-            .records
-            .get(&key)
-            .map(|current| (current.pane_id.clone(), current.focused));
+        let previous = self.records.get(&key).map(|current| {
+            (
+                current.pane_id.clone(),
+                current.focused,
+                current
+                    .checkout_path
+                    .clone()
+                    .or_else(|| current.effective_cwd.clone()),
+            )
+        });
 
         // The pane-to-key lookup always points at the record's current pane id,
         // replacing the previous entry on a pane move.
-        if let Some((old_pane_id, _)) = &previous {
+        if let Some((old_pane_id, _, _)) = &previous {
             self.pane_lookup
                 .remove(&(session.clone(), old_pane_id.clone()));
         }
@@ -315,14 +321,23 @@ impl AgentSyncState {
         }
 
         let mut effects = Vec::new();
-        if let Some((old_pane_id, was_focused)) = previous {
+        if let Some((old_pane_id, was_focused, old_path)) = previous {
             let pane_moved = old_pane_id != record.pane_id;
+            let path_changed = old_path.as_deref()
+                != record
+                    .checkout_path
+                    .as_deref()
+                    .or(record.effective_cwd.as_deref());
             let retry_open = self.failed_revision.contains_key(&key);
-            if pane_moved && !retry_open {
-                effects.push(AgentSyncEffect::PaneMoved {
-                    key: key.clone(),
-                    pane_id: record.pane_id.clone(),
-                });
+            if (pane_moved || path_changed) && !retry_open {
+                if pane_moved {
+                    effects.push(AgentSyncEffect::PaneMoved {
+                        key: key.clone(),
+                        pane_id: record.pane_id.clone(),
+                    });
+                } else {
+                    effects.push(AgentSyncEffect::Open(record.clone()));
+                }
             }
             if retry_open {
                 effects.push(AgentSyncEffect::Open(record.clone()));
@@ -410,6 +425,47 @@ impl AgentSyncState {
     pub(crate) fn record(&self, key: &AgentKey) -> Option<AgentRecord> {
         self.records.get(key).cloned()
     }
+    /// Returns non-dismissed live records for a fresh connection generation.
+    /// Unlike `resync`, this preserves failure/dismissal state and only
+    /// supplies the connection bootstrap with records that need routing.
+    pub(crate) fn live_records(&self, session: &SessionIdentity) -> Vec<AgentRecord> {
+        self.records
+            .values()
+            .filter(|record| {
+                &record.key.session == session && !self.dismissed.contains(&record.key)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Drops records for agents absent from a fresh connection snapshot.
+    /// This reconciles events missed while the previous stream was down while
+    /// leaving records present in the snapshot (and their dismissal state)
+    /// available for generation replay.
+    pub(crate) fn reconcile_snapshot(
+        &mut self,
+        session: &SessionIdentity,
+        panes: &[PaneInfo],
+    ) -> Vec<AgentSyncEffect> {
+        let snapshot_terminals: HashSet<&str> = panes
+            .iter()
+            .filter(|pane| pane.agent.is_some() && !pane.terminal_id.is_empty())
+            .map(|pane| pane.terminal_id.as_str())
+            .collect();
+        let stale_keys: Vec<AgentKey> = self
+            .records
+            .keys()
+            .filter(|key| {
+                &key.session == session && !snapshot_terminals.contains(key.terminal_id.as_ref())
+            })
+            .cloned()
+            .collect();
+        stale_keys
+            .into_iter()
+            .map(|key| self.forget_one(&key))
+            .collect()
+    }
+
 
     /// The latest recorded checkout path for one herdr workspace, independent
     /// of whether any agent is currently live in it. Window focus routing uses
