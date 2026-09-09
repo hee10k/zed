@@ -619,7 +619,10 @@ impl TerminalPanel {
                 .find_map(|(item_index, item)| {
                     let terminal_view = item.downcast::<TerminalView>()?;
                     let terminal = terminal_view.read(cx).terminal().clone();
-                    if terminal.read(cx).working_directory().as_ref() == Some(&working_directory) {
+                    let terminal_read = terminal.read(cx);
+                    if terminal_read.task().is_none()
+                        && terminal_read.working_directory().as_ref() == Some(&working_directory)
+                    {
                         Some((pane.clone(), item_index, terminal.downgrade()))
                     } else {
                         None
@@ -2100,7 +2103,77 @@ mod tests {
                 .read(cx)
                 .terminal()
                 .clone();
+
             assert_eq!(active_terminal.entity_id(), other_terminal.entity_id());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_or_activate_terminal_does_not_reuse_task_terminal(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let working_directory = terminal_test_working_directory("task");
+        let task_terminal = window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.add_terminal_task(
+                        SpawnInTerminal {
+                            cwd: Some(working_directory.clone()),
+                            ..long_running_task()
+                        },
+                        RevealStrategy::Always,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let regular_terminal = window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.open_or_activate_terminal(working_directory.clone(), window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+
+        cx.run_until_parked();
+        terminal_panel.update(cx, |panel, cx| {
+            let terminals = panel
+                .active_pane
+                .read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<TerminalView>())
+                .map(|terminal_view| {
+                    let terminal = terminal_view.read(cx).terminal().clone();
+                    (
+                        terminal.entity_id(),
+                        terminal.read(cx).task().is_some(),
+                        terminal.read(cx).working_directory(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(terminals.len(), 2);
+            assert!(terminals.iter().any(|(id, is_task, cwd)| {
+                *id == task_terminal.entity_id()
+                    && *is_task
+                    && cwd.as_ref() == Some(&working_directory)
+            }));
+            assert!(terminals.iter().any(|(id, is_task, cwd)| {
+                *id == regular_terminal.entity_id()
+                    && !*is_task
+                    && cwd.as_ref() == Some(&working_directory)
+            }));
         });
     }
 
@@ -3032,6 +3105,22 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn long_running_task() -> SpawnInTerminal {
+        let (command, args) = if cfg!(windows) {
+            (
+                "cmd.exe",
+                vec!["/C".to_owned(), "ping -n 30 127.0.0.1 > NUL".to_owned()],
+            )
+        } else {
+            ("sleep", vec!["30".to_owned()])
+        };
+        SpawnInTerminal {
+            command: Some(command.to_owned()),
+            args,
+            ..SpawnInTerminal::default()
+        }
     }
 
     // On Windows `echo` is a shell builtin rather than an executable, so spawning it directly fails.
