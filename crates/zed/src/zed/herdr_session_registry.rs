@@ -532,8 +532,9 @@ pub(crate) struct HerdrSessionRegistry {
     >,
     /// Last window selected for each agent in its current connection generation.
     /// This lightweight route preserves pane-move targeting without Agent Panel
-    /// ownership.
-    agent_window_targets: HashMap<AgentKey, MirrorTarget>,
+    /// ownership. The revision prevents an older async completion from
+    /// replacing a newer targeted event.
+    agent_window_targets: HashMap<AgentKey, (u64, MirrorTarget)>,
     /// Focus echoes are keyed by session and target so workspace and agent
     /// transitions never overwrite one another.
     focus_echoes: HashMap<SessionIdentity, FocusEcho<FocusTarget>>,
@@ -1337,6 +1338,23 @@ impl HerdrSessionRegistry {
         }
     }
 
+    fn remember_agent_window_target(
+        &mut self,
+        key: &AgentKey,
+        revision: u64,
+        target: MirrorTarget,
+    ) {
+        if self
+            .agent_window_targets
+            .get(key)
+            .is_some_and(|(current_revision, _)| *current_revision > revision)
+        {
+            return;
+        }
+        self.agent_window_targets
+            .insert(key.clone(), (revision, target));
+    }
+
     fn workspace_root_lock(
         &mut self,
         window_id: WindowId,
@@ -1371,12 +1389,12 @@ impl HerdrSessionRegistry {
         let target = target
             .filter(|target| self.mirror_target_window(&record.key, *target).is_some());
         if let Some(target) = target {
-            self.agent_window_targets.insert(record.key.clone(), target);
+            self.remember_agent_window_target(&record.key, record.revision, target);
         }
         let target = target.or_else(|| {
             self.agent_window_targets
                 .get(&record.key)
-                .copied()
+                .map(|(_, target)| *target)
                 .filter(|target| target.generation == generation)
         });
         let candidate = record
@@ -1489,8 +1507,9 @@ impl HerdrSessionRegistry {
                 let window = target
                     .and_then(|target| registry.mirror_target_window(&record.key, target))
                     .or_else(|| registry.source_window_for_session(&record.key.session, generation))?;
-                registry.agent_window_targets.insert(
-                    record.key.clone(),
+                registry.remember_agent_window_target(
+                    &record.key,
+                    record.revision,
                     MirrorTarget {
                         window_id: window.window_id(),
                         generation,
@@ -3418,6 +3437,28 @@ mod tests {
             _window_observer: None,
             _window_close_subscription: None,
         }
+    }
+
+    #[test]
+    fn stale_agent_route_completion_cannot_replace_newer_target() {
+        let mut registry = empty_registry();
+        let key = AgentKey::new(session("main"), "agent");
+        let newer = MirrorTarget {
+            window_id: WindowId::from(42),
+            generation: 1,
+        };
+        let stale = MirrorTarget {
+            window_id: WindowId::from(41),
+            generation: 1,
+        };
+
+        registry.remember_agent_window_target(&key, 2, newer);
+        registry.remember_agent_window_target(&key, 1, stale);
+
+        assert_eq!(
+            registry.agent_window_targets.get(&key),
+            Some(&(2, newer))
+        );
     }
 
     #[test]
