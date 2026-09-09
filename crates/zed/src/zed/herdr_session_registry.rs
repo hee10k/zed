@@ -1354,6 +1354,23 @@ impl HerdrSessionRegistry {
         self.agent_window_targets
             .insert(key.clone(), (revision, target));
     }
+    fn select_agent_window_target(
+        &self,
+        key: &AgentKey,
+        generation: u64,
+        revision: u64,
+        requested: Option<MirrorTarget>,
+    ) -> Option<MirrorTarget> {
+        if let Some((route_revision, target)) = self.agent_window_targets.get(key) {
+            if target.generation == generation
+                && (*route_revision > revision || requested.is_none())
+            {
+                return Some(*target);
+            }
+        }
+        requested
+    }
+
 
     fn workspace_root_lock(
         &mut self,
@@ -1386,17 +1403,17 @@ impl HerdrSessionRegistry {
             );
             return;
         };
-        let target = target
+        let requested_target = target
             .filter(|target| self.mirror_target_window(&record.key, *target).is_some());
-        if let Some(target) = target {
+        if let Some(target) = requested_target {
             self.remember_agent_window_target(&record.key, record.revision, target);
         }
-        let target = target.or_else(|| {
-            self.agent_window_targets
-                .get(&record.key)
-                .map(|(_, target)| *target)
-                .filter(|target| target.generation == generation)
-        });
+        let target = self.select_agent_window_target(
+            &record.key,
+            generation,
+            record.revision,
+            requested_target,
+        );
         let candidate = record
             .checkout_path
             .clone()
@@ -1504,6 +1521,12 @@ impl HerdrSessionRegistry {
                 if !registry.connection_matches(&record.key.session, generation) {
                     return None;
                 }
+                let target = registry.select_agent_window_target(
+                    &record.key,
+                    generation,
+                    record.revision,
+                    target,
+                );
                 let window = target
                     .and_then(|target| registry.mirror_target_window(&record.key, target))
                     .or_else(|| registry.source_window_for_session(&record.key.session, generation))?;
