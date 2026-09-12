@@ -1210,7 +1210,7 @@ impl HerdrSessionRegistry {
         let effects = if is_fresh_generation {
             import_snapshot_for_new_generation(&mut self.sync, identity, snapshot)
         } else {
-            import_snapshot_workspace_effects(&mut self.sync, identity, snapshot)
+            Vec::new()
         };
         let routed_keys: HashSet<AgentKey> = effects
             .iter()
@@ -3152,6 +3152,14 @@ async fn run_connection(
                     ))
                 });
                 let Some(outcome) = outcome else {
+                    fail(
+                        registry.clone(),
+                        window_id,
+                        &session_name,
+                        generation,
+                        "herdr shared connection ended before snapshot workspace import".into(),
+                        &mut cx,
+                    );
                     return;
                 };
                 let (final_window, mirror_target_window) = match outcome {
@@ -3337,6 +3345,14 @@ async fn run_connection(
             ))
         });
         let Some(outcome) = outcome else {
+            fail(
+                registry.clone(),
+                window_id,
+                &session_name,
+                generation,
+                "herdr shared connection ended before snapshot workspace import".into(),
+                &mut cx,
+            );
             return;
         };
         let (final_window, mirror_target_window) = match outcome {
@@ -4259,6 +4275,21 @@ mod tests {
         snapshot
             .agents
             .push(test_pane("terminal-1", "pane-1", 1, root));
+        let mut snapshot_workspace = workspace_without_checkout();
+        snapshot_workspace.workspace_id = "workspace-1".to_owned();
+        snapshot_workspace.worktree = Some(herdr::WorkspaceWorktreeInfo {
+            checkout_path: root.to_owned(),
+            repo_root: None,
+            repo_key: None,
+            repo_name: None,
+            is_linked_worktree: false,
+        });
+        snapshot.workspaces.push(snapshot_workspace);
+        let other = if cfg!(windows) {
+            "C:/other-root"
+        } else {
+            "/other-root"
+        };
         registry.update(cx, |registry, cx| {
             registry.dispatch_snapshot_effects(
                 &identity,
@@ -4277,6 +4308,44 @@ mod tests {
                 .contains(&(identity.clone(), 1))
                 && registry.mirroring_in_flight.contains(&(key.clone(), 1))
         }));
+        let mut updated_workspace = workspace_without_checkout();
+        updated_workspace.workspace_id = "workspace-1".to_owned();
+        updated_workspace.worktree = Some(herdr::WorkspaceWorktreeInfo {
+            checkout_path: other.to_owned(),
+            repo_root: None,
+            repo_key: None,
+            repo_name: None,
+            is_linked_worktree: false,
+        });
+        registry.update(cx, |registry, _| {
+            registry
+                .sync
+                .apply_workspace(&identity, &updated_workspace);
+        });
+        assert_eq!(
+            registry.read_with(cx, |registry, _| {
+                registry.sync.workspace_checkout(&identity, "workspace-1")
+            }),
+            Some(PathBuf::from(other))
+        );
+        registry.update(cx, |registry, cx| {
+            registry.dispatch_snapshot_effects(
+                &identity,
+                &snapshot,
+                Some(MirrorTarget {
+                    window_id: owner_id,
+                    generation: 1,
+                }),
+                cx,
+            );
+        });
+        assert_eq!(
+            registry.read_with(cx, |registry, _| {
+                registry.sync.workspace_checkout(&identity, "workspace-1")
+            }),
+            Some(PathBuf::from(other)),
+            "a stale same-generation snapshot must not regress checkout routing"
+        );
         registry.update(cx, |registry, cx| {
             let effects = registry.sync.exit(&identity, "pane-1");
             assert_eq!(effects.len(), 1);
@@ -4307,11 +4376,6 @@ mod tests {
         assert!(registry.read_with(cx, |registry, _| {
             registry.sync.record(&key).is_none()
         }));
-        let other = if cfg!(windows) {
-            "C:/other-root"
-        } else {
-            "/other-root"
-        };
         registry.update(cx, |registry, cx| {
             let effects =
                 registry
