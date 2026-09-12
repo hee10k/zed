@@ -296,12 +296,21 @@ fn import_snapshot(
     identity: &SessionIdentity,
     snapshot: &SessionSnapshot,
 ) -> Vec<AgentSyncEffect> {
+    let mut effects = import_snapshot_workspace_effects(sync, identity, snapshot);
+    for pane in &snapshot.agents {
+        effects.extend(sync.upsert(identity.clone(), pane.clone()));
+    }
+    effects
+}
+
+fn import_snapshot_workspace_effects(
+    sync: &mut AgentSyncState,
+    identity: &SessionIdentity,
+    snapshot: &SessionSnapshot,
+) -> Vec<AgentSyncEffect> {
     let mut effects = Vec::new();
     for workspace in &snapshot.workspaces {
         effects.extend(sync.apply_workspace(identity, workspace));
-    }
-    for pane in &snapshot.agents {
-        effects.extend(sync.upsert(identity.clone(), pane.clone()));
     }
     effects
 }
@@ -1201,7 +1210,7 @@ impl HerdrSessionRegistry {
         let effects = if is_fresh_generation {
             import_snapshot_for_new_generation(&mut self.sync, identity, snapshot)
         } else {
-            import_snapshot(&mut self.sync, identity, snapshot)
+            import_snapshot_workspace_effects(&mut self.sync, identity, snapshot)
         };
         let routed_keys: HashSet<AgentKey> = effects
             .iter()
@@ -2404,6 +2413,35 @@ impl HerdrSessionRegistry {
             .is_some_and(|connection| connection.generation == generation)
     }
 
+    fn has_live_snapshot_finalizer(
+        &self,
+        identity: &SessionIdentity,
+        generation: u64,
+    ) -> bool {
+        let Some(connection) = self.connections.get(identity) else {
+            return false;
+        };
+        if connection.generation != generation {
+            return false;
+        }
+        connection.bound_windows.iter().any(|window_id| {
+            let Some(slot_generation) = self
+                .slot_generations
+                .get(&(identity.clone(), *window_id))
+                .copied()
+            else {
+                return false;
+            };
+            self.finalize_tokens.get(window_id) == Some(&slot_generation)
+                && self.attempts.get(window_id) == Some(&slot_generation)
+                && matches!(
+                    self.windows.get(window_id).map(|binding| &binding.state),
+                    Some(BindingState::Starting { session_name })
+                        if session_name.as_ref() == identity.name.as_ref()
+                )
+        })
+    }
+
     fn clear_in_flight(&mut self, identity: &SessionIdentity, generation: u64) {
         if self.in_flight.get(identity) == Some(&generation) {
             self.in_flight.remove(identity);
@@ -2954,9 +2992,7 @@ async fn wait_for_generation_snapshot_bootstrap(
                 .contains(&(identity.clone(), generation))
             {
                 Some(true)
-            } else if registry.connections.get(&identity).is_some_and(|connection| {
-                connection.generation == generation && !connection.bound_windows.is_empty()
-            }) {
+            } else if registry.has_live_snapshot_finalizer(&identity, generation) {
                 Some(false)
             } else {
                 None
@@ -4240,6 +4276,36 @@ mod tests {
                 .snapshot_bootstrapped
                 .contains(&(identity.clone(), 1))
                 && registry.mirroring_in_flight.contains(&(key.clone(), 1))
+        }));
+        registry.update(cx, |registry, cx| {
+            let effects = registry.sync.exit(&identity, "pane-1");
+            assert_eq!(effects.len(), 1);
+            registry.dispatch_effects(
+                &identity,
+                effects,
+                Some(MirrorTarget {
+                    window_id: owner_id,
+                    generation: 1,
+                }),
+                cx,
+            );
+        });
+        assert!(registry.read_with(cx, |registry, _| {
+            registry.sync.record(&key).is_none()
+        }));
+        registry.update(cx, |registry, cx| {
+            registry.dispatch_snapshot_effects(
+                &identity,
+                &snapshot,
+                Some(MirrorTarget {
+                    window_id: owner_id,
+                    generation: 1,
+                }),
+                cx,
+            );
+        });
+        assert!(registry.read_with(cx, |registry, _| {
+            registry.sync.record(&key).is_none()
         }));
         let other = if cfg!(windows) {
             "C:/other-root"
