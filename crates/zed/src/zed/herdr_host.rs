@@ -9,8 +9,8 @@ use paths::home_dir;
 use task::{RevealStrategy, RevealTarget, Shell, SpawnInTerminal, TaskId};
 use terminal_view::TerminalView;
 use ui::{TintColor, Tooltip, prelude::*};
+use util::ResultExt as _;
 use workspace::{MultiWorkspace, Workspace};
-
 use super::herdr_session_registry::{
     BindingState, HerdrHostSink, HerdrLaunch, HerdrSessionRegistry,
 };
@@ -578,7 +578,7 @@ fn with_active_window(
         return;
     };
     cx.defer(move |cx| {
-        let _ = window.update(cx, action);
+        window.update(cx, action).log_err();
     });
 }
 

@@ -4472,24 +4472,6 @@ mod tests {
 
 
 
-    fn test_agent(
-        identity: &SessionIdentity,
-        terminal_id: &str,
-        pane_id: &str,
-        path: &str,
-    ) -> AgentRecord {
-        AgentRecord {
-            key: AgentKey::new(identity.clone(), terminal_id),
-            workspace_id: Arc::from("workspace-1"),
-            pane_id: Arc::from(pane_id),
-            revision: 1,
-            focused: true,
-            checkout_path: Some(PathBuf::from(path)),
-            effective_cwd: Some(PathBuf::from(path)),
-            agent_name: Arc::from("claude"),
-        }
-    }
-
     fn test_pane(terminal_id: &str, pane_id: &str, revision: u64, path: &str) -> herdr::PaneInfo {
         herdr::PaneInfo {
             workspace_id: "workspace-1".to_owned(),
@@ -4864,13 +4846,6 @@ mod tests {
         fs.insert_tree("/root", serde_json::json!({ "file.txt": "" }))
             .await;
         project::Project::test(fs, [std::path::Path::new("/root")], cx).await
-    }
-
-    async fn test_project_at(cx: &mut TestAppContext, path: &str) -> Entity<project::Project> {
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(path, serde_json::json!({ "file.txt": "" }))
-            .await;
-        project::Project::test(fs, [std::path::Path::new(path)], cx).await
     }
 
     fn roots_in_window(
