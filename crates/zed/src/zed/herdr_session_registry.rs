@@ -1610,10 +1610,12 @@ impl HerdrSessionRegistry {
                             return;
                         }
                     }
-                    if registry
+                    if !registry
                         .sync
                         .record(&key)
-                        .is_some_and(|live| live.revision > revision)
+                        .is_some_and(|live| {
+                            live.revision == revision && !registry.sync.is_dismissed(&key)
+                        })
                     {
                         registry.finish_mirror_flight(
                             &key,
@@ -1625,6 +1627,7 @@ impl HerdrSessionRegistry {
                         );
                         return;
                     }
+
                     registry.report_mirror_failure(&key, revision, message, target, cx);
                     registry.finish_mirror_flight(
                         &key,
@@ -1982,6 +1985,13 @@ impl HerdrSessionRegistry {
         target: Option<MirrorTarget>,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .sync
+            .record(key)
+            .is_some_and(|live| live.revision == revision && !self.sync.is_dismissed(key))
+        {
+            return;
+        }
         if !self.record_mirror_failure(key, revision) {
             return;
         }
@@ -4573,10 +4583,48 @@ mod tests {
             );
         });
         registry.update(cx, |registry, cx| {
+
             registry.finish_mirror_flight(&pending_key, 1, 1, false, None, cx);
         });
         assert!(registry.read_with(cx, |registry, _| {
             registry.mirroring_in_flight.contains(&(pending_key, 1))
+        }));
+    }
+
+    #[gpui::test]
+    fn stale_mirror_failure_after_pane_exit_is_suppressed(cx: &mut TestAppContext) {
+        let gateway = HerdrGateway::fake(
+            || async { Ok(Vec::new()) }.boxed_local(),
+            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+            |_name| async { Ok(()) }.boxed_local(),
+        );
+        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        let identity = session("main");
+        let key = AgentKey::new(identity.clone(), "terminal-1");
+
+        registry.update(cx, |registry, cx| {
+            assert_eq!(
+                registry
+                    .sync
+                    .upsert(
+                        identity.clone(),
+                        test_pane("terminal-1", "pane-1", 1, "C:/root")
+                    )
+                    .len(),
+                1
+            );
+            assert_eq!(registry.sync.exit(&identity, "pane-1").len(), 1);
+            registry.report_mirror_failure(
+                &key,
+                1,
+                "stale failure".into(),
+                None,
+                cx,
+            );
+        });
+
+        assert!(registry.update(cx, |registry, _| {
+            registry.record_mirror_failure(&key, 1)
         }));
     }
 
