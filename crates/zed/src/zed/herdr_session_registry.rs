@@ -1884,7 +1884,7 @@ impl HerdrSessionRegistry {
                     .record(key)
                     .is_some_and(|record| record.revision > pending_revision)
                 {
-                    self.requeue_latest_mirror_record(key, generation, revision, false, cx);
+                    self.requeue_latest_mirror_record(key, revision, false, cx);
                 } else if !pending_target_is_explicit
                     && pending_target.is_some_and(|target| {
                         self.mirror_target_window(key, target).is_none()
@@ -1894,7 +1894,6 @@ impl HerdrSessionRegistry {
                     self.forget_agent_window_target_if_matches(key, stale_target);
                     self.requeue_latest_mirror_record(
                         key,
-                        generation,
                         pending_revision,
                         true,
                         cx,
@@ -1908,16 +1907,15 @@ impl HerdrSessionRegistry {
         {
             let stale_target = target.expect("checked above");
             self.forget_agent_window_target_if_matches(key, stale_target);
-            self.requeue_latest_mirror_record(key, generation, revision, true, cx);
+            self.requeue_latest_mirror_record(key, revision, true, cx);
             return;
         }
-        self.requeue_latest_mirror_record(key, generation, revision, false, cx);
+        self.requeue_latest_mirror_record(key, revision, false, cx);
     }
 
     fn requeue_latest_mirror_record(
         &mut self,
         key: &AgentKey,
-        generation: u64,
         revision: u64,
         allow_equal: bool,
         cx: &mut Context<Self>,
@@ -2939,6 +2937,40 @@ macro_rules! await_before_deadline {
     }};
 }
 
+/// A timed-out owner must not drain its buffered stream frames until another
+/// bound window has claimed the generation's snapshot bootstrap. Otherwise an
+/// older survivor snapshot can reconcile against post-snapshot events in the
+/// wrong order.
+async fn wait_for_generation_snapshot_bootstrap(
+    registry: Entity<HerdrSessionRegistry>,
+    identity: SessionIdentity,
+    generation: u64,
+    cx: &mut AsyncApp,
+) -> bool {
+    loop {
+        match registry.read_with(cx, |registry, _| {
+            if registry
+                .snapshot_bootstrapped
+                .contains(&(identity.clone(), generation))
+            {
+                Some(true)
+            } else if registry.connections.get(&identity).is_some_and(|connection| {
+                connection.generation == generation && !connection.bound_windows.is_empty()
+            }) {
+                Some(false)
+            } else {
+                None
+            }
+        }) {
+            Some(true) => return true,
+            Some(false) => {
+                cx.background_executor().timer(ATTEMPT_INTERVAL).await;
+            }
+            None => return false,
+        }
+    }
+}
+
 async fn run_connection(
     registry: Entity<HerdrSessionRegistry>,
     gateway: HerdrGateway,
@@ -3509,19 +3541,41 @@ async fn run_connection(
         }
     };
     if import_effects {
-        let _ = registry.update(&mut cx, |registry, cx| {
-            if !registry.connection_matches(&identity, generation)
-                || !registry.snapshot_import_is_current(
-                    window_id,
-                    &identity,
-                    &session_name,
-                    generation,
-                )
-            {
-                return;
-            }
-            registry.dispatch_snapshot_effects(&identity, &snapshot, mirror_target_window, cx);
+        let connection_survives = registry.read_with(&mut cx, |registry, _| {
+            registry.connections.get(&identity).is_some_and(|connection| {
+                connection.generation == generation && !connection.bound_windows.is_empty()
+            })
         });
+        if connection_survives {
+            let _ = registry.update(&mut cx, |registry, cx| {
+                if !registry.connection_matches(&identity, generation)
+                    || !registry.snapshot_import_is_current(
+                        window_id,
+                        &identity,
+                        &session_name,
+                        generation,
+                    )
+                {
+                    return;
+                }
+                registry.dispatch_snapshot_effects(
+                    &identity,
+                    &snapshot,
+                    mirror_target_window,
+                    cx,
+                );
+            });
+        }
+    }
+    if !wait_for_generation_snapshot_bootstrap(
+        registry.clone(),
+        identity.clone(),
+        generation,
+        &mut cx,
+    )
+    .await
+    {
+        return;
     }
     for event in buffered {
         process_stream_event(&registry, &identity, generation, event, &mut cx).await;
@@ -4185,8 +4239,59 @@ mod tests {
             registry
                 .snapshot_bootstrapped
                 .contains(&(identity.clone(), 1))
-                && registry.mirroring_in_flight.contains(&(key, 1))
+                && registry.mirroring_in_flight.contains(&(key.clone(), 1))
         }));
+        let other = if cfg!(windows) {
+            "C:/other-root"
+        } else {
+            "/other-root"
+        };
+        registry.update(cx, |registry, cx| {
+            let effects =
+                registry
+                    .sync
+                    .upsert(identity.clone(), test_pane("terminal-1", "pane-1", 2, other));
+            assert_eq!(effects.len(), 1);
+            registry.dispatch_effects(
+                &identity,
+                effects,
+                Some(MirrorTarget {
+                    window_id: owner_id,
+                    generation: 1,
+                }),
+                cx,
+            );
+        });
+        assert_eq!(
+            registry.read_with(cx, |registry, _| {
+                registry
+                    .pending_mirror_replay
+                    .get(&(key.clone(), 1))
+                    .map(|(record, _, _)| record.revision)
+            }),
+            Some(2)
+        );
+        registry.update(cx, |registry, cx| {
+            registry.dispatch_snapshot_effects(
+                &identity,
+                &snapshot,
+                Some(MirrorTarget {
+                    window_id: owner_id,
+                    generation: 1,
+                }),
+                cx,
+            );
+        });
+        assert_eq!(
+            registry.read_with(cx, |registry, _| {
+                registry
+                    .pending_mirror_replay
+                    .get(&(key.clone(), 1))
+                    .map(|(record, _, _)| record.revision)
+            }),
+            Some(2),
+            "a later stale snapshot must not reorder buffered events"
+        );
     }
 
 
