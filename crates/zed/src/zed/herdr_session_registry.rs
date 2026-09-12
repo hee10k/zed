@@ -187,10 +187,6 @@ impl SessionSelection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SelectionTarget {
-    InvokingWindow,
-}
 
 struct WindowBinding {
     window: WindowHandle<MultiWorkspace>,
@@ -251,9 +247,6 @@ fn transition(current: BindingState, event: BindingEvent) -> BindingState {
     }
 }
 
-fn selection_target(_state: &BindingState) -> SelectionTarget {
-    SelectionTarget::InvokingWindow
-}
 
 
 /// Workspace work the reducer asked for. `Forget` releases synchronization
@@ -383,7 +376,6 @@ pub(crate) trait HerdrSessionHandle {
     fn subscribe(&self) -> LocalBoxFuture<'static, anyhow::Result<Box<dyn HerdrEventStream>>>;
     fn snapshot(&self) -> LocalBoxFuture<'static, anyhow::Result<SessionSnapshot>>;
     fn pane(&self, pane_id: String) -> LocalBoxFuture<'static, anyhow::Result<herdr::PaneInfo>>;
-    fn focus_agent(&self, pane_id: String) -> LocalBoxFuture<'static, anyhow::Result<()>>;
     fn focus_workspace(&self, workspace_id: String) -> LocalBoxFuture<'static, anyhow::Result<()>>;
 }
 
@@ -488,11 +480,6 @@ impl HerdrSessionHandle for RealHerdrHandle {
     fn pane(&self, pane_id: String) -> LocalBoxFuture<'static, anyhow::Result<herdr::PaneInfo>> {
         let client = self.client.clone();
         async move { Ok(client.pane(pane_id).await?) }.boxed_local()
-    }
-
-    fn focus_agent(&self, pane_id: String) -> LocalBoxFuture<'static, anyhow::Result<()>> {
-        let client = self.client.clone();
-        async move { Ok(client.focus_agent(pane_id).await?) }.boxed_local()
     }
 
     fn focus_workspace(&self, workspace_id: String) -> LocalBoxFuture<'static, anyhow::Result<()>> {
@@ -684,7 +671,7 @@ impl HerdrSessionRegistry {
         handle: WindowHandle<MultiWorkspace>,
         cx: &mut Context<Self>,
     ) {
-        let window_id = self.register_window(handle);
+        let _window_id = self.register_window(handle);
         // Read the new window's roots once construction finishes. The
         // entity is still being built while this observer runs, so reading
         // it here would panic; the spawned update lands after the flush.
@@ -1613,9 +1600,7 @@ impl HerdrSessionRegistry {
                     if !registry
                         .sync
                         .record(&key)
-                        .is_some_and(|live| {
-                            live.revision == revision && !registry.sync.is_dismissed(&key)
-                        })
+                        .is_some_and(|live| live.revision == revision)
                     {
                         registry.finish_mirror_flight(
                             &key,
@@ -1738,9 +1723,10 @@ impl HerdrSessionRegistry {
                     && registry
                         .mirror_target_window(&record.key, target_window)
                         .is_some()
-                    && registry.sync.record(&record.key).is_some_and(|live| {
-                        live.revision == record.revision && !registry.sync.is_dismissed(&record.key)
-                    })
+                    && registry
+                        .sync
+                        .record(&record.key)
+                        .is_some_and(|live| live.revision == record.revision)
             });
             if !owned {
                 done(&registry, &mut cx, Some(target_window));
@@ -1774,9 +1760,10 @@ impl HerdrSessionRegistry {
                     && registry
                         .mirror_target_window(&record.key, target_window)
                         .is_some()
-                    && registry.sync.record(&record.key).is_some_and(|live| {
-                        live.revision == record.revision && !registry.sync.is_dismissed(&record.key)
-                    })
+                    && registry
+                        .sync
+                        .record(&record.key)
+                        .is_some_and(|live| live.revision == record.revision)
             });
             if !owned {
                 done(&registry, &mut cx, Some(target_window));
@@ -1798,9 +1785,10 @@ impl HerdrSessionRegistry {
                     && registry
                         .mirror_target_window(&record.key, target_window)
                         .is_some()
-                    && registry.sync.record(&record.key).is_some_and(|live| {
-                        live.revision == record.revision && !registry.sync.is_dismissed(&record.key)
-                    })
+                    && registry
+                        .sync
+                        .record(&record.key)
+                        .is_some_and(|live| live.revision == record.revision)
             });
             if !live {
                 done(&registry, &mut cx, Some(target_window));
@@ -1832,9 +1820,10 @@ impl HerdrSessionRegistry {
                     && registry
                         .mirror_target_window(&record.key, target_window)
                         .is_some()
-                    && registry.sync.record(&record.key).is_some_and(|live| {
-                        live.revision == record.revision && !registry.sync.is_dismissed(&record.key)
-                    })
+                    && registry
+                        .sync
+                        .record(&record.key)
+                        .is_some_and(|live| live.revision == record.revision)
             });
             if !live {
                 done(&registry, &mut cx, Some(target_window));
@@ -1873,7 +1862,7 @@ impl HerdrSessionRegistry {
     ) {
         let flight_key = (key.clone(), generation);
         self.mirroring_in_flight.remove(&flight_key);
-        if self.sync.record(key).is_none() || self.sync.is_dismissed(key) {
+        if self.sync.record(key).is_none() {
             self.agent_window_targets.remove(key);
             self.pending_mirror_replay.remove(&flight_key);
             return;
@@ -1933,8 +1922,7 @@ impl HerdrSessionRegistry {
         cx: &mut Context<Self>,
     ) {
         let Some(record) = self.sync.record(key).filter(|record| {
-            (allow_equal && record.revision >= revision || record.revision > revision)
-                && !self.sync.is_dismissed(key)
+            allow_equal && record.revision >= revision || record.revision > revision
         }) else {
             return;
         };
@@ -1988,7 +1976,7 @@ impl HerdrSessionRegistry {
         if !self
             .sync
             .record(key)
-            .is_some_and(|live| live.revision == revision && !self.sync.is_dismissed(key))
+            .is_some_and(|live| live.revision == revision)
         {
             return;
         }
@@ -2180,6 +2168,7 @@ impl HerdrSessionRegistry {
         cx.notify();
     }
 
+    #[cfg(test)]
     fn attach_connection_window(
         &mut self,
         identity: &SessionIdentity,
@@ -2608,6 +2597,7 @@ impl HerdrSessionRegistry {
         self.start_binding_for_window(window_id, session_name, cx);
     }
 
+    #[cfg(test)]
     pub(crate) fn finalize_binding_for_test(
         &mut self,
         bootstrap: WindowId,
@@ -2857,26 +2847,6 @@ fn report_workspace_import_failure(
             "could not report herdr workspace import failure for {}: {update_error:#}",
             root.as_str()
         );
-    }
-}
-
-async fn import_snapshot_workspaces(
-    window: WindowHandle<MultiWorkspace>,
-    roots: Vec<herdr::CanonicalPath>,
-    cx: &mut AsyncApp,
-) -> anyhow::Result<()> {
-    let mut first_error = None;
-    for root in roots {
-        if let Err(error) = add_workspace_root(window, root.clone(), cx).await {
-            report_workspace_import_failure(window, &root, &error, cx);
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
-        }
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
     }
 }
 
@@ -3979,28 +3949,6 @@ mod tests {
         assert!(matches!(state, BindingState::Failed { .. }));
     }
 
-    #[test]
-    fn every_binding_state_selects_the_invoking_window() {
-        let states = [
-            BindingState::Unselected,
-            BindingState::Starting {
-                session_name: Arc::from("main"),
-            },
-            BindingState::Connected(session("main")),
-            BindingState::Failed {
-                session_name: Arc::from("main"),
-                message: "failed".into(),
-            },
-        ];
-
-        for state in states {
-            assert_eq!(
-                selection_target(&state),
-                SelectionTarget::InvokingWindow
-            );
-        }
-    }
-
 
 
     struct FakeHandle;
@@ -4021,10 +3969,6 @@ mod tests {
             _pane_id: String,
         ) -> LocalBoxFuture<'static, anyhow::Result<herdr::PaneInfo>> {
             async { Err::<herdr::PaneInfo, _>(anyhow::anyhow!("unused fake pane")) }.boxed_local()
-        }
-
-        fn focus_agent(&self, _pane_id: String) -> LocalBoxFuture<'static, anyhow::Result<()>> {
-            async { Ok(()) }.boxed_local()
         }
 
         fn focus_workspace(
@@ -4093,10 +4037,6 @@ mod tests {
             _pane_id: String,
         ) -> LocalBoxFuture<'static, anyhow::Result<herdr::PaneInfo>> {
             async { Err::<herdr::PaneInfo, _>(anyhow::anyhow!("unused fake pane")) }.boxed_local()
-        }
-
-        fn focus_agent(&self, _pane_id: String) -> LocalBoxFuture<'static, anyhow::Result<()>> {
-            async { Ok(()) }.boxed_local()
         }
 
         fn focus_workspace(

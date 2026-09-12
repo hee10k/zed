@@ -3,7 +3,6 @@ use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_ui::{ExternalTerminalThread, TerminalId};
 use herdr::{PaneInfo, SessionInfo, WorkspaceInfo};
 
 /// Stable identity of one herdr CLI session. The CLI session directory, not
@@ -55,87 +54,6 @@ pub(crate) struct AgentRecord {
     pub(crate) agent_name: Arc<str>,
 }
 
-/// Build structured launch parameters for a host integration that explicitly
-/// requests an agent attach. Herdr event handling does not invoke this helper;
-/// regular Zed terminals are opened directly by the session registry.
-pub(crate) fn external_terminal_spec(
-    record: &AgentRecord,
-    herdr_program: &Path,
-) -> ExternalTerminalThread {
-    ExternalTerminalThread {
-        identity: format!(
-            "herdr:{}:{}",
-            record.key.session.session_dir.display(),
-            record.key.terminal_id
-        )
-        .into(),
-        executable: herdr_program.to_string_lossy().into_owned(),
-        args: vec![
-            "--session".into(),
-            record.key.session.name.to_string(),
-            "agent".into(),
-            "attach".into(),
-            record.pane_id.to_string(),
-        ],
-        title: format!("herdr · {}", record.agent_name).into(),
-        working_directory: record
-            .checkout_path
-            .clone()
-            .or_else(|| record.effective_cwd.clone())
-            .unwrap_or_default(),
-    }
-}
-
-/// Pure index of live herdr agent keys and consumer terminal ids.
-///
-/// The registry owns any window/panel handles around this index. Keeping the
-/// identity-to-terminal mapping pure makes synchronization reconciliation
-/// deterministic and keeps it independently testable.
-pub(crate) struct MirrorIndex<T = TerminalId> {
-    entries: HashMap<AgentKey, T>,
-}
-
-impl<T> Default for MirrorIndex<T> {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::default(),
-        }
-    }
-}
-
-impl<T: Copy> MirrorIndex<T> {
-    pub(crate) fn insert(&mut self, key: AgentKey, terminal_id: T) {
-        self.entries.insert(key, terminal_id);
-    }
-
-    pub(crate) fn remove(&mut self, key: &AgentKey) -> Option<T> {
-        self.entries.remove(key)
-    }
-    /// Test-only inspection of the identity-to-terminal mapping.
-    #[cfg(test)]
-    pub(crate) fn get(&self, key: &AgentKey) -> Option<T> {
-        self.entries.get(key).copied()
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&AgentKey, T)> {
-        self.entries
-            .iter()
-            .map(|(key, terminal_id)| (key, *terminal_id))
-    }
-
-    /// Keys whose consumer terminal is no longer present. Test-only
-    /// reconciliation helper: a production consumer scopes detection to its
-    /// own terminal collection.
-    #[cfg(test)]
-    pub(crate) fn missing(&self, mut terminal_present: impl FnMut(T) -> bool) -> Vec<AgentKey> {
-        self.entries
-            .iter()
-            .filter_map(|(key, terminal_id)| {
-                (!terminal_present(*terminal_id)).then_some(key.clone())
-            })
-            .collect()
-    }
-}
 /// Effects the driver applies after each reduction, in emitted order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentSyncEffect {
@@ -153,7 +71,6 @@ pub(crate) enum FocusTarget {
         session: SessionIdentity,
         workspace_id: Arc<str>,
     },
-    Agent(AgentKey),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,9 +82,9 @@ pub(crate) enum FocusObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FocusToken(u64);
 
-/// One pending focus transition per target so concurrent workspace and agent
-/// requests never overwrite each other. The saturating global generation makes
-/// every token unique, so a completion carrying a superseded token is rejected.
+/// One pending focus transition per target so concurrent workspace requests
+/// never overwrite each other. The saturating global generation makes every
+/// token unique, so a completion carrying a superseded token is rejected.
 pub(crate) struct FocusEcho<T> {
     generation: u64,
     pending: HashMap<T, FocusToken>,
@@ -233,9 +150,6 @@ pub(crate) struct AgentSyncState {
     /// Maps (session identity, current pane id) to the owning agent key so
     /// exit events, which carry no terminal id, resolve to their agent.
     pane_lookup: HashMap<(SessionIdentity, Arc<str>), AgentKey>,
-    /// Agents whose synchronized terminal was closed locally; reopening is
-    /// suppressed until resync or pane exit.
-    dismissed: HashSet<AgentKey>,
     /// Last failed terminal-open revision per agent.
     failed_revision: HashMap<AgentKey, u64>,
 }
@@ -258,8 +172,7 @@ impl AgentSyncState {
     /// Applies the latest pane snapshot for one agent, in revision order.
     ///
     /// Guard rules, in order: panes without an agent or with an empty terminal
-    /// id are ignored; revisions at or below the stored revision are ignored;
-    /// dismissed agents record the snapshot without emitting any effect.
+    /// id are ignored; revisions at or below the stored revision are ignored.
     /// Otherwise a new key opens, a pane move emits `PaneMoved` (or one
     /// retrying `Open` when the previous open failed), and a false-to-true
     /// focus transition emits `Focus`.
@@ -315,11 +228,6 @@ impl AgentSyncState {
         self.pane_lookup
             .insert((session.clone(), record.pane_id.clone()), key.clone());
 
-        if self.dismissed.contains(&key) {
-            self.records.insert(key, record);
-            return Vec::new();
-        }
-
         let mut effects = Vec::new();
         if let Some((old_pane_id, was_focused, old_path)) = previous {
             let pane_moved = old_pane_id != record.pane_id;
@@ -354,7 +262,7 @@ impl AgentSyncState {
 
     /// A herdr pane exited. The pane id resolves to its agent through the
     /// lookup, forgetting the agent even though exit events carry no terminal
-    /// id, and clears its dismissal permanently.
+    /// id.
     pub(crate) fn exit(
         &mut self,
         session: &SessionIdentity,
@@ -380,18 +288,6 @@ impl AgentSyncState {
         keys.into_iter().map(|key| self.forget_one(&key)).collect()
     }
 
-    /// Used when the synchronized terminal is closed locally: the herdr agent
-    /// keeps running; we just stop reopening its Zed terminal.
-    pub(crate) fn dismiss(&mut self, key: AgentKey) {
-        self.dismissed.insert(key);
-    }
-
-    /// Whether the synchronized terminal for this agent was closed by the user;
-    /// reopening is suppressed until resync or pane exit.
-    pub(crate) fn is_dismissed(&self, key: &AgentKey) -> bool {
-        self.dismissed.contains(key)
-    }
-
     /// Records a failed terminal open. Returns `true` only for the first
     /// failure at this revision so the driver emits exactly one actionable
     /// notification; a later revision or resync permits one new attempt.
@@ -409,10 +305,9 @@ impl AgentSyncState {
         self.failed_revision.remove(key);
     }
 
-    /// Explicit resync: lift dismissal and failed-revision suppression for the
-    /// session and replay an `Open` for every live record.
+    /// Explicit resync: lift failed-revision suppression for the session and
+    /// replay an `Open` for every live record.
     pub(crate) fn resync(&mut self, session: &SessionIdentity) -> Vec<AgentSyncEffect> {
-        self.dismissed.retain(|key| &key.session != session);
         self.failed_revision
             .retain(|key, _| &key.session != session);
         self.records
@@ -425,23 +320,21 @@ impl AgentSyncState {
     pub(crate) fn record(&self, key: &AgentKey) -> Option<AgentRecord> {
         self.records.get(key).cloned()
     }
-    /// Returns non-dismissed live records for a fresh connection generation.
-    /// Unlike `resync`, this preserves failure/dismissal state and only
-    /// supplies the connection bootstrap with records that need routing.
+    /// Returns live records for a fresh connection generation. Unlike
+    /// `resync`, this preserves failure state and only supplies the
+    /// connection bootstrap with records that need routing.
     pub(crate) fn live_records(&self, session: &SessionIdentity) -> Vec<AgentRecord> {
         self.records
             .values()
-            .filter(|record| {
-                &record.key.session == session && !self.dismissed.contains(&record.key)
-            })
+            .filter(|record| &record.key.session == session)
             .cloned()
             .collect()
     }
 
     /// Drops records for agents absent from a fresh connection snapshot.
     /// This reconciles events missed while the previous stream was down while
-    /// leaving records present in the snapshot (and their dismissal state)
-    /// available for generation replay.
+    /// leaving records present in the snapshot available for generation
+    /// replay.
     pub(crate) fn reconcile_snapshot(
         &mut self,
         session: &SessionIdentity,
@@ -500,15 +393,14 @@ impl AgentSyncState {
                 (candidate == wanted).then(|| workspace_id.clone())
             })
     }
-    /// Removes every trace of `key` (record, pane lookup, dismissal, failed
-    /// revision) and returns its `Forget` effect. `Forget` only drops
+    /// Removes every trace of `key` (record, pane lookup, failed revision)
+    /// and returns its `Forget` effect. `Forget` only drops
     /// synchronization ownership; it never closes the Zed terminal.
     fn forget_one(&mut self, key: &AgentKey) -> AgentSyncEffect {
         if let Some(record) = self.records.remove(key) {
             self.pane_lookup
                 .remove(&(record.key.session.clone(), record.pane_id.clone()));
         }
-        self.dismissed.remove(key);
         self.failed_revision.remove(key);
         AgentSyncEffect::Forget(key.clone())
     }
@@ -540,49 +432,6 @@ mod tests {
             foreground_cwd: None,
             agent_session: None,
         }
-    }
-
-    fn test_session() -> SessionIdentity {
-        SessionIdentity {
-            name: Arc::from("main"),
-            session_dir: Arc::from(PathBuf::from(r"C:\sessions\main")),
-        }
-    }
-
-    fn agent_record(terminal_id: &str, pane_id: &str, worktree: &str) -> AgentRecord {
-        AgentRecord {
-            key: AgentKey::new(test_session(), terminal_id),
-            workspace_id: Arc::from("workspace-1"),
-            pane_id: Arc::from(pane_id),
-            revision: 4,
-            focused: true,
-            checkout_path: Some(PathBuf::from(worktree)),
-            effective_cwd: Some(PathBuf::from(worktree)),
-            agent_name: Arc::from("claude"),
-        }
-    }
-
-    #[test]
-    fn attach_spec_uses_latest_pane_and_structured_args() {
-        let record = agent_record("terminal-1", "pane-new", r"C:\repo\worktree");
-        let spec = external_terminal_spec(&record, Path::new("herdr.exe"));
-
-        assert_eq!(spec.executable, "herdr.exe");
-        assert_eq!(
-            spec.args,
-            vec!["--session", "main", "agent", "attach", "pane-new"]
-        );
-        assert_eq!(spec.working_directory, PathBuf::from(r"C:\repo\worktree"));
-    }
-
-    #[test]
-    fn missing_panel_terminal_returns_the_live_agent_key() {
-        let key = AgentKey::new(test_session(), "terminal-1");
-        let terminal_id = 7_u64;
-        let mut mirrors: MirrorIndex<u64> = MirrorIndex::default();
-        mirrors.insert(key.clone(), terminal_id);
-        assert_eq!(mirrors.missing(|_| false), vec![key]);
-        assert!(mirrors.missing(|id| id == terminal_id).is_empty());
     }
 
     #[test]
@@ -669,19 +518,6 @@ mod tests {
     }
 
     #[test]
-    fn dismissed_terminal_stays_closed_until_resync() {
-        let mut state = AgentSyncState::default();
-        let key = AgentKey::new(session("main"), "terminal-1");
-        state.dismiss(key.clone());
-        assert!(
-            state
-                .upsert(session("main"), pane("terminal-1", "pane-a", 3))
-                .is_empty()
-        );
-        assert_eq!(state.resync(&session("main")).len(), 1);
-    }
-
-    #[test]
     fn stopped_session_forgets_every_agent() {
         let mut state = AgentSyncState::default();
         let identity = session("main");
@@ -722,12 +558,11 @@ mod tests {
     }
 
     #[test]
-    fn pane_exit_forgets_and_clears_dismissal() {
+    fn pane_exit_forgets_agent() {
         let mut state = AgentSyncState::default();
         let identity = session("main");
         let key = AgentKey::new(identity.clone(), "terminal-1");
         state.upsert(identity.clone(), pane("terminal-1", "pane-a", 1));
-        state.dismiss(key.clone());
 
         let effects = state.exit(&identity, "pane-a");
         assert!(matches!(
@@ -736,7 +571,7 @@ mod tests {
         ));
         assert_eq!(state.records.len(), 0);
 
-        // Pane exit clears dismissal permanently, so a later update reopens.
+        // A later update for the same terminal opens fresh.
         assert!(matches!(
             state
                 .upsert(identity.clone(), pane("terminal-1", "pane-b", 2))
@@ -859,15 +694,18 @@ mod tests {
             session: session("session-a"),
             workspace_id: Arc::from("space-1"),
         };
-        let agent = FocusTarget::Agent(AgentKey::new(session("session-a"), "terminal-1"));
+        let other = FocusTarget::Workspace {
+            session: session("session-a"),
+            workspace_id: Arc::from("space-4"),
+        };
 
         let workspace_token = focus.request(workspace.clone());
-        let _agent_token = focus.request(agent.clone());
+        let _other_token = focus.request(other.clone());
 
         // Each pending transition acknowledges its own target and never a peer.
         assert_eq!(focus.observe(workspace), FocusObservation::Echo);
-        assert!(focus.is_current(workspace_token) == false);
-        assert_eq!(focus.observe(agent), FocusObservation::Echo);
+        assert!(!focus.is_current(workspace_token));
+        assert_eq!(focus.observe(other), FocusObservation::Echo);
 
         // Requesting the same target again supersedes the earlier token, so a
         // stale completion carrying the old token is rejected by the
