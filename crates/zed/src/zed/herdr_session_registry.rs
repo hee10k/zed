@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::herdr_agent_sync::{
     AgentKey, AgentRecord, AgentSyncEffect, AgentSyncState, FocusEcho, FocusObservation,
@@ -219,6 +219,17 @@ struct MirrorTarget {
     generation: u64,
 }
 
+/// Everything a regular-terminal open attempt must still hold true for its
+/// mutations to be visible: the connection generation, the target window's
+/// bound membership, and the exact live record revision.
+#[derive(Clone)]
+struct TerminalRoute {
+    key: AgentKey,
+    generation: u64,
+    revision: u64,
+    target: MirrorTarget,
+}
+
 enum FinalizeResult {
     Ready {
         window_id: WindowId,
@@ -309,7 +320,9 @@ fn import_snapshot_workspace_effects(
 }
 
 /// Imports a snapshot after reconciling agents that disappeared while the
-/// previous connection generation was unavailable.
+/// previous connection generation was unavailable. Retained records dedupe by
+/// revision, so their checkout derivation is refreshed from the new
+/// workspace map before anything replays them.
 fn import_snapshot_for_new_generation(
     sync: &mut AgentSyncState,
     identity: &SessionIdentity,
@@ -317,6 +330,7 @@ fn import_snapshot_for_new_generation(
 ) -> Vec<AgentSyncEffect> {
     let mut effects = sync.reconcile_snapshot(identity, &snapshot.agents);
     effects.extend(import_snapshot(sync, identity, snapshot));
+    sync.refresh_record_paths(identity);
     effects
 }
 
@@ -529,8 +543,10 @@ pub(crate) struct HerdrSessionRegistry {
     finalize_tokens: HashMap<u64, u64>,
     /// Abort handles for snapshot imports currently finalizing each target.
     snapshot_import_abort_handles: HashMap<u64, AbortHandle>,
-    /// Per-window/root gates serialize unmatched workspace additions. Entries
-    /// are intentionally retained so a waiter can never race a removed lock.
+    /// Per-window/root gates serialize unmatched workspace additions. A
+    /// waiter keeps its own `Arc` clone, so pruning on window release can
+    /// never dangle; two waiters racing a pruned entry at worst both add,
+    /// which the double-check under the lock reduces.
     workspace_root_locks: HashMap<(u64, herdr::CanonicalPath), Arc<Mutex<()>>>,
     sync: AgentSyncState,
     /// Agents whose regular terminal open is still in flight, scoped to the
@@ -1102,6 +1118,8 @@ impl HerdrSessionRegistry {
             .remove(&(identity.clone(), window_id.as_u64()));
         self.agent_window_targets
             .retain(|_, (_, target)| target.window_id != window_id);
+        self.workspace_root_locks
+            .retain(|(lock_window, _), _| *lock_window != window_id.as_u64());
         let connection_generation = self
             .connections
             .get(identity)
@@ -1468,6 +1486,17 @@ impl HerdrSessionRegistry {
             .clone()
     }
 
+    /// The single liveness predicate shared by every checkpoint of a
+    /// terminal-open attempt, including the panel's `should_open` gate.
+    fn route_is_live(&self, route: &TerminalRoute) -> bool {
+        self.connection_matches(&route.key.session, route.generation)
+            && self.mirror_target_window(&route.key, route.target).is_some()
+            && self
+                .sync
+                .record(&route.key)
+                .is_some_and(|live| live.revision == route.revision)
+    }
+
     /// Open (or re-activate) the regular shell for one live Herdr agent. The
     /// captured connection generation invalidates the whole attempt once its
     /// session connection is superseded or released.
@@ -1664,7 +1693,7 @@ impl HerdrSessionRegistry {
                 );
                 return;
             };
-            let Some((window, root_lock)) = registry.update(cx, |registry, cx| {
+            let Some(window) = registry.update(cx, |registry, _cx| {
                 if !registry.connection_matches(&record.key.session, generation) {
                     return None;
                 }
@@ -1695,14 +1724,12 @@ impl HerdrSessionRegistry {
                         registry.source_window_for_session(&record.key.session, generation)?
                     }
                 };
-                let root_lock = registry.workspace_root_lock(window.window_id(), &root);
                 #[cfg(test)]
                 if let Some(sink) = &registry.mirror_target_sink {
                     sink.borrow_mut()
                         .push((record.key.clone(), window.window_id()));
                 }
-                let _ = cx;
-                Some((window, root_lock))
+                Some(window)
             }) else {
                 fail(
                     &registry,
@@ -1713,21 +1740,17 @@ impl HerdrSessionRegistry {
                 return;
             };
 
-            let _root_lock = root_lock.lock().await;
             let target_window = MirrorTarget {
                 window_id: window.window_id(),
                 generation,
             };
-            let owned = registry.read_with(cx, |registry, _| {
-                registry.connection_matches(&record.key.session, generation)
-                    && registry
-                        .mirror_target_window(&record.key, target_window)
-                        .is_some()
-                    && registry
-                        .sync
-                        .record(&record.key)
-                        .is_some_and(|live| live.revision == record.revision)
-            });
+            let route = TerminalRoute {
+                key: record.key.clone(),
+                generation,
+                revision: record.revision,
+                target: target_window,
+            };
+            let owned = registry.read_with(cx, |registry, _| registry.route_is_live(&route));
             if !owned {
                 done(&registry, &mut cx, Some(target_window));
                 return;
@@ -1739,7 +1762,14 @@ impl HerdrSessionRegistry {
                     target_window,
                 );
             });
-            let workspace = match activate_or_add_agent_workspace(window, root.clone(), &mut cx).await
+            let workspace = match prepare_agent_workspace(
+                registry.clone(),
+                window,
+                root.clone(),
+                route.clone(),
+                &mut cx,
+            )
+            .await
             {
                 Ok(workspace) => workspace,
                 Err(error) => {
@@ -1755,16 +1785,7 @@ impl HerdrSessionRegistry {
                     return;
                 }
             };
-            let owned = registry.read_with(cx, |registry, _| {
-                registry.connection_matches(&record.key.session, generation)
-                    && registry
-                        .mirror_target_window(&record.key, target_window)
-                        .is_some()
-                    && registry
-                        .sync
-                        .record(&record.key)
-                        .is_some_and(|live| live.revision == record.revision)
-            });
+            let owned = registry.read_with(cx, |registry, _| registry.route_is_live(&route));
             if !owned {
                 done(&registry, &mut cx, Some(target_window));
                 return;
@@ -1780,51 +1801,54 @@ impl HerdrSessionRegistry {
                 );
                 return;
             }
-            let live = registry.read_with(cx, |registry, _| {
-                registry.connection_matches(&record.key.session, generation)
-                    && registry
-                        .mirror_target_window(&record.key, target_window)
-                        .is_some()
-                    && registry
-                        .sync
-                        .record(&record.key)
-                        .is_some_and(|live| live.revision == record.revision)
-            });
+            let live = registry.read_with(cx, |registry, _| registry.route_is_live(&route));
             if !live {
                 done(&registry, &mut cx, Some(target_window));
                 return;
             }
+            // The only visible mutation for this attempt: activation, panel
+            // reveal, and the guarded terminal open all happen in one
+            // synchronous window update, after re-checking that the route is
+            // still live. A superseded attempt leaves the window untouched.
             let opened = window.update(cx, |multi_workspace, window, cx| {
+                let should_open = {
+                    let registry = registry.clone();
+                    let route = route.clone();
+                    move |app: &App| {
+                        registry
+                            .read_with(app, |registry, _| registry.route_is_live(&route))
+                    }
+                };
                 multi_workspace.activate(workspace.clone(), None, window, cx);
-                workspace.update(cx, |workspace, cx| {
+                // The panel's reuse path re-enters the workspace entity for
+                // its modal-focus rule, so the reveal and the guarded open
+                // must be sequential updates, not nested.
+                let panel = workspace.update(cx, |workspace, cx| {
                     let panel = workspace
                         .panel::<TerminalPanel>(cx)
                         .ok_or_else(|| anyhow::anyhow!("terminal panel is unavailable"))?;
-                    workspace.focus_panel::<TerminalPanel>(window, cx);
-                    Ok(panel.update(cx, |panel, cx| {
-                        panel.open_or_activate_terminal(
-                            PathBuf::from(root.as_str()),
-                            window,
-                            cx,
-                        )
-                    }))
-                })
+                    if workspace.has_active_modal(window, cx) {
+                        workspace.open_panel::<TerminalPanel>(window, cx);
+                    } else {
+                        workspace.focus_panel::<TerminalPanel>(window, cx);
+                    }
+                    Ok::<_, anyhow::Error>(panel)
+                })?;
+                Ok::<_, anyhow::Error>(panel.update(cx, |panel, cx| {
+                    panel.open_or_activate_terminal_guarded(
+                        PathBuf::from(root.as_str()),
+                        should_open,
+                        window,
+                        cx,
+                    )
+                }))
             });
             let result = match opened {
                 Ok(Ok(task)) => task.await,
                 Ok(Err(error)) => Err(error),
                 Err(error) => Err(error),
             };
-            let live = registry.read_with(cx, |registry, _| {
-                registry.connection_matches(&record.key.session, generation)
-                    && registry
-                        .mirror_target_window(&record.key, target_window)
-                        .is_some()
-                    && registry
-                        .sync
-                        .record(&record.key)
-                        .is_some_and(|live| live.revision == record.revision)
-            });
+            let live = registry.read_with(cx, |registry, _| registry.route_is_live(&route));
             if !live {
                 done(&registry, &mut cx, Some(target_window));
                 return;
@@ -2351,6 +2375,8 @@ impl HerdrSessionRegistry {
         self.prompt_pending.remove(&window_id);
         self.attempts.remove(&window_id.as_u64());
         self.finalize_tokens.remove(&window_id.as_u64());
+        self.workspace_root_locks
+            .retain(|(lock_window, _), _| *lock_window != window_id.as_u64());
         let identities: Vec<SessionIdentity> = self
             .connections
             .iter()
@@ -2687,13 +2713,15 @@ fn workspace_root_matches_agent_root(
     workspace_root == agent_root
         || Path::new(agent_root.as_str()).starts_with(Path::new(workspace_root.as_str()))
 }
-async fn activate_or_add_agent_workspace(
-
-    window: WindowHandle<MultiWorkspace>,
-    root: herdr::CanonicalPath,
+/// Find the workspace in `window` whose checkout matches the agent root
+/// (exact root, or an ancestor workspace containing it). Pure inspection:
+/// activation is the caller's, performed under the final liveness gate.
+fn find_agent_workspace(
+    window: &WindowHandle<MultiWorkspace>,
+    root: &herdr::CanonicalPath,
     cx: &mut AsyncApp,
-) -> anyhow::Result<Entity<Workspace>> {
-    let existing = window
+) -> anyhow::Result<Option<Entity<Workspace>>> {
+    window
         .read_with(cx, |multi_workspace, cx| {
             let mut ancestor = None;
             for workspace in multi_workspace.workspaces() {
@@ -2709,11 +2737,11 @@ async fn activate_or_add_agent_workspace(
                     let Ok(candidate) = canonical_checkout_path(candidate.as_ref()) else {
                         continue;
                     };
-                    if candidate == root {
+                    if candidate == *root {
                         exact = true;
                         break;
                     }
-                    if workspace_root_matches_agent_root(&candidate, &root) {
+                    if workspace_root_matches_agent_root(&candidate, root) {
                         contains = true;
                     }
                 }
@@ -2726,15 +2754,39 @@ async fn activate_or_add_agent_workspace(
             }
             ancestor
         })
-        .map_err(|error| anyhow::anyhow!("could not inspect invoking workspace: {error:#}"))?;
+        .map_err(|error| anyhow::anyhow!("could not inspect invoking workspace: {error:#}"))
+}
 
-    if let Some(workspace) = existing {
-        window.update(cx, |multi_workspace, window, cx| {
-            multi_workspace.activate(workspace.clone(), None, window, cx);
-        })?;
+/// Resolve (or add) the checkout workspace for one agent root without
+/// activating it. Only unmatched additions are serialized by the per
+/// window/root lock, and the route is revalidated immediately before the
+/// `Workspace::new_local` mutation so a superseded attempt never adds a
+/// root. The visible activation happens later, in the caller's single
+/// guarded window update.
+async fn prepare_agent_workspace(
+    registry: Entity<HerdrSessionRegistry>,
+    window: WindowHandle<MultiWorkspace>,
+    root: herdr::CanonicalPath,
+    route: TerminalRoute,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<Entity<Workspace>> {
+    if let Some(workspace) = find_agent_workspace(&window, &root, cx)? {
         return Ok(workspace);
     }
-
+    let root_lock = registry.update(cx, |registry, _| {
+        registry.workspace_root_lock(window.window_id(), &root)
+    });
+    let _root_guard = root_lock.lock().await;
+    // Double-check under the lock: a concurrent open for the same checkout
+    // may have added the workspace while this attempt waited.
+    if let Some(workspace) = find_agent_workspace(&window, &root, cx)? {
+        return Ok(workspace);
+    }
+    // Revalidate the route right before the only window mutation this
+    // function performs; a disconnected or superseded attempt bails.
+    if !registry.read_with(cx, |registry, _| registry.route_is_live(&route)) {
+        anyhow::bail!("herdr agent terminal route is no longer live");
+    }
     let Some(app_state) = cx.update(|cx| AppState::try_global(cx)) else {
         return Err(anyhow::anyhow!("Zed app state is unavailable"));
     };
@@ -2746,7 +2798,7 @@ async fn activate_or_add_agent_workspace(
                 Some(window),
                 None,
                 None,
-                OpenMode::Activate,
+                OpenMode::Add,
                 cx,
             )
         })
@@ -2765,17 +2817,23 @@ async fn wait_for_workspace_panels(
         panels_task.await?;
     }
 
-    let started = Instant::now();
+    // The background executor's clock is virtual in tests (timers advance
+    // with `advance_clock`), so the deadline must use it rather than the
+    // wall clock.
+    let deadline = cx.background_executor().now() + PANEL_READY_TIMEOUT;
     loop {
         let panel_ready =
             workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx).is_some());
         if panel_ready {
             return Ok(());
         }
-        if started.elapsed() >= PANEL_READY_TIMEOUT {
+        let now = cx.background_executor().now();
+        if now >= deadline {
             return Err(anyhow::anyhow!("terminal panel did not finish initializing"));
         }
-        cx.background_executor().timer(PANEL_READY_POLL).await;
+        let remaining = deadline.saturating_duration_since(now);
+        let poll = PANEL_READY_POLL.min(remaining);
+        cx.background_executor().timer(poll).await;
     }
 }
 
@@ -3949,6 +4007,44 @@ mod tests {
         assert!(matches!(state, BindingState::Failed { .. }));
     }
 
+    #[gpui::test]
+    fn released_window_prunes_its_workspace_root_locks(cx: &mut TestAppContext) {
+        let gateway = HerdrGateway::fake(
+            || async { Ok(Vec::new()) }.boxed_local(),
+            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+            |_name| async { Ok(()) }.boxed_local(),
+        );
+        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        let identity = session("main");
+        let window_id = registry.update(cx, |registry, _| {
+            registry.register_window_for_test(
+                WindowHandle::new(WindowId::from(77)),
+                BindingState::Unselected,
+                Vec::new(),
+            )
+        });
+        registry.update(cx, |registry, _| {
+            registry.install_connection_for_test(identity.clone(), Rc::new(FakeHandle), 1);
+            registry.attach_connection_window(&identity, window_id);
+            let _lock = registry.workspace_root_lock(window_id, &checkout("C:/locked"));
+        });
+        assert!(
+            !registry.read_with(cx, |registry, _| registry
+                .workspace_root_locks
+                .is_empty()),
+            "an open attempt registers its window/root lock"
+        );
+
+        registry.update(cx, |registry, cx| registry.note_window_released(window_id, cx));
+
+        assert!(
+            registry.read_with(cx, |registry, _| registry
+                .workspace_root_locks
+                .is_empty()),
+            "a released window must not retain per-root locks forever"
+        );
+    }
+
 
 
     struct FakeHandle;
@@ -4996,6 +5092,241 @@ mod tests {
                 (expected_key, window.window_id())
             ],
             "the invoking window must remain the terminal target"
+        );
+    }
+
+    /// Every regular (non-task) shell in the active workspace's terminal
+    /// panel: `(entity id, working directory)`. Task terminals (what an Agent
+    /// Panel `agent attach` thread would spawn) are returned separately so a
+    /// regression can name them.
+    fn panel_shell_terminals(
+        window: WindowHandle<MultiWorkspace>,
+        cx: &mut TestAppContext,
+    ) -> (Vec<(u64, Option<PathBuf>)>, Vec<(u64, String)>) {
+        window
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace();
+                let panel = workspace
+                    .read(cx)
+                    .panel::<TerminalPanel>(cx)
+                    .expect("the active workspace has a terminal panel");
+                panel.read_with(cx, |panel, cx| {
+                    let mut shells = Vec::new();
+                    let mut tasks = Vec::new();
+                    for pane in panel.panes() {
+                        for item in pane.read(cx).items() {
+                            let Some(view) = item.downcast::<terminal_view::TerminalView>() else {
+                                continue;
+                            };
+                            let terminal_entity = view.read(cx).terminal().clone();
+                            let terminal = terminal_entity.read(cx);
+                            let id = terminal_entity.entity_id().as_u64();
+                            match terminal.task() {
+                                Some(task) => tasks.push((
+                                    id,
+                                    format!(
+                                        "{} {}",
+                                        task.spawned_task.command.clone().unwrap_or_default(),
+                                        task.spawned_task.args.join(" ")
+                                    ),
+                                )),
+                                None => shells.push((id, terminal.working_directory())),
+                            }
+                        }
+                    }
+                    (shells, tasks)
+                })
+            })
+            .expect("window is alive")
+    }
+
+    #[gpui::test]
+    async fn agent_open_activates_checkout_and_reuses_one_regular_terminal(
+        cx: &mut TestAppContext,
+    ) {
+        init_app(cx);
+        cx.executor().allow_parking();
+        install_test_terminal_panel_observer(cx);
+        let app_state = import_test_app(cx).await;
+        // The shell really spawns, so the checkout must exist on the real
+        // filesystem as well as in the fake one.
+        let agent_root = std::env::temp_dir().join(format!(
+            "zed-herdr-agent-open-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&agent_root).unwrap();
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(&agent_root, serde_json::json!({ "file.txt": "" }))
+            .await;
+        // `canonical_checkout_path` lowercases Windows paths, and the real
+        // temp directory has mixed-case components (`Users`, `AppData`, ...).
+        // Match real Windows semantics so the fake filesystem resolves the
+        // canonicalized checkout.
+        app_state.fs.as_fake().set_case_sensitive(false);
+        let project = project::Project::test(
+            app_state.fs.clone(),
+            [std::path::Path::new("C:/existing")],
+            cx,
+        )
+        .await;
+        let (multi_workspace, window) = add_terminal_window(cx, &project).await;
+        let mut snapshot = empty_snapshot();
+        snapshot.workspaces = vec![workspace_without_checkout()];
+        let mut agent = herdr::PaneInfo::default();
+        agent.workspace_id = "workspace".to_owned();
+        agent.tab_id = "tab-1".to_owned();
+        agent.pane_id = "pane-1".to_owned();
+        agent.terminal_id = "terminal-1".to_owned();
+        agent.focused = true;
+        agent.revision = 1;
+        agent.agent = Some("test-agent".to_owned());
+        agent.cwd = Some(agent_root.to_string_lossy().into_owned());
+        snapshot.agents.push(agent);
+        let gateway = HerdrGateway::fake(
+            || async { Ok(vec![session_info("main", true)]) }.boxed_local(),
+            move |_info| {
+                let snapshot = snapshot.clone();
+                async move {
+                    Ok(Rc::new(FakeConnection {
+                        snapshot,
+                        dropped: Rc::new(Cell::new(0)),
+                        subscribe_calls: Rc::new(Cell::new(0)),
+                        idle_stream: true,
+                        event: None,
+                    }) as Rc<dyn HerdrSessionHandle>)
+                }
+                .boxed_local()
+            },
+            |_name| async { Ok(()) }.boxed_local(),
+        );
+        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        let window_id = registry.update(cx, |registry, _| {
+            registry.register_window_for_test(window, BindingState::Unselected, Vec::new())
+        });
+        registry.update(cx, |registry, cx| {
+            registry.start_binding_for_test(window_id, Arc::from("main"), cx);
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(Duration::from_secs(1));
+        // The terminal really spawns and the attempt's waits use the virtual
+        // clock, so settle by pumping both: real sleeps for the PTY thread and
+        // clock advancement for the fake-executor timers.
+        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let in_flight =
+                registry.read_with(cx, |registry, _| !registry.mirroring_in_flight.is_empty());
+            if !in_flight || std::time::Instant::now() >= settle_deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cx.background_executor.advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+        }
+        let expected_root =
+            canonical_checkout_path(&agent_root).expect("temporary agent root canonicalizes");
+        let expected_cwd = PathBuf::from(expected_root.as_str());
+        // The snapshot Open effect must have activated the added checkout and
+        // opened exactly one regular shell there.
+        let active_workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        assert!(
+            active_workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .worktrees(cx)
+                        .filter_map(|worktree| worktree.read(cx).root_dir())
+                        .filter_map(|root| canonical_checkout_path(root.as_ref()).ok())
+                        .any(|root| root == expected_root)
+                }),
+            "the agent checkout workspace must be the active one"
+        );
+        assert_eq!(
+            active_workspace.read_with(cx, |workspace, _| workspace.notification_ids().len()),
+            0,
+            "a successful terminal open reports no mirror failure"
+        );
+        assert!(
+            active_workspace
+                .read_with(cx, |workspace, cx| workspace.panel::<agent_ui::AgentPanel>(cx))
+                .is_none(),
+            "the consumer must not create an Agent Panel for herdr agents"
+        );
+        let (shells, tasks) = panel_shell_terminals(window, cx);
+        assert!(
+            tasks.is_empty(),
+            "no task terminal (agent attach thread) may be spawned: {tasks:?}"
+        );
+        assert_eq!(
+            shells.len(),
+            1,
+            "exactly one regular shell must exist: {shells:?}"
+        );
+        // The shell's reported cwd arrives from the PTY's process-info thread;
+        // wait for that report before asserting (and before the reuse pass,
+        // which matches shells by their reported directory).
+        let settle_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut reported_cwd = shells[0].1.clone();
+        while reported_cwd.as_ref() != Some(&expected_cwd)
+            && std::time::Instant::now() < settle_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cx.run_until_parked();
+            let (again, _) = panel_shell_terminals(window, cx);
+            reported_cwd = again.first().and_then(|(_, cwd)| cwd.clone());
+        }
+        assert_eq!(
+            reported_cwd.as_ref(),
+            Some(&expected_cwd),
+            "the shell must run at the agent checkout"
+        );
+
+        // A repeated Open for the same agent activates the existing shell
+        // instead of spawning a second one.
+        let key = AgentKey::new(session("main"), "terminal-1");
+        let live_record = registry
+            .read_with(cx, |registry, _| registry.sync.record(&key))
+            .expect("the agent record remains live");
+        registry.update(cx, |registry, cx| {
+            registry.dispatch_effects(
+                &session("main"),
+                vec![AgentSyncEffect::Open(live_record)],
+                None,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        let (shells_after, tasks_after) = panel_shell_terminals(window, cx);
+        assert!(
+            tasks_after.is_empty(),
+            "the repeat Open must not spawn an attach task terminal: {tasks_after:?}"
+        );
+        assert_eq!(
+            shells_after.len(),
+            1,
+            "the repeat Open must reuse the existing shell"
+        );
+        assert_eq!(
+            shells_after[0].0, shells[0].0,
+            "the same terminal entity must be reused"
+        );
+        assert_eq!(
+            shells_after[0].1.as_ref(),
+            Some(&expected_cwd),
+            "the reused shell stays at the agent checkout"
+        );
+        assert_eq!(
+            active_workspace.read_with(cx, |workspace, _| workspace.notification_ids().len()),
+            0,
+            "reuse must not report a failure"
         );
     }
 

@@ -288,6 +288,32 @@ impl AgentSyncState {
         keys.into_iter().map(|key| self.forget_one(&key)).collect()
     }
 
+    /// Rebuilds each live record's checkout-path derivation from the
+    /// current workspace map without touching revisions. A fresh connection
+    /// generation deduplicates equal pane revisions, so records retained
+    /// across stream loss would otherwise replay with a checkout path the
+    /// herdr workspace has since changed. Returns how many records changed.
+    pub(crate) fn refresh_record_paths(&mut self, session: &SessionIdentity) -> usize {
+        let mut refreshed = 0;
+        for record in self
+            .records
+            .values_mut()
+            .filter(|record| &record.key.session == session)
+        {
+            let checkout_path = self
+                .workspace_checkouts
+                .get(&(session.clone(), record.workspace_id.clone()))
+                .cloned()
+                .flatten();
+            if record.checkout_path != checkout_path {
+                record.checkout_path = checkout_path;
+                refreshed += 1;
+            }
+        }
+        refreshed
+    }
+
+
     /// Records a failed terminal open. Returns `true` only for the first
     /// failure at this revision so the driver emits exactly one actionable
     /// notification; a later revision or resync permits one new attempt.
@@ -598,6 +624,71 @@ mod tests {
             moved.as_slice(),
             [AgentSyncEffect::PaneMoved { .. }]
         ));
+    }
+
+    #[test]
+    fn refresh_record_paths_rebuilds_checkout_without_a_new_revision() {
+        let mut state = AgentSyncState::default();
+        let identity = session("main");
+        let key = AgentKey::new(identity.clone(), "terminal-1");
+        // Upsert before the workspace map exists: the record has no checkout.
+        state.upsert(identity.clone(), pane("terminal-1", "pane-a", 1));
+        assert_eq!(
+            state
+                .record(&key)
+                .expect("live record")
+                .checkout_path
+                .as_deref(),
+            None
+        );
+
+        let mut workspace = WorkspaceInfo {
+            workspace_id: "workspace-1".into(),
+            number: 1,
+            label: "work".into(),
+            focused: true,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: None,
+            agent_status: "connected".into(),
+            worktree: Some(WorkspaceWorktreeInfo {
+                checkout_path: "/repo/live".into(),
+                repo_root: None,
+                repo_key: None,
+                repo_name: None,
+                is_linked_worktree: false,
+            }),
+        };
+        assert!(state.apply_workspace(&identity, &workspace).is_empty());
+
+        // A retained record replays its stale derivation unless refreshed.
+        assert_eq!(state.refresh_record_paths(&identity), 1);
+        let refreshed = state.record(&key).expect("live record");
+        assert_eq!(
+            refreshed.checkout_path.as_deref(),
+            Some(Path::new("/repo/live"))
+        );
+        assert_eq!(refreshed.revision, 1, "refresh must not bump the revision");
+
+        // A later workspace change refreshes again; an unchanged map is a no-op.
+        workspace.worktree = Some(WorkspaceWorktreeInfo {
+            checkout_path: "/repo/moved".into(),
+            repo_root: None,
+            repo_key: None,
+            repo_name: None,
+            is_linked_worktree: false,
+        });
+        assert!(state.apply_workspace(&identity, &workspace).is_empty());
+        assert_eq!(state.refresh_record_paths(&identity), 1);
+        assert_eq!(
+            state
+                .record(&key)
+                .expect("live record")
+                .checkout_path
+                .as_deref(),
+            Some(Path::new("/repo/moved"))
+        );
+        assert_eq!(state.refresh_record_paths(&identity), 0);
     }
 
     #[test]

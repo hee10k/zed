@@ -612,6 +612,22 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
+        self.open_or_activate_terminal_guarded(working_directory, |_| true, window, cx)
+    }
+
+    /// Open or activate a regular shell for `working_directory`, consulting
+    /// `should_open` immediately before every mutation: the reuse activation,
+    /// and (on the create path) after the shell process spawns, before the
+    /// terminal view is inserted. A rejected gate leaves the window
+    /// untouched; on the create path the freshly spawned shell is dropped,
+    /// which kills its process.
+    pub fn open_or_activate_terminal_guarded(
+        &mut self,
+        working_directory: PathBuf,
+        should_open: impl Fn(&App) -> bool + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
         let existing_terminal = self.center.panes().into_iter().find_map(|pane| {
             pane.read(cx)
                 .items()
@@ -631,14 +647,26 @@ impl TerminalPanel {
         });
 
         if let Some((pane, item_index, terminal)) = existing_terminal {
+            if !should_open(cx) {
+                return Task::ready(Err(anyhow!("terminal activation became stale")));
+            }
             self.active_pane = pane.clone();
-            self.activate_terminal_view(&pane, item_index, true, window, cx);
+            // Reveal without stealing focus from an open modal, mirroring
+            // the create path's `take_focus` rule.
+            let take_focus = match self.workspace.upgrade() {
+                Some(workspace) => {
+                    workspace.update(cx, |workspace, cx| !workspace.has_active_modal(window, cx))
+                }
+                None => true,
+            };
+            self.activate_terminal_view(&pane, item_index, take_focus, window, cx);
             Task::ready(Ok(terminal))
         } else {
-            self.add_terminal_shell(
+            self.add_terminal_shell_guarded(
                 false,
                 Some(working_directory),
                 RevealStrategy::Always,
+                should_open,
                 window,
                 cx,
             )
@@ -976,6 +1004,18 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
+        self.add_terminal_shell_guarded(force_local, cwd, reveal_strategy, |_| true, window, cx)
+    }
+
+    fn add_terminal_shell_guarded(
+        &mut self,
+        force_local: bool,
+        cwd: Option<PathBuf>,
+        reveal_strategy: RevealStrategy,
+        should_open: impl Fn(&App) -> bool + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
         let workspace = self.workspace.clone();
         self.spawn_pending_terminal(window, cx, async move |terminal_panel, cx| {
             if workspace.update(cx, |workspace, cx| !is_enabled_in_workspace(workspace, cx))? {
@@ -991,6 +1031,20 @@ impl TerminalPanel {
                     .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
                     .await
             };
+
+            // Revalidate the caller's routing immediately before touching
+            // the window: an attempt superseded while the shell was spawning
+            // must not insert its item. Dropping a freshly created terminal
+            // kills its process.
+            let still_open = cx
+                .update(|_, app| should_open(app))
+                .unwrap_or(false);
+            if !still_open {
+                if let Err(error) = terminal {
+                    log::debug!("dropped stale failed terminal open: {error:#}");
+                }
+                anyhow::bail!("terminal open was cancelled before insertion");
+            }
 
             let pane = terminal_panel
                 .read_with(cx, |terminal_panel, _| terminal_panel.active_pane.clone())?;
@@ -1788,6 +1842,12 @@ impl Panel for TerminalPanel {
             return;
         }
         cx.defer_in(window, |this, window, cx| {
+            // Re-check at execution time: another caller (e.g. a guarded
+            // herdr terminal open) may have added or started adding a
+            // terminal between this deferral and its flush.
+            if !this.has_no_terminals(cx) {
+                return;
+            }
             let Ok(kind) = this
                 .workspace
                 .update(cx, |workspace, cx| default_working_directory(workspace, cx))
@@ -2174,6 +2234,184 @@ mod tests {
                     && !*is_task
                     && cwd.as_ref() == Some(&working_directory)
             }));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_guarded_open_rejects_a_stale_create_before_insertion(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let working_directory = terminal_test_working_directory("stale-create");
+
+        let error = terminal_panel
+            .update_in(cx, |panel, window, cx| {
+                panel.open_or_activate_terminal_guarded(
+                    working_directory.clone(),
+                    |_| false,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect_err("a rejected gate must cancel the open");
+        assert!(
+            error.to_string().contains("cancelled before insertion"),
+            "expected a cancellation error, got: {error:#}"
+        );
+        cx.run_until_parked();
+        terminal_panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.active_pane.read(cx).items_len(),
+                0,
+                "a superseded attempt must not insert its terminal item"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_guarded_open_rejects_a_stale_reuse_without_activating(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let working_directory = terminal_test_working_directory("stale-reuse");
+        let first = terminal_panel
+            .update_in(cx, |panel, window, cx| {
+                panel.add_terminal_shell(
+                    false,
+                    Some(working_directory.clone()),
+                    RevealStrategy::Always,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        // Make a different shell the active item, so a stale reuse attempt
+        // cannot appear to have succeeded.
+        terminal_panel
+            .update_in(cx, |panel, window, cx| {
+                panel.add_terminal_shell(
+                    false,
+                    Some(terminal_test_working_directory("stale-reuse-other")),
+                    RevealStrategy::Always,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let error = terminal_panel
+            .update_in(cx, |panel, window, cx| {
+                panel.open_or_activate_terminal_guarded(
+                    working_directory.clone(),
+                    |_| false,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect_err("a rejected gate must not activate the matching shell");
+        assert!(
+            error.to_string().contains("stale"),
+            "expected a staleness error, got: {error:#}"
+        );
+        terminal_panel.read_with(cx, |panel, cx| {
+            let active = panel
+                .active_pane
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<TerminalView>())
+                .expect("a terminal stays active");
+            assert_ne!(
+                active.read(cx).terminal().entity_id(),
+                first.entity_id(),
+                "the stale attempt must not have activated the matching shell"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_guarded_open_reuse_keeps_focus_on_active_modal(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let workspace = window_handle
+            .update(cx, |multi_workspace, _, _| multi_workspace.workspace().clone())
+            .expect("workspace is alive");
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let working_directory = terminal_test_working_directory("modal-reuse");
+        let first = terminal_panel
+            .update_in(cx, |panel, window, cx| {
+                panel.add_terminal_shell(
+                    false,
+                    Some(working_directory.clone()),
+                    RevealStrategy::Always,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        // Move focus off the first shell before the modal opens.
+        terminal_panel
+            .update_in(cx, |panel, window, cx| {
+                panel.add_terminal_shell(
+                    false,
+                    Some(terminal_test_working_directory("modal-reuse-other")),
+                    RevealStrategy::Always,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let modal_focus_handle = workspace.update_in(cx, |workspace, window, cx| {
+            let focus_handle = cx.focus_handle();
+            workspace.toggle_modal(window, cx, {
+                let focus_handle = focus_handle.clone();
+                move |_, _| FocusOnlyModal { focus_handle }
+            });
+            focus_handle
+        });
+
+        let reused = terminal_panel
+            .update_in(cx, |panel, window, cx| {
+                panel.open_or_activate_terminal_guarded(
+                    working_directory.clone(),
+                    |_| true,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            reused.entity_id(),
+            first.entity_id(),
+            "the matching shell is reused"
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(
+                workspace.has_active_modal(window, cx),
+                "reusing a shell must not dismiss the modal"
+            );
+            assert!(
+                modal_focus_handle.is_focused(window),
+                "reusing a shell must not steal focus from an active modal"
+            );
         });
     }
 
