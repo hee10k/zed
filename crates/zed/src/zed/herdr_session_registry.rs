@@ -523,6 +523,9 @@ pub(crate) struct HerdrSessionRegistry {
     /// In-flight reservations coalesce concurrent connection attempts for an
     /// identity before a client or stream is installed.
     in_flight: HashMap<SessionIdentity, u64>,
+    /// Fresh-generation snapshot bootstrap is claimed once by whichever
+    /// bound window completes finalization first.
+    snapshot_bootstrapped: HashSet<(SessionIdentity, u64)>,
     next_generation: u64,
     /// finalization must not tear down a newer shared attachment.
     slot_generations: HashMap<(SessionIdentity, u64), u64>,
@@ -613,6 +616,7 @@ impl HerdrSessionRegistry {
             connections: HashMap::default(),
             attempts: HashMap::default(),
             in_flight: HashMap::default(),
+            snapshot_bootstrapped: HashSet::default(),
             slot_generations: HashMap::default(),
             finalize_tokens: HashMap::default(),
             snapshot_import_abort_handles: HashMap::default(),
@@ -1102,6 +1106,10 @@ impl HerdrSessionRegistry {
             .remove(&(identity.clone(), window_id.as_u64()));
         self.agent_window_targets
             .retain(|_, (_, target)| target.window_id != window_id);
+        let connection_generation = self
+            .connections
+            .get(identity)
+            .map(|connection| connection.generation);
         let released = self
             .connections
             .get_mut(identity)
@@ -1110,6 +1118,10 @@ impl HerdrSessionRegistry {
                 connection.bound_windows.is_empty()
             });
         if released {
+            if let Some(generation) = connection_generation {
+                self.snapshot_bootstrapped
+                    .remove(&(identity.clone(), generation));
+            }
             self.connections.remove(identity);
             self.focus_echoes.remove(identity);
             let effects = self.sync.forget_session(identity);
@@ -1165,16 +1177,32 @@ impl HerdrSessionRegistry {
             self.apply_workspace_effect(identity, effect, target, cx);
         }
     }
-    /// Snapshot bootstrap can deduplicate a live record already seen by an
-    /// older connection generation. Schedule such records explicitly while
-    /// avoiding duplicate opens for keys already represented by an effect.
+    /// Snapshot bootstrap is claimed once per connection generation by the
+    /// first bound window that completes finalization. This makes replay
+    /// ownership transferable when the owner's workspace import times out.
     fn dispatch_snapshot_effects(
         &mut self,
         identity: &SessionIdentity,
-        effects: Vec<AgentSyncEffect>,
+        snapshot: &SessionSnapshot,
         target: Option<MirrorTarget>,
         cx: &mut Context<Self>,
     ) {
+        let generation = target
+            .map(|target| target.generation)
+            .or_else(|| {
+                self.connections
+                    .get(identity)
+                    .map(|connection| connection.generation)
+            });
+        let is_fresh_generation = generation.is_some_and(|generation| {
+            self.snapshot_bootstrapped
+                .insert((identity.clone(), generation))
+        });
+        let effects = if is_fresh_generation {
+            import_snapshot_for_new_generation(&mut self.sync, identity, snapshot)
+        } else {
+            import_snapshot(&mut self.sync, identity, snapshot)
+        };
         let routed_keys: HashSet<AgentKey> = effects
             .iter()
             .filter_map(|effect| match effect {
@@ -1184,6 +1212,9 @@ impl HerdrSessionRegistry {
             })
             .collect();
         self.dispatch_effects(identity, effects, target, cx);
+        if !is_fresh_generation {
+            return;
+        }
         for record in self
             .sync
             .live_records(identity)
@@ -1853,7 +1884,7 @@ impl HerdrSessionRegistry {
                     .record(key)
                     .is_some_and(|record| record.revision > pending_revision)
                 {
-                    self.requeue_latest_mirror_record(key, generation, revision, cx);
+                    self.requeue_latest_mirror_record(key, generation, revision, false, cx);
                 } else if !pending_target_is_explicit
                     && pending_target.is_some_and(|target| {
                         self.mirror_target_window(key, target).is_none()
@@ -1864,7 +1895,8 @@ impl HerdrSessionRegistry {
                     self.requeue_latest_mirror_record(
                         key,
                         generation,
-                        pending_revision.saturating_sub(1),
+                        pending_revision,
+                        true,
                         cx,
                     );
                 }
@@ -1876,10 +1908,10 @@ impl HerdrSessionRegistry {
         {
             let stale_target = target.expect("checked above");
             self.forget_agent_window_target_if_matches(key, stale_target);
-            self.requeue_latest_mirror_record(key, generation, revision.saturating_sub(1), cx);
+            self.requeue_latest_mirror_record(key, generation, revision, true, cx);
             return;
         }
-        self.requeue_latest_mirror_record(key, generation, revision, cx);
+        self.requeue_latest_mirror_record(key, generation, revision, false, cx);
     }
 
     fn requeue_latest_mirror_record(
@@ -1887,13 +1919,13 @@ impl HerdrSessionRegistry {
         key: &AgentKey,
         generation: u64,
         revision: u64,
+        allow_equal: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(record) = self
-            .sync
-            .record(key)
-            .filter(|record| record.revision > revision && !self.sync.is_dismissed(key))
-        else {
+        let Some(record) = self.sync.record(key).filter(|record| {
+            (allow_equal && record.revision >= revision || record.revision > revision)
+                && !self.sync.is_dismissed(key)
+        }) else {
             return;
         };
         let target = match self.agent_window_targets.get(key).map(|(_, target)| *target) {
@@ -2233,7 +2265,14 @@ impl HerdrSessionRegistry {
             self.dispatch_effects(identity, effects, None, cx);
         }
         self.mark_state(identity, event, cx);
-        self.connections.remove(identity);
+        let generation = self
+            .connections
+            .remove(identity)
+            .map(|connection| connection.generation);
+        if let Some(generation) = generation {
+            self.snapshot_bootstrapped
+                .remove(&(identity.clone(), generation));
+        }
         self.focus_echoes.remove(identity);
         self.in_flight.remove(identity);
     }
@@ -2245,7 +2284,14 @@ impl HerdrSessionRegistry {
         cx: &mut Context<Self>,
     ) {
         self.mark_state(identity, BindingEvent::SessionStillRunning(message), cx);
-        self.connections.remove(identity);
+        let generation = self
+            .connections
+            .remove(identity)
+            .map(|connection| connection.generation);
+        if let Some(generation) = generation {
+            self.snapshot_bootstrapped
+                .remove(&(identity.clone(), generation));
+        }
         self.focus_echoes.remove(identity);
         self.in_flight.remove(identity);
     }
@@ -2378,6 +2424,7 @@ impl HerdrSessionRegistry {
             connections: HashMap::default(),
             attempts: HashMap::default(),
             in_flight: HashMap::default(),
+            snapshot_bootstrapped: HashSet::default(),
             next_generation: 0,
             #[cfg(test)]
             slot_generations: HashMap::default(),
@@ -3082,8 +3129,12 @@ async fn run_connection(
                     {
                         return;
                     }
-                    let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
-                    registry.dispatch_effects(&identity, effects, mirror_target_window, cx);
+                    registry.dispatch_snapshot_effects(
+                        &identity,
+                        &snapshot,
+                        mirror_target_window,
+                        cx,
+                    );
                     if let Some(final_window) = final_window {
                         registry.finish_connected(final_window, &identity, generation, cx);
                     }
@@ -3260,8 +3311,12 @@ async fn run_connection(
             {
                 return;
             }
-            let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
-            registry.dispatch_effects(&identity, effects, mirror_target_window, cx);
+            registry.dispatch_snapshot_effects(
+                &identity,
+                &snapshot,
+                mirror_target_window,
+                cx,
+            );
             if let Some(final_window) = final_window {
                 registry.finish_connected(final_window, &identity, generation, cx);
             }
@@ -3465,9 +3520,7 @@ async fn run_connection(
             {
                 return;
             }
-            let effects =
-                import_snapshot_for_new_generation(&mut registry.sync, &identity, &snapshot);
-            registry.dispatch_snapshot_effects(&identity, effects, mirror_target_window, cx);
+            registry.dispatch_snapshot_effects(&identity, &snapshot, mirror_target_window, cx);
         });
     }
     for event in buffered {
@@ -3715,6 +3768,7 @@ mod tests {
             connections: HashMap::default(),
             attempts: HashMap::default(),
             in_flight: HashMap::default(),
+            snapshot_bootstrapped: HashSet::default(),
             next_generation: 0,
             slot_generations: HashMap::default(),
             finalize_tokens: HashMap::default(),
@@ -4026,7 +4080,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn finalized_timeout_detaches_only_timed_out_window(cx: &mut TestAppContext) {
+    async fn finalized_timeout_detaches_only_timed_out_window(cx: &mut TestAppContext) {
+        init_app(cx);
+        let _app_state = import_test_app(cx).await;
         let gateway = HerdrGateway::fake(
             || async { Ok(Vec::new()) }.boxed_local(),
             |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
@@ -4038,7 +4094,7 @@ mod tests {
         let owner = WindowHandle::<MultiWorkspace>::new(WindowId::from(42));
         let detached = Rc::new(RefCell::new(Vec::new()));
         let effects = Rc::new(RefCell::new(Vec::new()));
-        let target_id = registry.update(cx, |registry, _| {
+        let (target_id, owner_id) = registry.update(cx, |registry, _| {
             registry.set_host_sink(Rc::new(RecordingHost {
                 detached: detached.clone(),
             }));
@@ -4065,7 +4121,15 @@ mod tests {
                 .slot_generations
                 .insert((identity.clone(), target_id.as_u64()), 2);
             registry.finalize_tokens.insert(target_id.as_u64(), 2);
-            target_id
+            let root = if cfg!(windows) { "C:/root" } else { "/root" };
+            assert_eq!(
+                registry
+                    .sync
+                    .upsert(identity.clone(), test_pane("terminal-1", "pane-1", 1, root))
+                    .len(),
+                1
+            );
+            (target_id, owner_id)
         });
 
         let mut async_cx = cx.to_async();
@@ -4100,6 +4164,29 @@ mod tests {
             effects.borrow().is_empty(),
             "timeout cleanup must not dispatch agent effects"
         );
+        let root = if cfg!(windows) { "C:/root" } else { "/root" };
+        let mut snapshot = empty_snapshot();
+        snapshot
+            .agents
+            .push(test_pane("terminal-1", "pane-1", 1, root));
+        registry.update(cx, |registry, cx| {
+            registry.dispatch_snapshot_effects(
+                &identity,
+                &snapshot,
+                Some(MirrorTarget {
+                    window_id: owner_id,
+                    generation: 1,
+                }),
+                cx,
+            );
+        });
+        let key = AgentKey::new(identity.clone(), "terminal-1");
+        assert!(registry.read_with(cx, |registry, _| {
+            registry
+                .snapshot_bootstrapped
+                .contains(&(identity.clone(), 1))
+                && registry.mirroring_in_flight.contains(&(key, 1))
+        }));
     }
 
 
