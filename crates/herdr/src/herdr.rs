@@ -123,6 +123,22 @@ impl Error {
     }
 }
 
+/// Builds a `herdr` CLI command. On Windows, `herdr.exe` is a console-subsystem
+/// binary, so without `CREATE_NO_WINDOW` every catalog/validation call briefly
+/// flashes a console window; the output is captured, so no console is ever needed.
+fn cli_command(program: PathBuf) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut command = std::process::Command::new(program);
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+    #[cfg(not(windows))]
+    std::process::Command::new(program)
+}
+
 /// Lists herdr sessions by running the CLI's own `session list --json`
 /// subcommand. The catalog is authoritative; endpoint paths come from here.
 // The disallowed `std::process::Command::output` runs inside `smol::unblock`,
@@ -130,7 +146,7 @@ impl Error {
 #[allow(clippy::disallowed_methods)]
 pub async fn list_sessions(program: PathBuf) -> Result<Vec<SessionInfo>> {
     smol::unblock(move || {
-        let output = std::process::Command::new(program)
+        let output = cli_command(program)
             .args(["session", "list", "--json"])
             .output()?;
         if !output.status.success() {
@@ -159,7 +175,7 @@ pub async fn list_sessions(program: PathBuf) -> Result<Vec<SessionInfo>> {
 #[allow(clippy::disallowed_methods)]
 pub async fn validate_session_name(program: PathBuf, name: String) -> Result<()> {
     smol::unblock(move || {
-        let output = std::process::Command::new(program)
+        let output = cli_command(program)
             .arg("--session")
             .arg(&name)
             .args(["session", "list", "--json"])
