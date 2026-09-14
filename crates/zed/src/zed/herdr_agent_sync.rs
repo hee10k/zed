@@ -3,6 +3,8 @@ use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+
+use agent_ui::{ExternalTerminalThread, TerminalId};
 use herdr::{PaneInfo, SessionInfo, WorkspaceInfo};
 
 /// Stable identity of one herdr CLI session. The CLI session directory, not
@@ -54,6 +56,83 @@ pub(crate) struct AgentRecord {
     pub(crate) agent_name: Arc<str>,
 }
 
+/// Build the structured external terminal command for one live agent.
+///
+/// The terminal id is the stable identity while the pane id is deliberately
+/// read from the latest reducer record, so a moved agent keeps one Zed thread
+/// while subsequent opens/focuses target its current pane.
+pub(crate) fn external_terminal_spec(
+    record: &AgentRecord,
+    herdr_program: &Path,
+) -> ExternalTerminalThread {
+    ExternalTerminalThread {
+        identity: format!(
+            "herdr:{}:{}",
+            record.key.session.session_dir.display(),
+            record.key.terminal_id
+        )
+        .into(),
+        executable: herdr_program.to_string_lossy().into_owned(),
+        args: vec![
+            "--session".into(),
+            record.key.session.name.to_string(),
+            "agent".into(),
+            "attach".into(),
+            record.pane_id.to_string(),
+        ],
+        title: format!("herdr · {}", record.agent_name).into(),
+        working_directory: record
+            .checkout_path
+            .clone()
+            .or_else(|| record.effective_cwd.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// Pure index of live herdr agent keys and their Agent Panel terminal ids.
+pub(crate) struct MirrorIndex<T = TerminalId> {
+    entries: HashMap<AgentKey, T>,
+}
+
+impl<T> Default for MirrorIndex<T> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::default(),
+        }
+    }
+}
+
+impl<T: Copy> MirrorIndex<T> {
+    pub(crate) fn insert(&mut self, key: AgentKey, terminal_id: T) {
+        self.entries.insert(key, terminal_id);
+    }
+
+    pub(crate) fn remove(&mut self, key: &AgentKey) -> Option<T> {
+        self.entries.remove(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self, key: &AgentKey) -> Option<T> {
+        self.entries.get(key).copied()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&AgentKey, T)> {
+        self.entries
+            .iter()
+            .map(|(key, terminal_id)| (key, *terminal_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn missing(&self, mut terminal_present: impl FnMut(T) -> bool) -> Vec<AgentKey> {
+        self.entries
+            .iter()
+            .filter_map(|(key, terminal_id)| {
+                (!terminal_present(*terminal_id)).then_some(key.clone())
+            })
+            .collect()
+    }
+}
+
 /// Effects the driver applies after each reduction, in emitted order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentSyncEffect {
@@ -71,6 +150,7 @@ pub(crate) enum FocusTarget {
         session: SessionIdentity,
         workspace_id: Arc<str>,
     },
+    Agent(AgentKey),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,6 +231,9 @@ pub(crate) struct AgentSyncState {
     /// exit events, which carry no terminal id, resolve to their agent.
     pane_lookup: HashMap<(SessionIdentity, Arc<str>), AgentKey>,
     /// Last failed terminal-open revision per agent.
+    /// Agents dismissed after their Agent Panel mirror closes remain live in
+    /// the reducer, but are suppressed until an explicit resync or pane exit.
+    dismissed: HashSet<AgentKey>,
     failed_revision: HashMap<AgentKey, u64>,
 }
 
@@ -227,6 +310,10 @@ impl AgentSyncState {
         }
         self.pane_lookup
             .insert((session, record.pane_id.clone()), key.clone());
+        if self.dismissed.contains(&key) {
+            self.records.insert(key, record);
+            return Vec::new();
+        }
 
         let mut effects = Vec::new();
         if let Some((old_pane_id, was_focused, old_path)) = previous {
@@ -287,6 +374,14 @@ impl AgentSyncState {
             .collect();
         keys.into_iter().map(|key| self.forget_one(&key)).collect()
     }
+    /// Suppress automatic reopening of one agent until resync or pane exit.
+    pub(crate) fn dismiss(&mut self, key: AgentKey) {
+        self.dismissed.insert(key);
+    }
+
+    pub(crate) fn is_dismissed(&self, key: &AgentKey) -> bool {
+        self.dismissed.contains(key)
+    }
 
     /// Rebuilds each live record's checkout-path derivation from the
     /// current workspace map without touching revisions. A fresh connection
@@ -331,9 +426,10 @@ impl AgentSyncState {
         self.failed_revision.remove(key);
     }
 
-    /// Explicit resync: lift failed-revision suppression for the session and
-    /// replay an `Open` for every live record.
+    /// Explicit resync: lift dismissal and failed-revision suppression for the
+    /// session and replay an `Open` for every live record.
     pub(crate) fn resync(&mut self, session: &SessionIdentity) -> Vec<AgentSyncEffect> {
+        self.dismissed.retain(|key| &key.session != session);
         self.failed_revision
             .retain(|key, _| &key.session != session);
         self.records
@@ -352,7 +448,9 @@ impl AgentSyncState {
     pub(crate) fn live_records(&self, session: &SessionIdentity) -> Vec<AgentRecord> {
         self.records
             .values()
-            .filter(|record| &record.key.session == session)
+            .filter(|record| {
+                &record.key.session == session && !self.dismissed.contains(&record.key)
+            })
             .cloned()
             .collect()
     }
@@ -379,10 +477,17 @@ impl AgentSyncState {
             })
             .cloned()
             .collect();
-        stale_keys
+        let dismissed_stale: Vec<AgentKey> = stale_keys
+            .iter()
+            .filter(|key| self.dismissed.contains(*key))
+            .cloned()
+            .collect();
+        let effects = stale_keys
             .into_iter()
             .map(|key| self.forget_one(&key))
-            .collect()
+            .collect();
+        self.dismissed.extend(dismissed_stale);
+        effects
     }
 
 
@@ -419,14 +524,14 @@ impl AgentSyncState {
                 (candidate == wanted).then(|| workspace_id.clone())
             })
     }
-    /// Removes every trace of `key` (record, pane lookup, failed revision)
-    /// and returns its `Forget` effect. `Forget` only drops
-    /// synchronization ownership; it never closes the Zed terminal.
+    /// Removes every trace of `key` (record, pane lookup, dismissal, failed
+    /// revision) and returns its `Forget` effect.
     fn forget_one(&mut self, key: &AgentKey) -> AgentSyncEffect {
         if let Some(record) = self.records.remove(key) {
             self.pane_lookup
                 .remove(&(record.key.session, record.pane_id));
         }
+        self.dismissed.remove(key);
         self.failed_revision.remove(key);
         AgentSyncEffect::Forget(key.clone())
     }
@@ -458,6 +563,71 @@ mod tests {
             foreground_cwd: None,
             agent_session: None,
         }
+    }
+
+    fn agent_record(terminal_id: &str, pane_id: &str, worktree: &str) -> AgentRecord {
+        AgentRecord {
+            key: AgentKey::new(session("main"), terminal_id),
+            workspace_id: Arc::from("workspace-1"),
+            pane_id: Arc::from(pane_id),
+            revision: 4,
+            focused: true,
+            checkout_path: Some(PathBuf::from(worktree)),
+            effective_cwd: Some(PathBuf::from(worktree)),
+            agent_name: Arc::from("claude"),
+        }
+    }
+
+    #[test]
+    fn attach_spec_uses_latest_pane_and_structured_args() {
+        let record = agent_record("terminal-1", "pane-new", r"C:\repo\worktree");
+        let spec = external_terminal_spec(&record, Path::new("herdr.exe"));
+        assert_eq!(spec.executable, "herdr.exe");
+        assert_eq!(
+            spec.args,
+            vec!["--session", "main", "agent", "attach", "pane-new"]
+        );
+        assert_eq!(spec.working_directory, PathBuf::from(r"C:\repo\worktree"));
+    }
+
+    #[test]
+    fn missing_panel_terminal_returns_the_live_agent_key() {
+        let key = AgentKey::new(session("main"), "terminal-1");
+        let mut mirrors: MirrorIndex<u64> = MirrorIndex::default();
+        mirrors.insert(key.clone(), 7);
+        assert_eq!(mirrors.get(&key), Some(7));
+        assert_eq!(mirrors.missing(|_| false), vec![key]);
+        assert!(mirrors.missing(|id| id == 7).is_empty());
+    }
+
+    #[test]
+    fn dismissed_terminal_stays_closed_until_resync() {
+        let mut state = AgentSyncState::default();
+        let key = AgentKey::new(session("main"), "terminal-1");
+        state.dismiss(key.clone());
+        assert!(state.upsert(session("main"), pane("terminal-1", "pane-a", 3)).is_empty());
+        assert!(state.is_dismissed(&key));
+        assert_eq!(state.resync(&session("main")).len(), 1);
+        assert!(!state.is_dismissed(&key));
+    }
+
+    #[test]
+    fn pane_exit_forgets_and_clears_dismissal() {
+        let mut state = AgentSyncState::default();
+        let identity = session("main");
+        let key = AgentKey::new(identity.clone(), "terminal-1");
+        state.upsert(identity.clone(), pane("terminal-1", "pane-a", 1));
+        state.dismiss(key.clone());
+        let effects = state.exit(&identity, "pane-a");
+        assert!(matches!(
+            effects.as_slice(),
+            [AgentSyncEffect::Forget(forgotten)] if forgotten == &key
+        ));
+        assert!(!state.is_dismissed(&key));
+        assert!(matches!(
+            state.upsert(identity, pane("terminal-1", "pane-b", 2)).as_slice(),
+            [AgentSyncEffect::Open(_)]
+        ));
     }
 
     #[test]
