@@ -551,12 +551,12 @@ mod tests {
         });
     }
 
-    fn add_picker<'a>(
-        cx: &'a mut TestAppContext,
+    fn add_picker(
+        cx: &mut TestAppContext,
         gateway: HerdrGateway,
     ) -> (
         gpui::Entity<Picker<SessionPickerDelegate>>,
-        &'a mut gpui::VisualTestContext,
+        &mut gpui::VisualTestContext,
         mpsc::Receiver<super::SessionSelection>,
     ) {
         let (tx, rx) = mpsc::channel(8);
@@ -566,12 +566,12 @@ mod tests {
         (picker, cx, rx)
     }
 
-    /// `futures`' `try_next` reports "nothing buffered" as `Err(Empty)`;
-    /// normalize both empty and closed to `None`.
+    /// `try_recv` reports "nothing buffered" as `Err(Empty)` and a closed
+    /// channel as `Err(Disconnected)`; normalize both to `None`.
     fn take_selection(
         rx: &mut mpsc::Receiver<super::SessionSelection>,
     ) -> Option<super::SessionSelection> {
-        rx.try_next().ok().flatten()
+        rx.try_recv().ok()
     }
 
     #[gpui::test]

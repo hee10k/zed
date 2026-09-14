@@ -274,13 +274,13 @@ pub(crate) enum WorkspaceEffect {
 fn plan_effects(effects: Vec<AgentSyncEffect>) -> Vec<WorkspaceEffect> {
     effects
         .into_iter()
-        .filter_map(|effect| match effect {
-            AgentSyncEffect::Open(record) => Some(WorkspaceEffect::Open(record)),
+        .map(|effect| match effect {
+            AgentSyncEffect::Open(record) => WorkspaceEffect::Open(record),
             AgentSyncEffect::PaneMoved { key, pane_id } => {
-                Some(WorkspaceEffect::PaneMoved { key, pane_id })
+                WorkspaceEffect::PaneMoved { key, pane_id }
             }
-            AgentSyncEffect::Focus(key) => Some(WorkspaceEffect::Focus(key)),
-            AgentSyncEffect::Forget(key) => Some(WorkspaceEffect::Forget(key)),
+            AgentSyncEffect::Focus(key) => WorkspaceEffect::Focus(key),
+            AgentSyncEffect::Forget(key) => WorkspaceEffect::Forget(key),
         })
         .collect()
 }
@@ -571,8 +571,6 @@ pub(crate) struct HerdrSessionRegistry {
     #[cfg(test)]
     sink_effects: Option<Rc<dyn AgentEffectSink>>,
     #[cfg(test)]
-    program_override: Option<PathBuf>,
-    #[cfg(test)]
     mirror_target_sink: Option<Rc<std::cell::RefCell<Vec<(AgentKey, WindowId)>>>>,
     host_sink: Rc<dyn HerdrHostSink>,
     picker_sink: Rc<dyn SessionPickerSink>,
@@ -639,8 +637,6 @@ impl HerdrSessionRegistry {
             #[cfg(test)]
             sink_effects: None,
             #[cfg(test)]
-            program_override: None,
-            #[cfg(test)]
             mirror_target_sink: None,
             agent_window_targets: HashMap::default(),
             mirroring_in_flight: HashSet::default(),
@@ -665,10 +661,6 @@ impl HerdrSessionRegistry {
         Ok(gateway)
     }
     fn program(&self) -> PathBuf {
-        #[cfg(test)]
-        if let Some(program) = &self.program_override {
-            return program.clone();
-        }
         herdr_program().unwrap_or_else(|| PathBuf::from("herdr"))
     }
 
@@ -927,7 +919,7 @@ impl HerdrSessionRegistry {
         let generation = self.next_generation;
         self.attempts.insert(window_id.as_u64(), generation);
         self.finalize_tokens.remove(&window_id.as_u64());
-        let name = session_name.clone();
+        let name = session_name;
         self.apply_binding_event(
             window_id,
             BindingEvent::Selected {
@@ -1395,7 +1387,7 @@ impl HerdrSessionRegistry {
             .filter(|binding| {
                 matches!(&binding.state, BindingState::Connected(bound) if bound == identity)
             })
-            .find(|binding| binding.roots.iter().any(|candidate| *candidate == root))
+            .find(|binding| binding.roots.contains(&root))
             .map(|binding| binding.window);
         if let Some(window) = window {
             let _ = window.update(cx, |_, window, _| window.activate_window());
@@ -2500,8 +2492,6 @@ impl HerdrSessionRegistry {
             #[cfg(test)]
             sink_effects: None,
             #[cfg(test)]
-            program_override: None,
-            #[cfg(test)]
             mirror_target_sink: None,
             host_sink: Rc::new(NoopHerdrHostSink),
             picker_sink: Rc::new(NoopSessionPickerSink),
@@ -2533,22 +2523,8 @@ impl HerdrSessionRegistry {
     }
 
     #[cfg(test)]
-    pub(crate) fn effect_sink(&self) -> Rc<dyn AgentEffectSink> {
-        self.sink_effects
-            .as_ref()
-            .expect("test effect sink is installed before inspection")
-            .clone()
-    }
-
-    #[cfg(test)]
     pub(crate) fn set_effect_sink(&mut self, sink: Rc<dyn AgentEffectSink>) {
         self.sink_effects = Some(sink);
-    }
-
-
-    #[cfg(test)]
-    pub(crate) fn set_program_for_test(&mut self, program: PathBuf) {
-        self.program_override = Some(program);
     }
 
     #[cfg(test)]
@@ -2570,13 +2546,8 @@ impl HerdrSessionRegistry {
         generation: u64,
     ) {
         let installed =
-            self.install_connection(identity.clone(), client, Task::ready(()), generation);
+            self.install_connection(identity, client, Task::ready(()), generation);
         assert!(installed, "test connection is installed exactly once");
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_window_prompted(&self, window_id: WindowId) -> bool {
-        self.prompted.contains(&window_id)
     }
 
     #[cfg(test)]
@@ -2621,60 +2592,6 @@ impl HerdrSessionRegistry {
         cx: &mut Context<Self>,
     ) {
         self.start_binding_for_window(window_id, session_name, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn finalize_binding_for_test(
-        &mut self,
-        bootstrap: WindowId,
-        identity: &SessionIdentity,
-        session_name: &str,
-        generation: u64,
-        snapshot: &SessionSnapshot,
-        cx: &mut Context<Self>,
-    ) -> Option<WindowId> {
-        match self.finalize_binding(
-            bootstrap,
-            identity,
-            session_name,
-            generation,
-            snapshot,
-            cx,
-        ) {
-            FinalizeResult::Ready { window_id, task } => {
-                task.detach();
-                Some(window_id)
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn classify_loss_for_test(
-        &mut self,
-        identity: &SessionIdentity,
-        message: SharedString,
-        sessions: Vec<SessionInfo>,
-        cx: &mut Context<Self>,
-    ) {
-        self.classify_loss(identity, message, sessions, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn bind_connected_for_test(
-        &mut self,
-        window_id: WindowId,
-        identity: &SessionIdentity,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(generation) = self
-            .connections
-            .get(identity)
-            .map(|connection| connection.generation)
-        else {
-            return;
-        };
-        self.install_binding_target(window_id, identity, generation, cx);
-        self.finish_connected(window_id, identity, generation, cx);
     }
 
 }
@@ -3926,8 +3843,6 @@ mod tests {
             #[cfg(test)]
             sink_effects: None,
             #[cfg(test)]
-            program_override: None,
-            #[cfg(test)]
             mirror_target_sink: None,
             host_sink: Rc::new(NoopHerdrHostSink),
             picker_sink: Rc::new(NoopSessionPickerSink),
@@ -4701,7 +4616,7 @@ mod tests {
         });
         cx.update(|cx| HerdrSessionRegistry::install_as_global(registry.clone(), cx));
 
-        let (multi_workspace, first_window, first_workspace) = {
+        let (_multi_workspace, first_window, first_workspace) = {
             let (multi_workspace, window_cx) = cx.add_window_view(|window, cx| {
                 MultiWorkspace::test_new(project.clone(), window, cx)
             });
@@ -4753,7 +4668,7 @@ mod tests {
         );
         let second_project = test_project(cx).await;
 
-        let (second_multi_workspace, second_window, second_workspace) = {
+        let (_second_multi_workspace, second_window, second_workspace) = {
             let (multi_workspace, window_cx) = cx
                 .add_window_view(|window, cx| MultiWorkspace::test_new(second_project, window, cx));
             let handle = window_cx
@@ -5706,7 +5621,7 @@ mod tests {
         // Every catalog call hangs far past the connection deadline, so both
         // attempts are still parked in their first await when the fake clock
         // reaches the first attempt's 15-second deadline.
-        let executor = cx.executor().clone();
+        let executor = cx.executor();
         let gateway = HerdrGateway::fake(
             move || {
                 let executor = executor.clone();

@@ -103,22 +103,6 @@ impl StashRenameModal {
 impl EventEmitter<DismissEvent> for StashRenameModal {}
 impl ModalView for StashRenameModal {}
 
-#[cfg(any(test, feature = "test-support"))]
-impl StashRenameModal {
-    /// Test hook: set the composed message directly so a test can drive the
-    /// confirm path without synthesizing keystrokes.
-    pub(crate) fn test_set_editor_text(
-        &mut self,
-        message: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.editor
-            .update(cx, |editor, cx| editor.set_text(message.to_owned(), window, cx));
-        cx.notify();
-    }
-}
-
 impl Focusable for StashRenameModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.focus_handle(cx)

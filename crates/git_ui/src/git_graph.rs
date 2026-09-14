@@ -1376,7 +1376,6 @@ pub(crate) struct BranchDiff {
 /// The selected working-tree file's diff, shown in the right detail panel when
 /// a file in the expandable worktree status breakdown is clicked.
 pub(crate) struct WorktreeFileDiff {
-    pub(crate) repo_path: RepoPath,
     /// Display label (`dir/file` or `file`) shown in the panel header.
     pub(crate) label: SharedString,
     /// Unified diff text, or a synthesized new-file diff for untracked paths.
@@ -1947,7 +1946,7 @@ impl GitGraph {
             return chip.into_any_element();
         };
         let ref_for_menu = resolved_ref.clone();
-        let ref_for_click = resolved_ref.clone();
+        let ref_for_click = resolved_ref;
         div()
             .min_w_0()
             .id(("git-graph-ref-chip", commit_idx))
@@ -2239,7 +2238,6 @@ pub fn worktree_status_detail(summary: GitSummary) -> String {
         self.selected_branch_diff = None;
         self._diff_task = None;
         self.selected_worktree_file = Some(WorktreeFileDiff {
-            repo_path: entry.repo_path.clone(),
             label,
             text: String::new(),
             is_untracked,
@@ -9433,7 +9431,7 @@ mod tests {
         git_graph: &Entity<GitGraph>,
         cx: &VisualTestContext,
     ) -> Vec<String> {
-        git_graph.read_with(&*cx, |git_graph, app_cx| {
+        git_graph.read_with(cx, |git_graph, app_cx| {
             git_graph
                 .context_menu
                 .as_ref()

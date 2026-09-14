@@ -226,7 +226,7 @@ impl AgentSyncState {
                 .remove(&(session.clone(), old_pane_id.clone()));
         }
         self.pane_lookup
-            .insert((session.clone(), record.pane_id.clone()), key.clone());
+            .insert((session, record.pane_id.clone()), key.clone());
 
         let mut effects = Vec::new();
         if let Some((old_pane_id, was_focused, old_path)) = previous {
@@ -425,7 +425,7 @@ impl AgentSyncState {
     fn forget_one(&mut self, key: &AgentKey) -> AgentSyncEffect {
         if let Some(record) = self.records.remove(key) {
             self.pane_lookup
-                .remove(&(record.key.session.clone(), record.pane_id.clone()));
+                .remove(&(record.key.session, record.pane_id));
         }
         self.failed_revision.remove(key);
         AgentSyncEffect::Forget(key.clone())
@@ -492,7 +492,7 @@ mod tests {
         );
         assert!(
             state
-                .upsert(identity.clone(), pane("terminal-1", "pane-b", 5))
+                .upsert(identity, pane("terminal-1", "pane-b", 5))
                 .is_empty()
         );
         assert_eq!(state.records.len(), 1);
@@ -700,7 +700,7 @@ mod tests {
         assert!(state.upsert(identity.clone(), no_agent).is_empty());
         assert!(
             state
-                .upsert(identity.clone(), pane("", "pane-a", 1))
+                .upsert(identity, pane("", "pane-a", 1))
                 .is_empty()
         );
         assert_eq!(state.records.len(), 0);
@@ -712,7 +712,7 @@ mod tests {
         let identity = session("main");
         let mut focused_pane = pane("terminal-1", "pane-a", 1);
         focused_pane.foreground_cwd = Some("/repo/foreground".into());
-        let effects = state.upsert(identity.clone(), focused_pane);
+        let effects = state.upsert(identity, focused_pane);
         assert!(matches!(
             effects.as_slice(),
             [AgentSyncEffect::Open(record)]
@@ -775,7 +775,7 @@ mod tests {
         let token = focus.request(target.clone());
         assert!(focus.is_current(token));
         assert_eq!(focus.observe(target.clone()), FocusObservation::Echo);
-        assert_eq!(focus.observe(target.clone()), FocusObservation::External);
+        assert_eq!(focus.observe(target), FocusObservation::External);
     }
 
     #[test]

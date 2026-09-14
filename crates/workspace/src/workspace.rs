@@ -9805,7 +9805,7 @@ impl Render for Workspace {
                                                                     this.child(p.border_r_1())
                                                                 })
                                                                 .child(self.render_center(
-                                                                    center_override.clone(),
+                                                                    center_override,
                                                                     &pane_render_context,
                                                                     window,
                                                                     cx,
@@ -9871,7 +9871,7 @@ impl Render for Workspace {
                                                                             },
                                                                         )
                                                                         .child(self.render_center(
-                                                                            center_override.clone(),
+                                                                            center_override,
                                                                             &pane_render_context,
                                                                             window,
                                                                             cx,
@@ -9939,7 +9939,7 @@ impl Render for Workspace {
                                                                             },
                                                                         )
                                                                         .child(self.render_center(
-                                                                            center_override.clone(),
+                                                                            center_override,
                                                                             &pane_render_context,
                                                                             window,
                                                                             cx,
@@ -9991,7 +9991,7 @@ impl Render for Workspace {
                                                             this.child(p.border_r_1())
                                                         })
                                                         .child(self.render_center(
-                                                            center_override.clone(),
+                                                            center_override,
                                                             &pane_render_context,
                                                             window,
                                                             cx,

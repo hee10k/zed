@@ -341,8 +341,6 @@ _ => menu.submenu(copy_tag_label, move |menu, _window, _cx| {
                         })
                         .entry("Drop…", None, {
                             let stash_identity = stash_identity.clone();
-                            let repository = repository.clone();
-                            let workspace = workspace.clone();
                             let graph = graph.clone();
                             move |window, cx| {
                                 schedule_stash_mutation(
@@ -1160,7 +1158,7 @@ pub(crate) fn ref_chip_context_menu(
             let switch_path = worktree.path.clone();
             let switch_label = linked_worktree_label
                 .clone()
-                .unwrap_or_else(|| display_name.clone().into());
+                .unwrap_or_else(|| display_name.clone());
             let switch_offer_sha = commit_sha.to_string();
             menu = menu.entry("Switch Here", None, move |window, cx| {
                 let Some(workspace) = switch_workspace.upgrade() else {
@@ -1427,7 +1425,7 @@ fn schedule_ref_merge(
     cx: &mut App,
 ) {
     schedule_ref_operation(
-        graph.clone(),
+        graph,
         |graph, graph_cx| {
             graph.schedule_mutation(
                 GraphMutation::Merge {
@@ -1537,7 +1535,7 @@ impl Render for RefDestroyConfirmModal {
                         },
                     )))
                     .child(
-                        Button::new("destroy", confirm_label.clone())
+                        Button::new("destroy", confirm_label)
                             .style(ButtonStyle::Filled)
                             .color(Color::Error)
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1622,8 +1620,7 @@ fn emit_toast(
 ) {
     let message = message.into();
     if let Some(workspace_entity) = workspace.upgrade() {
-        let for_toast = workspace_entity.clone();
-        let _ = for_toast.update(cx, |workspace, app_cx| {
+        let _ = workspace_entity.update(cx, |workspace, app_cx| {
             let status_toast =
                 StatusToast::new(message.clone(), app_cx, |this, _| this.dismiss_button(true));
             workspace.toggle_status_toast(status_toast, app_cx);

@@ -302,7 +302,8 @@ async fn test_right_sidebar_stays_inside_narrow_viewport(cx: &mut TestAppContext
     cx.simulate_resize(viewport);
     cx.update_window(window.into(), |_, window, cx| {
         window.draw(cx).clear(cx);
-    });
+    })
+    .unwrap();
     cx.run_until_parked();
     let central_bounds = cx
         .debug_bounds("herdr-central-content")
@@ -437,7 +438,7 @@ async fn test_herdr_central_view_visibility(cx: &mut TestAppContext) {
 
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
-    let (editor_id, host) = multi_workspace.update(cx, |multi_workspace, cx| {
+    let (editor_id, _host) = multi_workspace.update(cx, |multi_workspace, cx| {
         let editor_id = multi_workspace.workspace().entity_id();
         let host = cx.new(|_| TestHerdrCentralHost { collapsed: false });
         multi_workspace.set_window_root_host(Some(host.clone().into()), cx);
