@@ -1237,6 +1237,14 @@ pub fn open_or_reuse_graph(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    // The git graph replaces the center content, so a visible herdr host
+    // (the full-window session view) must step aside first; otherwise the
+    // graph opens behind it and appears unrevealed.
+    if let Some(multi_workspace) = workspace.multi_workspace().cloned() {
+        let _ = multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.set_herdr_visible(false, cx);
+        });
+    }
     let existing = workspace.items_of_type::<GitGraph>(cx).find(|graph| {
         let graph = graph.read(cx);
         graph.repo_id == repo_id && graph.log_source == log_source
@@ -8156,6 +8164,65 @@ mod tests {
         git_graph.read_with(&*cx, |graph, _| {
             assert_eq!(graph.selection.primary, Some(1));
         });
+    }
+
+    #[gpui::test]
+    async fn test_open_or_reuse_graph_hides_herdr_host(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "hello\nworld\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        multi_workspace.update_in(cx, |multi_workspace, _, cx| {
+            multi_workspace.set_herdr_visible(true, cx);
+        });
+        assert!(
+            multi_workspace.read_with(&*cx, |multi_workspace, _| multi_workspace.herdr_visible()),
+            "the host view starts visible"
+        );
+
+        let repository = project.read_with(&*cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_or_reuse_graph(
+                workspace,
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                LogSource::All,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !multi_workspace.read_with(&*cx, |multi_workspace, _| multi_workspace.herdr_visible()),
+            "revealing the git graph must hide the herdr host center view"
+        );
+        assert!(
+            workspace.read_with(&*cx, |workspace, cx| workspace
+                .items_of_type::<GitGraph>(cx)
+                .next()
+                .is_some()),
+            "the git graph item should be opened in the workspace"
+        );
     }
 
     #[gpui::test]
