@@ -171,10 +171,11 @@ impl AgentSyncState {
     /// Applies the latest pane snapshot for one agent, in revision order.
     ///
     /// Guard rules, in order: panes without an agent or with an empty terminal
-    /// id are ignored; revisions at or below the stored revision are ignored.
-    /// Otherwise a new key opens, a pane move emits `PaneMoved`, a checkout
-    /// path change re-emits `Open`, and a false-to-true focus transition
-    /// emits `Focus`.
+    /// id are ignored; revisions below the stored revision are ignored. At an
+    /// equal revision only the focus flag is actionable (herdr does not bump
+    /// the revision when a pane merely gains or loses focus). Otherwise a new
+    /// key opens, a pane move emits `PaneMoved`, a checkout path change
+    /// re-emits `Open`, and a false-to-true focus transition emits `Focus`.
     pub(crate) fn upsert(
         &mut self,
         session: SessionIdentity,
@@ -184,12 +185,30 @@ impl AgentSyncState {
             return Vec::new();
         }
         let key = AgentKey::new(session.clone(), Arc::from(pane.terminal_id.as_str()));
-        if self
-            .records
-            .get(&key)
-            .is_some_and(|current| current.revision >= pane.revision)
-        {
-            return Vec::new();
+        if let Some(current) = self.records.get(&key) {
+            if pane.revision < current.revision {
+                return Vec::new();
+            }
+            if pane.revision == current.revision {
+                // Herdr does not bump the revision when a pane merely gains
+                // focus. A focused pane at an unchanged revision is still a
+                // follow signal (the record may hold a stale `focused` flag
+                // because unfocused panes receive no event); an unfocused one
+                // with an unchanged flag is a pure no-op. The stored record's
+                // flag must be synced before emitting, because the follow
+                // consumer re-reads it from the reducer.
+                if current.focused != pane.focused {
+                    let mut record = current.clone();
+                    record.focused = pane.focused;
+                    self.records.insert(key.clone(), record);
+                }
+                let effects = if pane.focused {
+                    vec![AgentSyncEffect::Focus(key.clone())]
+                } else {
+                    Vec::new()
+                };
+                return effects;
+            }
         }
         let workspace_id: Arc<str> = Arc::from(pane.workspace_id.as_str());
         let checkout_path = self
@@ -511,6 +530,38 @@ mod tests {
         let mut unfocused = pane("terminal-1", "pane-a", 4);
         unfocused.focused = false;
         assert!(state.upsert(identity, unfocused).is_empty());
+    }
+
+    #[test]
+    fn focus_transition_emits_focus_at_unchanged_revision() {
+        let mut state = AgentSyncState::default();
+        let identity = session("main");
+        let key = AgentKey::new(identity.clone(), "terminal-1");
+        assert!(matches!(
+            state
+                .upsert(identity.clone(), pane("terminal-1", "pane-a", 1))
+                .as_slice(),
+            [AgentSyncEffect::Open(_)]
+        ));
+
+        // Herdr does not bump the revision when a pane only gains focus, so
+        // the false-to-true transition must still emit Focus at revision 1.
+        let mut focused = pane("terminal-1", "pane-a", 1);
+        focused.focused = true;
+        assert!(matches!(
+            state.upsert(identity.clone(), focused.clone()).as_slice(),
+            [AgentSyncEffect::Focus(emitted)] if emitted == &key
+        ));
+
+        // A repeated focused upsert at the same revision still emits Focus:
+        // the consumer re-reads the live record, and a follow is idempotent.
+        assert!(matches!(
+            state.upsert(identity.clone(), focused).as_slice(),
+            [AgentSyncEffect::Focus(emitted)] if emitted == &key
+        ));
+
+        // An unfocused upsert at the same revision is a pure no-op.
+        assert!(state.upsert(identity, pane("terminal-1", "pane-a", 1)).is_empty());
     }
 
     #[test]
