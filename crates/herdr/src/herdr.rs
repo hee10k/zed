@@ -954,11 +954,16 @@ fn parse_event(value: Value) -> Result<Option<HerdrEvent>> {
     };
     let data = value.get("data").cloned().unwrap_or(Value::Null);
     let event = match event_name {
+        // Created/updated events carry the entity nested under `data.workspace`
+        // / `data.pane` (as live herdr 0.8.2 frames show); id-only events are
+        // flat.
         "workspace_created" => {
-            HerdrEvent::Workspace(WorkspaceEvent::Created(serde_json::from_value(data)?))
+            let workspace = data.get("workspace").cloned().ok_or(Error::MissingResult)?;
+            HerdrEvent::Workspace(WorkspaceEvent::Created(serde_json::from_value(workspace)?))
         }
         "workspace_updated" => {
-            HerdrEvent::Workspace(WorkspaceEvent::Updated(serde_json::from_value(data)?))
+            let workspace = data.get("workspace").cloned().ok_or(Error::MissingResult)?;
+            HerdrEvent::Workspace(WorkspaceEvent::Updated(serde_json::from_value(workspace)?))
         }
         "workspace_closed" => HerdrEvent::Workspace(WorkspaceEvent::Closed {
             workspace_id: event_id(&data, "workspace_id")?,
@@ -966,12 +971,18 @@ fn parse_event(value: Value) -> Result<Option<HerdrEvent>> {
         "workspace_focused" => HerdrEvent::Workspace(WorkspaceEvent::Focused {
             workspace_id: event_id(&data, "workspace_id")?,
         }),
-        "pane_created" => HerdrEvent::Pane(PaneEvent {
-            kind: PaneEventKind::Created(serde_json::from_value(data)?),
-        }),
-        "pane_updated" => HerdrEvent::Pane(PaneEvent {
-            kind: PaneEventKind::Updated(serde_json::from_value(data)?),
-        }),
+        "pane_created" => {
+            let pane = data.get("pane").cloned().ok_or(Error::MissingResult)?;
+            HerdrEvent::Pane(PaneEvent {
+                kind: PaneEventKind::Created(serde_json::from_value(pane)?),
+            })
+        }
+        "pane_updated" => {
+            let pane = data.get("pane").cloned().ok_or(Error::MissingResult)?;
+            HerdrEvent::Pane(PaneEvent {
+                kind: PaneEventKind::Updated(serde_json::from_value(pane)?),
+            })
+        }
         "pane_closed" => HerdrEvent::Pane(PaneEvent {
             kind: PaneEventKind::Closed {
                 pane_id: event_id(&data, "pane_id")?,
@@ -1167,14 +1178,17 @@ mod tests {
             parse_event(serde_json::json!({
                 "event": "workspace_created",
                 "data": {
-                    "workspace_id": "workspace-1",
-                    "number": 1,
-                    "label": "main",
-                    "focused": true,
-                    "pane_count": 1,
-                    "tab_count": 1,
-                    "active_tab_id": "tab-1",
-                    "agent_status": "idle"
+                    "type": "workspace_created",
+                    "workspace": {
+                        "workspace_id": "workspace-1",
+                        "number": 1,
+                        "label": "main",
+                        "focused": true,
+                        "pane_count": 1,
+                        "tab_count": 1,
+                        "active_tab_id": "tab-1",
+                        "agent_status": "idle"
+                    }
                 }
             }))
             .expect("workspace created event")
@@ -1187,14 +1201,17 @@ mod tests {
             parse_event(serde_json::json!({
                 "event": "workspace_updated",
                 "data": {
-                    "workspace_id": "workspace-1",
-                    "number": 1,
-                    "label": "main",
-                    "focused": false,
-                    "pane_count": 2,
-                    "tab_count": 3,
-                    "active_tab_id": "tab-2",
-                    "agent_status": "working"
+                    "type": "workspace_updated",
+                    "workspace": {
+                        "workspace_id": "workspace-1",
+                        "number": 1,
+                        "label": "main",
+                        "focused": false,
+                        "pane_count": 2,
+                        "tab_count": 3,
+                        "active_tab_id": "tab-2",
+                        "agent_status": "working"
+                    }
                 }
             }))
             .expect("workspace updated event")
@@ -1229,7 +1246,10 @@ mod tests {
             kind: PaneEventKind::Created(pane),
         })) = parse_event(serde_json::json!({
             "event": "pane_created",
-            "data": pane_payload("workspace-1", "tab-1", "pane-7", 9)
+            "data": {
+                "type": "pane_created",
+                "pane": pane_payload("workspace-1", "tab-1", "pane-7", 9)
+            }
         }))
         .expect("pane created event")
         else {
@@ -1242,7 +1262,10 @@ mod tests {
             kind: PaneEventKind::Updated(pane),
         })) = parse_event(serde_json::json!({
             "event": "pane_updated",
-            "data": pane_payload("workspace-1", "tab-1", "pane-7", 10)
+            "data": {
+                "type": "pane_updated",
+                "pane": pane_payload("workspace-1", "tab-1", "pane-7", 10)
+            }
         }))
         .expect("pane updated event")
         else {

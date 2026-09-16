@@ -3196,6 +3196,7 @@ fn fail(
     message: String,
     cx: &mut AsyncApp,
 ) {
+    log::error!("herdr connection failed for session {session_name}: {message}");
     let _ = registry.update(cx, |registry, cx| {
         if !registry.attempt_is_current(window_id, generation, session_name) {
             return;
