@@ -352,16 +352,39 @@ fn apply_event_effects(
     }
 }
 
-/// Locate the herdr CLI through `PATH` without extra dependencies. The
-/// returned path is only a launch candidate: session endpoints always come
-/// from `herdr session list --json`.
+/// Select the installed Herdr binary before a possibly stale `PATH` binary.
+fn select_herdr_program(
+    installed_program: Option<PathBuf>,
+    path_program: Option<PathBuf>,
+) -> Option<PathBuf> {
+    installed_program.or(path_program)
+}
+
+/// Locate the herdr CLI through its managed installation or `PATH` without
+/// extra dependencies. The returned path is only a launch candidate: session
+/// endpoints always come from `herdr session list --json`.
 pub(crate) fn herdr_program() -> Option<PathBuf> {
     let executable_name = if cfg!(windows) { "herdr.exe" } else { "herdr" };
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|directory| {
-        let candidate = directory.join(executable_name);
-        candidate.is_file().then_some(candidate)
-    })
+    #[cfg(windows)]
+    let installed_program = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|local_app_data| {
+            local_app_data
+                .join("Programs")
+                .join("Herdr")
+                .join("bin")
+                .join(executable_name)
+        })
+        .filter(|candidate| candidate.is_file());
+    #[cfg(not(windows))]
+    let installed_program = None;
+    let path_program = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).find_map(|directory| {
+            let candidate = directory.join(executable_name);
+            candidate.is_file().then_some(candidate)
+        })
+    });
+    select_herdr_program(installed_program, path_program)
 }
 
 /// The transport seam the registry drives. Production wraps the typed
@@ -508,6 +531,10 @@ pub(crate) struct HerdrSessionRegistry {
     /// Prompts scheduled by the restoration observer but not shown yet.
     prompt_pending: HashSet<WindowId>,
     connections: HashMap<SessionIdentity, SessionConnection>,
+    /// Selections reserved for windows while their `MultiWorkspace` root is
+    /// being constructed. The window id is known before the new root is
+    /// observed, so unrelated windows cannot consume the reservation.
+    pending_new_window_selections: HashMap<WindowId, Arc<str>>,
     /// A generation per window invalidates detached connection work after a
     /// disconnect, re-selection, or retry.
     attempts: HashMap<u64, u64>,
@@ -587,6 +614,7 @@ impl HerdrSessionRegistry {
             prompted: HashSet::default(),
             prompt_pending: HashSet::default(),
             connections: HashMap::default(),
+            pending_new_window_selections: HashMap::default(),
             attempts: HashMap::default(),
             in_flight: HashMap::default(),
             snapshot_bootstrapped: HashSet::default(),
@@ -637,7 +665,7 @@ impl HerdrSessionRegistry {
         handle: WindowHandle<MultiWorkspace>,
         cx: &mut Context<Self>,
     ) {
-        let _window_id = self.register_window(handle);
+        let window_id = self.register_window(handle);
         // Read the new window's roots once construction finishes. The
         // entity is still being built while this observer runs, so reading
         // it here would panic; the spawned update lands after the flush.
@@ -646,7 +674,13 @@ impl HerdrSessionRegistry {
             let _ = registry.update(cx, |registry, cx| registry.refresh_window_roots(cx));
         })
         .detach();
-        self.schedule_startup_prompt(handle, cx);
+
+        if let Some(session_name) = self.pending_new_window_selections.remove(&window_id) {
+            self.prompt_completed(window_id);
+            self.start_binding_for_window(window_id, session_name, cx);
+        } else {
+            self.schedule_startup_prompt(handle, cx);
+        }
     }
 
     fn register_window(&mut self, handle: WindowHandle<MultiWorkspace>) -> WindowId {
@@ -853,17 +887,113 @@ impl HerdrSessionRegistry {
         cx: &mut Context<Self>,
     ) {
         let window_id = invoking.window_id();
-        self.prompt_completed(window_id);
-        if matches!(
-            self.binding_state(window_id),
-            BindingState::Starting { .. }
-                | BindingState::Connected(_)
-                | BindingState::Failed { .. }
-        ) {
-            self.disconnect_session(window_id, cx);
-        }
+        let state = self.binding_state(window_id);
         let name: Arc<str> = Arc::from(selection.name());
-        self.start_binding_for_window(window_id, name, cx);
+
+        match state {
+            BindingState::Unselected => {
+                self.prompt_completed(window_id);
+                self.start_binding_for_window(window_id, name, cx);
+            }
+            BindingState::Starting { session_name } if session_name == name => {}
+            BindingState::Failed { session_name, .. } if session_name == name => {
+                self.prompt_completed(window_id);
+                self.start_binding_for_window(window_id, name, cx);
+            }
+            BindingState::Connected(identity) => {
+                if let SessionSelection::Existing(info) = &selection
+                    && SessionIdentity::from_info(info) == identity
+                {
+                    return;
+                }
+                self.open_selection_in_new_window(invoking, name, cx);
+            }
+            BindingState::Starting { .. } | BindingState::Failed { .. } => {
+                self.open_selection_in_new_window(invoking, name, cx);
+            }
+        }
+    }
+
+    fn open_selection_in_new_window(
+        &mut self,
+        invoking: WindowHandle<MultiWorkspace>,
+        session_name: Arc<str>,
+        cx: &mut Context<Self>,
+    ) {
+        let registry = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            let result = async {
+                let (paths, app_state) = invoking
+                    .read_with(cx, |multi_workspace, cx| {
+                        let workspace = multi_workspace.workspace();
+                        let workspace = workspace.read(cx);
+                        (
+                            workspace
+                                .root_paths(cx)
+                                .into_iter()
+                                .map(|path| path.to_path_buf())
+                                .collect::<Vec<_>>(),
+                            workspace.app_state().clone(),
+                        )
+                    })
+                    .map_err(|error| {
+                        anyhow::anyhow!("could not inspect invoking workspace: {error:#}")
+                    })?;
+                let registry_for_init = registry.clone();
+                let session_for_init = session_name.clone();
+                let open = cx.update(|cx| {
+                    Workspace::new_local(
+                        paths,
+                        app_state,
+                        None,
+                        None,
+                        Some(Box::new(move |_workspace, window, cx| {
+                            let window_id = window.window_handle().window_id();
+                            registry_for_init.update(cx, |registry, _| {
+                                registry
+                                    .pending_new_window_selections
+                                    .insert(window_id, session_for_init);
+                            });
+                        })),
+                        OpenMode::NewWindow,
+                        cx,
+                    )
+                });
+                let opened = open.await?;
+                Ok::<WindowHandle<MultiWorkspace>, anyhow::Error>(opened.window)
+            }
+            .await;
+
+            match result {
+                Ok(window) => {
+                    registry.update(cx, |registry, cx| {
+                        registry.claim_new_window_selection(window, cx);
+                    });
+                }
+                Err(error) => {
+                    registry.update(cx, |registry, _| {
+                        registry
+                            .pending_new_window_selections
+                            .retain(|_, name| name != &session_name);
+                    });
+                    log::error!("could not open herdr session window: {error:#}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn claim_new_window_selection(
+        &mut self,
+        window: WindowHandle<MultiWorkspace>,
+        cx: &mut Context<Self>,
+    ) {
+        let window_id = window.window_id();
+        let Some(session_name) = self.pending_new_window_selections.remove(&window_id) else {
+            return;
+        };
+        self.prompt_completed(window_id);
+        self.start_binding_for_window(window_id, session_name, cx);
     }
 
     fn start_binding_for_window(
@@ -2098,6 +2228,7 @@ impl HerdrSessionRegistry {
             prompted: HashSet::default(),
             prompt_pending: HashSet::default(),
             connections: HashMap::default(),
+            pending_new_window_selections: HashMap::default(),
             attempts: HashMap::default(),
             in_flight: HashMap::default(),
             snapshot_bootstrapped: HashSet::default(),
@@ -3328,6 +3459,22 @@ mod tests {
 
 
     #[test]
+    fn installed_herdr_program_precedes_path_program() {
+        let installed_program = PathBuf::from("/installed/herdr");
+        let path_program = PathBuf::from("/path/herdr");
+
+        assert_eq!(
+            select_herdr_program(Some(installed_program.clone()), Some(path_program.clone())),
+            Some(installed_program),
+        );
+        assert_eq!(
+            select_herdr_program(None, Some(path_program.clone())),
+            Some(path_program),
+        );
+        assert_eq!(select_herdr_program(None, None), None);
+    }
+
+    #[test]
     fn normal_exit_returns_to_unselected_without_retry() {
         let state = transition(
             BindingState::Connected(session("main")),
@@ -4051,17 +4198,32 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn connected_selection_reuses_invoking_window(cx: &mut TestAppContext) {
+    async fn connected_selection_opens_new_window_and_preserves_invoking_window(
+        cx: &mut TestAppContext,
+    ) {
         init_app(cx);
         let project = test_project(cx).await;
         let invoking = add_real_window(cx, &project).await;
+        let original_roots = roots_in_window(invoking, cx);
         let old_identity = session("old");
         let gateway = HerdrGateway::fake(
-            || async { Ok(Vec::new()) }.boxed_local(),
-            |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+            || async { Ok(vec![session_info("new", true)]) }.boxed_local(),
+            |_info| {
+                async {
+                    Ok(Rc::new(FakeConnection {
+                        snapshot: empty_snapshot(),
+                        dropped: Rc::new(Cell::new(0)),
+                        subscribe_calls: Rc::new(Cell::new(0)),
+                        idle_stream: true,
+                        event: None,
+                    }) as Rc<dyn HerdrSessionHandle>)
+                }
+                .boxed_local()
+            },
             |_name| async { Ok(()) }.boxed_local(),
         );
-        let registry = cx.update(|cx| cx.new(|cx| HerdrSessionRegistry::test(cx, gateway)));
+        let registry = cx.update(|cx| cx.new(HerdrSessionRegistry::new));
+        registry.update(cx, |registry, _| registry.gateway = Some(gateway));
         let window_id = registry.update(cx, |registry, _| {
             let window_id = registry.register_window_for_test(
                 invoking,
@@ -4073,6 +4235,20 @@ mod tests {
             window_id
         });
 
+        // Re-selecting the currently bound session is a no-op.
+        registry.update(cx, |registry, cx| {
+            registry.confirm_selection_for_test(
+                invoking,
+                SessionSelection::Existing(session_info("old", true)),
+                cx,
+            );
+            assert_eq!(
+                registry.binding_state(window_id),
+                BindingState::Connected(old_identity.clone())
+            );
+        });
+        assert_eq!(cx.windows().len(), 1);
+
         registry.update(cx, |registry, cx| {
             registry.confirm_selection_for_test(
                 invoking,
@@ -4083,14 +4259,41 @@ mod tests {
             );
             assert_eq!(
                 registry.binding_state(window_id),
-                BindingState::Starting {
-                    session_name: Arc::from("new"),
-                }
+                BindingState::Connected(old_identity.clone())
             );
-            assert_eq!(registry.bound_window_count(&old_identity), 0);
-            assert!(!registry.has_connection(&old_identity));
+            assert_eq!(registry.bound_window_count(&old_identity), 1);
+            assert!(registry.has_connection(&old_identity));
         });
-        assert_eq!(cx.windows().len(), 1);
+        cx.run_until_parked();
+
+        assert_eq!(cx.windows().len(), 2);
+        assert_eq!(roots_in_window(invoking, cx), original_roots);
+        let new_identity = session("new");
+        let states = registry.read_with(cx, |registry, _| {
+            registry
+                .windows
+                .iter()
+                .map(|(window_id, binding)| (*window_id, binding.state.clone()))
+                .collect::<Vec<_>>()
+        });
+        assert!(states.iter().any(|(_, state)| {
+            *state == BindingState::Connected(old_identity.clone())
+        }));
+        let new_window_id = states
+            .iter()
+            .find_map(|(window_id, state)| {
+                (*state == BindingState::Connected(new_identity.clone())).then_some(*window_id)
+            })
+            .expect("the selected session must bind the new window");
+        assert!(
+            !registry.read_with(cx, |registry, _| registry
+                .prompt_pending
+                .contains(&WindowId::from(new_window_id))),
+            "the selected new window must not open the startup picker"
+        );
+        assert_eq!(registry.read_with(cx, |registry, _| {
+            registry.bound_window_count(&old_identity)
+        }), 1);
     }
 
     #[gpui::test]
