@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use collections::HashMap;
+
 use gpui::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement,
     Render, Subscription, Task, Window, WindowHandle, div, px,
@@ -203,6 +205,7 @@ impl HerdRHost {
         let launch = self.launch.clone().expect("selected host has a launch");
         let project = self.backing_workspace.read(cx).project().clone();
         let fixed_worktree = self.fixed_worktree.clone();
+        let herdr_environment = herdr_terminal_environment();
         let terminal_task = project.update(cx, |project, cx| {
             project.create_terminal_task(
                 SpawnInTerminal {
@@ -213,6 +216,7 @@ impl HerdRHost {
                     args: vec!["--session".to_owned(), launch.session_name.to_string()],
                     command_label: format!("herdr --session {}", launch.session_name),
                     cwd: Some(fixed_worktree),
+                    env: herdr_environment,
                     use_new_terminal: true,
                     reveal: RevealStrategy::Never,
                     reveal_target: RevealTarget::Dock,
@@ -450,6 +454,14 @@ impl Render for HerdRHost {
     }
 }
 
+/// Zed can itself run inside Herdr, but the central client must not inherit
+/// Herdr's nested-session marker or it exits immediately.
+fn herdr_terminal_environment() -> HashMap<String, String> {
+    let mut environment = HashMap::default();
+    environment.insert("HERDR_ENV".to_owned(), "0".to_owned());
+    environment
+}
+
 pub(crate) fn binding_label(state: &BindingState) -> String {
     match state {
         BindingState::Unselected => "herdr: Select a session".to_owned(),
@@ -663,8 +675,8 @@ pub fn status_from_app(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        HerdRHost, HerdRStatusButton, HerdRVisibilityTransition, binding_label, toggle_from_app,
-        toggle_visibility,
+        HerdRHost, HerdRStatusButton, HerdRVisibilityTransition, binding_label,
+        herdr_terminal_environment, toggle_from_app, toggle_visibility,
     };
     use crate::zed::herdr_agent_sync::SessionIdentity;
     use crate::zed::herdr_session_registry::{BindingState, HerdrSessionRegistry};
@@ -699,6 +711,16 @@ mod tests {
         assert_eq!(
             toggle_visibility(true),
             HerdRVisibilityTransition::HideAndRestoreEditor
+        );
+    }
+
+    #[test]
+    fn herdr_terminal_disables_nested_environment() {
+        let environment = herdr_terminal_environment();
+
+        assert_eq!(
+            environment.get("HERDR_ENV").map(String::as_str),
+            Some("0"),
         );
     }
 
