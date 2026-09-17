@@ -16,6 +16,9 @@ use thiserror::Error;
 
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SUBSCRIPTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// Windows polls for data, unlike Unix's blocking read with a cancellation timeout.
+#[cfg(windows)]
+const NAMED_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_PROTOCOL: u32 = 21;
 pub const MIN_SUPPORTED_PROTOCOL: u32 = 16;
@@ -762,9 +765,9 @@ fn read_named_pipe_frame_until(
                         "timed out waiting for herdr response",
                     )));
                 }
-                std::thread::sleep((deadline - now).min(SUBSCRIPTION_POLL_INTERVAL));
+                std::thread::sleep((deadline - now).min(NAMED_PIPE_POLL_INTERVAL));
             } else {
-                std::thread::sleep(SUBSCRIPTION_POLL_INTERVAL);
+                std::thread::sleep(NAMED_PIPE_POLL_INTERVAL);
             }
             continue;
         }
