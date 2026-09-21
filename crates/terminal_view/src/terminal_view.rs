@@ -138,6 +138,8 @@ pub struct TerminalView {
     cursor_shape: CursorShape,
     blink_manager: Entity<BlinkManager>,
     mode: TerminalMode,
+    // Opt-in input profile for terminals hosted by Herdr.
+    herdr_mode: bool,
     // Explicit override for whether workspace-specific context menu actions are shown.
     // When `None`, visibility is derived from `mode` (hidden for embedded terminals).
     show_workspace_actions: Option<bool>,
@@ -286,6 +288,7 @@ impl TerminalView {
             context_menu: None,
             cursor_shape,
             blink_manager,
+            herdr_mode: false,
             blinking_terminal_enabled: false,
             hover: None,
             hover_tooltip_update: Task::ready(()),
@@ -327,6 +330,19 @@ impl TerminalView {
     /// visibility is derived from the terminal's `mode`.
     pub fn set_show_workspace_actions(&mut self, show: bool, cx: &mut Context<Self>) {
         self.show_workspace_actions = Some(show);
+        cx.notify();
+    }
+
+    /// Enables Herdr's PTY-first keyboard profile and paste framing.
+    pub fn set_herdr_mode(&mut self, cx: &mut Context<Self>) {
+        if self.herdr_mode {
+            return;
+        }
+
+        self.herdr_mode = true;
+        self.terminal.update(cx, |terminal, _| {
+            terminal.set_bracketed_paste_override(true);
+        });
         cx.notify();
     }
 
@@ -993,6 +1009,9 @@ impl TerminalView {
     fn dispatch_context(&self, cx: &App) -> KeyContext {
         let mut dispatch_context = KeyContext::new_with_defaults();
         dispatch_context.add("Terminal");
+        if self.herdr_mode {
+            dispatch_context.add("HerdrTerminal");
+        }
 
         if self.terminal.read(cx).vi_mode_enabled() {
             dispatch_context.add("vi_mode");
@@ -2177,7 +2196,7 @@ fn first_project_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
+    use gpui::{Keymap, TestAppContext, UpdateGlobal, VisualTestContext};
     use project::{Entry, Project, ProjectPath, Worktree};
     use remote::RemoteClient;
     use std::path::{Path, PathBuf};
@@ -2251,6 +2270,153 @@ mod tests {
             let input_log = terminal.update(cx, |terminal, _| terminal.take_input_log());
             assert_eq!(input_log, vec![b"foo".to_vec()]);
         });
+    }
+
+    #[gpui::test]
+    async fn herdr_mode_routes_unreserved_control_chords_to_the_pty(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+
+        let ordinary_context =
+            terminal_view.read_with(cx, |terminal_view, cx| terminal_view.dispatch_context(cx));
+        assert!(
+            !ordinary_context.contains("HerdrTerminal"),
+            "ordinary terminals must not opt into Herdr's keyboard context"
+        );
+
+        terminal_view.update(cx, |terminal_view, cx| {
+            terminal_view.set_herdr_mode(cx);
+        });
+        let herdr_context =
+            terminal_view.read_with(cx, |terminal_view, cx| terminal_view.dispatch_context(cx));
+        assert!(
+            herdr_context.contains("HerdrTerminal"),
+            "Herdr terminals must opt into the dedicated keyboard context"
+        );
+
+        // Resolve bindings directly: a missing or shadowed Herdr keymap block fails
+        // here even though an unmatched keystroke would fall through to the terminal.
+        let keymap = cx.update(|cx| default_keymap(cx));
+        let ordinary_stack = || {
+            vec![
+                KeyContext::parse("Workspace").unwrap(),
+                ordinary_context.clone(),
+            ]
+        };
+        let herdr_stack = || {
+            vec![
+                KeyContext::parse("Workspace").unwrap(),
+                herdr_context.clone(),
+            ]
+        };
+        for keystroke in ["ctrl-a", "ctrl-b", "ctrl-i", "ctrl-n"] {
+            assert_eq!(
+                resolved_action(&keymap, keystroke, &herdr_stack()),
+                "terminal::SendKeystroke",
+                "{keystroke} must be PTY-owned in the Herdr terminal context"
+            );
+        }
+        for keystroke in ["ctrl-i", "ctrl-n"] {
+            assert_ne!(
+                resolved_action(&keymap, keystroke, &ordinary_stack()),
+                "terminal::SendKeystroke",
+                "{keystroke} must stay Zed-owned in an ordinary terminal"
+            );
+        }
+        // Reserved clipboard and close chords must keep their Zed owner.
+        for keystroke in [
+            "ctrl-v",
+            "ctrl-shift-v",
+            "shift-insert",
+            "ctrl-insert",
+            "ctrl-shift-c",
+            "cmd-v",
+            "cmd-c",
+            "ctrl-shift-w",
+            "alt-f4",
+            "cmd-w",
+        ] {
+            assert_eq!(
+                resolved_action(&keymap, keystroke, &herdr_stack()),
+                resolved_action(&keymap, keystroke, &ordinary_stack()),
+                "the Herdr context must not rebind the reserved {keystroke} chord"
+            );
+        }
+        // The Herdr visibility toggle must stay a Zed chord, not a PTY keystroke.
+        for keystroke in ["ctrl-alt-u", "cmd-alt-u"] {
+            assert_ne!(
+                resolved_action(&keymap, keystroke, &herdr_stack()),
+                "terminal::SendKeystroke",
+                "{keystroke} must remain the Herdr toggle in a Herdr terminal"
+            );
+        }
+
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            terminal.update(cx, |terminal, _| terminal.take_input_log());
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-n");
+        cx.simulate_keystrokes("ctrl-i");
+
+        assert_eq!(
+            terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
+            vec![b"\x0e".to_vec(), b"\x09".to_vec()],
+            "Herdr control chords must reach the PTY instead of workspace actions"
+        );
+    }
+
+    #[gpui::test]
+    async fn herdr_terminal_always_frames_paste_and_ordinary_terminal_does_not(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, herdr_terminal, herdr_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+        let (pane, ordinary_terminal, _ordinary_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+
+        herdr_view.update(cx, |terminal_view, cx| {
+            terminal_view.set_herdr_mode(cx);
+        });
+
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("first\nsecond".to_string()));
+        });
+
+        // The most recently added item is active, so this dispatch reaches the
+        // ordinary terminal.
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            ordinary_terminal.update(cx, |terminal, _| terminal.take_input_log());
+            window.dispatch_action(Box::new(Paste), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            ordinary_terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
+            vec![b"first\rsecond".to_vec()],
+            "an ordinary terminal must keep converting paste line endings when the program did not request bracketed paste",
+        );
+
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.activate_item(0, true, true, window, cx);
+            });
+            let _ = window.draw(cx);
+            herdr_terminal.update(cx, |terminal, _| terminal.take_input_log());
+            window.dispatch_action(Box::new(Paste), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            herdr_terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
+            vec![b"\x1b[200~first\nsecond\x1b[201~".to_vec()],
+            "a Herdr terminal must frame paste even when the program did not request bracketed paste",
+        );
     }
 
     #[gpui::test]
@@ -2595,6 +2761,30 @@ mod tests {
             )
             .unwrap(),
         );
+    }
+
+    /// The default keymap asset on its own, so binding precedence can be
+    /// resolved without depending on which action the running harness handles.
+    fn default_keymap(cx: &App) -> Keymap {
+        let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+            settings::DEFAULT_KEYMAP_PATH,
+            cx,
+        )
+        .unwrap();
+        let mut keymap = Keymap::default();
+        keymap.add_bindings(bindings);
+        keymap
+    }
+
+    /// The action a keystroke resolves to, in the given context stack, or `None`
+    /// when the default keymap binds nothing for it.
+    fn resolved_action(keymap: &Keymap, keystroke: &str, context_stack: &[KeyContext]) -> String {
+        let stroke = Keystroke::parse(keystroke).unwrap();
+        let (bindings, _pending) = keymap.bindings_for_input(&[stroke], context_stack);
+        bindings
+            .first()
+            .map(|binding| binding.action().name().to_owned())
+            .unwrap_or_else(|| "<unbound>".to_owned())
     }
 
     fn add_display_only_terminal(

@@ -1327,6 +1327,37 @@
     },
   },
   {
+    "context": "Terminal && HerdrTerminal",
+    "bindings": {
+      // Herdr owns unreserved control chords so shell keybindings win over
+      // workspace actions such as New File, Save, and pane navigation.
+      "ctrl-a": ["terminal::SendKeystroke", "ctrl-a"],
+      "ctrl-b": ["terminal::SendKeystroke", "ctrl-b"],
+      "ctrl-d": ["terminal::SendKeystroke", "ctrl-d"],
+      "ctrl-e": ["terminal::SendKeystroke", "ctrl-e"],
+      "ctrl-f": ["terminal::SendKeystroke", "ctrl-f"],
+      "ctrl-g": ["terminal::SendKeystroke", "ctrl-g"],
+      "ctrl-h": ["terminal::SendKeystroke", "ctrl-h"],
+      "ctrl-i": ["terminal::SendKeystroke", "ctrl-i"],
+      "ctrl-j": ["terminal::SendKeystroke", "ctrl-j"],
+      "ctrl-k": ["terminal::SendKeystroke", "ctrl-k"],
+      "ctrl-l": ["terminal::SendKeystroke", "ctrl-l"],
+      "ctrl-m": ["terminal::SendKeystroke", "ctrl-m"],
+      "ctrl-n": ["terminal::SendKeystroke", "ctrl-n"],
+      "ctrl-o": ["terminal::SendKeystroke", "ctrl-o"],
+      "ctrl-p": ["terminal::SendKeystroke", "ctrl-p"],
+      "ctrl-q": ["terminal::SendKeystroke", "ctrl-q"],
+      "ctrl-r": ["terminal::SendKeystroke", "ctrl-r"],
+      "ctrl-s": ["terminal::SendKeystroke", "ctrl-s"],
+      "ctrl-t": ["terminal::SendKeystroke", "ctrl-t"],
+      "ctrl-u": ["terminal::SendKeystroke", "ctrl-u"],
+      "ctrl-w": ["terminal::SendKeystroke", "ctrl-w"],
+      "ctrl-x": ["terminal::SendKeystroke", "ctrl-x"],
+      "ctrl-y": ["terminal::SendKeystroke", "ctrl-y"],
+      "ctrl-z": ["terminal::SendKeystroke", "ctrl-z"],
+    },
+  },
+  {
     "context": "AgentPanel > Terminal",
     "use_key_equivalents": true,
     "bindings": {

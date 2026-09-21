@@ -244,9 +244,12 @@ impl HerdRHost {
                             cx,
                         );
                         view.set_show_workspace_actions(false, cx);
+                        view.set_herdr_mode(cx);
                         view
                     })?;
-                    host.update(cx, |host, cx| {
+                    host.update_in(cx, |host, window, cx| {
+                        let should_focus_terminal = host.focus_handle.is_focused(window);
+                        let terminal_view_for_focus = terminal_view.clone();
                         let completion = terminal_view
                             .read(cx)
                             .terminal()
@@ -255,6 +258,9 @@ impl HerdRHost {
                         let completion_host = cx.weak_entity();
                         let window_id = host.window_id;
                         host.terminal_view = Some(terminal_view);
+                        if should_focus_terminal {
+                            terminal_view_for_focus.focus_handle(cx).focus(window, cx);
+                        }
                         host.terminal_setup = None;
                         host.terminal_completion = Some(cx.spawn(async move |_, cx| {
                             let _ = completion.await;

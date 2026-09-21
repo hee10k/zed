@@ -1037,6 +1037,7 @@ impl TerminalBuilder {
             selection_phase: SelectionPhase::Ended,
             hyperlink_regex_searches: RegexSearches::default(),
             vi_mode_enabled: false,
+            bracketed_paste_override: false,
             is_remote_terminal: false,
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
@@ -1301,6 +1302,7 @@ impl TerminalBuilder {
             let no_task = task.is_none();
             let terminal = Terminal {
                 task,
+                bracketed_paste_override: false,
                 terminal_type,
                 subprocess,
                 completion_tx,
@@ -1525,6 +1527,7 @@ pub struct Terminal {
     hyperlink_regex_searches: RegexSearches,
     task: Option<TaskState>,
     vi_mode_enabled: bool,
+    bracketed_paste_override: bool,
     is_remote_terminal: bool,
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<GpuiPoint<Pixels>>,
@@ -2205,6 +2208,13 @@ impl Terminal {
     pub fn is_pty(&self) -> bool {
         matches!(self.terminal_type, TerminalType::Pty { .. })
     }
+    /// Forces paste framing regardless of the terminal program's negotiated mode.
+    ///
+    /// This is intended for hosts whose protocol requires bracketed-paste framing
+    /// even when the child process has not enabled DECSET 2004.
+    pub fn set_bracketed_paste_override(&mut self, enabled: bool) {
+        self.bracketed_paste_override = enabled;
+    }
 
     pub fn write_init_command_after_startup(
         &mut self,
@@ -2399,7 +2409,9 @@ impl Terminal {
 
     ///Paste text into the terminal
     pub fn paste(&mut self, text: &str) {
-        let paste_text = if self.last_content.mode.contains(Modes::BRACKETED_PASTE) {
+        let paste_text = if self.bracketed_paste_override
+            || self.last_content.mode.contains(Modes::BRACKETED_PASTE)
+        {
             format!("{}{}{}", "\x1b[200~", text.replace('\x1b', ""), "\x1b[201~")
         } else {
             text.replace("\r\n", "\r").replace('\n', "\r")
@@ -5788,6 +5800,7 @@ mod tests {
     fn make_display_only_terminal() -> Terminal {
         let dispatcher = gpui::TestDispatcher::new(rand::random());
         let executor = gpui::BackgroundExecutor::new(std::sync::Arc::new(dispatcher));
+
         TerminalBuilder::new_display_only(
             SettingsCursorShape::default(),
             AlternateScroll::On,
@@ -5797,6 +5810,41 @@ mod tests {
             PathStyle::local(),
         )
         .terminal
+    }
+
+    #[test]
+    fn paste_override_frames_multiline_input_even_without_terminal_mode() {
+        let mut terminal = make_display_only_terminal();
+
+        terminal.set_bracketed_paste_override(true);
+        terminal.paste("first\nsecond");
+
+        assert_eq!(
+            terminal.take_input_log(),
+            vec![b"\x1b[200~first\nsecond\x1b[201~".to_vec()]
+        );
+    }
+
+    #[test]
+    fn paste_without_override_still_honors_terminal_bracketed_mode() {
+        let mut terminal = make_display_only_terminal();
+        terminal.last_content.mode.insert(Modes::BRACKETED_PASTE);
+
+        terminal.paste("first\nsecond");
+
+        assert_eq!(
+            terminal.take_input_log(),
+            vec![b"\x1b[200~first\nsecond\x1b[201~".to_vec()]
+        );
+    }
+
+    #[test]
+    fn paste_without_override_keeps_mode_driven_line_endings() {
+        let mut terminal = make_display_only_terminal();
+
+        terminal.paste("first\r\nsecond\n");
+
+        assert_eq!(terminal.take_input_log(), vec![b"first\rsecond\r".to_vec()]);
     }
 
     #[test]

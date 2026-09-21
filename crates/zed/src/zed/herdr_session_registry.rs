@@ -1390,6 +1390,10 @@ impl HerdrSessionRegistry {
     /// an unmapped workspace never addresses a herdr session. The checkout
     /// is re-read from the window's live worktree set first so a workspace
     /// switch or worktree add is reflected immediately.
+    ///
+    /// Only the reflected event consumes a token: a repeated local target
+    /// supersedes its pending request and still issues a fresh RPC, so a
+    /// rapid A->B->A never loses A's final switch.
     pub(crate) fn focus_herdr_workspace(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
         self.refresh_window_roots(cx);
         let Some((identity, checkout)) =
@@ -1410,32 +1414,32 @@ impl HerdrSessionRegistry {
         else {
             return;
         };
+        let Some((client, generation)) = self.shared_connection(&identity) else {
+            return;
+        };
         let target = FocusTarget::Workspace {
             session: identity.clone(),
             workspace_id: workspace_id.clone(),
         };
         let echo = self.focus_echoes.entry(identity.clone()).or_default();
-        if echo.observe(target.clone()) == FocusObservation::Echo {
-            return;
-        }
         let token = echo.request(target);
-        let Some(client) = self
-            .connections
-            .get(&identity)
-            .map(|connection| connection.client.clone())
-        else {
-            return;
-        };
         let registry = cx.entity();
         cx.spawn(async move |_this, cx| {
             if let Err(error) = client.focus_workspace(workspace_id.to_string()).await {
                 log::debug!("herdr workspace focus failed: {error:#}");
+                // A failed RPC cannot produce a reflected event, so release
+                // only this request's token. Successful requests remain
+                // pending until their reflected workspace event arrives.
+                let _ = registry.update(cx, |registry, _| {
+                    // A detached generation must not resolve a replacement's
+                    // same-numbered token after reconnect.
+                    if registry.connection_matches(&identity, generation) {
+                        if let Some(echo) = registry.focus_echoes.get_mut(&identity) {
+                            echo.resolve(token);
+                        }
+                    }
+                });
             }
-            let _ = registry.update(cx, |registry, _| {
-                if let Some(echo) = registry.focus_echoes.get_mut(&identity) {
-                    echo.resolve(token);
-                }
-            });
         })
         .detach();
     }
@@ -1443,10 +1447,9 @@ impl HerdrSessionRegistry {
     /// A remote workspace focus activates the matching inner workspace of a
     /// bound window exactly once. The mapping is the workspace's recorded
     /// checkout resolved against live window roots: a connected window with
-    /// *no* detected agents is still focusable. The reflected event either
-    /// resolves the pending echo for the matching target or, when none
-    /// exists, records nothing: activation never loops because it sends no
-    /// RPC back.
+    /// *no* detected agents is still focusable. Activation changes the window,
+    /// so the local observer sends exactly one focus RPC back; the token that
+    /// RPC registers absorbs its own reflection, and the loop stops there.
     fn focus_remote_workspace(
         &mut self,
         identity: &SessionIdentity,
@@ -3430,9 +3433,10 @@ async fn process_stream_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::channel::oneshot;
     use std::cell::{Cell, RefCell};
 
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualTestContext};
     use settings::Settings as _;
 
     fn session(name: &str) -> SessionIdentity {
@@ -3556,6 +3560,125 @@ mod tests {
             &self,
             _workspace_id: String,
         ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
+            async { Ok(()) }.boxed_local()
+        }
+    }
+
+    struct FocusResultHandle {
+        succeeds: bool,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl HerdrSessionHandle for FocusResultHandle {
+        fn subscribe(&self) -> LocalBoxFuture<'static, anyhow::Result<Box<dyn HerdrEventStream>>> {
+            async { Err::<Box<dyn HerdrEventStream>, _>(anyhow::anyhow!("unused focus stream")) }
+                .boxed_local()
+        }
+
+        fn snapshot(&self) -> LocalBoxFuture<'static, anyhow::Result<SessionSnapshot>> {
+            async { Err::<SessionSnapshot, _>(anyhow::anyhow!("unused focus snapshot")) }
+                .boxed_local()
+        }
+
+        fn pane(
+            &self,
+            _pane_id: String,
+        ) -> LocalBoxFuture<'static, anyhow::Result<herdr::PaneInfo>> {
+            async { Err::<herdr::PaneInfo, _>(anyhow::anyhow!("unused focus pane")) }.boxed_local()
+        }
+
+        fn focus_workspace(
+            &self,
+            _workspace_id: String,
+        ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
+            self.calls.set(self.calls.get().saturating_add(1));
+            let succeeds = self.succeeds;
+            async move {
+                if succeeds {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("focus failed"))
+                }
+            }
+            .boxed_local()
+        }
+    }
+
+
+    struct DelayedFailureHandle {
+        sender: Rc<RefCell<Option<oneshot::Sender<anyhow::Result<()>>>>>,
+    }
+
+    impl HerdrSessionHandle for DelayedFailureHandle {
+        fn subscribe(&self) -> LocalBoxFuture<'static, anyhow::Result<Box<dyn HerdrEventStream>>> {
+            async {
+                Err::<Box<dyn HerdrEventStream>, _>(anyhow::anyhow!(
+                    "unused delayed focus stream"
+                ))
+            }
+            .boxed_local()
+        }
+
+        fn snapshot(&self) -> LocalBoxFuture<'static, anyhow::Result<SessionSnapshot>> {
+            async { Err::<SessionSnapshot, _>(anyhow::anyhow!("unused delayed focus snapshot")) }
+                .boxed_local()
+        }
+
+        fn pane(
+            &self,
+            _pane_id: String,
+        ) -> LocalBoxFuture<'static, anyhow::Result<herdr::PaneInfo>> {
+            async { Err::<herdr::PaneInfo, _>(anyhow::anyhow!("unused delayed focus pane")) }
+                .boxed_local()
+        }
+
+        fn focus_workspace(
+            &self,
+            _workspace_id: String,
+        ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
+            let (sender, receiver) = oneshot::channel();
+            *self.sender.borrow_mut() = Some(sender);
+            async move {
+                receiver
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("focus request cancelled")))
+            }
+            .boxed_local()
+        }
+    }
+
+    struct RecordingFocusHandle {
+        workspace_ids: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl HerdrSessionHandle for RecordingFocusHandle {
+        fn subscribe(&self) -> LocalBoxFuture<'static, anyhow::Result<Box<dyn HerdrEventStream>>> {
+            async {
+                Err::<Box<dyn HerdrEventStream>, _>(anyhow::anyhow!(
+                    "unused recording focus stream"
+                ))
+            }
+            .boxed_local()
+        }
+
+        fn snapshot(&self) -> LocalBoxFuture<'static, anyhow::Result<SessionSnapshot>> {
+            async { Err::<SessionSnapshot, _>(anyhow::anyhow!("unused recording focus snapshot")) }
+                .boxed_local()
+        }
+
+        fn pane(
+            &self,
+            _pane_id: String,
+        ) -> LocalBoxFuture<'static, anyhow::Result<herdr::PaneInfo>> {
+            async { Err::<herdr::PaneInfo, _>(anyhow::anyhow!("unused recording focus pane")) }
+                .boxed_local()
+        }
+
+        fn focus_workspace(
+            &self,
+            workspace_id: String,
+        ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
+            self.workspace_ids.borrow_mut().push(workspace_id);
             async { Ok(()) }.boxed_local()
         }
     }
@@ -4072,6 +4195,83 @@ mod tests {
             .insert_tree("C:/agent-root", serde_json::json!({ "file.txt": "" }))
             .await;
         app_state
+    }
+
+    async fn focus_registry_fixture(
+        cx: &mut TestAppContext,
+        handle: Option<Rc<dyn HerdrSessionHandle>>,
+    ) -> (
+        Entity<HerdrSessionRegistry>,
+        VisualTestContext,
+        WindowId,
+        SessionIdentity,
+    ) {
+        init_app(cx);
+        let app_state = import_test_app(cx).await;
+        let project = project::Project::test(
+            app_state.fs.clone(),
+            [std::path::Path::new("C:/existing")],
+            cx,
+        )
+        .await;
+        let window = add_real_window(cx, &project).await;
+        let roots = roots_in_window(window, cx);
+        let identity = session("main");
+        let registry = cx.update(|cx| {
+            cx.new(|cx| {
+                HerdrSessionRegistry::test(
+                    cx,
+                    HerdrGateway::fake(
+                        || async { Ok(Vec::new()) }.boxed_local(),
+                        |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+                        |_name| async { Ok(()) }.boxed_local(),
+                    ),
+                )
+            })
+        });
+        let window_id = registry.update(cx, |registry, _| {
+            registry.register_window_for_test(
+                window,
+                BindingState::Connected(identity.clone()),
+                roots,
+            )
+        });
+        registry.update(cx, |registry, _| {
+            registry
+                .windows
+                .get_mut(&window_id.as_u64())
+                .expect("focus fixture window is registered")
+                .checkout_path = Some(checkout("C:/existing"));
+            let _ = registry
+                .sync
+                .apply_workspace(&identity, &workspace_with_checkout("C:/existing"));
+            if let Some(handle) = handle {
+                registry.install_connection_for_test(identity.clone(), handle, 1);
+            }
+        });
+        let visual = VisualTestContext::from_window(window.into(), cx);
+        (registry, visual, window_id, identity)
+    }
+
+    fn process_workspace_focus_event(
+        cx: &mut VisualTestContext,
+        registry: &Entity<HerdrSessionRegistry>,
+        identity: &SessionIdentity,
+        generation: u64,
+        workspace_id: &str,
+    ) {
+        let identity = identity.clone();
+        let event = HerdrEvent::Workspace(WorkspaceEvent::Focused {
+            workspace_id: workspace_id.to_owned(),
+        });
+        let task = registry.update(cx, |_, cx| {
+            let registry = cx.entity();
+            cx.spawn(async move |_this, mut cx| {
+                process_stream_event(&registry, &identity, generation, event, &mut cx).await;
+            })
+        });
+        task.detach();
+        cx.cx.run_until_parked();
     }
 
     #[gpui::test]
@@ -4793,6 +4993,241 @@ mod tests {
         assert!(
             registry.read_with(cx, |registry, _| registry.sync.record(&key).is_none()),
             "exit stream event should remove the live agent through process_stream_event"
+        );
+    }
+
+    #[gpui::test]
+    async fn successful_local_focus_waits_for_reflected_echo_before_activation(
+        cx: &mut TestAppContext,
+    ) {
+        let calls = Rc::new(Cell::new(0));
+        let (registry, mut visual, window_id, identity) = focus_registry_fixture(
+            cx,
+            Some(Rc::new(FocusResultHandle {
+                succeeds: true,
+                calls: calls.clone(),
+            }) as Rc<dyn HerdrSessionHandle>),
+        )
+        .await;
+
+        visual.deactivate_window();
+        registry.update(&mut visual, |registry, cx| {
+            registry.focus_herdr_workspace(window_id, cx);
+        });
+        visual.cx.run_until_parked();
+        assert_eq!(calls.get(), 1, "local focus must issue one RPC");
+        visual.update(|window, _| assert!(!window.is_window_active()));
+
+        process_workspace_focus_event(&mut visual, &registry, &identity, 1, "workspace");
+        visual.update(|window, _| {
+            assert!(
+                !window.is_window_active(),
+                "a reflected local focus must be consumed as an echo"
+            );
+        });
+
+        visual.deactivate_window();
+        process_workspace_focus_event(&mut visual, &registry, &identity, 1, "workspace");
+        visual.update(|window, _| {
+            assert!(
+                window.is_window_active(),
+                "a later genuinely external focus must activate the window"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn failed_local_focus_clears_echo_for_later_external_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let calls = Rc::new(Cell::new(0));
+        let (registry, mut visual, window_id, identity) = focus_registry_fixture(
+            cx,
+            Some(Rc::new(FocusResultHandle {
+                succeeds: false,
+                calls: calls.clone(),
+            }) as Rc<dyn HerdrSessionHandle>),
+        )
+        .await;
+        visual.deactivate_window();
+        registry.update(&mut visual, |registry, cx| {
+            registry.focus_herdr_workspace(window_id, cx);
+        });
+        visual.cx.run_until_parked();
+        assert_eq!(calls.get(), 1, "failed local focus must issue one RPC");
+
+        process_workspace_focus_event(&mut visual, &registry, &identity, 1, "workspace");
+        visual.update(|window, _| {
+            assert!(
+                window.is_window_active(),
+                "an RPC failure must clear its echo so the reflected focus is external"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn local_focus_without_connection_does_not_create_echo(
+        cx: &mut TestAppContext,
+    ) {
+        let calls = Rc::new(Cell::new(0));
+        let (registry, mut visual, window_id, identity) = focus_registry_fixture(cx, None).await;
+
+        visual.deactivate_window();
+        registry.update(&mut visual, |registry, cx| {
+            registry.focus_herdr_workspace(window_id, cx);
+            registry.install_connection_for_test(
+                identity.clone(),
+                Rc::new(FocusResultHandle {
+                    succeeds: true,
+                    calls: calls.clone(),
+                }),
+                1,
+            );
+        });
+        visual.cx.run_until_parked();
+
+        process_workspace_focus_event(&mut visual, &registry, &identity, 1, "workspace");
+        visual.update(|window, _| {
+            assert!(
+                window.is_window_active(),
+                "a missing client must not leave an orphan echo"
+            );
+        });
+        assert_eq!(
+            calls.get(),
+            0,
+            "neither the unconnected local focus nor the external activation may issue an RPC"
+        );
+    }
+
+    #[gpui::test]
+    async fn stale_focus_failure_cannot_clear_new_generation_echo(
+        cx: &mut TestAppContext,
+    ) {
+        let old_failure_sender = Rc::new(RefCell::new(None));
+        let new_focus_calls = Rc::new(Cell::new(0));
+        let (registry, mut visual, window_id, identity) = focus_registry_fixture(
+            cx,
+            Some(Rc::new(DelayedFailureHandle {
+                sender: old_failure_sender.clone(),
+            }) as Rc<dyn HerdrSessionHandle>),
+        )
+        .await;
+
+        visual.deactivate_window();
+        registry.update(&mut visual, |registry, cx| {
+            registry.focus_herdr_workspace(window_id, cx);
+        });
+        visual.cx.run_until_parked();
+        assert!(
+            old_failure_sender.borrow().is_some(),
+            "the old generation focus RPC must be in flight"
+        );
+
+        registry.update(&mut visual, |registry, cx| {
+            registry.detach_window(&identity, window_id, cx);
+            registry.install_connection_for_test(
+                identity.clone(),
+                Rc::new(FocusResultHandle {
+                    succeeds: true,
+                    calls: new_focus_calls.clone(),
+                }),
+                2,
+            );
+            registry.focus_herdr_workspace(window_id, cx);
+        });
+        visual.cx.run_until_parked();
+        assert_eq!(new_focus_calls.get(), 1, "new generation focus must issue one RPC");
+
+        old_failure_sender
+            .borrow_mut()
+            .take()
+            .expect("old focus RPC sender must remain available")
+            .send(Err(anyhow::anyhow!("old generation failed")))
+            .expect("old focus RPC receiver is still pending");
+        visual.cx.run_until_parked();
+
+        visual.deactivate_window();
+        process_workspace_focus_event(&mut visual, &registry, &identity, 2, "workspace");
+        visual.update(|window, _| {
+            assert!(
+                !window.is_window_active(),
+                "a stale failure must not clear a newer generation's echo"
+            );
+        });
+    }
+    #[gpui::test]
+    fn rapid_local_focus_reissues_superseded_workspace_rpc(cx: &mut TestAppContext) {
+        let identity = session("main");
+        let workspace_ids = Rc::new(RefCell::new(Vec::new()));
+        let registry = cx.update(|cx| {
+            cx.new(|cx| {
+                HerdrSessionRegistry::test(
+                    cx,
+                    HerdrGateway::fake(
+                        || async { Ok(Vec::new()) }.boxed_local(),
+                        |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+                        |_name| async { Ok(()) }.boxed_local(),
+                    ),
+                )
+            })
+        });
+        let window_id = registry.update(cx, |registry, _| {
+            let window_id = registry.register_window_for_test(
+                WindowHandle::new(WindowId::from(77)),
+                BindingState::Connected(identity.clone()),
+                Vec::new(),
+            );
+            registry
+                .windows
+                .get_mut(&window_id.as_u64())
+                .expect("rapid-focus fixture window is registered")
+                .checkout_path = Some(checkout("C:/existing"));
+            let _ = registry
+                .sync
+                .apply_workspace(&identity, &workspace_with_checkout("C:/existing"));
+            let mut second_workspace = workspace_with_checkout("C:/space-b");
+            second_workspace.workspace_id = "workspace-b".to_owned();
+            let _ = registry
+                .sync
+                .apply_workspace(&identity, &second_workspace);
+            registry.install_connection_for_test(
+                identity.clone(),
+                Rc::new(RecordingFocusHandle {
+                    workspace_ids: workspace_ids.clone(),
+                }),
+                1,
+            );
+            window_id
+        });
+
+        // One park at the end: the pending A token can only be superseded by
+        // a third RPC if a repeated local request never consumes it.
+        registry.update(cx, |registry, cx| {
+            registry.focus_herdr_workspace(window_id, cx);
+            registry
+                .windows
+                .get_mut(&window_id.as_u64())
+                .expect("rapid-focus fixture window is registered")
+                .checkout_path = Some(checkout("C:/space-b"));
+            registry.focus_herdr_workspace(window_id, cx);
+            registry
+                .windows
+                .get_mut(&window_id.as_u64())
+                .expect("rapid-focus fixture window is registered")
+                .checkout_path = Some(checkout("C:/existing"));
+            registry.focus_herdr_workspace(window_id, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            *workspace_ids.borrow(),
+            vec![
+                "workspace".to_owned(),
+                "workspace-b".to_owned(),
+                "workspace".to_owned(),
+            ],
+            "a repeated local target must issue a new superseding RPC"
         );
     }
 
