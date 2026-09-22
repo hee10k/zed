@@ -1064,12 +1064,17 @@ impl TerminalBuilder {
             path_style,
             cwd_history: Vec::new(),
             pending_cwd_boundary: None,
+            pending_pty_resize: None,
+            pty_resize_task: None,
+            last_sent_pty_resize: None,
             #[cfg(any(test, feature = "test-support"))]
             input_log: Vec::new(),
             #[cfg(test)]
             suppress_hyperlink_throttle_once: false,
             #[cfg(any(test, feature = "test-support"))]
             pty_write_log: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            pty_resize_log: Default::default(),
         };
 
         TerminalBuilder {
@@ -1364,12 +1369,17 @@ impl TerminalBuilder {
                         .unwrap_or_default()
                 },
                 pending_cwd_boundary: None,
+                pending_pty_resize: None,
+                pty_resize_task: None,
+                last_sent_pty_resize: None,
                 #[cfg(any(test, feature = "test-support"))]
                 input_log: Vec::new(),
                 #[cfg(test)]
                 suppress_hyperlink_throttle_once: false,
                 #[cfg(any(test, feature = "test-support"))]
                 pty_write_log: Default::default(),
+                #[cfg(any(test, feature = "test-support"))]
+                pty_resize_log: Default::default(),
             };
 
             if !activation_script.is_empty() && no_task {
@@ -1545,12 +1555,26 @@ pub struct Terminal {
     path_style: PathStyle,
     cwd_history: Vec<CwdHistoryEntry>,
     pending_cwd_boundary: Option<i32>,
+    /// Newest bounds waiting for [`PTY_RESIZE_THROTTLE`] of resize silence, so
+    /// the child always ends up at the size the user stopped at.
+    pending_pty_resize: Option<TerminalBounds>,
+    /// Delivers [`pending_pty_resize`](Self::pending_pty_resize) after the quiet
+    /// period. Replacing the task restarts that period; `None` means the next
+    /// resize is the leading edge of a new burst and is delivered immediately.
+    pty_resize_task: Option<Task<()>>,
+    /// The size the child was last told about, so a drag that ends on its
+    /// leading size does not make it reflow for nothing.
+    last_sent_pty_resize: Option<TerminalBounds>,
     #[cfg(any(test, feature = "test-support"))]
     input_log: Vec<Vec<u8>>,
     #[cfg(test)]
     suppress_hyperlink_throttle_once: bool,
     #[cfg(any(test, feature = "test-support"))]
     pty_write_log: std::cell::RefCell<Vec<Vec<u8>>>,
+    /// Every size the terminal actually handed to the PTY, newest last. Only
+    /// recorded in tests so resize traffic can be observed.
+    #[cfg(any(test, feature = "test-support"))]
+    pty_resize_log: std::cell::RefCell<Vec<TerminalBounds>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1609,6 +1633,11 @@ impl TaskStatus {
 
 const FIND_HYPERLINK_THROTTLE_PX: Pixels = px(5.0);
 const FIND_HYPERLINK_THROTTLE: Duration = Duration::from_millis(100);
+
+/// How long the PTY must receive no new bounds before it gets the trailing
+/// resize. This prevents a continuous window-edge drag from making the child
+/// reflow its whole grid on every column change.
+const PTY_RESIZE_THROTTLE: Duration = Duration::from_millis(50);
 
 /// Minimum pointer movement before a left click begins a selection. This keeps
 /// a click that jitters by a pixel or two (such as the window-focusing click)
@@ -1722,12 +1751,8 @@ impl Terminal {
                     self.last_content.terminal_bounds.num_columns() != new_bounds.num_columns();
                 self.last_content.terminal_bounds = new_bounds;
 
-                if let TerminalType::Pty {
-                    resources: PtyResources::Active(pty_tx),
-                    ..
-                } = &self.terminal_type
-                {
-                    pty_tx.resize(new_bounds);
+                if self.has_active_pty_resources() {
+                    self.throttle_pty_resize(new_bounds, cx);
                 }
 
                 resize(term, new_bounds);
@@ -2084,7 +2109,7 @@ impl Terminal {
         self.last_content.scrolled_to_bottom
     }
 
-    ///Resize the terminal and the PTY.
+    /// Resize the terminal, and the PTY through [`Terminal::throttle_pty_resize`].
     pub fn set_size(&mut self, new_bounds: TerminalBounds) {
         let new_bounds = normalize_terminal_bounds(new_bounds);
 
@@ -2105,6 +2130,62 @@ impl Terminal {
         match self.events.back_mut() {
             Some(InternalEvent::Resize(pending_bounds)) => *pending_bounds = new_bounds,
             _ => self.events.push_back(InternalEvent::Resize(new_bounds)),
+        }
+    }
+
+    /// Hands the leading and trailing sizes of a resize burst to the child.
+    ///
+    /// The caller has already resized the alacritty grid, so only PTY traffic
+    /// is bounded: that traffic is what makes a full-screen child reflow and
+    /// repaint its entire UI, which a window-edge drag used to provoke dozens
+    /// of times per second. The first change is delivered right away. Each
+    /// later change restarts the quiet period, after which only the newest size
+    /// is delivered. An isolated resize therefore costs no latency, continuous
+    /// dragging cannot trigger intermediate child reflows, and the child is
+    /// never left at a stale size.
+    fn throttle_pty_resize(&mut self, new_bounds: TerminalBounds, cx: &mut Context<Self>) {
+        self.pending_pty_resize = Some(new_bounds);
+        if self.pty_resize_task.is_none() {
+            self.send_pending_pty_resize();
+        }
+
+        // Dropping the previous task cancels its timer. Restarting the timer on
+        // every new bound makes this a quiet-period debounce rather than a
+        // periodic repaint while the drag is still moving.
+        self.pty_resize_task.take();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PTY_RESIZE_THROTTLE).await;
+            this.update(cx, |this, _| {
+                this.send_pending_pty_resize();
+                this.pty_resize_task = None;
+            })
+            .ok();
+        });
+        self.pty_resize_task = Some(task);
+    }
+
+    /// Delivers the newest queued bounds to the PTY, if anything is still
+    /// waiting for it and the child does not already have exactly that size.
+    fn send_pending_pty_resize(&mut self) {
+        let Some(new_bounds) = self.pending_pty_resize else {
+            return;
+        };
+        self.pending_pty_resize = None;
+        if self.last_sent_pty_resize == Some(new_bounds) {
+            // An oscillating drag can stop on the size the window opened with;
+            // telling the child again would buy nothing but another full
+            // reflow.
+            return;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        self.pty_resize_log.borrow_mut().push(new_bounds);
+        if let TerminalType::Pty {
+            resources: PtyResources::Active(pty_tx),
+            ..
+        } = &self.terminal_type
+        {
+            self.last_sent_pty_resize = Some(new_bounds);
+            pty_tx.resize(new_bounds);
         }
     }
 
@@ -2269,6 +2350,11 @@ impl Terminal {
     #[cfg(any(test, feature = "test-support"))]
     pub fn take_pty_write_log(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(self.pty_write_log.get_mut())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn take_pty_resize_log(&mut self) -> Vec<TerminalBounds> {
+        std::mem::take(self.pty_resize_log.get_mut())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -3724,37 +3810,62 @@ mod tests {
         program: String,
         args: Vec<String>,
     ) -> Entity<Terminal> {
+        let builder = build_test_terminal_builder_with_arguments(cx, program, args).await;
+        cx.new(|cx| builder.subscribe(cx))
+    }
+
+    async fn build_test_terminal_builder_with_arguments(
+        cx: &mut TestAppContext,
+        program: String,
+        args: Vec<String>,
+    ) -> TerminalBuilder {
         let mode = TerminalMode::task(SpawnInTerminal {
             command: Some(program.clone()),
             args: args.clone(),
             ..Default::default()
         });
-        let builder = cx
-            .update(|cx| {
-                TerminalBuilder::new(
-                    None,
-                    mode,
-                    task::Shell::WithArguments {
-                        program,
-                        args,
-                        title_override: None,
-                    },
-                    HashMap::default(),
-                    SettingsCursorShape::default(),
-                    AlternateScroll::On,
-                    None,
-                    vec![],
-                    Duration::ZERO,
-                    false,
-                    0,
-                    cx,
-                    vec![],
-                    PathStyle::local(),
-                )
-            })
-            .await
-            .unwrap();
-        cx.new(|cx| builder.subscribe(cx))
+        cx.update(|cx| {
+            TerminalBuilder::new(
+                None,
+                mode,
+                task::Shell::WithArguments {
+                    program,
+                    args,
+                    title_override: None,
+                },
+                HashMap::default(),
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                vec![],
+                Duration::ZERO,
+                false,
+                0,
+                cx,
+                vec![],
+                PathStyle::local(),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Builds a real PTY-backed terminal and a window for exercising
+    /// [`Terminal::sync`].
+    async fn build_test_pty_terminal_in_window<'a>(
+        cx: &'a mut TestAppContext,
+        command: &str,
+        args: &[&str],
+    ) -> (Entity<Terminal>, &'a mut VisualTestContext) {
+        use gpui::VisualContext as _;
+
+        let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let (program, args) =
+            ShellBuilder::new(&Shell::System, false).build(Some(command.to_owned()), &args);
+        let builder = build_test_terminal_builder_with_arguments(cx, program, args).await;
+        let window = cx.add_empty_window();
+        let terminal = window.new_window_entity(|_, cx| builder.subscribe(cx));
+        (terminal, window)
     }
 
     /// Builds a non-PTY (`no_pty`) task terminal, exercising the path used by
@@ -4493,6 +4604,147 @@ mod tests {
             terminal.events.back(),
             Some(InternalEvent::Resize(_))
         ));
+    }
+
+    /// Dragging a window edge changes the column count dozens of times per
+    /// second, and every one of those changes used to ask the child process to
+    /// reflow and repaint its whole UI. The child must see the leading size and
+    /// the final size after a quiet period, but nothing between them.
+    #[gpui::test]
+    async fn pty_resize_drag_is_rate_limited_and_final_size_arrives(cx: &mut TestAppContext) {
+        use gpui::VisualContext as _;
+
+        cx.executor().allow_parking();
+        let clock = cx.executor();
+        let (terminal, window) = build_test_pty_terminal_in_window(cx, "echo", &["ready"]).await;
+        window.run_until_parked();
+
+        let base_bounds = TerminalBounds::new(
+            px(20.),
+            px(10.),
+            bounds(point(px(0.), px(0.)), size(px(400.), px(200.))),
+        );
+        // A rightward drag: 40, 44 then 48 columns. Each frame arrives before
+        // the quiet period ends, as it does during a continuous real resize.
+        let drag: Vec<TerminalBounds> = [400., 440., 480.]
+            .into_iter()
+            .map(|width| TerminalBounds {
+                bounds: bounds(
+                    point(px(0.), px(0.)),
+                    size(px(width), base_bounds.bounds.size.height),
+                ),
+                ..base_bounds
+            })
+            .collect();
+        assert_ne!(drag[0].num_columns(), drag[2].num_columns());
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            assert!(
+                terminal.has_active_pty_resources(),
+                "this test needs a terminal backed by a live PTY"
+            );
+            terminal.set_size(drag[0]);
+            terminal.sync(window, cx);
+        });
+        let leading =
+            window.update_window_entity(&terminal, |terminal, _, _| terminal.take_pty_resize_log());
+        assert_eq!(
+            leading,
+            vec![drag[0]],
+            "a drag must hand its leading size to the PTY immediately"
+        );
+
+        for new_bounds in &drag[1..] {
+            clock.advance_clock(PTY_RESIZE_THROTTLE / 2);
+            window.run_until_parked();
+            window.update_window_entity(&terminal, |terminal, window, cx| {
+                terminal.set_size(*new_bounds);
+                terminal.sync(window, cx);
+            });
+            let during_drag = window
+                .update_window_entity(&terminal, |terminal, _, _| terminal.take_pty_resize_log());
+            assert!(
+                during_drag.is_empty(),
+                "a continuous drag must not trigger an intermediate PTY reflow, got {during_drag:?}"
+            );
+        }
+        window.update_window_entity(&terminal, |terminal, _, _| {
+            let content = terminal.last_content();
+            assert_eq!(
+                content.columns,
+                drag[drag.len() - 1].num_columns(),
+                "the alacritty grid must resize without waiting for the PTY"
+            );
+            assert_eq!(
+                content.screen_lines,
+                drag[drag.len() - 1].num_lines(),
+                "the alacritty grid must resize without waiting for the PTY"
+            );
+        });
+
+        // The quiet period delivers the newest size, and nothing stale.
+        clock.advance_clock(PTY_RESIZE_THROTTLE * 2);
+        window.run_until_parked();
+        let trailing =
+            window.update_window_entity(&terminal, |terminal, _, _| terminal.take_pty_resize_log());
+        assert_eq!(
+            trailing,
+            vec![drag[drag.len() - 1]],
+            "the size the drag stopped at must reach the PTY exactly once"
+        );
+
+        // An oscillating drag: 40 -> 44 -> 40 columns within one burst. The
+        // leading edge already told the child about 40, so the trailing flush
+        // must not make it reflow again for a size it already has.
+        let oscillating = vec![drag[0], drag[1], drag[0]];
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            for new_bounds in &oscillating {
+                terminal.set_size(*new_bounds);
+                terminal.sync(window, cx);
+            }
+        });
+        let oscillating_leading =
+            window.update_window_entity(&terminal, |terminal, _, _| terminal.take_pty_resize_log());
+        assert_eq!(
+            oscillating_leading,
+            vec![drag[0]],
+            "the oscillating drag must start with one immediate resize"
+        );
+        clock.advance_clock(PTY_RESIZE_THROTTLE * 2);
+        window.run_until_parked();
+        let oscillating_trailing =
+            window.update_window_entity(&terminal, |terminal, _, _| terminal.take_pty_resize_log());
+        assert!(
+            oscillating_trailing.is_empty(),
+            "an unchanged size must not be re-delivered after the quiet period, got {oscillating_trailing:?}"
+        );
+        window.update_window_entity(&terminal, |terminal, _, _| {
+            assert_eq!(
+                terminal.last_content().columns,
+                drag[0].num_columns(),
+                "skipping the redundant resize must still leave the grid at the final size"
+            );
+        });
+
+        // After the quiet period, the next change is immediate again.
+        let after_drag = TerminalBounds {
+            bounds: bounds(
+                point(px(0.), px(0.)),
+                size(px(520.), base_bounds.bounds.size.height),
+            ),
+            ..base_bounds
+        };
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(after_drag);
+            terminal.sync(window, cx);
+        });
+        let next =
+            window.update_window_entity(&terminal, |terminal, _, _| terminal.take_pty_resize_log());
+        assert_eq!(
+            next,
+            vec![after_drag],
+            "an isolated resize after the quiet period must reach the PTY at once"
+        );
     }
 
     fn get_cells(size: TerminalBounds, rng: &mut StdRng) -> Vec<Vec<char>> {
