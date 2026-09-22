@@ -1,6 +1,17 @@
 #!/usr/bin/env node --redirect-warnings=/dev/null
 
 const { execFileSync } = require("child_process");
+const { parseArgs } = require("util");
+const { releaseNotesSection, releaseNotesEntries } = require("./lib/release-notes");
+
+const GPUI_PREFIX_PATTERN = /^- \[GPUI\]\s*/i;
+
+const USAGE = [
+  "Usage: draft-release-notes <version> {stable|preview} [--gpui]",
+  "",
+  "By default, release notes entries prefixed with `- [GPUI]` are excluded.",
+  "With --gpui, only those entries are included, with the prefix removed.",
+].join("\n");
 
 const SECTION_VERBS = {
   New: "Added",
@@ -8,26 +19,66 @@ const SECTION_VERBS = {
   Fixes: "Fixed",
 };
 
-function parseReleaseNotes(body) {
-  const match = String(body || "").match(/(?:^|\n)Release Notes:\s*\n([\s\S]*)/i);
-  if (!match) {
+function parseArguments() {
+  let values, positionals;
+  try {
+    ({ values, positionals } = parseArgs({
+      allowPositionals: true,
+      options: { gpui: { type: "boolean", default: false } },
+    }));
+  } catch (e) {
+    return { error: e.message };
+  }
+
+  let [version, channel, ...rest] = positionals;
+  if (version == null || channel == null || rest.length > 0) {
+    return { error: "Expected exactly two positional arguments: <version> {stable|preview}" };
+  }
+
+  const versionParts = version.split(".");
+  if (versionParts.length !== 3 || versionParts.some((part) => !/^\d+$/.test(part))) {
+    return { error: `Invalid version "${version}", expected <major>.<minor>.<patch>` };
+  }
+  const parts = versionParts.map((part) => Number(part));
+
+  if (channel !== "stable" && channel !== "preview") {
+    return { error: `Invalid channel "${channel}", expected "stable" or "preview"` };
+  }
+
+  return { version, channel, parts, gpui: values.gpui };
+}
+
+function filterReleaseNotes(releaseNotes, gpui) {
+  return releaseNotes
+    .split("\n")
+    .filter((line) => line !== "" && GPUI_PREFIX_PATTERN.test(line) === gpui)
+    .map((line) => (gpui ? line.replace(GPUI_PREFIX_PATTERN, "- ") : line))
+    .join("\n");
+}
+
+function releaseNoteEntries(body, gpui) {
+  const section = releaseNotesSection(String(body || ""));
+  const entries = releaseNotesEntries(section).join("\n");
+  const filtered = filterReleaseNotes(entries, gpui);
+  return filtered === ""
+    ? []
+    : filtered.split("\n").map((entry) => entry.replace(/\s+/g, " ").trim());
+}
+
+function parseReleaseNotes(body, gpui = false) {
+  const section = releaseNotesSection(String(body || ""));
+  const allEntries = releaseNotesEntries(section);
+  if (allEntries.length === 0) {
     return { kind: "missing", text: "" };
   }
 
-  const lines = match[1].split(/\r?\n\r?\n/, 1)[0].split(/\r?\n/);
-  const firstBulletIndex = lines.findIndex((line) => /^\s*-\s+\S/.test(line));
-  if (firstBulletIndex === -1) {
-    return { kind: "missing", text: "" };
+  const entries = releaseNoteEntries(body, gpui);
+  if (entries.length === 0) {
+    return { kind: "skip", text: "" };
   }
 
-  const bulletLines = [lines[firstBulletIndex].replace(/^\s*-\s+/, "").trim()];
-  for (const line of lines.slice(firstBulletIndex + 1)) {
-    if (line.trim() === "" || /^\s*-\s+\S/.test(line)) break;
-    bulletLines.push(line.trim());
-  }
-
-  const text = bulletLines.join(" ").trim();
-  if (/^N\/A\b/i.test(text)) {
+  const text = entries[0].replace(/^\s*-\s+/, "").trim();
+  if (/^N\/A\b/i.test(text) || text.includes("<public_issue_number_if_exists>")) {
     return { kind: "skip", text: "" };
   }
   return { kind: "explicit", text };
@@ -90,22 +141,39 @@ function attachLink(text, commit) {
   return `${text} ([commit](https://github.com/zed-industries/zed/commit/${commit.hash}))`;
 }
 
-function formatCommitEntry(commit) {
-  const parsed = parseReleaseNotes(commit.body);
-  if (parsed.kind === "skip") return null;
+function formatCommitEntries(commit, gpui = false) {
+  const parsed = parseReleaseNotes(commit.body, gpui);
+  if (parsed.kind === "skip") return [];
 
-  const entry =
-    parsed.kind === "explicit"
-      ? normalizeExplicitEntry(parsed.text)
-      : fallbackReleaseEntry(commit.firstLine);
-  if (!entry) return null;
+  const entries = releaseNoteEntries(commit.body, gpui);
+  if (parsed.kind === "missing") {
+    const entry = fallbackReleaseEntry(commit.firstLine);
+    if (!entry) return [];
+    const text = attachLink(entry.text, commit);
+    return [{
+      section: entry.section,
+      text,
+      key: `${entry.section}\n${text}`,
+    }];
+  }
 
-  const text = attachLink(entry.text, commit);
-  return {
-    section: entry.section,
-    text,
-    key: `${entry.section}\n${text}`,
-  };
+  return entries
+    .map((line) => line.replace(/^\s*-\s+/, "").trim())
+    .filter((text) => !/^N\/A\b/i.test(text) && !text.includes("<public_issue_number_if_exists>"))
+    .map(normalizeExplicitEntry)
+    .filter((entry) => entry !== null)
+    .map((entry) => {
+      const text = attachLink(entry.text, commit);
+      return {
+        section: entry.section,
+        text,
+        key: `${entry.section}\n${text}`,
+      };
+    });
+}
+
+function formatCommitEntry(commit, gpui = false) {
+  return formatCommitEntries(commit, gpui)[0] || null;
 }
 
 function renderReleaseNotes(entries, compareUrl) {
@@ -133,6 +201,51 @@ function renderReleaseNotes(entries, compareUrl) {
     return `No public-facing changes in this release. [View the commits](${compareUrl}).\n`;
   }
   return `${sections.join("\n\n")}\n`;
+}
+
+function main() {
+  const { error, version, channel, parts, gpui } = parseArguments();
+  if (error) {
+    console.error(error);
+    console.error("");
+    console.error(USAGE);
+    process.exit(1);
+  }
+  // We currently draft notes only for patch releases.
+  if (parts[2] === 0) process.exit(0);
+
+  const priorVersion = [parts[0], parts[1], Number(parts[2]) - 1].join(".");
+  const suffix = channel === "preview" ? "-pre" : "";
+  const [tag, priorTag] = [`v${version}${suffix}`, `v${priorVersion}${suffix}`];
+
+  try {
+    execFileSync("rm", ["-rf", "target/shallow_clone"]);
+    execFileSync("git", [
+      "clone",
+      "https://github.com/zed-industries/zed",
+      "target/shallow_clone",
+      "--filter=tree:0",
+      "--no-checkout",
+      "--branch",
+      tag,
+      "--depth",
+      100,
+    ]);
+    execFileSync("git", ["-C", "target/shallow_clone", "rev-parse", "--verify", tag]);
+    try {
+      execFileSync("git", ["-C", "target/shallow_clone", "rev-parse", "--verify", priorTag]);
+    } catch {
+      console.error(`Prior tag ${priorTag} not found`);
+      process.exit(0);
+    }
+  } catch (error) {
+    console.error(error.stderr?.toString() || error.toString());
+    process.exit(1);
+  }
+
+  const compareUrl = `https://github.com/zed-industries/zed/compare/${priorTag}...${tag}#commits_bucket`;
+  const entries = getCommits(priorTag, tag).flatMap((commit) => formatCommitEntries(commit, gpui));
+  console.log(renderReleaseNotes(entries, compareUrl));
 }
 
 function getCommits(oldTag, newTag) {
@@ -168,60 +281,6 @@ function getCommits(oldTag, newTag) {
   return log;
 }
 
-function main() {
-  const version = process.argv[2];
-  const channel = process.argv[3];
-  const parts = String(version || "").split(".");
-
-  if (
-    process.argv.length !== 4 ||
-    parts.length !== 3 ||
-    parts.some((part) => !/^\d+$/.test(part)) ||
-    (channel !== "stable" && channel !== "preview")
-  ) {
-    console.log("Usage: draft-release-notes <version> {stable|preview}");
-    process.exit(1);
-  }
-
-  // We currently draft notes only for patch releases.
-  if (parts[2] === "0") process.exit(0);
-
-  const priorVersion = [parts[0], parts[1], Number(parts[2]) - 1].join(".");
-  const suffix = channel === "preview" ? "-pre" : "";
-  const [tag, priorTag] = [`v${version}${suffix}`, `v${priorVersion}${suffix}`];
-
-  try {
-    execFileSync("rm", ["-rf", "target/shallow_clone"]);
-    execFileSync("git", [
-      "clone",
-      "https://github.com/zed-industries/zed",
-      "target/shallow_clone",
-      "--filter=tree:0",
-      "--no-checkout",
-      "--branch",
-      tag,
-      "--depth",
-      100,
-    ]);
-    execFileSync("git", ["-C", "target/shallow_clone", "rev-parse", "--verify", tag]);
-    try {
-      execFileSync("git", ["-C", "target/shallow_clone", "rev-parse", "--verify", priorTag]);
-    } catch {
-      console.error(`Prior tag ${priorTag} not found`);
-      process.exit(0);
-    }
-  } catch (error) {
-    console.error(error.stderr?.toString() || error.toString());
-    process.exit(1);
-  }
-
-  const compareUrl = `https://github.com/zed-industries/zed/compare/${priorTag}...${tag}#commits_bucket`;
-  const entries = getCommits(priorTag, tag)
-    .map(formatCommitEntry)
-    .filter((entry) => entry !== null);
-  console.log(renderReleaseNotes(entries, compareUrl));
-}
-
 if (require.main === module) {
   main();
 }
@@ -229,6 +288,8 @@ if (require.main === module) {
 module.exports = {
   classifyReleaseEntry,
   fallbackReleaseEntry,
+  filterReleaseNotes,
+  formatCommitEntries,
   formatCommitEntry,
   parseReleaseNotes,
   renderReleaseNotes,
