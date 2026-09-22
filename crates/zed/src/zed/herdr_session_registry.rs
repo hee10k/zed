@@ -524,6 +524,11 @@ impl HerdrEventStream for RealHerdrStream {
 struct GlobalHerdrSessionRegistry(Entity<HerdrSessionRegistry>);
 impl Global for GlobalHerdrSessionRegistry {}
 
+struct FocusIntent {
+    marker: Arc<()>,
+    target: Option<FocusTarget>,
+}
+
 pub(crate) struct HerdrSessionRegistry {
     windows: HashMap<u64, WindowBinding>,
     /// Windows that already received (or declined) the startup prompt.
@@ -560,6 +565,9 @@ pub(crate) struct HerdrSessionRegistry {
     /// Focus echoes are keyed by session and target so workspace and agent
     /// transitions never overwrite one another.
     focus_echoes: HashMap<SessionIdentity, FocusEcho<FocusTarget>>,
+    /// Every new focus intent supersedes all earlier ones for its session
+    /// (latest wins; nothing is queued).
+    focus_intents: HashMap<SessionIdentity, FocusIntent>,
     #[cfg(test)]
     sink_effects: Option<Rc<dyn AgentEffectSink>>,
     host_sink: Rc<dyn HerdrHostSink>,
@@ -625,6 +633,7 @@ impl HerdrSessionRegistry {
             next_generation: 0,
             sync: AgentSyncState::default(),
             focus_echoes: HashMap::default(),
+            focus_intents: HashMap::default(),
             #[cfg(test)]
             sink_effects: None,
             host_sink: Rc::new(NoopHerdrHostSink),
@@ -1216,8 +1225,9 @@ impl HerdrSessionRegistry {
             }
             self.connections.remove(identity);
             self.focus_echoes.remove(identity);
+            self.focus_intents.remove(identity);
             let effects = self.sync.forget_session(identity);
-            self.dispatch_effects(identity, effects, None, cx);
+            self.dispatch_effects(identity, effects, None, None, cx);
             cx.notify();
         }
     }
@@ -1236,7 +1246,7 @@ impl HerdrSessionRegistry {
             return;
         };
         let effects = self.sync.resync(&identity);
-        self.dispatch_effects(&identity, effects, None, cx);
+        self.dispatch_effects(&identity, effects, None, None, cx);
         cx.notify();
         let registry = cx.entity();
         // A fresh snapshot through the existing shared connection refreshes
@@ -1247,18 +1257,23 @@ impl HerdrSessionRegistry {
             };
             let _ = registry.update(cx, |registry, cx| {
                 let effects = import_snapshot(&mut registry.sync, &identity, &snapshot);
-                registry.dispatch_effects(&identity, effects, None, cx);
+                registry.dispatch_effects(&identity, effects, None, None, cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
+    /// `focus_receipt` is the intent marker recorded when the driving stream
+    /// event arrived. A follow that carries one must never record a newer
+    /// intent after its `client.pane` await, or it would supersede a focus
+    /// the user performed while the fetch was in flight.
     fn dispatch_effects(
         &mut self,
         identity: &SessionIdentity,
         effects: Vec<AgentSyncEffect>,
         target: Option<MirrorTarget>,
+        focus_receipt: Option<Arc<()>>,
         cx: &mut Context<Self>,
     ) {
         for effect in plan_effects(effects) {
@@ -1266,7 +1281,7 @@ impl HerdrSessionRegistry {
             if let Some(sink) = self.sink_effects.as_ref() {
                 sink.push(identity, &effect);
             }
-            self.apply_workspace_effect(identity, effect, target, cx);
+            self.apply_workspace_effect(identity, effect, target, focus_receipt.clone(), cx);
         }
     }
     /// Snapshot bootstrap is claimed once per connection generation by the
@@ -1303,7 +1318,7 @@ impl HerdrSessionRegistry {
                 AgentSyncEffect::Focus(_) | AgentSyncEffect::Forget(_) => None,
             })
             .collect();
-        self.dispatch_effects(identity, effects, target, cx);
+        self.dispatch_effects(identity, effects, target, None, cx);
         if !is_fresh_generation {
             return;
         }
@@ -1313,7 +1328,7 @@ impl HerdrSessionRegistry {
             .into_iter()
             .filter(|record| !routed_keys.contains(&record.key))
         {
-            self.follow_agent_workspace(record, target, cx);
+            self.follow_agent_workspace(record, target, None, cx);
         }
     }
 
@@ -1393,33 +1408,41 @@ impl HerdrSessionRegistry {
     ///
     /// Only the reflected event consumes a token: a repeated local target
     /// supersedes its pending request and still issues a fresh RPC, so a
-    /// rapid A->B->A never loses A's final switch.
+    /// rapid A->B->A never loses A's final switch. Every local focus intent
+    /// also supersedes any older follow; focus is latest-wins rather than a
+    /// queue because delayed activations must not replay stale user choices.
     pub(crate) fn focus_herdr_workspace(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
         self.refresh_window_roots(cx);
-        let Some((identity, checkout)) =
-            self.windows
-                .get(&window_id.as_u64())
-                .and_then(|binding| match &binding.state {
-                    BindingState::Connected(identity) => {
-                        Some((identity.clone(), binding.checkout_path.clone()?))
-                    }
-                    _ => None,
-                })
+        let Some(identity) = self.windows.get(&window_id.as_u64()).and_then(|binding| {
+            match &binding.state {
+                BindingState::Connected(identity) => Some(identity.clone()),
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+        let Some(checkout) = self
+            .windows
+            .get(&window_id.as_u64())
+            .and_then(|binding| binding.checkout_path.clone())
         else {
+            self.note_focus_intent(&identity, None);
             return;
         };
         let Some(workspace_id) = self
             .sync
             .workspace_id_for_checkout(&identity, Path::new(checkout.as_str()))
         else {
-            return;
-        };
-        let Some((client, generation)) = self.shared_connection(&identity) else {
+            self.note_focus_intent(&identity, None);
             return;
         };
         let target = FocusTarget::Workspace {
             session: identity.clone(),
             workspace_id: workspace_id.clone(),
+        };
+        self.note_focus_intent(&identity, Some(target.clone()));
+        let Some((client, generation)) = self.shared_connection(&identity) else {
+            return;
         };
         let echo = self.focus_echoes.entry(identity.clone()).or_default();
         let token = echo.request(target);
@@ -1450,6 +1473,8 @@ impl HerdrSessionRegistry {
     /// *no* detected agents is still focusable. Activation changes the window,
     /// so the local observer sends exactly one focus RPC back; the token that
     /// RPC registers absorbs its own reflection, and the loop stops there.
+    /// This remote intent is latest-wins with local and agent follows rather
+    /// than queued, because delayed older activations must not retake focus.
     fn focus_remote_workspace(
         &mut self,
         identity: &SessionIdentity,
@@ -1462,10 +1487,11 @@ impl HerdrSessionRegistry {
         };
         let echo = self.focus_echoes.get_mut(identity);
         if let Some(echo) = echo {
-            if echo.observe(target) == FocusObservation::Echo {
+            if echo.observe(target.clone()) == FocusObservation::Echo {
                 return;
             }
         }
+        self.note_focus_intent(identity, Some(target));
         let Some(checkout) = self.sync.workspace_checkout(identity, workspace_id) else {
             return;
         };
@@ -1503,13 +1529,16 @@ impl HerdrSessionRegistry {
         _identity: &SessionIdentity,
         effect: WorkspaceEffect,
         target: Option<MirrorTarget>,
+        focus_receipt: Option<Arc<()>>,
         cx: &mut Context<Self>,
     ) {
         match effect {
-            WorkspaceEffect::Open(record) => self.follow_agent_workspace(record, target, cx),
+            WorkspaceEffect::Open(record) => {
+                self.follow_agent_workspace(record, target, focus_receipt, cx)
+            }
             WorkspaceEffect::PaneMoved { key, .. } | WorkspaceEffect::Focus(key) => {
                 if let Some(record) = self.sync.record(&key) {
-                    self.follow_agent_workspace(record, target, cx);
+                    self.follow_agent_workspace(record, target, focus_receipt, cx);
                 }
             }
             WorkspaceEffect::Forget(_) => {}
@@ -1614,10 +1643,22 @@ impl HerdrSessionRegistry {
     /// import surfaces, through the shared snapshot-import notification. The
     /// captured connection generation invalidates the whole attempt once its
     /// session connection is superseded or released.
+    ///
+    /// Following focus is latest-wins and never queues, so a follow records no
+    /// intent of its own. A `focus_receipt` taken when the driving
+    /// `PaneEventKind::Focused` arrived admits activation while that marker is
+    /// still the session's latest: a reply that lands late can never overtake a
+    /// focus the user performed during the fetch. Without a receipt (pane
+    /// create/update, `AgentDetected`, resync or snapshot replay) activation is
+    /// admitted only while the live intent already names this workspace *and*
+    /// that workspace's checkout still canonicalizes to the root this follow
+    /// resolved, which keeps a re-import of the current workspace useful without
+    /// letting a stale reply mint a fresh intent.
     fn follow_agent_workspace(
         &mut self,
         record: AgentRecord,
         target: Option<MirrorTarget>,
+        focus_receipt: Option<Arc<()>>,
         cx: &mut Context<Self>,
     ) {
         if !record.focused {
@@ -1635,6 +1676,10 @@ impl HerdrSessionRegistry {
             return;
         };
         let target = target.filter(|target| target.generation == generation);
+        let intent_target = FocusTarget::Workspace {
+            session: record.key.session.clone(),
+            workspace_id: record.workspace_id.clone(),
+        };
         let Some(candidate) = record
             .checkout_path
             .clone()
@@ -1719,7 +1764,14 @@ impl HerdrSessionRegistry {
                 });
             }
             let _ = registry.update(cx, |registry, cx| {
-                if !registry.connection_matches(&record.key.session, generation) {
+                if !registry.connection_matches(&record.key.session, generation)
+                    || !registry.focus_intent_admits(
+                        &record.key.session,
+                        focus_receipt.as_ref(),
+                        &intent_target,
+                        &root,
+                    )
+                {
                     return;
                 }
                 registry.activate_workspace_for_root(&window, &root, cx);
@@ -2040,7 +2092,7 @@ impl HerdrSessionRegistry {
             // Drops synchronization ownership only; the `Forget` effects stay
             // out of the workspace queue and no terminal is closed.
             let effects = self.sync.forget_session(identity);
-            self.dispatch_effects(identity, effects, None, cx);
+            self.dispatch_effects(identity, effects, None, None, cx);
         }
         self.mark_state(identity, event, cx);
         let generation = self
@@ -2052,6 +2104,7 @@ impl HerdrSessionRegistry {
                 .remove(&(identity.clone(), generation));
         }
         self.focus_echoes.remove(identity);
+        self.focus_intents.remove(identity);
         self.in_flight.remove(identity);
     }
 
@@ -2071,6 +2124,7 @@ impl HerdrSessionRegistry {
                 .remove(&(identity.clone(), generation));
         }
         self.focus_echoes.remove(identity);
+        self.focus_intents.remove(identity);
         self.in_flight.remove(identity);
     }
 
@@ -2221,6 +2275,60 @@ impl HerdrSessionRegistry {
         }
     }
 
+    fn note_focus_intent(
+        &mut self,
+        identity: &SessionIdentity,
+        target: Option<FocusTarget>,
+    ) -> Arc<()> {
+        let marker = Arc::new(());
+        self.focus_intents.insert(
+            identity.clone(),
+            FocusIntent {
+                marker: marker.clone(),
+                target,
+            },
+        );
+        marker
+    }
+
+    /// Whether an in-flight follow may still activate `root`.
+    ///
+    /// A follow that carries its stream event's `receipt` is admitted only
+    /// while that marker is still the session's latest intent. A follow without
+    /// a receipt (pane create/update, agent detection, resync, snapshot replay)
+    /// owns no intent at all: it is admitted only while the live intent already
+    /// names the same workspace *and* that workspace's checkout still
+    /// canonicalizes exactly to `root`. So a delayed reply can neither mint a
+    /// fresh intent that overtakes a newer focus nor reactivate a root the
+    /// checkout has since moved away from.
+    fn focus_intent_admits(
+        &self,
+        identity: &SessionIdentity,
+        receipt: Option<&Arc<()>>,
+        target: &FocusTarget,
+        root: &herdr::CanonicalPath,
+    ) -> bool {
+        let Some(intent) = self.focus_intents.get(identity) else {
+            return false;
+        };
+        if receipt.is_some_and(|marker| Arc::ptr_eq(marker, &intent.marker)) {
+            return true;
+        }
+        if intent.target.as_ref() != Some(target) {
+            return false;
+        }
+        let FocusTarget::Workspace {
+            session: target_session,
+            workspace_id,
+        } = target;
+        if target_session != identity {
+            return false;
+        }
+        self.sync
+            .workspace_checkout(identity, workspace_id.as_ref())
+            .and_then(|checkout| canonical_checkout_path(&checkout).ok())
+            .is_some_and(|checkout| &checkout == root)
+    }
 
     // ------------------------------------------------------------ test seams
 
@@ -2243,6 +2351,7 @@ impl HerdrSessionRegistry {
             workspace_root_locks: HashMap::default(),
             sync: AgentSyncState::default(),
             focus_echoes: HashMap::default(),
+            focus_intents: HashMap::default(),
             #[cfg(test)]
             sink_effects: None,
             host_sink: Rc::new(NoopHerdrHostSink),
@@ -3382,6 +3491,29 @@ async fn process_stream_event(
             });
         }
     }
+    // A focused pane is itself a user focus intent, so it is recorded before
+    // the pane refresh awaits: a focus performed while that fetch is in flight
+    // must not be overtaken by this older intent when the reply lands.
+    // `AgentDetected` only discovers an agent and records no intent.
+    let focus_receipt = match &event {
+        HerdrEvent::Pane(PaneEvent {
+            kind: PaneEventKind::Focused { workspace_id, .. },
+        }) => {
+            let session = identity.clone();
+            let workspace_id: Arc<str> = Arc::from(workspace_id.as_str());
+            registry.update(cx, |registry, _| {
+                if !registry.connection_matches(&session, generation) {
+                    return None;
+                }
+                let target = FocusTarget::Workspace {
+                    session: session.clone(),
+                    workspace_id,
+                };
+                Some(registry.note_focus_intent(&session, Some(target)))
+            })
+        }
+        _ => None,
+    };
     let fetched = match &event {
         HerdrEvent::Pane(PaneEvent {
             kind:
@@ -3425,7 +3557,7 @@ async fn process_stream_event(
             }
             None => apply_event_effects(&mut registry.sync, identity, &event),
         };
-        registry.dispatch_effects(identity, effects, None, cx);
+        registry.dispatch_effects(identity, effects, None, focus_receipt, cx);
         cx.notify();
     });
 }
@@ -3679,6 +3811,86 @@ mod tests {
             workspace_id: String,
         ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
             self.workspace_ids.borrow_mut().push(workspace_id);
+            async { Ok(()) }.boxed_local()
+        }
+    }
+
+    /// Answers `client.pane` from a fixed script. One pane id can be held in
+    /// flight, so a refresh's reply can land after a newer focus superseded the
+    /// intent its stream event recorded.
+    struct ScriptedPaneHandle {
+        panes: RefCell<HashMap<String, herdr::PaneInfo>>,
+        held_pane_id: RefCell<Option<String>>,
+        sender: Rc<RefCell<Option<oneshot::Sender<()>>>>,
+    }
+
+    impl ScriptedPaneHandle {
+        fn new() -> Rc<Self> {
+            Rc::new(Self {
+                panes: RefCell::new(HashMap::default()),
+                held_pane_id: RefCell::new(None),
+                sender: Rc::new(RefCell::new(None)),
+            })
+        }
+
+        fn script(&self, pane_id: &str, pane: herdr::PaneInfo) {
+            self.panes
+                .borrow_mut()
+                .insert(pane_id.to_owned(), pane);
+        }
+
+        fn hold(&self, pane_id: &str) {
+            *self.held_pane_id.borrow_mut() = Some(pane_id.to_owned());
+        }
+
+        fn release(&self) {
+            self.sender
+                .borrow_mut()
+                .take()
+                .expect("the scripted pane refresh must be in flight")
+                .send(())
+                .expect("the scripted pane receiver is still pending");
+        }
+    }
+
+    impl HerdrSessionHandle for ScriptedPaneHandle {
+        fn subscribe(&self) -> LocalBoxFuture<'static, anyhow::Result<Box<dyn HerdrEventStream>>> {
+            async {
+                Err::<Box<dyn HerdrEventStream>, _>(anyhow::anyhow!("unused scripted pane stream"))
+            }
+            .boxed_local()
+        }
+
+        fn snapshot(&self) -> LocalBoxFuture<'static, anyhow::Result<SessionSnapshot>> {
+            async { Err::<SessionSnapshot, _>(anyhow::anyhow!("unused scripted pane snapshot")) }
+                .boxed_local()
+        }
+
+        fn pane(
+            &self,
+            pane_id: String,
+        ) -> LocalBoxFuture<'static, anyhow::Result<herdr::PaneInfo>> {
+            let scripted = self.panes.borrow().get(&pane_id).cloned();
+            let Some(pane) = scripted else {
+                return async move { Err(anyhow::anyhow!("pane {pane_id} was not scripted")) }
+                    .boxed_local();
+            };
+            if self.held_pane_id.borrow().as_deref() != Some(pane_id.as_str()) {
+                return async move { Ok(pane) }.boxed_local();
+            }
+            let (sender, receiver) = oneshot::channel();
+            *self.sender.borrow_mut() = Some(sender);
+            async move {
+                receiver.await.ok();
+                Ok(pane)
+            }
+            .boxed_local()
+        }
+
+        fn focus_workspace(
+            &self,
+            _workspace_id: String,
+        ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
             async { Ok(()) }.boxed_local()
         }
     }
@@ -4164,6 +4376,204 @@ mod tests {
                     .collect()
             })
             .expect("test window remains open")
+    }
+
+    fn active_root_in_window(
+        window: WindowHandle<MultiWorkspace>,
+        cx: &mut TestAppContext,
+    ) -> herdr::CanonicalPath {
+        window
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .worktrees(cx)
+                    .filter_map(|worktree| worktree.read(cx).root_dir())
+                    .find_map(|root| canonical_checkout_path(root.as_ref()).ok())
+            })
+            .expect("test window remains open")
+            .expect("active workspace has a project root")
+    }
+
+    fn workspace_target(identity: &SessionIdentity, workspace_id: &str) -> FocusTarget {
+        FocusTarget::Workspace {
+            session: identity.clone(),
+            workspace_id: Arc::from(workspace_id),
+        }
+    }
+
+    fn focused_pane(
+        terminal_id: &str,
+        pane_id: &str,
+        workspace_id: &str,
+        path: &str,
+    ) -> herdr::PaneInfo {
+        let mut pane = test_pane(terminal_id, pane_id, 1, path);
+        pane.workspace_id = workspace_id.to_owned();
+        pane
+    }
+
+    /// Drives one frame through the production stream path, exactly as the
+    /// connection loop does, so a pane refresh's ordering against a newer
+    /// focus is what the test observes.
+    fn process_pane_event(
+        cx: &mut TestAppContext,
+        registry: &Entity<HerdrSessionRegistry>,
+        identity: &SessionIdentity,
+        kind: PaneEventKind,
+    ) {
+        let identity = identity.clone();
+        let task = registry.update(cx, |_, cx| {
+            let registry = cx.entity();
+            cx.spawn(async move |_this, mut cx| {
+                process_stream_event(&registry, &identity, 1, HerdrEvent::Pane(PaneEvent { kind }), &mut cx)
+                    .await;
+            })
+        });
+        task.detach();
+    }
+
+    fn focused_pane_event(pane_id: &str, workspace_id: &str) -> PaneEventKind {
+        PaneEventKind::Focused {
+            pane_id: pane_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+        }
+    }
+
+    async fn workspace_follow_fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<HerdrSessionRegistry>,
+        WindowHandle<MultiWorkspace>,
+        SessionIdentity,
+    ) {
+        workspace_follow_fixture_with_handle(cx, Rc::new(FakeHandle)).await
+    }
+
+    async fn workspace_follow_fixture_with_handle(
+        cx: &mut TestAppContext,
+        client: Rc<dyn HerdrSessionHandle>,
+    ) -> (
+        Entity<HerdrSessionRegistry>,
+        WindowHandle<MultiWorkspace>,
+        SessionIdentity,
+    ) {
+        init_app(cx);
+        let app_state = import_test_app(cx).await;
+        let project = project::Project::test(
+            app_state.fs.clone(),
+            [std::path::Path::new("C:/existing")],
+            cx,
+        )
+        .await;
+        let window = add_real_window(cx, &project).await;
+        let mut async_cx = cx.to_async();
+        add_workspace_root(window, checkout("C:/space-a"), &mut async_cx)
+            .await
+            .expect("space-a root imports");
+        add_workspace_root(window, checkout("C:/space-b"), &mut async_cx)
+            .await
+            .expect("space-b root imports");
+        drop(async_cx);
+
+        let roots = roots_in_window(window, cx);
+        assert!(
+            roots.contains(&checkout("C:/space-a")),
+            "space-a must be present before dispatching a follow"
+        );
+        assert!(
+            roots.contains(&checkout("C:/space-b")),
+            "space-b must be present before dispatching a follow"
+        );
+
+        let identity = session("main");
+        let registry = cx.update(|cx| {
+            cx.new(|cx| {
+                HerdrSessionRegistry::test(
+                    cx,
+                    HerdrGateway::fake(
+                        || async { Ok(Vec::new()) }.boxed_local(),
+                        |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+                        |_name| async { Ok(()) }.boxed_local(),
+                    ),
+                )
+            })
+        });
+        registry.update(cx, |registry, _| {
+            let window_id = registry.register_window_for_test(
+                window,
+                BindingState::Connected(identity.clone()),
+                roots,
+            );
+            registry.install_connection_for_test(identity.clone(), client, 1);
+            let mut workspace_a = workspace_with_checkout("C:/space-a");
+            workspace_a.workspace_id = "space-a".to_owned();
+            registry.sync.apply_workspace(&identity, &workspace_a);
+            let mut workspace_b = workspace_with_checkout("C:/space-b");
+            workspace_b.workspace_id = "space-b".to_owned();
+            registry.sync.apply_workspace(&identity, &workspace_b);
+            registry
+                .windows
+                .get_mut(&window_id.as_u64())
+                .expect("workspace follow fixture window is registered")
+                .checkout_path = Some(checkout("C:/existing"));
+        });
+        (registry, window, identity)
+    }
+
+    async fn workspace_follow_missing_root_fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<HerdrSessionRegistry>,
+        WindowHandle<MultiWorkspace>,
+        SessionIdentity,
+    ) {
+        init_app(cx);
+        let app_state = import_test_app(cx).await;
+        let project = project::Project::test(
+            app_state.fs.clone(),
+            [std::path::Path::new("C:/existing")],
+            cx,
+        )
+        .await;
+        let window = add_real_window(cx, &project).await;
+        let roots = roots_in_window(window, cx);
+        assert!(
+            !roots.contains(&checkout("C:/space-b")),
+            "space-b must be absent before the follow imports it"
+        );
+        let identity = session("main");
+        let registry = cx.update(|cx| {
+            cx.new(|cx| {
+                HerdrSessionRegistry::test(
+                    cx,
+                    HerdrGateway::fake(
+                        || async { Ok(Vec::new()) }.boxed_local(),
+                        |_info| async { Err(anyhow::anyhow!("unused")) }.boxed_local(),
+                        |_name| async { Ok(()) }.boxed_local(),
+                    ),
+                )
+            })
+        });
+        registry.update(cx, |registry, _| {
+            let window_id = registry.register_window_for_test(
+                window,
+                BindingState::Connected(identity.clone()),
+                roots,
+            );
+            registry.install_connection_for_test(identity.clone(), Rc::new(FakeHandle), 1);
+            let mut workspace_b = workspace_with_checkout("C:/space-b");
+            workspace_b.workspace_id = "space-b".to_owned();
+            registry.sync.apply_workspace(&identity, &workspace_b);
+            registry
+                .windows
+                .get_mut(&window_id.as_u64())
+                .expect("missing-root fixture window is registered")
+                .checkout_path = Some(checkout("C:/existing"));
+        });
+        (registry, window, identity)
     }
 
 
@@ -5230,5 +5640,348 @@ mod tests {
             "a repeated local target must issue a new superseding RPC"
         );
     }
+    #[gpui::test]
+    async fn superseded_workspace_follow_never_steals_focus_back(
+        cx: &mut TestAppContext,
+    ) {
+        let (registry, window, identity) = workspace_follow_fixture(cx).await;
+        let effects = registry.update(cx, |registry, _| {
+            let effects = registry.sync.upsert(
+                identity.clone(),
+                focused_pane("terminal-a", "pane-a", "space-a", "C:/space-a"),
+            );
+            assert!(
+                registry
+                    .sync
+                    .record(&AgentKey::new(identity.clone(), "terminal-a"))
+                    .is_some_and(|record| record.focused),
+                "the upsert must produce a focused record"
+            );
+            effects
+        });
+        registry.update(cx, |registry, cx| {
+            let receipt = registry
+                .note_focus_intent(&identity, Some(workspace_target(&identity, "space-a")));
+            registry.dispatch_effects(&identity, effects, None, Some(receipt), cx);
+            registry.focus_remote_workspace(&identity, "space-b", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-b"),
+            "a delayed older follow must not steal focus from the newer remote intent"
+        );
+    }
+
+    #[gpui::test]
+    async fn newest_workspace_follow_wins_when_follows_race(cx: &mut TestAppContext) {
+        let (registry, window, identity) = workspace_follow_fixture(cx).await;
+        registry.update(cx, |registry, cx| {
+            assert!(
+                registry.activate_workspace_for_root(&window, &checkout("C:/existing"), cx),
+                "the race must start on a root neither follow targets"
+            );
+        });
+        let effects_a = registry.update(cx, |registry, _| {
+            registry.sync.upsert(
+                identity.clone(),
+                focused_pane("terminal-a", "pane-a", "space-a", "C:/space-a"),
+            )
+        });
+        let effects_b = registry.update(cx, |registry, _| {
+            registry.sync.upsert(
+                identity.clone(),
+                focused_pane("terminal-b", "pane-b", "space-b", "C:/space-b"),
+            )
+        });
+        registry.update(cx, |registry, cx| {
+            let receipt_a = registry
+                .note_focus_intent(&identity, Some(workspace_target(&identity, "space-a")));
+            registry.dispatch_effects(&identity, effects_a, None, Some(receipt_a), cx);
+            let receipt_b = registry
+                .note_focus_intent(&identity, Some(workspace_target(&identity, "space-b")));
+            registry.dispatch_effects(&identity, effects_b, None, Some(receipt_b), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-b"),
+            "the newest follow must still activate its workspace"
+        );
+    }
+
+    #[gpui::test]
+    async fn unrouteable_remote_focus_supersedes_pending_follow(cx: &mut TestAppContext) {
+        let (registry, window, identity) = workspace_follow_fixture(cx).await;
+        registry.update(cx, |registry, cx| {
+            registry.focus_remote_workspace(&identity, "space-b", cx);
+        });
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-b"),
+            "the pending follow needs a different starting root"
+        );
+        let effects = registry.update(cx, |registry, _| {
+            registry.sync.upsert(
+                identity.clone(),
+                focused_pane("terminal-a", "pane-a", "space-a", "C:/space-a"),
+            )
+        });
+        registry.update(cx, |registry, cx| {
+            let receipt = registry
+                .note_focus_intent(&identity, Some(workspace_target(&identity, "space-a")));
+            registry.dispatch_effects(&identity, effects, None, Some(receipt), cx);
+            // A herdr space no Zed window holds yet: routing gives up, but the
+            // intent was already recorded, so it still supersedes.
+            registry.focus_remote_workspace(&identity, "space-c", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-b"),
+            "an unrouteable newer remote intent must still cancel the older follow"
+        );
+    }
+
+    #[gpui::test]
+    async fn connected_local_unmapped_focus_supersedes_pending_follow(
+        cx: &mut TestAppContext,
+    ) {
+        let (registry, window, identity) = workspace_follow_fixture(cx).await;
+        registry.update(cx, |registry, cx| {
+            assert!(
+                registry.activate_workspace_for_root(&window, &checkout("C:/existing"), cx),
+                "the local switch must start from the unmapped project root"
+            );
+        });
+        let effects = registry.update(cx, |registry, _| {
+            registry.sync.upsert(
+                identity.clone(),
+                focused_pane("terminal-a", "pane-a", "space-a", "C:/space-a"),
+            )
+        });
+        registry.update(cx, |registry, cx| {
+            let receipt = registry
+                .note_focus_intent(&identity, Some(workspace_target(&identity, "space-a")));
+            registry.dispatch_effects(&identity, effects, None, Some(receipt), cx);
+            // The window's own checkout maps to no herdr workspace, so no RPC
+            // is sent, yet the local switch still supersedes the follow.
+            registry.focus_herdr_workspace(window.window_id(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/existing"),
+            "a connected but unmapped local focus must cancel the older follow"
+        );
+    }
+
+    #[gpui::test]
+    async fn matching_remote_focus_preserves_in_flight_follow(cx: &mut TestAppContext) {
+        let (registry, window, identity) = workspace_follow_missing_root_fixture(cx).await;
+        let effects = registry.update(cx, |registry, _| {
+            let effects = registry.sync.upsert(
+                identity.clone(),
+                focused_pane("terminal-b", "pane-b", "space-b", "C:/space-b"),
+            );
+            assert!(
+                registry
+                    .sync
+                    .record(&AgentKey::new(identity.clone(), "terminal-b"))
+                    .is_some_and(|record| record.focused),
+                "the upsert must produce a focused record"
+            );
+            effects
+        });
+        registry.update(cx, |registry, cx| {
+            registry.dispatch_effects(&identity, effects, None, None, cx);
+            registry.focus_remote_workspace(&identity, "space-b", cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            roots_in_window(window, cx).contains(&checkout("C:/space-b")),
+            "the in-flight follow must still import space-b"
+        );
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-b"),
+            "a matching remote target must not suppress its follow"
+        );
+    }
+
+    #[gpui::test]
+    async fn moved_same_workspace_id_blocks_stale_follow_root(cx: &mut TestAppContext) {
+        let (registry, window, identity) = workspace_follow_fixture(cx).await;
+        let effects = registry.update(cx, |registry, _| {
+            registry.sync.upsert(
+                identity.clone(),
+                focused_pane("terminal-a", "pane-a", "space-a", "C:/space-a"),
+            )
+        });
+        registry.update(cx, |registry, cx| {
+            registry.dispatch_effects(&identity, effects, None, None, cx);
+            let mut moved_workspace = workspace_with_checkout("C:/space-b");
+            moved_workspace.workspace_id = "space-a".to_owned();
+            registry
+                .sync
+                .apply_workspace(&identity, &moved_workspace);
+            registry.focus_remote_workspace(&identity, "space-a", cx);
+        });
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-b"),
+            "the newer remote intent must activate the moved workspace root"
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-b"),
+            "the stale follow must not reclaim the old root after a same-id move"
+        );
+    }
+
+    #[gpui::test]
+    async fn delayed_pane_focus_cannot_supersede_a_newer_intent(cx: &mut TestAppContext) {
+        let panes = ScriptedPaneHandle::new();
+        panes.script(
+            "pane-a",
+            focused_pane("terminal-a", "pane-a", "space-a", "C:/space-a"),
+        );
+        panes.hold("pane-a");
+        let (registry, window, identity) = workspace_follow_fixture_with_handle(
+            cx,
+            panes.clone() as Rc<dyn HerdrSessionHandle>,
+        )
+        .await;
+        registry.update(cx, |registry, cx| {
+            registry.focus_remote_workspace(&identity, "space-a", cx);
+        });
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-a"),
+            "the delayed event names the root the window starts on"
+        );
+
+        process_pane_event(
+            cx,
+            &registry,
+            &identity,
+            focused_pane_event("pane-a", "space-a"),
+        );
+        cx.run_until_parked();
+        assert!(
+            panes.sender.borrow().is_some(),
+            "the focused pane refresh must still be in flight"
+        );
+
+        registry.update(cx, |registry, cx| {
+            registry.focus_remote_workspace(&identity, "space-b", cx);
+        });
+        panes.release();
+        cx.run_until_parked();
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-b"),
+            "a pane focus that resolves late must not outrank the newer intent"
+        );
+    }
+
+    #[gpui::test]
+    async fn unreceived_agent_detected_follow_cannot_steal_a_newer_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let panes = ScriptedPaneHandle::new();
+        panes.script(
+            "pane-a",
+            focused_pane("terminal-a", "pane-a", "space-a", "C:/space-a"),
+        );
+        let (registry, window, identity) = workspace_follow_fixture_with_handle(
+            cx,
+            panes.clone() as Rc<dyn HerdrSessionHandle>,
+        )
+        .await;
+        registry.update(cx, |registry, cx| {
+            registry.focus_remote_workspace(&identity, "space-b", cx);
+        });
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-b"),
+            "the user's newer focus must be active before the detection lands"
+        );
+
+        process_pane_event(
+            cx,
+            &registry,
+            &identity,
+            PaneEventKind::AgentDetected {
+                pane_id: "pane-a".to_owned(),
+                workspace_id: "space-a".to_owned(),
+            },
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-b"),
+            "detecting an agent in another workspace must not record a focus intent"
+        );
+    }
+
+    #[gpui::test]
+    async fn unroutable_pane_focus_cancels_an_older_follow(cx: &mut TestAppContext) {
+        let panes = ScriptedPaneHandle::new();
+        panes.script(
+            "pane-a",
+            focused_pane("terminal-a", "pane-a", "space-a", "C:/space-a"),
+        );
+        panes.script(
+            "pane-u",
+            focused_pane("terminal-u", "pane-u", "space-u", "relative/workspace"),
+        );
+        panes.hold("pane-a");
+        let (registry, window, identity) = workspace_follow_fixture_with_handle(
+            cx,
+            panes.clone() as Rc<dyn HerdrSessionHandle>,
+        )
+        .await;
+        registry.update(cx, |registry, cx| {
+            registry.focus_remote_workspace(&identity, "space-b", cx);
+        });
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-b"),
+            "the user's focus must be active before either reply lands"
+        );
+
+        process_pane_event(
+            cx,
+            &registry,
+            &identity,
+            focused_pane_event("pane-a", "space-a"),
+        );
+        cx.run_until_parked();
+        assert!(
+            panes.sender.borrow().is_some(),
+            "the first pane refresh must still be in flight"
+        );
+
+        // The user focuses an agent whose checkout herdr has not resolved yet:
+        // no activation follows, but the intent itself supersedes the pending
+        // one.
+        process_pane_event(
+            cx,
+            &registry,
+            &identity,
+            focused_pane_event("pane-u", "space-u"),
+        );
+        cx.run_until_parked();
+        panes.release();
+        cx.run_until_parked();
+        assert_eq!(
+            active_root_in_window(window, cx),
+            checkout("C:/space-b"),
+            "an unroutable focus intent must still cancel the older in-flight follow"
+        );
+    }
+
 
 }
