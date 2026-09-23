@@ -2501,17 +2501,50 @@ impl Terminal {
         self.schedule_find_hyperlink(*modifiers, window.mouse_position(), cx);
     }
 
-    ///Paste text into the terminal
+    /// Paste text into the terminal.
     pub fn paste(&mut self, text: &str) {
-        let paste_text = if self.bracketed_paste_override
-            || self.last_content.mode.contains(Modes::BRACKETED_PASTE)
-        {
-            format!("{}{}{}", "\x1b[200~", text.replace('\x1b', ""), "\x1b[201~")
-        } else {
-            text.replace("\r\n", "\r").replace('\n', "\r")
-        };
+        const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+        const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
-        self.input(paste_text.into_bytes());
+        let bracketed = self.bracketed_paste_override
+            || self.last_content.mode.contains(Modes::BRACKETED_PASTE);
+        // Herdr's Windows ConPTY fallback turns LF into a semantic Enter before it can
+        // finish the outer paste frame. Lone CR remains paste content and is reframed
+        // for the inner pane application.
+        let normalize_line_endings =
+            !bracketed || (cfg!(target_os = "windows") && self.bracketed_paste_override);
+        let mut paste_text = Vec::with_capacity(
+            text.len()
+                + if bracketed {
+                    BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len()
+                } else {
+                    0
+                },
+        );
+
+        if bracketed {
+            paste_text.extend_from_slice(BRACKETED_PASTE_START);
+        }
+
+        let bytes = text.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\x1b' if bracketed => {}
+                b'\r' if normalize_line_endings && bytes.get(index + 1) == Some(&b'\n') => {
+                    paste_text.push(b'\r');
+                    index += 1;
+                }
+                b'\n' if normalize_line_endings => paste_text.push(b'\r'),
+                byte => paste_text.push(byte),
+            }
+            index += 1;
+        }
+
+        if bracketed {
+            paste_text.extend_from_slice(BRACKETED_PASTE_END);
+        }
+        self.input(paste_text);
     }
 
     pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6264,15 +6297,39 @@ mod tests {
     }
 
     #[test]
-    fn paste_override_frames_multiline_input_even_without_terminal_mode() {
+    fn paste_override_uses_platform_transport_line_endings() {
         let mut terminal = make_display_only_terminal();
 
         terminal.set_bracketed_paste_override(true);
-        terminal.paste("first\nsecond");
+        terminal.paste("first\r\nsecond\nthird\rfourth");
+
+        let expected = if cfg!(target_os = "windows") {
+            vec![b"\x1b[200~first\rsecond\rthird\rfourth\x1b[201~".to_vec()]
+        } else {
+            vec![b"\x1b[200~first\r\nsecond\nthird\rfourth\x1b[201~".to_vec()]
+        };
+        assert_eq!(terminal.take_input_log(), expected);
+    }
+
+    #[test]
+    fn paste_strips_escape_bytes_only_inside_bracketed_frames() {
+        let mut framed = make_display_only_terminal();
+        framed.last_content.mode.insert(Modes::BRACKETED_PASTE);
+        framed.paste("a\x1b[31mb");
 
         assert_eq!(
-            terminal.take_input_log(),
-            vec![b"\x1b[200~first\nsecond\x1b[201~".to_vec()]
+            framed.take_input_log(),
+            vec![b"\x1b[200~a[31mb\x1b[201~".to_vec()],
+            "a bracketed frame must not carry raw escape bytes into the child",
+        );
+
+        let mut plain = make_display_only_terminal();
+        plain.paste("a\x1b[31mb");
+
+        assert_eq!(
+            plain.take_input_log(),
+            vec![b"a\x1b[31mb".to_vec()],
+            "unframed paste must pass escape bytes through unchanged",
         );
     }
 

@@ -2449,7 +2449,9 @@ mod tests {
 
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
         cx.update(|_, cx| {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string("first\nsecond".to_string()));
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                "first\r\nsecond\nthird".to_string(),
+            ));
         });
 
         // The most recently added item is active, so this dispatch reaches the
@@ -2462,7 +2464,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             ordinary_terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
-            vec![b"first\rsecond".to_vec()],
+            vec![b"first\rsecond\rthird".to_vec()],
             "an ordinary terminal must keep converting paste line endings when the program did not request bracketed paste",
         );
 
@@ -2475,10 +2477,15 @@ mod tests {
             window.dispatch_action(Box::new(Paste), cx);
         });
         cx.run_until_parked();
+        let expected_herdr_paste = if cfg!(target_os = "windows") {
+            vec![b"\x1b[200~first\rsecond\rthird\x1b[201~".to_vec()]
+        } else {
+            vec![b"\x1b[200~first\r\nsecond\nthird\x1b[201~".to_vec()]
+        };
         assert_eq!(
             herdr_terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
-            vec![b"\x1b[200~first\nsecond\x1b[201~".to_vec()],
-            "a Herdr terminal must frame paste even when the program did not request bracketed paste",
+            expected_herdr_paste,
+            "a Herdr terminal must use transport-safe bracketed paste framing",
         );
     }
 
