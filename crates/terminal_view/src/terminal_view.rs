@@ -2477,15 +2477,10 @@ mod tests {
             window.dispatch_action(Box::new(Paste), cx);
         });
         cx.run_until_parked();
-        let expected_herdr_paste = if cfg!(target_os = "windows") {
-            vec![b"\x1b[200~first\rsecond\rthird\x1b[201~".to_vec()]
-        } else {
-            vec![b"\x1b[200~first\r\nsecond\nthird\x1b[201~".to_vec()]
-        };
         assert_eq!(
             herdr_terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
-            expected_herdr_paste,
-            "a Herdr terminal must use transport-safe bracketed paste framing",
+            vec![b"\x1b[200~first\r\nsecond\nthird\x1b[201~".to_vec()],
+            "a Herdr terminal must frame paste bytes exactly as the clipboard provided them",
         );
     }
 
