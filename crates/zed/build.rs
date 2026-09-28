@@ -102,7 +102,7 @@ fn main() {
             let conpty_dll_target = target_dir.join("conpty.dll");
             let open_console_target = target_dir.join("OpenConsole.exe");
 
-            let conpty_url = "https://github.com/microsoft/terminal/releases/download/v1.24.10621.0/Microsoft.Windows.Console.ConPTY.1.24.260303001.nupkg";
+            let conpty_url = "https://github.com/microsoft/terminal/releases/download/v1.24.11911.0/Microsoft.Windows.Console.ConPTY.1.24.260710001.nupkg";
             let nupkg_path = out_dir.join("conpty.nupkg.zip");
             let extract_dir = out_dir.join("conpty");
 
@@ -132,7 +132,14 @@ fn main() {
                     );
 
                     let extract_result = Command::new("powershell")
-                        .args(["-NoProfile", "-NonInteractive", "-Command", &extract_script])
+                        .args([
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-Command",
+                            &extract_script,
+                        ])
                         .output();
 
                     match extract_result {
